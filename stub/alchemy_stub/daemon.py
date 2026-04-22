@@ -205,6 +205,9 @@ class StubDaemon:
         else:
             payload["type"] = "workstation"
 
+        if self.config.slurm_account_id:
+            payload["slurm_account_id"] = self.config.slurm_account_id
+
         await self.sio.emit("register", payload, namespace="/stubs")
 
     def _get_slurm_info(self) -> dict | None:

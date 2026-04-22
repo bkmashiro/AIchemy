@@ -38,7 +38,7 @@ export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
 
   // POST /api/grids — create grid task
   router.post("/", (req: Request, res: Response) => {
-    const { name, command_template, parameters, base_config, stub_id } = req.body;
+    const { name, command_template, parameters, base_config, stub_id, force } = req.body;
 
     if (!name || !command_template || !parameters) {
       res.status(400).json({ error: "name, command_template, and parameters required" });
@@ -48,6 +48,23 @@ export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
     if (typeof parameters !== "object" || Object.values(parameters).some((v) => !Array.isArray(v))) {
       res.status(400).json({ error: "parameters must be an object of arrays" });
       return;
+    }
+
+    // Conflict detection: check for existing grid with same name that has completed cells
+    if (!force) {
+      const existingGrid = store.getAllGrids().find((g) => g.name === name);
+      if (existingGrid) {
+        const completedCells = existingGrid.cells.filter((c) => c.status === "completed");
+        if (completedCells.length > 0) {
+          res.status(409).json({
+            error: "Grid with this name already has completed cells",
+            existing_grid_id: existingGrid.id,
+            completed_count: completedCells.length,
+            hint: "Use force: true to override",
+          });
+          return;
+        }
+      }
     }
 
     const gridId = uuidv4();
@@ -230,6 +247,7 @@ function mapTaskStatusToCell(status: string): GridCell["status"] {
       return "completed";
     case "failed":
     case "killed":
+    case "interrupted":
       return "failed";
     case "running":
     case "paused":

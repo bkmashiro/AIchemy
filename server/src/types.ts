@@ -34,7 +34,8 @@ export type TaskStatus =
   | "waiting"
   | "blocked"
   | "completed_with_errors"
-  | "migrating";
+  | "migrating"
+  | "interrupted";
 
 export interface MigrationRecord {
   from_stub: string;
@@ -92,6 +93,7 @@ export interface Stub {
   hostname: string;
   gpu: GpuInfo;
   slurm_job_id?: string;
+  slurm_account_id?: string;
   status: "online" | "offline" | "stale";
   type: "slurm" | "workstation";
   slurm?: SlurmInfo;
@@ -168,6 +170,28 @@ export interface MigrationSuggestion {
   created_at: string;
 }
 
+// SLURM Accounts
+export interface SlurmAccount {
+  id: string;
+  name: string;                // e.g. "ys25", "hw2025"
+  ssh_target: string;          // e.g. "ys25@gpucluster2"
+  qos_limit: number;           // max concurrent jobs
+  partitions: string[];        // e.g. ["a40", "a30", "a100"]
+  default_walltime: string;
+  default_mem: string;
+  stub_command: string;        // template for stub launch
+}
+
+// SLURM Auto-Queue
+export interface AutoQueueConfig {
+  id: string;
+  account_id: string;
+  target_slots: number;        // how many stubs to maintain
+  idle_timeout_min: number;    // don't renew if idle this long
+  check_interval_s: number;
+  enabled: boolean;
+}
+
 export interface StallConfig {
   enabled: boolean;
   no_progress_timeout_min: number;
@@ -181,6 +205,8 @@ export interface ServerState {
   slurm_pool?: SlurmPoolConfig;
   grids?: GridTask[];
   stall_config?: StallConfig;
+  slurm_accounts?: SlurmAccount[];
+  autoqueue_configs?: AutoQueueConfig[];
 }
 
 // Socket event payloads
@@ -188,6 +214,7 @@ export interface RegisterPayload {
   hostname: string;
   gpu: GpuInfo;
   slurm_job_id?: string;
+  slurm_account_id?: string;
   max_concurrent: number;
   token: string;
   type?: "slurm" | "workstation";

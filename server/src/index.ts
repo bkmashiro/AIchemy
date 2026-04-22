@@ -10,7 +10,9 @@ import { setupWebNamespace } from "./socket/web";
 import { createStubsRouter } from "./api/stubs";
 import { createTasksRouter, createGlobalTasksRouter } from "./api/tasks";
 import { createGridsRouter } from "./api/grids";
+import { createSlurmAccountsRouter } from "./api/slurm-accounts";
 import { startScheduler } from "./scheduler";
+import { startAutoQueueLoop } from "./slurm-autoqueue";
 import { Token } from "./types";
 
 const PORT = parseInt(process.env.PORT || "3001", 10);
@@ -32,6 +34,7 @@ const webNs = io.of("/web");
 setupWebNamespace(webNs);
 setupStubNamespace(stubNs, webNs);
 startScheduler(webNs, stubNs);
+startAutoQueueLoop(webNs);
 
 // REST API
 const api = express.Router();
@@ -114,6 +117,7 @@ api.use("/stubs/:id/tasks", createTasksRouter(stubNs, webNs));
 api.use("/stubs", createStubsRouter(stubNs, webNs));
 api.use("/tasks", createGlobalTasksRouter(stubNs, webNs));
 api.use("/grids", createGridsRouter(stubNs, webNs));
+api.use("/slurm/accounts", createSlurmAccountsRouter());
 
 // Alerts
 api.get("/alerts", (_req, res) => {

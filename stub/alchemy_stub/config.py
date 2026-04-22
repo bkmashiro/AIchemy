@@ -35,6 +35,11 @@ def parse_args():
         default=os.environ.get("ALCHEMY_PID_FILE", "/tmp/alchemy_stub_tasks.json"),
         help="PID file for task re-attach on restart",
     )
+    parser.add_argument(
+        "--slurm-account-id",
+        default=os.environ.get("ALCHEMY_SLURM_ACCOUNT_ID"),
+        help="SLURM account ID for multi-account tracking",
+    )
     return parser.parse_args()
 
 
@@ -48,6 +53,8 @@ class Config:
         self.idle_timeout: int = args.idle_timeout
         self.hostname: str = args.hostname
         self.pid_file: str = args.pid_file
+
+        self.slurm_account_id: str | None = args.slurm_account_id
 
         # SLURM env
         self.slurm_job_id: str | None = os.environ.get("SLURM_JOB_ID")

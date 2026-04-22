@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { Stub, Task, Token, ServerState, SlurmPoolConfig, GridTask, GridCell, AnomalyAlert, MigrationSuggestion, StallConfig } from "../types";
+import { Stub, Task, Token, ServerState, SlurmPoolConfig, GridTask, GridCell, AnomalyAlert, MigrationSuggestion, StallConfig, SlurmAccount, AutoQueueConfig } from "../types";
 
 const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), "state.json");
 const SNAPSHOT_INTERVAL = 60_000;
@@ -11,6 +11,8 @@ class Store {
   private grids: Map<string, GridTask> = new Map();
   private alerts: Map<string, AnomalyAlert> = new Map();
   private migrationSuggestions: Map<string, MigrationSuggestion> = new Map();
+  private slurmAccounts: Map<string, SlurmAccount> = new Map();
+  private autoqueueConfigs: Map<string, AutoQueueConfig> = new Map();
   private slurmPool: SlurmPoolConfig = {
     enabled: false,
     ssh_target: "gpucluster2",
@@ -182,6 +184,51 @@ class Store {
     this.migrationSuggestions.delete(id);
   }
 
+  // SLURM Accounts
+  getSlurmAccount(id: string): SlurmAccount | undefined {
+    return this.slurmAccounts.get(id);
+  }
+
+  getAllSlurmAccounts(): SlurmAccount[] {
+    return Array.from(this.slurmAccounts.values());
+  }
+
+  setSlurmAccount(account: SlurmAccount): void {
+    this.slurmAccounts.set(account.id, account);
+  }
+
+  deleteSlurmAccount(id: string): void {
+    this.slurmAccounts.delete(id);
+  }
+
+  // Auto-Queue Configs
+  getAutoQueueConfig(id: string): AutoQueueConfig | undefined {
+    return this.autoqueueConfigs.get(id);
+  }
+
+  getAllAutoQueueConfigs(): AutoQueueConfig[] {
+    return Array.from(this.autoqueueConfigs.values());
+  }
+
+  setAutoQueueConfig(config: AutoQueueConfig): void {
+    this.autoqueueConfigs.set(config.id, config);
+  }
+
+  deleteAutoQueueConfig(id: string): void {
+    this.autoqueueConfigs.delete(id);
+  }
+
+  // Store reset (for testing)
+  reset(): void {
+    this.stubs.clear();
+    this.tokens.clear();
+    this.grids.clear();
+    this.alerts.clear();
+    this.migrationSuggestions.clear();
+    this.slurmAccounts.clear();
+    this.autoqueueConfigs.clear();
+  }
+
   // Stall config
   getStallConfig(): StallConfig {
     return this.stallConfig;
@@ -204,6 +251,8 @@ class Store {
         slurm_pool: this.slurmPool,
         grids: Array.from(this.grids.values()),
         stall_config: this.stallConfig,
+        slurm_accounts: Array.from(this.slurmAccounts.values()),
+        autoqueue_configs: Array.from(this.autoqueueConfigs.values()),
       };
       fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
     } catch (err) {
@@ -239,7 +288,15 @@ class Store {
         this.stallConfig = state.stall_config;
       }
 
-      console.log(`[store] Loaded state: ${this.stubs.size} stubs, ${this.tokens.size} tokens, ${this.grids.size} grids`);
+      for (const account of state.slurm_accounts || []) {
+        this.slurmAccounts.set(account.id, account);
+      }
+
+      for (const config of state.autoqueue_configs || []) {
+        this.autoqueueConfigs.set(config.id, config);
+      }
+
+      console.log(`[store] Loaded state: ${this.stubs.size} stubs, ${this.tokens.size} tokens, ${this.grids.size} grids, ${this.slurmAccounts.size} slurm accounts`);
     } catch (err) {
       console.error("[store] Failed to load state:", err);
     }

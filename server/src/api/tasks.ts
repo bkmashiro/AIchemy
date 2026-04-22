@@ -47,10 +47,25 @@ export function createTasksRouter(stubNs: Namespace, webNs: Namespace): Router {
     }
 
     const { command, cwd, env, env_setup, depends_on, post_hooks, run_dir, resumable,
-            estimated_vram_mb, auto_estimate } = req.body;
+            estimated_vram_mb, auto_estimate, force } = req.body;
     if (!command) {
       res.status(400).json({ error: "command required" });
       return;
+    }
+
+    // run_dir conflict detection
+    if (run_dir && !force) {
+      const conflict = store.getAllTasks().find(
+        (t) => t.run_dir === run_dir && ["completed", "completed_with_errors"].includes(t.status)
+      );
+      if (conflict) {
+        res.status(409).json({
+          error: `A completed task already exists with run_dir "${run_dir}"`,
+          conflicting_task_id: conflict.id,
+          hint: "Use force: true to override",
+        });
+        return;
+      }
     }
 
     // Validate dependencies
@@ -223,10 +238,25 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
   // POST /tasks — auto-assign to best stub
   router.post("/", (req: Request, res: Response) => {
     const { command, cwd, env, env_setup, depends_on, post_hooks, run_dir, resumable,
-            estimated_vram_mb, auto_estimate } = req.body;
+            estimated_vram_mb, auto_estimate, force } = req.body;
     if (!command) {
       res.status(400).json({ error: "command required" });
       return;
+    }
+
+    // run_dir conflict detection
+    if (run_dir && !force) {
+      const conflict = store.getAllTasks().find(
+        (t) => t.run_dir === run_dir && ["completed", "completed_with_errors"].includes(t.status)
+      );
+      if (conflict) {
+        res.status(409).json({
+          error: `A completed task already exists with run_dir "${run_dir}"`,
+          conflicting_task_id: conflict.id,
+          hint: "Use force: true to override",
+        });
+        return;
+      }
     }
 
     const targetStub = pickBestStub(estimated_vram_mb);

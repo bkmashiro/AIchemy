@@ -28,6 +28,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
         stub.missed_heartbeats = (stub.missed_heartbeats || 0) + 1;
         if (stub.missed_heartbeats >= MISSED_HEARTBEAT_LIMIT) {
           stub.status = "stale";
+          failStubTasks(stub, webNs);
           store.setStub(stub);
           webNs.emit("stub.offline", { stub_id: stub.id });
           console.log(`[stub] ${stub.name} marked stale after ${stub.missed_heartbeats} missed heartbeats`);
@@ -40,7 +41,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
     console.log(`[stub] Socket connected: ${socket.id}`);
 
     socket.on("register", (payload: RegisterPayload) => {
-      const { hostname, gpu, slurm_job_id, max_concurrent, token, type, slurm, remaining_walltime_s } = payload;
+      const { hostname, gpu, slurm_job_id, max_concurrent, token, type, slurm, remaining_walltime_s, slurm_account_id } = payload;
 
       // Auth check
       const tokenRecord = store.getToken(token);
@@ -62,15 +63,17 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
         stub.max_concurrent = max_concurrent;
         stub.gpu = gpu;
         if (slurm_job_id) stub.slurm_job_id = slurm_job_id;
+        if (slurm_account_id) stub.slurm_account_id = slurm_account_id;
         if (type) stub.type = type;
         if (slurm) stub.slurm = slurm;
         if (remaining_walltime_s !== undefined) stub.remaining_walltime_s = remaining_walltime_s;
-        // Reset running/paused/migrating tasks on reconnect — subprocesses don't survive stub restart.
+        // Reset interrupted/running/paused/migrating tasks on reconnect — subprocesses don't survive stub restart.
         for (const task of stub.tasks) {
-          if (["running", "paused", "migrating"].includes(task.status)) {
+          if (["running", "paused", "migrating", "interrupted"].includes(task.status)) {
             task.status = "queued";
             task.pid = undefined;
             task.started_at = undefined;
+            task.finished_at = undefined;
           }
         }
         store.setStub(stub);
@@ -85,6 +88,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
           hostname,
           gpu,
           slurm_job_id,
+          slurm_account_id,
           status: "online",
           type: type || (slurm_job_id ? "slurm" : "workstation"),
           slurm,
@@ -275,6 +279,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       const stub = store.getStub(stub_id);
       if (!stub) return;
       stub.status = "offline";
+      failStubTasks(stub, webNs);
       store.setStub(stub);
       webNs.emit("stub.offline", { stub_id });
       console.log(`[stub] Disconnected: ${stub.name}`);
@@ -388,6 +393,22 @@ export function execShell(
 
     ns.to(`stub:${stubId}`).emit("shell.exec", { id, command, timeout });
   });
+}
+
+function failStubTasks(stub: Stub, webNs: Namespace): void {
+  for (const task of stub.tasks) {
+    if (["running", "paused"].includes(task.status)) {
+      task.status = "interrupted";
+      task.finished_at = new Date().toISOString();
+      webNs.emit("task.update", task);
+
+      if (task.grid_id && task.grid_cell_id) {
+        store.updateGridCell(task.grid_id, task.grid_cell_id, { status: "failed" });
+        const grid = store.getGrid(task.grid_id);
+        if (grid) webNs.emit("grid.update", grid);
+      }
+    }
+  }
 }
 
 function sanitizeStub(stub: Stub) {
