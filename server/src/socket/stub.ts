@@ -354,6 +354,8 @@ export function dispatchQueuedTasks(stubId: string, ns: Namespace): void {
         cwd: task.cwd,
         env: task.env,
         env_setup: task.env_setup,
+        param_overrides: task.param_overrides,
+        base_config: task.base_config,
       });
       console.log(`[stub] Dispatched task ${task.id} to stub ${stubId}`);
     }

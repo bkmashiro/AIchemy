@@ -76,6 +76,14 @@ class StubDaemon:
             cwd = data.get("cwd")
             env = data.get("env") or {}
             env_setup = data.get("env_setup") or ""
+            param_overrides = data.get("param_overrides")
+            base_config = data.get("base_config")
+
+            # Mode B: ALCHEMY_PARAMS always injected via env (set by server)
+            # Mode C: generate config file from base YAML + overrides
+            if base_config and param_overrides:
+                config_path = self._generate_config(task_id, base_config, param_overrides, cwd)
+                command = command.replace("{generated_config_path}", config_path)
 
             print(f"[daemon] Starting task {task_id}: {command!r}")
             self.last_task_time = time.time()
@@ -239,6 +247,23 @@ class StubDaemon:
             return info
         except Exception:
             return None
+
+    def _generate_config(self, task_id: str, base_config: str, overrides: dict, cwd: str | None) -> str:
+        """Mode C: merge base YAML with param overrides, write temp config file."""
+        import yaml
+
+        base = yaml.safe_load(base_config) or {}
+        # Deep merge overrides into base
+        for k, v in overrides.items():
+            base[k] = v
+
+        config_dir = os.path.join(cwd or ".", ".aichemy_configs")
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, f"{task_id}.yaml")
+        with open(config_path, "w") as f:
+            yaml.dump(base, f, default_flow_style=False)
+        print(f"[daemon] Generated config: {config_path}")
+        return config_path
 
     async def _on_task_started(self, task_id: str, pid: int):
         if self.registered:

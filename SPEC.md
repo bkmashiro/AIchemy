@@ -687,9 +687,41 @@ interface GridCell {
 }
 ```
 
-### Config 模板引擎
+### 参数传递：双模式
 
-不再每个种子一个 yaml。用 base config + 参数覆盖：
+#### 模式 B: SDK Param API（新代码推荐）
+
+Server 通过环境变量 `ALCHEMY_PARAMS` 注入参数，SDK 读取：
+
+```python
+from aichemy_sdk import Alchemy
+al = Alchemy()
+
+ctx = al.param("context_len")       # 单个参数
+seed = al.param("seed", default=42) # 带默认值
+config = al.params()                # 整个 dict: {"context_len": 128, "seed": 42}
+```
+
+Stub 启动 task 时设置环境变量：
+```bash
+ALCHEMY_PARAMS='{"context_len":128,"seed":42}' python train.py
+```
+
+SDK 实现：
+```python
+def param(self, key: str, default=None):
+    params = json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
+    if key not in params and default is None:
+        raise KeyError(f"Parameter '{key}' not found. Available: {list(params.keys())}")
+    return params.get(key, default)
+
+def params(self) -> dict:
+    return json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
+```
+
+#### 模式 C: Config 生成（现有代码兼容）
+
+Server 拿 base YAML + grid 参数 → 生成临时 config 文件 → 通过 `{generated_config_path}` 传给命令。
 
 ```yaml
 # base_ctx_ablation.yaml
@@ -711,7 +743,19 @@ Grid 提交时：
 }
 ```
 
-Server 自动为每个组合生成临时 config（base + override），创建 task。
+生成流程：
+1. Stub 收到 `task.run` 时，如果 task 有 `base_config` + `param_overrides`
+2. Stub 读取 base YAML → deep merge 参数覆盖 → 写到临时文件 `{workdir}/.aichemy_configs/{task_id}.yaml`
+3. 命令中 `{generated_config_path}` 替换为临时文件路径
+4. 任务完成后清理临时文件（可选保留）
+
+这样训练代码零修改，只要原来支持 `--config xxx.yaml` 就行。
+
+#### 两种模式共存
+
+- `ALCHEMY_PARAMS` 环境变量**始终注入**（不管哪种模式）
+- 模式 C 额外生成 config 文件
+- 训练代码可以两种都用，也可以只用一种
 
 ### Dashboard: 矩阵视图
 

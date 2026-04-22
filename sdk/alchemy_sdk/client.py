@@ -1,4 +1,5 @@
 """Main SDK client class."""
+import json
 import os
 from typing import Any, Optional
 
@@ -72,6 +73,17 @@ class Alchemy:
         if self._reporter is None:
             return
         self._reporter.flush()
+
+    def param(self, key: str, default: Any = None) -> Any:
+        """Get a parameter from ALCHEMY_PARAMS env var (Mode B)."""
+        params = json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
+        if key not in params and default is None:
+            raise KeyError(f"Parameter '{key}' not found. Available: {list(params.keys())}")
+        return params.get(key, default)
+
+    def params(self) -> dict[str, Any]:
+        """Get all parameters from ALCHEMY_PARAMS env var (Mode B)."""
+        return json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
 
     def __enter__(self):
         return self

@@ -98,6 +98,9 @@ export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
         log_buffer: [],
         grid_id: gridId,
         grid_cell_id: cell.id,
+        param_overrides: cell.params,
+        base_config,
+        env: { ALCHEMY_PARAMS: JSON.stringify(cell.params) },
       };
 
       targetStub.tasks.push(task);
@@ -274,6 +277,9 @@ function resubmitCell(grid: GridTask, cell: GridCell, stubNs: Namespace, webNs: 
     log_buffer: [],
     grid_id: grid.id,
     grid_cell_id: cell.id,
+    param_overrides: cell.params,
+    base_config: grid.base_config,
+    env: { ALCHEMY_PARAMS: JSON.stringify(cell.params) },
   };
 
   targetStub.tasks.push(task);

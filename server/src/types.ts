@@ -74,6 +74,9 @@ export interface Task {
   // Grid cell reference
   grid_id?: string;
   grid_cell_id?: string;
+  // Param passing (Mode B+C)
+  param_overrides?: Record<string, any>;
+  base_config?: string;  // base YAML content for config generation
 }
 
 export interface SlurmInfo {
