@@ -660,8 +660,302 @@ python -m alchemy_stub \
 - 手动触发排队按钮
 - 历史：GPU 占用率时间线
 
+## Grid Tasks（参数网格）
+
+批量参数扫描，一次定义，自动展开为多个 task。
+
+### 数据模型
+
+```typescript
+interface GridTask {
+  id: string;
+  name: string;                    // e.g. "ctx_ablation"
+  command_template: string;        // "python train.py --config {config_path}"
+  parameters: Record<string, any[]>;  // {"context_len": [1,2,4,...], "seed": [42,123,789]}
+  cells: GridCell[];               // 自动展开的每个组合
+  status: "pending" | "running" | "completed" | "partial";
+  created_at: string;
+}
+
+interface GridCell {
+  id: string;
+  grid_id: string;
+  params: Record<string, any>;     // {"context_len": 128, "seed": 42}
+  task_id?: string;                // 关联的 task
+  status: "pending" | "running" | "completed" | "failed";
+  metrics?: Record<string, number>; // 从 run_dir/metrics.json 读取
+}
+```
+
+### Config 模板引擎
+
+不再每个种子一个 yaml。用 base config + 参数覆盖：
+
+```yaml
+# base_ctx_ablation.yaml
+hidden_dim: 512
+total_steps: 500000
+# ... 其他固定参数
+```
+
+Grid 提交时：
+```json
+{
+  "name": "ctx_ablation",
+  "base_config": "configs/base_ctx_ablation.yaml",
+  "parameters": {
+    "context_len": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+    "seed": [42, 123, 789]
+  },
+  "command_template": "python train.py --config {generated_config_path}"
+}
+```
+
+Server 自动为每个组合生成临时 config（base + override），创建 task。
+
+### Dashboard: 矩阵视图
+
+- 热力图矩阵：x=context_len, y=seed
+- 颜色 = status（灰=pending, 蓝=running, 绿=completed, 红=failed）或 metric 值
+- 点击格子 → 跳转到 task 详情
+- 操作：重跑单格、批量 kill、筛选失败的重提交
+- 自动检测缺失格子，一键补提交
+
+### REST API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/grids` | 创建 grid task |
+| `GET` | `/api/grids` | 列出所有 grids |
+| `GET` | `/api/grids/:id` | Grid 详情 + 所有 cells |
+| `POST` | `/api/grids/:id/retry-failed` | 重跑所有失败的 cell |
+| `POST` | `/api/grids/:id/cells/:cid/retry` | 重跑单个 cell |
+| `DELETE` | `/api/grids/:id` | Kill 所有 cell 任务 |
+
+---
+
+## Task DAG 编排
+
+Task 之间可以有依赖关系。
+
+### 数据模型
+
+```typescript
+interface Task {
+  // ... existing fields ...
+  depends_on?: string[];           // task IDs that must complete before this starts
+  post_hooks?: string[];           // commands to run after task completes successfully
+}
+```
+
+### 逻辑
+
+- Task 有 `depends_on` → 状态为 `waiting`，不下发给 stub
+- 所有前置 task completed → 状态变 `queued` → 正常调度
+- 任一前置 failed → 状态变 `blocked`，通知用户
+- Server 维护拓扑排序，检测循环依赖
+
+### Post-hooks（轻量版 DAG）
+
+大部分场景不需要完整 DAG，只需要"训练完自动跑 eval"：
+
+```json
+{
+  "command": "python train.py --config ctx128_s42.yaml",
+  "post_hooks": [
+    "python eval_silhouette.py --run {run_dir}",
+    "python probe_multiworld.py --checkpoint {run_dir}/final.pt"
+  ]
+}
+```
+
+- `{run_dir}` 等变量由 server 自动替换
+- post_hooks 在同一个 stub 上顺序执行
+- 任一 hook 失败 → 标记 task 为 `completed_with_errors`，不影响主任务状态
+
+### Dashboard
+
+- DAG 可视化：节点 = task，边 = 依赖
+- Grid 可以作为 DAG 的一个节点（等所有 cell 完成 → 触发后续）
+
+---
+
+## ManagedTraining SDK（可恢复任务）
+
+SDK 提供 `ManagedTraining` 基类，用户实现 4 个方法，AIchemy 管理其余一切。
+
+### 用户接口
+
+```python
+from aichemy_sdk import ManagedTraining
+
+class MyTraining(ManagedTraining):
+    def setup(self, config: dict):
+        """初始化模型、优化器。首次启动或恢复时调用。"""
+        self.model = build_model(config)
+        self.optimizer = Adam(self.model.parameters())
+        
+    def state(self) -> dict:
+        """导出全部可序列化状态。AIchemy 调用此方法做 checkpoint。"""
+        return {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "step": self.step,
+            "rng": torch.get_rng_state(),
+        }
+    
+    def load_state(self, state: dict):
+        """从 state dict 恢复。"""
+        self.model.load_state_dict(state["model"])
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.step = state["step"]
+        torch.set_rng_state(state["rng"])
+    
+    def step_fn(self, batch) -> dict:
+        """单步训练，返回 metrics。纯计算，无副作用。"""
+        loss = self.model(batch)
+        loss.backward()
+        self.optimizer.step()
+        return {"loss": loss.item()}
+
+# 启动
+if __name__ == "__main__":
+    ManagedTraining.run(MyTraining, config="ctx128_s42.yaml")
+```
+
+### AIchemy 管理的事
+
+- **自动 checkpoint**: 按策略存（每 N 步 / 每 M 分钟 / 收到迁移请求时）
+- **自动上报**: `step_fn` 返回的 metrics 自动通过 SDK 上报
+- **自动恢复**: 启动时检测已有 checkpoint → `setup()` + `load_state()` → 继续
+- **迁移支持**: 收到迁移请求 → `state()` → 序列化到共享存储 → 暂停
+
+### 迁移流程（人工触发）
+
+Dashboard 上显示"建议迁移到 gpu31"，用户点确认后：
+
+1. Server → Stub(旧): `task.checkpoint_and_pause`
+2. Stub(旧): 调 `state()` → 存到共享存储 `{shared_path}/migrate_{task_id}.pt`
+3. Stub(旧): 报告 checkpoint 路径 → task 状态变 `migrating`
+4. Server → Stub(新): `task.run --resume-from {path}`
+5. Stub(新): `setup()` + `load_state()` → 继续训练
+6. 确认新 stub 正常后 → Server → Stub(旧): `task.kill`
+
+**迁移和调度不自动执行，只给建议 + 一键操作。**
+
+### Task 元数据
+
+```typescript
+interface Task {
+  // ... existing fields ...
+  resumable: boolean;              // SDK ManagedTraining 标记
+  checkpoint_path?: string;        // 最新 state 路径
+  run_dir?: string;                // 训练输出目录
+  migration_history?: Array<{
+    from_stub: string;
+    to_stub: string;
+    at_step: number;
+    timestamp: string;
+  }>;
+}
+```
+
+---
+
+## 训练异常检测
+
+Stub 和 Server 配合检测训练异常。
+
+### Stall 检测
+
+```typescript
+interface StallConfig {
+  enabled: boolean;
+  no_progress_timeout_min: number;   // 默认 30min — 无新 checkpoint 且无 step 增长
+  gpu_idle_threshold_pct: number;    // GPU 利用率低于此值视为 idle，默认 5%
+  gpu_idle_timeout_min: number;      // GPU 连续 idle N 分钟 → 告警，默认 10min
+}
+```
+
+- Stub 上报 GPU stats，server 检测连续 idle
+- SDK 模式: step 不增长 N 分钟 → 告警
+- 非 SDK 模式: 监控 log 输出频率，长时间无输出 → 告警
+
+### Loss 异常
+
+SDK 模式下：
+- `step_fn` 返回 loss = NaN / Inf → 自动暂停 + Discord 通知
+- loss 突然跳升 10x → 警告（不暂停，可能是正常波动）
+
+### 通知
+
+所有告警发 Discord webhook + dashboard 高亮。**只告警不自动处理**（除了 NaN 暂停）。
+
+---
+
+## 智能分配（Heterogeneous-Aware）
+
+提交 task 时可以不指定 stub，server 根据任务需求自动选。
+
+### 显存估算
+
+```typescript
+interface TaskRequirements {
+  estimated_vram_mb?: number;      // 用户手动指定
+  auto_estimate?: boolean;         // 或根据 config 自动估算
+}
+```
+
+自动估算逻辑（基于 config 参数）：
+- `context_len` × `hidden_dim` × `batch_size` → 粗略 VRAM 估算
+- 用历史数据校准（同类 task 实际用了多少显存）
+
+### 分配策略
+
+1. 过滤：VRAM 够的 stub
+2. 优先：空闲 > 低负载 > 高负载
+3. 同类 GPU 优先（避免速度差异影响 seed 间对比）
+4. 如果无合适 stub → 进全局 queue，等 stub 空闲或 SLURM auto-queue 补坑
+
+### 迁移建议（不自动执行）
+
+Server 定期检查：
+- stub 上多个 task 共享 GPU，速度明显慢于单任务 → 建议拆分
+- 有空闲 stub 但繁忙 stub 排了队列 → 建议迁移
+- Dashboard 上显示建议，带"一键迁移"按钮
+
+---
+
+## 任务输出目录管理
+
+AIchemy 不管实验逻辑，但帮助 task 维护好输出。
+
+### 约定
+
+- 每个 task 有 `run_dir`（由命令行或 config 决定）
+- Task 完成后 stub 扫描 `{run_dir}/metrics.json`（如果存在）→ 读取 metrics 上报
+- Dashboard 展示 metrics，但不存中心数据库
+- Grid 视图的矩阵颜色可以用 metrics.json 中的值
+
+### metrics.json 格式（约定，不强制）
+
+```json
+{
+  "silhouette_l2": 0.543,
+  "nmi": 0.771,
+  "ari": 0.567,
+  "final_loss": 0.023
+}
+```
+
+训练代码在结束时写这个文件就行。SDK 模式下可自动生成。
+
+---
+
 ## Out of Scope (for now)
 
-- Persistent database (in-memory state is fine, stubs re-register on server restart)
+- Persistent database（in-memory + JSON snapshot 够用）
 - Multi-user / auth on dashboard
-- Task dependencies / DAG workflows
+- 自动迁移 / 自动降级（只给建议，人工确认）
+- 中心化结果数据库（metrics 留在 run_dir）
+- 自动生成论文 figure（耦合太强）

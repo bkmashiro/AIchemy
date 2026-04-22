@@ -24,6 +24,25 @@ export interface TaskProgress {
   metrics?: Record<string, number>;
 }
 
+export type TaskStatus =
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "killed"
+  | "waiting"
+  | "blocked"
+  | "completed_with_errors"
+  | "migrating";
+
+export interface MigrationRecord {
+  from_stub: string;
+  to_stub: string;
+  at_step: number;
+  timestamp: string;
+}
+
 export interface Task {
   id: string;
   stub_id: string;
@@ -31,7 +50,7 @@ export interface Task {
   cwd?: string;
   env?: Record<string, string>;
   env_setup?: string;
-  status: "queued" | "running" | "paused" | "completed" | "failed" | "killed";
+  status: TaskStatus;
   exit_code?: number;
   created_at: string;
   started_at?: string;
@@ -39,6 +58,22 @@ export interface Task {
   progress?: TaskProgress;
   log_buffer: string[];
   pid?: number;
+  // DAG
+  depends_on?: string[];
+  post_hooks?: string[];
+  // Run dir / metrics
+  run_dir?: string;
+  metrics?: Record<string, number>;
+  // ManagedTraining
+  resumable?: boolean;
+  checkpoint_path?: string;
+  migration_history?: MigrationRecord[];
+  // VRAM requirements
+  estimated_vram_mb?: number;
+  auto_estimate?: boolean;
+  // Grid cell reference
+  grid_id?: string;
+  grid_cell_id?: string;
 }
 
 export interface SlurmInfo {
@@ -87,10 +122,62 @@ export interface SlurmPoolConfig {
   min_queue_ahead: number;
 }
 
+// Grid Tasks
+export interface GridCell {
+  id: string;
+  grid_id: string;
+  params: Record<string, any>;
+  task_id?: string;
+  status: "pending" | "running" | "completed" | "failed";
+  metrics?: Record<string, number>;
+}
+
+export interface GridTask {
+  id: string;
+  name: string;
+  command_template: string;
+  base_config?: string;       // base YAML content
+  parameters: Record<string, any[]>;
+  cells: GridCell[];
+  status: "pending" | "running" | "completed" | "partial";
+  created_at: string;
+  stub_id?: string;           // optional target stub
+}
+
+// Anomaly alerts
+export interface AnomalyAlert {
+  id: string;
+  stub_id: string;
+  task_id?: string;
+  type: "stall" | "gpu_idle" | "loss_nan" | "loss_spike" | "no_output";
+  message: string;
+  created_at: string;
+  resolved: boolean;
+}
+
+// Migration suggestion
+export interface MigrationSuggestion {
+  id: string;
+  task_id: string;
+  from_stub: string;
+  to_stub: string;
+  reason: string;
+  created_at: string;
+}
+
+export interface StallConfig {
+  enabled: boolean;
+  no_progress_timeout_min: number;
+  gpu_idle_threshold_pct: number;
+  gpu_idle_timeout_min: number;
+}
+
 export interface ServerState {
   stubs: Stub[];
   tokens: Token[];
   slurm_pool?: SlurmPoolConfig;
+  grids?: GridTask[];
+  stall_config?: StallConfig;
 }
 
 // Socket event payloads

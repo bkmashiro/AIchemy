@@ -93,9 +93,9 @@ def server_url(server_process):
     return server_process["url"]
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def api_token(server_url):
-    """Create a token for use in tests."""
+    """Create a unique token per test function to ensure stub isolation."""
     r = _session.post(f"{server_url}/api/tokens", json={"label": "test"})
     assert r.status_code == 201
     return r.json()["token"]

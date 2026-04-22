@@ -12,6 +12,7 @@ import {
   ShellResultPayload,
   Stub,
 } from "../types";
+import { checkDagDependencies, checkLossAnomaly, updateTaskProgressTime, updateTaskOutputTime } from "../scheduler";
 
 const HEARTBEAT_INTERVAL = 30_000;
 const MISSED_HEARTBEAT_LIMIT = 3;
@@ -64,6 +65,14 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
         if (type) stub.type = type;
         if (slurm) stub.slurm = slurm;
         if (remaining_walltime_s !== undefined) stub.remaining_walltime_s = remaining_walltime_s;
+        // Reset running/paused/migrating tasks on reconnect — subprocesses don't survive stub restart.
+        for (const task of stub.tasks) {
+          if (["running", "paused", "migrating"].includes(task.status)) {
+            task.status = "queued";
+            task.pid = undefined;
+            task.started_at = undefined;
+          }
+        }
         store.setStub(stub);
         console.log(`[stub] Re-registered: ${stub.name} (${stub.id})`);
       } else {
@@ -149,6 +158,8 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
     socket.on("task.progress", (payload: TaskProgressPayload) => {
       const stub_id = socket.data.stub_id;
       if (!stub_id) return;
+      const existingTask = store.getTask(stub_id, payload.task_id);
+      const previousLoss = existingTask?.progress?.loss;
       const task = store.updateTask(stub_id, payload.task_id, {
         progress: {
           step: payload.step,
@@ -157,7 +168,12 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
           metrics: payload.metrics,
         },
       });
-      if (task) webNs.emit("task.update", task);
+      if (task) {
+        webNs.emit("task.update", task);
+        updateTaskProgressTime(payload.task_id);
+        // Check for loss anomalies
+        checkLossAnomaly(stub_id, payload.task_id, payload.loss, previousLoss, webNs, ns);
+      }
     });
 
     socket.on("task.log", (payload: TaskLogPayload) => {
@@ -170,19 +186,40 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       const newBuf = [...task.log_buffer, ...payload.lines].slice(-500);
       store.updateTask(stub_id, payload.task_id, { log_buffer: newBuf });
 
+      updateTaskOutputTime(payload.task_id);
       webNs.emit("task.log", { stub_id, task_id: payload.task_id, lines: payload.lines });
     });
 
-    socket.on("task.completed", (payload: TaskCompletedPayload) => {
+    socket.on("task.completed", (payload: TaskCompletedPayload & { metrics?: Record<string, number> }) => {
       const stub_id = socket.data.stub_id;
       if (!stub_id) return;
       const task = store.updateTask(stub_id, payload.task_id, {
         status: "completed",
         exit_code: payload.exit_code,
         finished_at: new Date().toISOString(),
+        metrics: payload.metrics,
       });
       if (task) {
         webNs.emit("task.update", task);
+
+        // Update grid cell if applicable
+        if (task.grid_id && task.grid_cell_id) {
+          store.updateGridCell(task.grid_id, task.grid_cell_id, {
+            status: "completed",
+            metrics: payload.metrics,
+          });
+          const grid = store.getGrid(task.grid_id);
+          if (grid) webNs.emit("grid.update", grid);
+        }
+
+        // Dispatch post-hooks
+        if (task.post_hooks && task.post_hooks.length > 0) {
+          schedulePostHooks(stub_id, task, ns, webNs);
+        }
+
+        // Trigger DAG dependency check
+        checkDagDependencies(webNs, ns);
+
         // Try to dispatch queued tasks
         dispatchQueuedTasks(stub_id, ns);
       }
@@ -198,8 +235,30 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       });
       if (task) {
         webNs.emit("task.update", task);
+
+        // Update grid cell if applicable
+        if (task.grid_id && task.grid_cell_id) {
+          store.updateGridCell(task.grid_id, task.grid_cell_id, { status: "failed" });
+          const grid = store.getGrid(task.grid_id);
+          if (grid) webNs.emit("grid.update", grid);
+        }
+
+        // Trigger DAG: dependents may be blocked
+        checkDagDependencies(webNs, ns);
+
         dispatchQueuedTasks(stub_id, ns);
       }
+    });
+
+    // Handle task.checkpoint_and_pause (ManagedTraining migration)
+    socket.on("task.checkpointed", (payload: { task_id: string; checkpoint_path: string }) => {
+      const stub_id = socket.data.stub_id;
+      if (!stub_id) return;
+      const task = store.updateTask(stub_id, payload.task_id, {
+        checkpoint_path: payload.checkpoint_path,
+        status: "migrating",
+      });
+      if (task) webNs.emit("task.update", task);
     });
 
     socket.on("shell.result", (payload: ShellResultPayload) => {
@@ -223,11 +282,61 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
   });
 }
 
+/**
+ * Schedule post-hooks to run sequentially on the same stub.
+ */
+async function schedulePostHooks(
+  stubId: string,
+  task: import("../types").Task,
+  ns: Namespace,
+  webNs: Namespace
+): Promise<void> {
+  const hooks = task.post_hooks || [];
+  let allPassed = true;
+
+  for (const hookTemplate of hooks) {
+    // Variable substitution
+    const command = hookTemplate
+      .replace(/\{run_dir\}/g, task.run_dir || "")
+      .replace(/\{task_id\}/g, task.id)
+      .replace(/\{stub_id\}/g, stubId);
+
+    try {
+      const result = await execShell(stubId, command, 300, ns);
+      if (result.exit_code !== 0) {
+        allPassed = false;
+        console.warn(`[post-hook] Failed: ${command} (exit ${result.exit_code})`);
+        webNs.emit("task.log", {
+          stub_id: stubId,
+          task_id: task.id,
+          lines: [`[post-hook] FAILED: ${command}`, result.stderr],
+        });
+        break;
+      } else {
+        webNs.emit("task.log", {
+          stub_id: stubId,
+          task_id: task.id,
+          lines: [`[post-hook] OK: ${command}`],
+        });
+      }
+    } catch (err) {
+      allPassed = false;
+      console.warn(`[post-hook] Error: ${command}`, err);
+      break;
+    }
+  }
+
+  if (!allPassed) {
+    const updated = store.updateTask(stubId, task.id, { status: "completed_with_errors" });
+    if (updated) webNs.emit("task.update", updated);
+  }
+}
+
 export function dispatchQueuedTasks(stubId: string, ns: Namespace): void {
   const stub = store.getStub(stubId);
   if (!stub || stub.status !== "online") return;
 
-  const running = stub.tasks.filter((t) => t.status === "running" || t.status === "paused").length;
+  const running = stub.tasks.filter((t) => t.status === "running").length;
   const slots = stub.max_concurrent - running;
   if (slots <= 0) return;
 
