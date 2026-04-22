@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "alchemy-sdk"
+version = "2.0.0"
+description = "Alchemy v2 SDK for training scripts"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alchemy_sdk*"]

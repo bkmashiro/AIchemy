@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "alchemy-stub"
+version = "2.0.0"
+description = "Alchemy v2 GPU job orchestration stub daemon"
+requires-python = ">=3.10"
+dependencies = [
+    "python-socketio[asyncio_client]>=5.10.0",
+    "aiohttp>=3.9.0",
+    "psutil>=5.9.0",
+]
+
+[project.scripts]
+alchemy-stub = "alchemy_stub.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alchemy_stub*"]

@@ -1,0 +1,3 @@
+python-socketio[asyncio_client]>=5.10.0
+aiohttp>=3.9.0
+psutil>=5.9.0
