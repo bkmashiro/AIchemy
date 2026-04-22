@@ -1,0 +1,9 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+state.json
+*.log
+.DS_Store
