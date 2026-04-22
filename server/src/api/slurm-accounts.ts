@@ -114,13 +114,17 @@ export function createSlurmAccountsRouter(): Router {
       return;
     }
 
-    const { target_slots, idle_timeout_min, check_interval_s, enabled } = req.body;
+    const { max_running, max_pending, qos_running_limit, qos_pending_limit,
+            idle_timeout_min, check_interval_s, enabled } = req.body;
     const config: AutoQueueConfig = {
       id: uuidv4(),
       account_id: account.id,
-      target_slots: target_slots || account.qos_limit,
-      idle_timeout_min: idle_timeout_min || 30,
-      check_interval_s: check_interval_s || 60,
+      max_running: max_running ?? account.qos_limit,
+      max_pending: max_pending ?? account.qos_limit,
+      qos_running_limit: qos_running_limit ?? account.qos_limit,
+      qos_pending_limit: qos_pending_limit ?? account.qos_limit,
+      idle_timeout_min: idle_timeout_min ?? 30,
+      check_interval_s: check_interval_s ?? 60,
       enabled: enabled !== false,
     };
 

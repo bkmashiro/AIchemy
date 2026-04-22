@@ -186,7 +186,10 @@ export interface SlurmAccount {
 export interface AutoQueueConfig {
   id: string;
   account_id: string;
-  target_slots: number;        // how many stubs to maintain
+  max_running: number;         // a: target active/running stubs
+  max_pending: number;         // b: target pending/queued SLURM jobs
+  qos_running_limit: number;   // c: QOS max concurrent running jobs
+  qos_pending_limit: number;   // d: QOS max pending jobs allowed
   idle_timeout_min: number;    // don't renew if idle this long
   check_interval_s: number;
   enabled: boolean;

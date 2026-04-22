@@ -29,7 +29,7 @@ describe("SLURM Accounts", () => {
     });
 
     expect(res.status).toBe(201);
-    const body = await res.json();
+    const body: any = await res.json();
     expect(body.name).toBe("ys25");
     expect(body.qos_limit).toBe(3);
     expect(body.partitions).toEqual(["a40", "a30", "a100"]);
@@ -50,7 +50,7 @@ describe("SLURM Accounts", () => {
     });
 
     const res = await fetch(`${ctx.baseUrl}/api/slurm/accounts`);
-    const body = await res.json();
+    const body: any = await res.json();
     expect(body.length).toBe(2);
     expect(body[0].current_usage).toBe(0);
   });
@@ -62,7 +62,7 @@ describe("SLURM Accounts", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "ys25", ssh_target: "ys25@cluster", qos_limit: 3 }),
     });
-    const account = await createRes.json();
+    const account: any = await createRes.json();
 
     // Create stubs linked to this account
     const stub1 = createMockStub({ slurm_account_id: account.id, status: "online" });
@@ -74,7 +74,7 @@ describe("SLURM Accounts", () => {
 
     // Check utilization
     const res = await fetch(`${ctx.baseUrl}/api/slurm/accounts/${account.id}/utilization`);
-    const body = await res.json();
+    const body: any = await res.json();
     expect(body.online_stubs).toBe(2);
     expect(body.total_stubs).toBe(3);
   });
@@ -85,7 +85,7 @@ describe("SLURM Accounts", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "ys25", ssh_target: "ys25@cluster", qos_limit: 3 }),
     });
-    const account = await createRes.json();
+    const account: any = await createRes.json();
 
     const res = await fetch(`${ctx.baseUrl}/api/slurm/accounts/${account.id}`, {
       method: "PATCH",
@@ -94,7 +94,7 @@ describe("SLURM Accounts", () => {
     });
 
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body: any = await res.json();
     expect(body.qos_limit).toBe(5);
     expect(body.name).toBe("ys25");
   });
@@ -105,7 +105,7 @@ describe("SLURM Accounts", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name: "temp", ssh_target: "t@c", qos_limit: 1 }),
     });
-    const account = await createRes.json();
+    const account: any = await createRes.json();
 
     const res = await fetch(`${ctx.baseUrl}/api/slurm/accounts/${account.id}`, { method: "DELETE" });
     expect(res.status).toBe(200);
@@ -121,20 +121,24 @@ describe("SLURM Accounts", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: "ys25", ssh_target: "ys25@cluster", qos_limit: 3 }),
       });
-      const account = await createRes.json();
+      const account: any = await createRes.json();
 
       const res = await fetch(`${ctx.baseUrl}/api/slurm/accounts/${account.id}/autoqueue`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          target_slots: 3,
+          max_running: 3,
+          max_pending: 3,
+          qos_running_limit: 3,
+          qos_pending_limit: 3,
           idle_timeout_min: 30,
         }),
       });
 
       expect(res.status).toBe(201);
-      const body = await res.json();
-      expect(body.target_slots).toBe(3);
+      const body: any = await res.json();
+      expect(body.max_running).toBe(3);
+      expect(body.max_pending).toBe(3);
       expect(body.account_id).toBe(account.id);
       expect(body.enabled).toBe(true);
     });
@@ -145,16 +149,16 @@ describe("SLURM Accounts", () => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: "ys25", ssh_target: "ys25@cluster", qos_limit: 3 }),
       });
-      const account = await createRes.json();
+      const account: any = await createRes.json();
 
       await fetch(`${ctx.baseUrl}/api/slurm/accounts/${account.id}/autoqueue`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ target_slots: 3 }),
+        body: JSON.stringify({ max_running: 3, max_pending: 3 }),
       });
 
       const res = await fetch(`${ctx.baseUrl}/api/slurm/accounts/${account.id}/autoqueue`);
-      const body = await res.json();
+      const body: any = await res.json();
       expect(body.length).toBe(1);
     });
   });

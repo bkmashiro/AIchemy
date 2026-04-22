@@ -83,55 +83,82 @@ async function submitSlurmJob(account: SlurmAccount, serverUrl: string): Promise
   }
 }
 
-async function checkAutoQueue(config: AutoQueueConfig, webNs: Namespace): Promise<void> {
-  if (!config.enabled) return;
+/**
+ * Auto-queue logic with 4-parameter model:
+ *   max_running (a): target number of active/online stubs
+ *   max_pending (b): target number of queued SLURM jobs
+ *   qos_running_limit (c): hard QOS cap on running jobs
+ *   qos_pending_limit (d): hard QOS cap on pending jobs
+ *
+ * Strategy:
+ *   running_deficit = min(max_running, qos_running_limit) - current_online_stubs
+ *   pending_deficit = min(max_pending, qos_pending_limit) - current_pending_jobs
+ *   total_to_submit = max(0, running_deficit + pending_deficit)
+ *   But also capped so: current_pending + submit <= min(max_pending, qos_pending_limit)
+ *
+ * Submitted jobs start as pending, then become running when SLURM schedules them.
+ * So we only submit to fill the *pending* pool — running stubs come from pending graduating.
+ */
+async function checkAutoQueue(config: AutoQueueConfig, webNs: Namespace): Promise<number> {
+  if (!config.enabled) return 0;
 
   const account = store.getSlurmAccount(config.account_id);
-  if (!account) return;
+  if (!account) return 0;
 
-  // Count active stubs for this account
-  const activeStubs = store.getAllStubs().filter(
+  // Current state
+  const onlineStubs = store.getAllStubs().filter(
     (s) => s.slurm_account_id === account.id && s.status === "online",
   ).length;
-
-  // Count pending SLURM jobs
   const pendingJobs = await countPendingSlurmJobs(account);
 
-  const totalSlots = activeStubs + pendingJobs;
-  const deficit = config.target_slots - totalSlots;
+  // How many running slots do we want filled?
+  const targetRunning = Math.min(config.max_running, config.qos_running_limit);
+  // How many are missing from the running pool?
+  const runningDeficit = Math.max(0, targetRunning - onlineStubs);
 
-  if (deficit <= 0) return;
+  // How many pending slots do we want?
+  const targetPending = Math.min(config.max_pending, config.qos_pending_limit);
+  // Pending should cover: its own target + any running deficit (pending graduates to running)
+  const desiredPending = Math.min(targetPending, runningDeficit + targetPending);
+  const pendingDeficit = Math.max(0, desiredPending - pendingJobs);
 
-  // Check if there are pending tasks anywhere
+  if (pendingDeficit <= 0) return 0;
+
+  // Check if there's actual work to do
   const allTasks = store.getAllTasks();
   const hasPendingWork = allTasks.some((t) => ["queued", "waiting"].includes(t.status));
   const hasRunningWork = allTasks.some((t) => t.status === "running");
 
-  // Idle timeout: don't submit if no work and idle for too long
   if (!hasPendingWork && !hasRunningWork) {
     const lastActive = lastActivity.get(account.id) || 0;
     const idleMinutes = (Date.now() - lastActive) / 60_000;
     if (idleMinutes > config.idle_timeout_min) {
-      return;
+      return 0;
     }
   }
 
-  // Only submit if there's work to do
-  if (!hasPendingWork && !hasRunningWork) return;
+  if (!hasPendingWork && !hasRunningWork) return 0;
 
   const serverUrl = process.env.ALCHEMY_SERVER_URL || `http://localhost:${process.env.PORT || 3001}`;
 
-  // Submit deficit jobs
-  for (let i = 0; i < deficit; i++) {
+  let submitted = 0;
+  for (let i = 0; i < pendingDeficit; i++) {
     const jobId = await submitSlurmJob(account, serverUrl);
     if (jobId) {
+      submitted++;
       webNs.emit("autoqueue.submitted", {
         account_id: account.id,
         account_name: account.name,
         job_id: jobId,
+        state: { online: onlineStubs, pending: pendingJobs + submitted, target_running: targetRunning, target_pending: targetPending },
       });
     }
   }
+
+  if (submitted > 0) {
+    console.log(`[autoqueue] ${account.name}: submitted ${submitted} jobs (online=${onlineStubs}, pending=${pendingJobs}→${pendingJobs + submitted}, target: ${targetRunning}R/${targetPending}P)`);
+  }
+  return submitted;
 }
 
 export function startAutoQueueLoop(webNs: Namespace): void {
@@ -154,10 +181,7 @@ export async function triggerAutoQueue(accountId: string, webNs: Namespace): Pro
   const configs = store.getAllAutoQueueConfigs().filter((c) => c.account_id === accountId);
   let submitted = 0;
   for (const config of configs) {
-    const before = submitted;
-    await checkAutoQueue({ ...config, enabled: true }, webNs);
-    // Can't easily track here, but the event was emitted
-    submitted++;
+    submitted += await checkAutoQueue({ ...config, enabled: true }, webNs);
   }
   return { submitted };
 }

@@ -60,7 +60,7 @@ describe("Conflict detection", () => {
       });
 
       expect(res.status).toBe(409);
-      const body = await res.json();
+      const body: any = await res.json();
       expect(body.error).toContain("completed task already exists");
       expect(body.hint).toBe("Use force: true to override");
     });
@@ -161,7 +161,7 @@ describe("Conflict detection", () => {
       });
 
       expect(res.status).toBe(409);
-      const body = await res.json();
+      const body: any = await res.json();
       expect(body.completed_count).toBe(1);
     });
 
