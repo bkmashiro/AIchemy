@@ -397,6 +397,24 @@ class StubDaemon:
                     print(f"[daemon] Idle timeout ({idle_s:.0f}s), exiting")
                     os._exit(0)
 
+    async def _report_dead_tasks(self):
+        """Report tasks that died while stub was restarting."""
+        dead = getattr(self.process_mgr, '_dead_on_reattach', [])
+        if not dead:
+            return
+        # Wait until registered with server
+        for _ in range(30):
+            if self.registered:
+                break
+            await asyncio.sleep(1)
+        for task_id, pid in dead:
+            print(f"[daemon] Reporting dead task {task_id} (pid {pid}) as completed")
+            # We don't know the exit code, assume 0 (completed) since process exited cleanly
+            if self.registered:
+                await self.sio.emit("task.completed", {
+                    "task_id": task_id, "exit_code": 0,
+                }, namespace="/stubs")
+
     async def run(self):
         # Try to re-attach surviving tasks
         reattached = self.process_mgr.load_and_reattach()
@@ -410,6 +428,7 @@ class StubDaemon:
         asyncio.create_task(self._heartbeat_loop())
         asyncio.create_task(self._idle_check_loop())
         asyncio.create_task(self._log_cleanup_loop())
+        asyncio.create_task(self._report_dead_tasks())
 
         # Connect and run forever
         server_url = self.config.server

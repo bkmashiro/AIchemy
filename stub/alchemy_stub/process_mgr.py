@@ -311,8 +311,12 @@ class ProcessManager:
         return True, ""
 
     def load_and_reattach(self) -> dict[str, int]:
-        """Try to re-attach surviving processes from previous stub run."""
+        """Try to re-attach surviving processes from previous stub run.
+        Returns dict of {task_id: pid} for alive processes.
+        Dead processes are reported via self._dead_on_reattach for the daemon to handle.
+        """
         result = {}
+        self._dead_on_reattach: list[tuple[str, int]] = []
         try:
             if not os.path.exists(self.pid_file):
                 return result
@@ -337,7 +341,8 @@ class ProcessManager:
                     result[task_id] = pid
                     print(f"[process_mgr] Re-attached task {task_id} (pid {pid})")
                 except ProcessLookupError:
-                    print(f"[process_mgr] Task {task_id} (pid {pid}) no longer alive")
+                    print(f"[process_mgr] Task {task_id} (pid {pid}) no longer alive, will report")
+                    self._dead_on_reattach.append((task_id, pid))
                     self._remove_pid(task_id)
         except Exception as e:
             print(f"[process_mgr] Failed to load PID file: {e}")
