@@ -20,12 +20,15 @@ class Alchemy:
         with Alchemy(server="...") as al:
             for step in range(1000):
                 al.log(step=step, total=1000)
+                if al.should_stop:
+                    break
     """
 
     def __init__(
         self,
         server: str,
         task_id: str = "auto",
+        collect_gpu: bool = True,
     ):
         self.server = server.rstrip("/")
         if task_id == "auto":
@@ -33,16 +36,22 @@ class Alchemy:
         self.task_id = task_id
 
         if not self.task_id:
-            # SDK used outside Alchemy — silently no-op
             self._reporter: Optional[ThrottledReporter] = None
         else:
-            self._reporter = ThrottledReporter(self.server, self.task_id)
+            self._reporter = ThrottledReporter(self.server, self.task_id, collect_gpu=collect_gpu)
 
     @property
     def should_checkpoint(self) -> bool:
         if self._reporter is None:
             return False
         return self._reporter.should_checkpoint
+
+    @property
+    def should_stop(self) -> bool:
+        """Server requests early termination."""
+        if self._reporter is None:
+            return False
+        return self._reporter.should_stop
 
     def log(
         self,
@@ -66,7 +75,7 @@ class Alchemy:
         if self._reporter is None:
             return
         self._reporter.report(checkpoint=path)
-        self._reporter.flush()  # checkpoints are important, send immediately
+        self._reporter.flush()
 
     def done(self):
         """Flush any pending reports."""
@@ -75,14 +84,14 @@ class Alchemy:
         self._reporter.flush()
 
     def param(self, key: str, default: Any = None) -> Any:
-        """Get a parameter from ALCHEMY_PARAMS env var (Mode B)."""
+        """Get a parameter from ALCHEMY_PARAMS env var."""
         params = json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
         if key not in params and default is None:
             raise KeyError(f"Parameter '{key}' not found. Available: {list(params.keys())}")
         return params.get(key, default)
 
     def params(self) -> dict[str, Any]:
-        """Get all parameters from ALCHEMY_PARAMS env var (Mode B)."""
+        """Get all parameters from ALCHEMY_PARAMS env var."""
         return json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
 
     def __enter__(self):

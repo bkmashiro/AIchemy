@@ -10,6 +10,7 @@ from typing import Any
 import socketio
 
 from .config import Config
+from .disk_monitor import get_disk_usage, check_low_disk
 from .gpu_monitor import GpuMonitor
 from .process_mgr import ProcessManager
 
@@ -92,6 +93,22 @@ class StubDaemon:
                 print(f"[daemon] Task {task_id} already running, ignoring")
                 return
 
+            # Pre-task validation
+            ok, validation_error = self.process_mgr.validate_before_start(command, cwd, env)
+            if not ok:
+                print(f"[daemon] Task {task_id} validation failed: {validation_error}")
+                await self.sio.emit(
+                    "task.failed",
+                    {
+                        "task_id": task_id,
+                        "exit_code": -2,
+                        "error": validation_error,
+                        "failure_reason": {"reason": "validation_error", "detail": validation_error},
+                    },
+                    namespace="/stubs",
+                )
+                return
+
             try:
                 pid = self.process_mgr.start(task_id, command, cwd, env, env_setup)
                 await self.sio.emit(
@@ -130,6 +147,12 @@ class StubDaemon:
             if "max_concurrent" in data:
                 self.process_mgr.max_concurrent = data["max_concurrent"]
                 print(f"[daemon] Updated max_concurrent to {data['max_concurrent']}")
+
+        @sio.on("stub.restart", namespace="/stubs")
+        async def on_stub_restart(data: dict):
+            print("[daemon] Server requested restart")
+            import os, signal
+            os.kill(os.getpid(), signal.SIGUSR1)
 
         @sio.on("shell.exec", namespace="/stubs")
         async def on_shell_exec(data: dict):
@@ -293,14 +316,19 @@ class StubDaemon:
                 namespace="/stubs",
             )
 
-    async def _on_task_failed(self, task_id: str, exit_code: int, error: str):
+    async def _on_task_failed(
+        self, task_id: str, exit_code: int, error: str, failure_reason: dict | None = None
+    ):
         self.last_task_time = time.time()
         if self.registered:
-            await self.sio.emit(
-                "task.failed",
-                {"task_id": task_id, "exit_code": exit_code, "error": error},
-                namespace="/stubs",
-            )
+            payload: dict[str, Any] = {
+                "task_id": task_id,
+                "exit_code": exit_code,
+                "error": error,
+            }
+            if failure_reason:
+                payload["failure_reason"] = failure_reason
+            await self.sio.emit("task.failed", payload, namespace="/stubs")
 
     async def _heartbeat_loop(self):
         while True:
@@ -313,6 +341,13 @@ class StubDaemon:
                 # GPU stats
                 gpu_stats = self.gpu_monitor.query()
                 await self.sio.emit("gpu_stats", gpu_stats, namespace="/stubs")
+
+                # Disk usage
+                disk_usage = get_disk_usage()
+                payload["disk_usage"] = disk_usage
+                disk_warnings = check_low_disk(threshold_gb=5.0)
+                if disk_warnings:
+                    payload["disk_warnings"] = disk_warnings
 
                 # Walltime
                 if self.config.slurm_job_id:
@@ -335,6 +370,15 @@ class StubDaemon:
 
             except Exception as e:
                 print(f"[daemon] Heartbeat error: {e}")
+
+    async def _log_cleanup_loop(self):
+        """Periodically clean up old log files."""
+        while True:
+            await asyncio.sleep(3600)  # every hour
+            try:
+                self.process_mgr.cleanup_old_logs(max_age_hours=24)
+            except Exception as e:
+                print(f"[daemon] Log cleanup error: {e}")
 
     async def _idle_check_loop(self):
         if self.config.idle_timeout <= 0:
@@ -359,6 +403,7 @@ class StubDaemon:
         # Start background loops
         asyncio.create_task(self._heartbeat_loop())
         asyncio.create_task(self._idle_check_loop())
+        asyncio.create_task(self._log_cleanup_loop())
 
         # Connect and run forever
         server_url = self.config.server

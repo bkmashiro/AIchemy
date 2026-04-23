@@ -211,6 +211,12 @@ class ManagedTraining(ABC):
         while instance._current_step < total:
             step = instance._current_step
 
+            # Server-requested early stop
+            if instance._alchemy and instance._alchemy.should_stop:
+                print("[ManagedTraining] Server requested stop, checkpointing and exiting.", flush=True)
+                instance._save_checkpoint()
+                break
+
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -224,9 +230,9 @@ class ManagedTraining(ABC):
             if instance._should_checkpoint(instance._current_step):
                 instance._immediate_checkpoint = False
                 instance._save_checkpoint()
-
-        # Final checkpoint
-        instance._save_checkpoint()
+        else:
+            # Normal completion — final checkpoint
+            instance._save_checkpoint()
 
         if instance._alchemy:
             instance._alchemy.done()

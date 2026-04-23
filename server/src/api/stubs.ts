@@ -50,8 +50,19 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
       stub.max_concurrent = req.body.max_concurrent;
       stubNs.to(`stub:${stub.id}`).emit("config.update", { max_concurrent: stub.max_concurrent });
     }
+    if (req.body.name !== undefined) {
+      stub.name = req.body.name;
+    }
+    if (req.body.auto_release !== undefined) {
+      stub.auto_release = req.body.auto_release;
+    }
+    if (req.body.idle_timeout_s !== undefined) {
+      stub.idle_timeout_s = req.body.idle_timeout_s;
+      stubNs.to(`stub:${stub.id}`).emit("config.update", { idle_timeout: stub.idle_timeout_s });
+    }
     store.setStub(stub);
     webNs.emit("stub.online", stub);
+    dispatchQueuedTasks(stub.id, stubNs);
     res.json({ ok: true });
   });
 

@@ -17,7 +17,7 @@ export function createSlurmAccountsRouter(): Router {
 
   // POST /api/slurm/accounts
   router.post("/", (req: Request, res: Response) => {
-    const { name, ssh_target, qos_limit, partitions, default_walltime, default_mem, stub_command } = req.body;
+    const { name, ssh_target, qos_limit, partitions, default_walltime, default_mem, stub_command, ssh_key_path } = req.body;
     if (!name || !ssh_target || !qos_limit) {
       res.status(400).json({ error: "name, ssh_target, and qos_limit required" });
       return;
@@ -32,6 +32,7 @@ export function createSlurmAccountsRouter(): Router {
       default_walltime: default_walltime || "72:00:00",
       default_mem: default_mem || "64G",
       stub_command: stub_command || "python -m alchemy_stub",
+      ...(ssh_key_path ? { ssh_key_path } : {}),
     };
 
     store.setSlurmAccount(account);

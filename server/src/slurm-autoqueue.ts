@@ -1,11 +1,11 @@
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { v4 as uuidv4 } from "uuid";
 import { store } from "./store";
 import { SlurmAccount, AutoQueueConfig } from "./types";
 import { Namespace } from "socket.io";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // Track last task activity per account for idle timeout
 const lastActivity: Map<string, number> = new Map();
@@ -14,8 +14,21 @@ export function updateAccountActivity(accountId: string): void {
   lastActivity.set(accountId, Date.now());
 }
 
-async function sshExec(sshTarget: string, command: string): Promise<{ stdout: string; stderr: string }> {
-  return execAsync(`ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${sshTarget} '${command}'`, {
+function validateSshTarget(target: string): boolean {
+  // Only allow user@host format (alphanumeric, dots, dashes, underscores)
+  return /^[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+$/.test(target);
+}
+
+async function sshExec(sshTarget: string, command: string, sshKeyPath?: string): Promise<{ stdout: string; stderr: string }> {
+  if (!validateSshTarget(sshTarget)) {
+    throw new Error(`Invalid ssh_target format: ${sshTarget}`);
+  }
+  const args = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"];
+  if (sshKeyPath) {
+    args.push("-i", sshKeyPath);
+  }
+  args.push(sshTarget, command);
+  return execFileAsync("ssh", args, {
     timeout: 30_000,
   });
 }
@@ -46,6 +59,7 @@ async function countPendingSlurmJobs(account: SlurmAccount): Promise<number> {
     const { stdout } = await sshExec(
       account.ssh_target,
       `squeue -u $(whoami) --format="%j %t" | grep alchemy-stub | grep PD | wc -l`,
+      account.ssh_key_path,
     );
     return parseInt(stdout.trim(), 10) || 0;
   } catch {
@@ -72,6 +86,7 @@ async function submitSlurmJob(account: SlurmAccount, serverUrl: string): Promise
     const { stdout } = await sshExec(
       account.ssh_target,
       `sbatch <<'SBATCH_EOF'\n${script}\nSBATCH_EOF`,
+      account.ssh_key_path,
     );
     const match = stdout.match(/Submitted batch job (\d+)/);
     const jobId = match ? match[1] : null;

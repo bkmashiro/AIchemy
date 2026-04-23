@@ -4,6 +4,8 @@ import { store } from "../store";
 import { GridTask, GridCell, Task } from "../types";
 import { Namespace } from "socket.io";
 import { dispatchQueuedTasks } from "../socket/stub";
+import { pickBestStub } from "../scheduler";
+import { logAudit } from "../audit";
 
 /**
  * Generate all combinations (cartesian product) of parameter values.
@@ -64,6 +66,21 @@ export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
           });
           return;
         }
+      }
+    }
+
+    // Pre-check: if stub_id is specified, verify it's online; otherwise check any stub is available
+    if (stub_id) {
+      const requestedStub = store.getStub(stub_id);
+      if (!requestedStub || requestedStub.status !== "online") {
+        res.status(503).json({ error: "Requested stub is offline or not found", stub_id });
+        return;
+      }
+    } else {
+      const anyOnline = store.getAllStubs().some((s) => s.status === "online");
+      if (!anyOnline) {
+        res.status(503).json({ error: "No stubs available to schedule grid cells" });
+        return;
       }
     }
 
@@ -130,7 +147,9 @@ export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
       dispatchQueuedTasks(targetStub.id, stubNs);
     }
 
-    res.status(201).json(store.getGrid(gridId));
+    const created = store.getGrid(gridId);
+    logAudit("grid.create", { grid_id: gridId, name, cells: cells.length });
+    res.status(201).json(created);
   });
 
   // GET /api/grids
@@ -226,6 +245,7 @@ export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
     }
 
     store.deleteGrid(grid.id);
+    logAudit("grid.delete", { grid_id: grid.id, name: grid.name });
     res.json({ ok: true });
   });
 
@@ -257,24 +277,6 @@ function mapTaskStatusToCell(status: string): GridCell["status"] {
   }
 }
 
-function pickBestStub(estimatedVram: number) {
-  const stubs = store.getAllStubs().filter((s) => s.status === "online");
-  if (stubs.length === 0) return undefined;
-
-  // Filter by VRAM if specified
-  const candidates = estimatedVram > 0
-    ? stubs.filter((s) => s.gpu.vram_total_mb >= estimatedVram)
-    : stubs;
-
-  if (candidates.length === 0) return stubs[0]; // fallback
-
-  // Sort by load: prefer idle stubs
-  return candidates.sort((a, b) => {
-    const aRunning = a.tasks.filter((t) => t.status === "running").length;
-    const bRunning = b.tasks.filter((t) => t.status === "running").length;
-    return aRunning - bRunning;
-  })[0];
-}
 
 function resubmitCell(grid: GridTask, cell: GridCell, stubNs: Namespace, webNs: Namespace): void {
   const command = interpolate(grid.command_template, {

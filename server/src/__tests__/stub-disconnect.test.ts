@@ -107,7 +107,8 @@ describe("Stub disconnect → task cleanup", () => {
 
     const updated = store.getStub(stub.id);
     expect(updated?.status).toBe("online");
-    expect(updated?.tasks[0].status).toBe("queued");
+    // Task is requeued then immediately dispatched (race condition fix)
+    expect(["queued", "dispatched"]).toContain(updated?.tasks[0].status);
     expect(updated?.tasks[0].finished_at).toBeUndefined();
 
     client.disconnect();

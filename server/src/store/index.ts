@@ -1,18 +1,26 @@
 import fs from "fs";
+import fsp from "fs/promises";
 import path from "path";
-import { Stub, Task, Token, ServerState, SlurmPoolConfig, GridTask, GridCell, AnomalyAlert, MigrationSuggestion, StallConfig, SlurmAccount, AutoQueueConfig } from "../types";
+import { Stub, Task, Token, ServerState, SlurmPoolConfig, GridTask, GridCell, AnomalyAlert, MigrationSuggestion, StallConfig, SlurmAccount, AutoQueueConfig, Workflow, WorkflowRun, NotificationConfig } from "../types";
+import { resetAuditLog } from "../audit";
 
 const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), "state.json");
 const SNAPSHOT_INTERVAL = 60_000;
+const BACKUP_INTERVAL = 30 * 60_000; // 30 minutes
+const BACKUP_KEEP_COUNT = 48;        // 24 hours at 30-min intervals
+export const BACKUPS_DIR = path.join(path.dirname(STATE_FILE), "backups");
 
 class Store {
   private stubs: Map<string, Stub> = new Map();
   private tokens: Map<string, Token> = new Map();
+  private globalQueue: Task[] = [];  // tasks not assigned to any stub yet
   private grids: Map<string, GridTask> = new Map();
   private alerts: Map<string, AnomalyAlert> = new Map();
   private migrationSuggestions: Map<string, MigrationSuggestion> = new Map();
   private slurmAccounts: Map<string, SlurmAccount> = new Map();
   private autoqueueConfigs: Map<string, AutoQueueConfig> = new Map();
+  private workflows: Map<string, Workflow> = new Map();
+  private workflowRuns: Map<string, WorkflowRun> = new Map();
   private slurmPool: SlurmPoolConfig = {
     enabled: false,
     ssh_target: "gpucluster2",
@@ -29,10 +37,37 @@ class Store {
     gpu_idle_threshold_pct: 5,
     gpu_idle_timeout_min: 10,
   };
+  private notificationConfig: NotificationConfig = {
+    enabled: false,
+    events: ["task.completed", "task.failed", "workflow.completed", "workflow.failed", "node.failed"],
+  };
 
   constructor() {
     this.load();
-    setInterval(() => this.save(), SNAPSHOT_INTERVAL);
+    setInterval(() => this.saveAsync(), SNAPSHOT_INTERVAL);
+    // Auto-backup every 30 minutes
+    setInterval(() => this.autoBackup(), BACKUP_INTERVAL);
+  }
+
+  private async autoBackup(): Promise<void> {
+    try {
+      // Save current state first, then back it up
+      await this.saveAsync();
+      const { backupState, pruneBackups } = await import("./backup");
+      await backupState(STATE_FILE, BACKUPS_DIR);
+      await pruneBackups(BACKUPS_DIR, BACKUP_KEEP_COUNT);
+      console.log("[store] Auto-backup completed");
+    } catch (err) {
+      console.error("[store] Auto-backup failed:", err);
+    }
+  }
+
+  getStateFile(): string {
+    return STATE_FILE;
+  }
+
+  getBackupsDir(): string {
+    return BACKUPS_DIR;
   }
 
   // Stubs
@@ -47,9 +82,15 @@ class Store {
     return undefined;
   }
 
-  getStubByHostnameAndToken(hostname: string, token: string): Stub | undefined {
+  getStubByHostnameAndToken(hostname: string, token: string, slurm_job_id?: string): Stub | undefined {
     for (const stub of this.stubs.values()) {
-      if (stub.token === token && stub.hostname === hostname) return stub;
+      if (stub.token !== token || stub.hostname !== hostname) continue;
+      // For SLURM stubs, match by job ID to allow multiple stubs per host
+      if (slurm_job_id) {
+        if (stub.slurm_job_id === slurm_job_id) return stub;
+      } else if (!stub.slurm_job_id) {
+        return stub;
+      }
     }
     return undefined;
   }
@@ -104,7 +145,55 @@ class Store {
     for (const stub of this.stubs.values()) {
       tasks.push(...stub.tasks);
     }
+    // Include global queue tasks
+    tasks.push(...this.globalQueue);
     return tasks;
+  }
+
+  // Global Queue
+  getGlobalQueue(): Task[] {
+    return this.globalQueue;
+  }
+
+  addToGlobalQueue(task: Task): void {
+    task.stub_id = "";
+    this.globalQueue.push(task);
+    // Maintain sorted order: by priority (lower number = higher priority, default 5), then by created_at
+    this.globalQueue.sort((a, b) => {
+      const pa = a.priority ?? 5;
+      const pb = b.priority ?? 5;
+      if (pa !== pb) return pa - pb;
+      return a.created_at.localeCompare(b.created_at);
+    });
+  }
+
+  /** Remove a task from the global queue by id. Returns the task if found. */
+  removeFromGlobalQueue(taskId: string): Task | undefined {
+    const idx = this.globalQueue.findIndex((t) => t.id === taskId);
+    if (idx === -1) return undefined;
+    const [task] = this.globalQueue.splice(idx, 1);
+    return task;
+  }
+
+  /** Update a task in the global queue. */
+  updateGlobalQueueTask(taskId: string, update: Partial<Task>): Task | undefined {
+    const idx = this.globalQueue.findIndex((t) => t.id === taskId);
+    if (idx === -1) return undefined;
+    this.globalQueue[idx] = { ...this.globalQueue[idx], ...update };
+    return this.globalQueue[idx];
+  }
+
+  /** Find a task by id across all stubs AND the global queue. */
+  findTask(taskId: string): { task: Task; stubId: string | null } | undefined {
+    // Search stubs first
+    for (const stub of this.stubs.values()) {
+      const task = stub.tasks.find((t) => t.id === taskId);
+      if (task) return { task, stubId: stub.id };
+    }
+    // Search global queue
+    const gq = this.globalQueue.find((t) => t.id === taskId);
+    if (gq) return { task: gq, stubId: null };
+    return undefined;
   }
 
   updateTask(stubId: string, taskId: string, update: Partial<Task>): Task | undefined {
@@ -218,15 +307,56 @@ class Store {
     this.autoqueueConfigs.delete(id);
   }
 
+  // Workflows
+  getWorkflow(id: string): Workflow | undefined {
+    return this.workflows.get(id);
+  }
+
+  getWorkflows(): Workflow[] {
+    return Array.from(this.workflows.values());
+  }
+
+  setWorkflow(w: Workflow): void {
+    this.workflows.set(w.id, w);
+  }
+
+  deleteWorkflow(id: string): void {
+    this.workflows.delete(id);
+  }
+
+  // Workflow Runs
+  getWorkflowRun(id: string): WorkflowRun | undefined {
+    return this.workflowRuns.get(id);
+  }
+
+  getWorkflowRuns(workflow_id?: string): WorkflowRun[] {
+    const all = Array.from(this.workflowRuns.values());
+    if (workflow_id) return all.filter((r) => r.workflow_id === workflow_id);
+    return all;
+  }
+
+  setWorkflowRun(run: WorkflowRun): void {
+    this.workflowRuns.set(run.id, run);
+  }
+
+  deleteWorkflowRun(id: string): void {
+    this.workflowRuns.delete(id);
+  }
+
   // Store reset (for testing)
   reset(): void {
     this.stubs.clear();
     this.tokens.clear();
+    this.globalQueue = [];
     this.grids.clear();
     this.alerts.clear();
     this.migrationSuggestions.clear();
     this.slurmAccounts.clear();
     this.autoqueueConfigs.clear();
+    this.workflows.clear();
+    this.workflowRuns.clear();
+    // Reset audit log
+    resetAuditLog();
   }
 
   // Stall config
@@ -238,23 +368,54 @@ class Store {
     this.stallConfig = { ...this.stallConfig, ...cfg };
   }
 
+  // Notification config
+  getNotificationConfig(): NotificationConfig {
+    return this.notificationConfig;
+  }
+
+  setNotificationConfig(cfg: Partial<NotificationConfig>): void {
+    this.notificationConfig = { ...this.notificationConfig, ...cfg };
+  }
+
   // Persistence
+  private serializeState(): string {
+    const state: ServerState = {
+      stubs: Array.from(this.stubs.values()).map((s) => ({
+        ...s,
+        socket_id: undefined, // don't persist socket ids
+        status: s.status === "online" ? "offline" : s.status,
+      })),
+      tokens: Array.from(this.tokens.values()),
+      global_queue: this.globalQueue,
+      slurm_pool: this.slurmPool,
+      grids: Array.from(this.grids.values()),
+      stall_config: this.stallConfig,
+      slurm_accounts: Array.from(this.slurmAccounts.values()),
+      autoqueue_configs: Array.from(this.autoqueueConfigs.values()),
+      workflows: Array.from(this.workflows.values()),
+      workflow_runs: Array.from(this.workflowRuns.values()),
+      notification_config: this.notificationConfig,
+    };
+    return JSON.stringify(state, null, 2);
+  }
+
+  /** Sync save — used by shutdown signal handlers only. */
   save(): void {
     try {
-      const state: ServerState = {
-        stubs: Array.from(this.stubs.values()).map((s) => ({
-          ...s,
-          socket_id: undefined, // don't persist socket ids
-          status: s.status === "online" ? "offline" : s.status,
-        })),
-        tokens: Array.from(this.tokens.values()),
-        slurm_pool: this.slurmPool,
-        grids: Array.from(this.grids.values()),
-        stall_config: this.stallConfig,
-        slurm_accounts: Array.from(this.slurmAccounts.values()),
-        autoqueue_configs: Array.from(this.autoqueueConfigs.values()),
-      };
-      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+      fs.writeFileSync(STATE_FILE, this.serializeState());
+    } catch (err) {
+      console.error("[store] Failed to save state:", err);
+    }
+  }
+
+  /** Async save — atomic write via temp file + rename. */
+  async saveAsync(): Promise<void> {
+    try {
+      const data = this.serializeState();
+      const dir = path.dirname(STATE_FILE);
+      const tmpFile = path.join(dir, `.state.tmp.${process.pid}`);
+      await fsp.writeFile(tmpFile, data);
+      await fsp.rename(tmpFile, STATE_FILE);
     } catch (err) {
       console.error("[store] Failed to save state:", err);
     }
@@ -274,6 +435,10 @@ class Store {
 
       for (const token of state.tokens || []) {
         this.tokens.set(token.token, token);
+      }
+
+      if (state.global_queue) {
+        this.globalQueue = state.global_queue;
       }
 
       if (state.slurm_pool) {
@@ -296,10 +461,50 @@ class Store {
         this.autoqueueConfigs.set(config.id, config);
       }
 
+      for (const wf of state.workflows || []) {
+        this.workflows.set(wf.id, wf);
+      }
+
+      for (const run of state.workflow_runs || []) {
+        this.workflowRuns.set(run.id, run);
+      }
+
+      if (state.notification_config) {
+        this.notificationConfig = state.notification_config;
+      }
+
       console.log(`[store] Loaded state: ${this.stubs.size} stubs, ${this.tokens.size} tokens, ${this.grids.size} grids, ${this.slurmAccounts.size} slurm accounts`);
     } catch (err) {
       console.error("[store] Failed to load state:", err);
     }
+  }
+
+  /** Load state from a pre-parsed object (used by restore-from-backup). */
+  loadFromState(state: ServerState): void {
+    this.reset();
+
+    for (const stub of state.stubs || []) {
+      stub.missed_heartbeats = 0;
+      stub.status = "offline";
+      this.stubs.set(stub.id, stub);
+    }
+
+    for (const token of state.tokens || []) {
+      this.tokens.set(token.token, token);
+    }
+
+    if (state.global_queue) this.globalQueue = state.global_queue;
+    if (state.slurm_pool) this.slurmPool = state.slurm_pool;
+
+    for (const grid of state.grids || []) this.grids.set(grid.id, grid);
+    if (state.stall_config) this.stallConfig = state.stall_config;
+    for (const account of state.slurm_accounts || []) this.slurmAccounts.set(account.id, account);
+    for (const config of state.autoqueue_configs || []) this.autoqueueConfigs.set(config.id, config);
+    for (const wf of state.workflows || []) this.workflows.set(wf.id, wf);
+    for (const run of state.workflow_runs || []) this.workflowRuns.set(run.id, run);
+    if (state.notification_config) this.notificationConfig = state.notification_config;
+
+    console.log(`[store] Restored state from backup: ${this.stubs.size} stubs, ${this.tokens.size} tokens`);
   }
 }
 

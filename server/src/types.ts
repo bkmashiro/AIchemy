@@ -35,7 +35,8 @@ export type TaskStatus =
   | "blocked"
   | "completed_with_errors"
   | "migrating"
-  | "interrupted";
+  | "interrupted"
+  | "dispatched";
 
 export interface MigrationRecord {
   from_stub: string;
@@ -46,7 +47,7 @@ export interface MigrationRecord {
 
 export interface Task {
   id: string;
-  stub_id: string;
+  stub_id: string;  // empty string "" when task is in global queue (no stub assigned yet)
   command: string;
   cwd?: string;
   env?: Record<string, string>;
@@ -78,6 +79,22 @@ export interface Task {
   // Param passing (Mode B+C)
   param_overrides?: Record<string, any>;
   base_config?: string;  // base YAML content for config generation
+  requeued_at?: string;  // timestamp when auto-requeued on reconnect
+  // Retry
+  retry_of?: string;     // original task ID this is a retry of
+  retry_count?: number;  // how many times this task has been auto-retried
+  max_retries?: number;  // max auto-retries (0 = disabled)
+  // Priority queue (0-9, lower = higher priority, default 5)
+  priority?: number;
+  // should_stop flag: set by server to signal SDK tasks to stop gracefully
+  should_stop?: boolean;
+  // Timeout enforcement
+  timeout_s?: number;    // if set, kill task after this many seconds
+  // Failure classification (set by stub via error_classifier)
+  failure_reason?: {
+    reason: string;
+    detail?: string;
+  };
 }
 
 export interface SlurmInfo {
@@ -106,6 +123,9 @@ export interface Stub {
   socket_id?: string;
   missed_heartbeats: number;
   remaining_walltime_s?: number;
+  // Server-side controls
+  auto_release?: boolean;        // shut down stub when all tasks are done
+  idle_timeout_s?: number;       // server-side idle timeout override (seconds)
 }
 
 export interface Token {
@@ -180,6 +200,7 @@ export interface SlurmAccount {
   default_walltime: string;
   default_mem: string;
   stub_command: string;        // template for stub launch
+  ssh_key_path?: string;       // path to SSH private key
 }
 
 // SLURM Auto-Queue
@@ -202,14 +223,24 @@ export interface StallConfig {
   gpu_idle_timeout_min: number;
 }
 
+export interface NotificationConfig {
+  discord_webhook_url?: string;
+  enabled: boolean;
+  events: string[];  // "task.completed", "task.failed", "workflow.completed", "workflow.failed", "node.failed"
+}
+
 export interface ServerState {
   stubs: Stub[];
   tokens: Token[];
+  global_queue?: Task[];      // tasks not yet assigned to any stub
   slurm_pool?: SlurmPoolConfig;
   grids?: GridTask[];
   stall_config?: StallConfig;
   slurm_accounts?: SlurmAccount[];
   autoqueue_configs?: AutoQueueConfig[];
+  workflows?: Workflow[];
+  workflow_runs?: WorkflowRun[];
+  notification_config?: NotificationConfig;
 }
 
 // Socket event payloads
@@ -257,6 +288,10 @@ export interface TaskFailedPayload {
   task_id: string;
   exit_code: number;
   error?: string;
+  failure_reason?: {
+    reason: string;
+    detail?: string;
+  };
 }
 
 export interface ShellResultPayload {
@@ -265,4 +300,83 @@ export interface ShellResultPayload {
   stderr: string;
   exit_code: number;
   timed_out: boolean;
+}
+
+// Workflow Engine
+export type PortType = "dir" | "file" | "checkpoint" | "metrics" | "params" | "bool" | "string" | "number" | "any";
+
+export interface Port {
+  id: string;
+  name: string;
+  type: PortType;
+  required: boolean;
+  value?: any;
+}
+
+export type WorkflowNodeType = "compute" | "copy" | "filter" | "branch" | "merge" | "transform" | "checkpoint_select";
+
+export interface WorkflowNode {
+  id: string;
+  type: WorkflowNodeType;
+  label: string;
+  config: Record<string, any>;  // may include timeout_s for compute nodes
+  position: { x: number; y: number };
+  inputs: Port[];
+  outputs: Port[];
+}
+
+export interface WorkflowEdge {
+  id: string;
+  source_node: string;
+  source_port: string;
+  target_node: string;
+  target_port: string;
+}
+
+export interface WorkflowVariable {
+  name: string;
+  type: "string" | "number" | "bool" | "path";
+  description?: string;
+  default?: any;
+  required?: boolean;
+}
+
+export type WorkflowStatus = "draft" | "validating" | "ready";
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description?: string;
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  variables?: WorkflowVariable[];
+  status: WorkflowStatus;
+  created_at: string;
+}
+
+// WorkflowRun — execution instance of a Workflow template
+export interface WorkflowRunNode {
+  node_id: string;
+  status: "pending" | "ready" | "running" | "completed" | "failed" | "skipped";
+  task_id?: string;
+  result?: any;
+  started_at?: string;
+  finished_at?: string;
+  exit_code?: number;
+  error?: string;
+  log_buffer?: string[];
+}
+
+export type WorkflowRunStatus = "running" | "completed" | "failed" | "paused" | "cancelled";
+
+export interface WorkflowRun {
+  id: string;
+  workflow_id: string;
+  workflow_snapshot: Workflow;  // snapshot of workflow definition at run creation time
+  variables: Record<string, any>;
+  nodes: WorkflowRunNode[];
+  status: WorkflowRunStatus;
+  created_at: string;
+  started_at: string;
+  finished_at?: string;
 }

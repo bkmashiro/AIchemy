@@ -42,9 +42,9 @@ export function pickBestStub(estimatedVramMb?: number, preferGpuType?: string): 
     const sameB = preferGpuType ? (b.gpu.name.includes(preferGpuType) ? 0 : 1) : 0;
     if (sameA !== sameB) return sameA - sameB;
 
-    const aRunning = a.tasks.filter((t) => t.status === "running").length;
-    const bRunning = b.tasks.filter((t) => t.status === "running").length;
-    return aRunning - bRunning;
+    const aLoad = a.tasks.filter((t) => ["running", "queued", "dispatched"].includes(t.status)).length;
+    const bLoad = b.tasks.filter((t) => ["running", "queued", "dispatched"].includes(t.status)).length;
+    return aLoad - bLoad;
   });
 
   return candidates[0];
@@ -66,21 +66,40 @@ export function checkDagDependencies(webNs: Namespace, stubNs: Namespace): void 
     const anyMissing = deps.some((d) => d === undefined);
     if (anyMissing) continue;
 
+    // Helper: update task regardless of whether it's on a stub or in global queue
+    const updateTask = (update: Partial<Task>): Task | undefined => {
+      if (!task.stub_id) {
+        // Global queue task
+        return store.updateGlobalQueueTask(task.id, update);
+      }
+      return store.updateTask(task.stub_id, task.id, update);
+    };
+
     const anyFailed = deps.some((d) => d && ["failed", "killed", "blocked"].includes(d.status));
     if (anyFailed) {
-      const updated = store.updateTask(task.stub_id, task.id, { status: "blocked" });
+      const updated = updateTask({ status: "blocked" });
       if (updated) webNs.emit("task.update", updated);
       continue;
     }
 
     const allDone = deps.every((d) => d && ["completed", "completed_with_errors"].includes(d.status));
     if (allDone) {
-      const updated = store.updateTask(task.stub_id, task.id, { status: "queued" });
+      const updated = updateTask({ status: "queued" });
       if (updated) {
         webNs.emit("task.update", updated);
-        // Try to dispatch
-        const { dispatchQueuedTasks } = require("./socket/stub");
-        dispatchQueuedTasks(task.stub_id, stubNs);
+        // Try to dispatch — use lazy require to break circular dependency
+        try {
+          const stubModule = require("./socket/stub");
+          if (task.stub_id) {
+            stubModule.dispatchQueuedTasks(task.stub_id, stubNs);
+          } else {
+            // Global queue task: pick best stub and dispatch
+            const bestStub = pickBestStub(task.estimated_vram_mb);
+            if (bestStub) stubModule.dispatchQueuedTasks(bestStub.id, stubNs);
+          }
+        } catch {
+          // Module not available yet (e.g. during tests before full init); skip dispatch
+        }
       }
     }
   }
@@ -276,13 +295,74 @@ export function generateMigrationSuggestions(webNs: Namespace): void {
 }
 
 /**
+ * Check running tasks for timeout violations. Kill any that have exceeded timeout_s.
+ */
+export function checkTaskTimeouts(stubNs: Namespace, webNs: Namespace): void {
+  const now = Date.now();
+  for (const stub of store.getAllStubs()) {
+    for (const task of stub.tasks) {
+      if (task.status !== "running") continue;
+      if (!task.timeout_s || !task.started_at) continue;
+
+      const elapsed = now - new Date(task.started_at).getTime();
+      if (elapsed > task.timeout_s * 1000) {
+        // Kill the task
+        stubNs.to(`stub:${stub.id}`).emit("task.kill", { task_id: task.id, signal: "SIGTERM" });
+        const updated = store.updateTask(stub.id, task.id, {
+          status: "killed",
+          finished_at: new Date().toISOString(),
+        });
+        if (updated) webNs.emit("task.update", updated);
+
+        // Create a timeout alert
+        const alert: AnomalyAlert = {
+          id: uuidv4(),
+          stub_id: stub.id,
+          task_id: task.id,
+          type: "stall",
+          message: `Task ${task.id} exceeded timeout of ${task.timeout_s}s and was killed`,
+          created_at: new Date().toISOString(),
+          resolved: false,
+        };
+        store.addAlert(alert);
+        webNs.emit("anomaly.alert", alert);
+        console.warn(`[scheduler] Task ${task.id} timed out after ${task.timeout_s}s`);
+      }
+    }
+  }
+}
+
+/**
+ * Drain global queue: dispatch queued tasks to stubs with available slots.
+ */
+export function drainGlobalQueue(stubNs: Namespace): void {
+  const globalQueue = store.getGlobalQueue();
+  if (globalQueue.length === 0) return;
+
+  const onlineStubs = store.getAllStubs().filter((s) => s.status === "online");
+  for (const stub of onlineStubs) {
+    const running = stub.tasks.filter((t) => t.status === "running" || t.status === "dispatched").length;
+    if (running < stub.max_concurrent) {
+      try {
+        const stubModule = require("./socket/stub");
+        stubModule.dispatchQueuedTasks(stub.id, stubNs);
+      } catch {}
+    }
+  }
+}
+
+/**
  * Start background monitoring loops.
  */
 export function startScheduler(webNs: Namespace, stubNs: Namespace): void {
   // DAG dependency check every 5s
   setInterval(() => checkDagDependencies(webNs, stubNs), 5_000);
+  // Global queue drain every 10s
+  setInterval(() => drainGlobalQueue(stubNs), 10_000);
   // Anomaly detection every 60s
   setInterval(() => runAnomalyDetection(webNs), 60_000);
   // Migration suggestions every 2 minutes
   setInterval(() => generateMigrationSuggestions(webNs), 120_000);
+  // Task timeout enforcement every 30s
+  setInterval(() => checkTaskTimeouts(stubNs, webNs), 30_000);
 }
