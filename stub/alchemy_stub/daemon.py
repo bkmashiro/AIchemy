@@ -334,6 +334,12 @@ class StubDaemon:
         while True:
             await asyncio.sleep(30)
             if not self.registered:
+                if self.sio.connected:
+                    print("[daemon] Connected but not registered, re-registering")
+                    try:
+                        await self._register()
+                    except Exception as e:
+                        print(f"[daemon] Re-register failed: {e}")
                 continue
             try:
                 payload: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat()}
