@@ -218,7 +218,7 @@ export default function ComparisonPage() {
                       })} />
                       <CompareRow label="Steps" values={selectedTasks.map((t) => (
                         <span className="text-gray-300 font-mono">
-                          {t.progress ? `${t.progress.step.toLocaleString()} / ${t.progress.total.toLocaleString()}` : "—"}
+                          {t.progress ? `${(t.progress.step ?? 0).toLocaleString()} / ${(t.progress.total ?? 0).toLocaleString()}` : "—"}
                         </span>
                       ))} />
                       <CompareRow label="Final Loss" values={selectedTasks.map((t) => {

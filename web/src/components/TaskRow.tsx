@@ -169,7 +169,7 @@ export default memo(function TaskRow({ task, stubName, onUpdate, selected, onSel
               <div className="flex items-center justify-between text-xs text-gray-400 mb-1 gap-2">
                 <span className="flex items-center gap-2 flex-wrap">
                   <span className="font-mono">
-                    {task.progress.step.toLocaleString()}/{task.progress.total.toLocaleString()}
+                    {(task.progress.step ?? 0).toLocaleString()}/{(task.progress.total ?? 0).toLocaleString()}
                   </span>
                   {task.progress.loss !== undefined && (
                     <span className="text-gray-300">loss={task.progress.loss.toFixed(4)}</span>
