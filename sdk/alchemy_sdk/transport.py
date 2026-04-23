@@ -99,9 +99,27 @@ class ThrottledReporter:
 
     def _do_post(self, payload: dict[str, Any]):
         """HTTP POST with fallback for environments where requests fails (e.g. A30 certs)."""
-        import requests
-        return requests.post(
-            f"{self.server}/api/sdk/report",
-            json=payload,
-            timeout=5,
-        )
+        url = f"{self.server}/api/sdk/report"
+        try:
+            import requests
+            return requests.post(url, json=payload, timeout=5)
+        except Exception:
+            # Fallback: use urllib3 with system certs (works on A30 VMs)
+            import json as _json
+            import ssl
+            import urllib.request
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(
+                url,
+                data=_json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+            # Return a minimal response-like object
+            class _Resp:
+                ok = 200 <= resp.status < 300
+                status_code = resp.status
+                def json(self_):
+                    return _json.loads(resp.read().decode())
+            return _Resp()
