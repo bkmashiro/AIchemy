@@ -16,6 +16,10 @@ cd server && npm run build 2>&1 | tail -3 && cd ..
 echo "==> Building web..."
 cd web && npx vite build 2>&1 | tail -3 && cd ..
 
+echo "==> Copying web build to server dashboard..."
+rm -rf server/dist/dashboard
+cp -r web/dist server/dist/dashboard
+
 # Read tunnel token from v1 config (shared CF tunnel)
 TUNNEL_TOKEN=$(cd /workspace/extra/projects/alchemy && node -e "
 const yaml = require('yaml');
@@ -24,13 +28,11 @@ process.stdout.write(cfg.tunnel?.token || '');
 ")
 
 echo "==> Starting server on :3002..."
-cd server && nohup node dist/index.js >> /tmp/alchemy-v2-server.log 2>&1 &
-cd ..
+nohup node server/dist/index.js >> /tmp/alchemy-v2-server.log 2>&1 &
 SERVER_PID=$!
 
 echo "==> Starting web on :3000..."
-cd web && nohup npx serve dist -l 3000 -s >> /tmp/alchemy-v2-web.log 2>&1 &
-cd ..
+nohup npx serve web/dist -l 3000 -s >> /tmp/alchemy-v2-web.log 2>&1 &
 WEB_PID=$!
 
 if [ -n "$TUNNEL_TOKEN" ]; then
