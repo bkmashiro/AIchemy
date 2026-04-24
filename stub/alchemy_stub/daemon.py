@@ -1,8 +1,22 @@
-"""Main stub daemon loop."""
+"""Main stub daemon — socket.io event loop, heartbeat, lifecycle.
+
+Unified resume flow (spec §4):
+  Every connect (first / reconnect / hot-restart) → send `resume` event.
+  Server responds with `resume_response`.
+  No separate register + sync_state events.
+
+Reliable messaging:
+  Reliable events (task.run, task.kill, task.signal, config.update, resume_response)
+  are wrapped in `r` transport event.  Non-reliable events (heartbeat, gpu_stats,
+  system_stats, task.progress, task.log) are emitted directly.
+"""
+from __future__ import annotations
+
 import asyncio
 import json
+import logging
 import os
-import subprocess
+import ssl
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -10,20 +24,58 @@ from typing import Any
 import socketio
 
 from .config import Config
-from .disk_monitor import get_disk_usage, check_low_disk
+from .env_discover import discover_python_envs
 from .gpu_monitor import GpuMonitor
+from .log_setup import jlog
+from .preflight import run_preflight
 from .process_mgr import ProcessManager
+from .reliable import ReliableEmitter, ReliableReceiver
+from .system_monitor import SystemMonitor
+from .task_socket import TaskSocketRegistry
+from .walltime import CHECK_INTERVAL_S, DRAIN_THRESHOLD_S, get_remaining_walltime
+
+log = logging.getLogger(__name__)
 
 
 class StubDaemon:
-    def __init__(self, config: Config):
+    """Core daemon. Instantiated fresh on each restart loop iteration."""
+
+    @staticmethod
+    def _build_ssl_context() -> ssl.SSLContext | bool:
+        """Build SSL context that respects SSL_CERT_FILE for A30 nodes."""
+        cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+        if not cert_file:
+            return True  # default verification
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cert_file)
+        return ctx
+
+    def __init__(self, config: Config) -> None:
         self.config = config
+
         self.gpu_monitor = GpuMonitor()
+        self.system_monitor = SystemMonitor(gpu_monitor=self.gpu_monitor)
+        self.task_socket_registry = TaskSocketRegistry()
+
+        identity = config.identity_hash
+        self.process_mgr = ProcessManager(
+            max_concurrent=config.max_concurrent,
+            env_setup=config.env_setup,
+            default_cwd=config.default_cwd,
+            pid_file=f"/tmp/alchemy_stub_{identity}_tasks.json",
+            on_started=self._on_task_started,
+            on_log=self._on_task_log,
+            on_completed=self._on_task_completed,
+            on_failed=self._on_task_failed,
+            on_zombie=self._on_task_zombie,
+        )
+
         self.stub_id: str | None = None
-        self.registered = False
-        self.last_task_time = time.time()
-        self.pong_received = False
-        self.missed_pongs = 0
+        self.stub_name: str | None = None
+        self.accepting_tasks: bool = True
+        self.last_task_time: float = time.time()
+        self._zombie_reported: set[str] = set()
+        self._walltime_draining: bool = False
 
         self.sio = socketio.AsyncClient(
             reconnection=True,
@@ -32,361 +84,610 @@ class StubDaemon:
             reconnection_delay_max=60,
             logger=False,
             engineio_logger=False,
+            ssl_verify=self._build_ssl_context(),
         )
 
-        self.process_mgr = ProcessManager(
-            max_concurrent=config.max_concurrent,
-            env_setup=config.env_setup,
-            pid_file=config.pid_file,
-            on_started=self._on_task_started,
-            on_log=self._on_task_log,
-            on_completed=self._on_task_completed,
-            on_failed=self._on_task_failed,
-        )
+        # Reliable messaging (stub → server direction)
+        self._emitter = ReliableEmitter(self._raw_emit)
+        # Reliable messaging (server → stub direction)
+        self._receiver = ReliableReceiver(self._raw_emit, self._deliver_reliable)
 
+        self._connected = False
         self._setup_handlers()
 
-    def _setup_handlers(self):
+    # ------------------------------------------------------------------ #
+    # Raw socket.io helpers                                                #
+    # ------------------------------------------------------------------ #
+
+    async def _raw_emit(self, event: str, data: Any) -> None:
+        if self.sio.connected:
+            await self.sio.emit(event, data, namespace="/stubs")
+
+    async def _emit_reliable(self, event: str, payload: Any) -> None:
+        await self._emitter.emit(event, payload)
+
+    async def _emit(self, event: str, payload: Any) -> None:
+        """Non-reliable direct emit."""
+        await self._raw_emit(event, payload)
+
+    # ------------------------------------------------------------------ #
+    # socket.io handler registration                                       #
+    # ------------------------------------------------------------------ #
+
+    def _setup_handlers(self) -> None:
         sio = self.sio
 
         @sio.event(namespace="/stubs")
         async def connect():
-            print("[daemon] Connected to server")
-            await self._register()
+            jlog("info", "sio.connect", server=self.config.server)
+            self._connected = True
+            await self._send_resume()
 
         @sio.event(namespace="/stubs")
         async def disconnect():
-            print("[daemon] Disconnected from server")
-            self.registered = False
+            jlog("info", "sio.disconnect")
+            self._connected = False
 
-        @sio.event(namespace="/stubs")
-        async def registered(data: dict):
-            self.stub_id = data["stub_id"]
-            self.registered = True
-            print(f"[daemon] Registered as {self.stub_id}")
+        @sio.on("r", namespace="/stubs")
+        async def on_reliable(data: dict):
+            await self._receiver.on_message(data)
 
-        @sio.event(namespace="/stubs")
-        async def pong(data: dict):
-            self.pong_received = True
-            self.missed_pongs = 0
+        @sio.on("r.ack", namespace="/stubs")
+        async def on_ack(data: dict):
+            self._emitter.on_ack(data["seq"])
 
-        @sio.on("task.run", namespace="/stubs")
-        async def on_task_run(data: dict):
-            task_id = data["task_id"]
-            command = data["command"]
-            cwd = data.get("cwd")
-            env = data.get("env") or {}
-            env_setup = data.get("env_setup") or ""
-            param_overrides = data.get("param_overrides")
-            base_config = data.get("base_config")
+        @sio.on("r.nack", namespace="/stubs")
+        async def on_nack(data: dict):
+            self._emitter.on_nack(data["from"], data["to"])
 
-            # Mode B: ALCHEMY_PARAMS always injected via env (set by server)
-            # Mode C: generate config file from base YAML + overrides
-            if base_config and param_overrides:
-                config_path = self._generate_config(task_id, base_config, param_overrides, cwd)
-                command = command.replace("{generated_config_path}", config_path)
+        # Non-reliable direct event
+        @sio.on("request_sync", namespace="/stubs")
+        async def on_request_sync(_data: dict):
+            log.debug("request_sync received — re-sending resume")
+            await self._send_resume()
 
-            print(f"[daemon] Starting task {task_id}: {command!r}")
-            self.last_task_time = time.time()
+    # ------------------------------------------------------------------ #
+    # Reliable event delivery (server → stub)                             #
+    # ------------------------------------------------------------------ #
 
-            if self.process_mgr.is_running(task_id):
-                print(f"[daemon] Task {task_id} already running, ignoring")
-                return
+    async def _deliver_reliable(self, event: str, payload: Any) -> None:
+        """Dispatch incoming reliable events from server."""
+        if event == "resume_response":
+            await self._handle_resume_response(payload)
+        elif event == "task.run":
+            await self._handle_task_run(payload)
+        elif event == "task.kill":
+            await self._handle_task_kill(payload)
+        elif event == "task.signal":
+            await self._handle_task_signal(payload)
+        elif event == "config.update":
+            await self._handle_config_update(payload)
+        elif event == "shell.exec":
+            await self._handle_shell_exec(payload)
+        else:
+            log.debug("Unknown reliable event: %s", event)
 
-            # Pre-task validation
-            ok, validation_error = self.process_mgr.validate_before_start(command, cwd, env)
-            if not ok:
-                print(f"[daemon] Task {task_id} validation failed: {validation_error}")
-                await self.sio.emit(
-                    "task.failed",
-                    {
-                        "task_id": task_id,
-                        "exit_code": -2,
-                        "error": validation_error,
-                        "failure_reason": {"reason": "validation_error", "detail": validation_error},
-                    },
-                    namespace="/stubs",
-                )
-                return
+    # ------------------------------------------------------------------ #
+    # Resume                                                               #
+    # ------------------------------------------------------------------ #
 
-            try:
-                pid = self.process_mgr.start(task_id, command, cwd, env, env_setup)
-                await self.sio.emit(
-                    "task.started",
-                    {"task_id": task_id, "pid": pid},
-                    namespace="/stubs",
-                )
-            except Exception as e:
-                await self.sio.emit(
-                    "task.failed",
-                    {"task_id": task_id, "exit_code": -1, "error": str(e)},
-                    namespace="/stubs",
-                )
-
-        @sio.on("task.kill", namespace="/stubs")
-        async def on_task_kill(data: dict):
-            task_id = data["task_id"]
-            sig = data.get("signal", "SIGTERM")
-            print(f"[daemon] Killing task {task_id} with {sig}")
-            self.process_mgr.kill(task_id, sig)
-
-        @sio.on("task.pause", namespace="/stubs")
-        async def on_task_pause(data: dict):
-            task_id = data["task_id"]
-            print(f"[daemon] Pausing task {task_id}")
-            self.process_mgr.pause(task_id)
-
-        @sio.on("task.resume", namespace="/stubs")
-        async def on_task_resume(data: dict):
-            task_id = data["task_id"]
-            print(f"[daemon] Resuming task {task_id}")
-            self.process_mgr.resume(task_id)
-
-        @sio.on("config.update", namespace="/stubs")
-        async def on_config_update(data: dict):
-            if "max_concurrent" in data:
-                self.process_mgr.max_concurrent = data["max_concurrent"]
-                print(f"[daemon] Updated max_concurrent to {data['max_concurrent']}")
-
-        @sio.on("stub.restart", namespace="/stubs")
-        async def on_stub_restart(data: dict):
-            print("[daemon] Server requested restart")
-            import os, signal
-            os.kill(os.getpid(), signal.SIGUSR1)
-
-        @sio.on("shell.exec", namespace="/stubs")
-        async def on_shell_exec(data: dict):
-            exec_id = data["id"]
-            command = data["command"]
-            timeout = data.get("timeout", 30)
-            print(f"[daemon] Shell exec: {command!r}")
-            try:
-                result = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: subprocess.run(
-                            command,
-                            shell=True,
-                            capture_output=True,
-                            text=True,
-                            timeout=timeout,
-                        ),
-                    ),
-                    timeout=timeout + 2,
-                )
-                await self.sio.emit(
-                    "shell.result",
-                    {
-                        "id": exec_id,
-                        "stdout": result.stdout,
-                        "stderr": result.stderr,
-                        "exit_code": result.returncode,
-                        "timed_out": False,
-                    },
-                    namespace="/stubs",
-                )
-            except (asyncio.TimeoutError, subprocess.TimeoutExpired):
-                await self.sio.emit(
-                    "shell.result",
-                    {
-                        "id": exec_id,
-                        "stdout": "",
-                        "stderr": "Timed out",
-                        "exit_code": -1,
-                        "timed_out": True,
-                    },
-                    namespace="/stubs",
-                )
-            except Exception as e:
-                await self.sio.emit(
-                    "shell.result",
-                    {
-                        "id": exec_id,
-                        "stdout": "",
-                        "stderr": str(e),
-                        "exit_code": -1,
-                        "timed_out": False,
-                    },
-                    namespace="/stubs",
-                )
-
-    async def _register(self):
+    async def _send_resume(self) -> None:
+        """Send unified resume event (spec §4)."""
         gpu_info = self.gpu_monitor.get_gpu_info()
+
+        running_tasks = []
+        for task_id, pid in self.process_mgr.get_task_pids().items():
+            running_tasks.append({"task_id": task_id, "pid": pid, "status": "running"})
+
         payload: dict[str, Any] = {
             "hostname": self.config.hostname,
             "gpu": gpu_info,
             "max_concurrent": self.config.max_concurrent,
             "token": self.config.token,
+            "running_tasks": running_tasks,
+            "local_queue": [],
+            "lastSeq": self._receiver.last_seq,
+            "env_setup": self.config.env_setup or None,
+            "default_cwd": self.config.default_cwd or None,
         }
+
         if self.config.slurm_job_id:
             payload["slurm_job_id"] = self.config.slurm_job_id
             payload["type"] = "slurm"
-            slurm_info = self._get_slurm_info()
-            if slurm_info:
-                payload["slurm"] = slurm_info
-                payload["remaining_walltime_s"] = slurm_info.get("walltime_remaining_s")
         else:
             payload["type"] = "workstation"
 
-        if self.config.slurm_account_id:
-            payload["slurm_account_id"] = self.config.slurm_account_id
+        if self.config.idle_timeout > 0:
+            payload["idle_timeout_s"] = self.config.idle_timeout
 
-        await self.sio.emit("register", payload, namespace="/stubs")
+        if self.config.tags:
+            payload["tags"] = self.config.tags
 
-    def _get_slurm_info(self) -> dict | None:
-        """Get SLURM job info including walltime."""
-        job_id = self.config.slurm_job_id
-        if not job_id:
-            return None
+        # Discover available Python environments (conda/mamba/venv)
         try:
-            result = subprocess.run(
-                ["scontrol", "show", "job", job_id],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return None
-            info: dict[str, Any] = {
-                "job_id": job_id,
-                "partition": self.config.slurm_partition or "unknown",
-                "node": self.config.slurm_node or "unknown",
-                "walltime_remaining_s": 0,
-            }
-            # Parse TimeLimit and StartTime
-            output = result.stdout
-            import re
-            tl_match = re.search(r"TimeLimit=(\d+):(\d+):(\d+)", output)
-            st_match = re.search(r"StartTime=(\S+)", output)
-            if tl_match and st_match:
-                tl_h, tl_m, tl_s = int(tl_match.group(1)), int(tl_match.group(2)), int(tl_match.group(3))
-                walltime_s = tl_h * 3600 + tl_m * 60 + tl_s
-                from datetime import datetime
-                start_str = st_match.group(1)
-                try:
-                    start = datetime.fromisoformat(start_str.replace("T", " "))
-                    elapsed = (datetime.now() - start).total_seconds()
-                    remaining = max(0, walltime_s - elapsed)
-                    info["walltime_remaining_s"] = int(remaining)
-                except Exception:
-                    pass
-            return info
+            payload["available_envs"] = discover_python_envs()
         except Exception:
-            return None
+            payload["available_envs"] = []
 
-    def _generate_config(self, task_id: str, base_config: str, overrides: dict, cwd: str | None) -> str:
-        """Mode C: merge base YAML with param overrides, write temp config file."""
-        import yaml
+        await self._emit_reliable("resume", payload)
+        jlog(
+            "info", "resume.sent",
+            running_tasks=len(running_tasks),
+            last_seq=self._receiver.last_seq,
+            tags=self.config.tags,
+        )
 
-        base = yaml.safe_load(base_config) or {}
-        # Deep merge overrides into base
-        for k, v in overrides.items():
-            base[k] = v
+    # ------------------------------------------------------------------ #
+    # Event handlers: server → stub                                        #
+    # ------------------------------------------------------------------ #
 
-        config_dir = os.path.join(cwd or ".", ".aichemy_configs")
-        os.makedirs(config_dir, exist_ok=True)
-        config_path = os.path.join(config_dir, f"{task_id}.yaml")
-        with open(config_path, "w") as f:
-            yaml.dump(base, f, default_flow_style=False)
-        print(f"[daemon] Generated config: {config_path}")
-        return config_path
+    async def _handle_resume_response(self, data: dict) -> None:
+        self.stub_id = data.get("stub_id")
+        self.stub_name = data.get("name")
+        config_update = data.get("config") or {}
 
-    async def _on_task_started(self, task_id: str, pid: int):
-        if self.registered:
-            await self.sio.emit(
-                "task.started",
-                {"task_id": task_id, "pid": pid},
-                namespace="/stubs",
+        jlog("info", "resume_response", stub_id=self.stub_id, name=self.stub_name)
+
+        # Apply server-authoritative config
+        if "max_concurrent" in config_update:
+            self.process_mgr.max_concurrent = config_update["max_concurrent"]
+            self.config.max_concurrent = config_update["max_concurrent"]
+
+        # Kill orphaned tasks the server doesn't know about
+        for task_id in data.get("kill_tasks", []):
+            log.info("resume_response: killing orphan task %s", task_id)
+            await self._kill_task(task_id, grace_period_s=0)
+
+        # Re-emit outbox messages server missed (handled by ReliableEmitter.on_resume)
+        last_server_seq = data.get("lastSeq", 0)
+        await self._emitter.on_resume(last_server_seq)
+
+        # Report tasks that died while stub was restarting
+        for task_id, _pid in self.process_mgr._dead_on_reattach:
+            log.info("Reporting dead task %s (died while offline)", task_id)
+            await self._emit_reliable(
+                "task.failed",
+                {"task_id": task_id, "exit_code": -1, "error": "Died while stub was offline"},
             )
+        self.process_mgr._dead_on_reattach.clear()
 
-    async def _on_task_log(self, task_id: str, lines: list[str]):
-        if self.registered and lines:
-            await self.sio.emit(
-                "task.log",
-                {"task_id": task_id, "lines": lines},
-                namespace="/stubs",
+        # Adopt tasks server wants us to run
+        for task in data.get("adopt_tasks", []):
+            await self._handle_task_run(task)
+
+    async def _handle_task_run(self, data: dict) -> None:
+        task_id: str = data["task_id"]
+        command: str = data["command"]
+
+        if not self.accepting_tasks:
+            log.info("Not accepting new tasks (draining), ignoring task.run %s", task_id)
+            return
+
+        if self.process_mgr.is_running(task_id):
+            log.info("Task %s already running, ignoring duplicate task.run", task_id)
+            return
+
+        # Preflight
+        result = await run_preflight(
+            task=data,
+            stub_id=self.stub_id or self.config.identity_hash,
+            stub_default_cwd=self.config.default_cwd,
+            server_url=self.config.server,
+            token=self.config.token,
+        )
+        if not result.ok:
+            jlog("error", "preflight.fail", task_id=task_id, errors=result.errors)
+            await self._emit_reliable(
+                "preflight.fail",
+                {"task_id": task_id, "errors": result.errors},
             )
+            return
 
-    async def _on_task_completed(self, task_id: str, exit_code: int):
+        jlog("info", "preflight.pass", task_id=task_id)
+
+        cwd = data.get("cwd") or self.config.default_cwd or None
+        env: dict[str, str] = data.get("env") or {}
+        task_env_setup: str = data.get("env_setup") or ""
+        params: dict[str, Any] | None = data.get("params")
+        run_dir: str | None = data.get("run_dir")
+
+        jlog("info", "task.run", task_id=task_id, command=command[:120], run_dir=run_dir)
         self.last_task_time = time.time()
-        if self.registered:
+
+        try:
+            pid = await self.process_mgr.start(
+                task_id=task_id,
+                command=command,
+                cwd=cwd,
+                env=env,
+                task_env_setup=task_env_setup,
+                params=params,
+                run_dir=run_dir,
+            )
+        except Exception as e:
+            log.error("Failed to start task %s: %s", task_id, e)
+            await self._emit_reliable(
+                "task.failed",
+                {"task_id": task_id, "exit_code": -1, "error": str(e)},
+            )
+            return
+
+        # Start Unix socket (non-fatal if it fails)
+        try:
+            await self.task_socket_registry.create(
+                task_id=task_id,
+                pid=pid,
+                on_progress=self._on_sdk_progress,
+                on_eval=self._on_sdk_eval,
+                on_checkpoint=self._on_sdk_checkpoint,
+                on_config=self._on_sdk_config,
+                on_done=self._on_sdk_done,
+                on_zombie=self._on_task_zombie,
+            )
+        except Exception as e:
+            log.warning("Failed to create task socket for %s: %s", task_id, e)
+
+    async def _handle_task_kill(self, data: dict) -> None:
+        task_id: str = data["task_id"]
+        grace_period_s: float = float(data.get("grace_period_s", 5))
+        jlog("info", "task.kill_chain", task_id=task_id, grace_period_s=grace_period_s)
+        await self._kill_task(task_id, grace_period_s=grace_period_s)
+
+    async def _kill_task(self, task_id: str, grace_period_s: float = 5.0) -> None:
+        if not self.process_mgr.is_running(task_id):
+            return
+        asyncio.create_task(
+            self.process_mgr.kill_graceful(
+                task_id,
+                grace_period_s=grace_period_s,
+                task_socket_registry=self.task_socket_registry,
+            )
+        )
+
+    async def _handle_task_signal(self, data: dict) -> None:
+        task_id: str = data["task_id"]
+        sig: str = data["signal"]
+        log.info("task.signal %s → %s", task_id, sig)
+        self.task_socket_registry.signal_task(task_id, sig)
+
+    async def _handle_config_update(self, data: dict) -> None:
+        if "max_concurrent" in data:
+            new_val = int(data["max_concurrent"])
+            self.process_mgr.max_concurrent = new_val
+            self.config.max_concurrent = new_val
+            log.info("config.update: max_concurrent=%d", new_val)
+
+    # ------------------------------------------------------------------ #
+    # Shell exec                                                           #
+    # ------------------------------------------------------------------ #
+
+    # Basic blocklist — not exhaustive, just guards against obvious destruction
+    _SHELL_BLOCKLIST = [
+        "rm -rf /",
+        "mkfs",
+        "dd if=",
+        ":(){ :|:& };:",
+        "> /dev/sda",
+        "chmod -R 777 /",
+        "chown -R",
+        "rm -rf /*",
+    ]
+
+    def _is_blocked_command(self, command: str) -> bool:
+        cmd_lower = command.lower()
+        for pattern in self._SHELL_BLOCKLIST:
+            if pattern.lower() in cmd_lower:
+                return True
+        return False
+
+    async def _handle_shell_exec(self, data: dict) -> None:
+        request_id: str = data.get("request_id", "")
+        command: str = data.get("command", "")
+        timeout: int = min(int(data.get("timeout", 30)), 120)
+
+        if self._is_blocked_command(command):
+            log.warning("shell.exec: blocked command request_id=%s", request_id)
             await self.sio.emit(
-                "task.completed",
-                {"task_id": task_id, "exit_code": exit_code},
+                "shell.output",
+                {"request_id": request_id, "chunk": "Error: command blocked by security policy\n", "stream": "stdout"},
                 namespace="/stubs",
             )
+            await self.sio.emit(
+                "shell.done",
+                {"request_id": request_id, "exit_code": 1},
+                namespace="/stubs",
+            )
+            return
 
-    async def _on_task_failed(
-        self, task_id: str, exit_code: int, error: str, failure_reason: dict | None = None
-    ):
+        # Build full command with env_setup prefix if configured
+        full_command = command
+        if self.config.env_setup:
+            full_command = f"{self.config.env_setup} && {command}"
+
+        cwd = self.config.default_cwd or "/tmp"
+        log.info("shell.exec: request_id=%s command=%s", request_id, command[:120])
+
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                full_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
+            )
+        except Exception as e:
+            log.error("shell.exec: failed to start process: %s", e)
+            await self.sio.emit(
+                "shell.output",
+                {"request_id": request_id, "chunk": f"Error: {e}\n", "stream": "stdout"},
+                namespace="/stubs",
+            )
+            await self.sio.emit(
+                "shell.done",
+                {"request_id": request_id, "exit_code": -1},
+                namespace="/stubs",
+            )
+            return
+
+        async def _stream_output() -> int:
+            assert proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk:
+                    break
+                if self.sio.connected:
+                    await self.sio.emit(
+                        "shell.output",
+                        {"request_id": request_id, "chunk": chunk.decode("utf-8", errors="replace"), "stream": "stdout"},
+                        namespace="/stubs",
+                    )
+            await proc.wait()
+            return proc.returncode if proc.returncode is not None else -1
+
+        try:
+            exit_code = await asyncio.wait_for(_stream_output(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning("shell.exec: timeout request_id=%s", request_id)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            await self.sio.emit(
+                "shell.output",
+                {"request_id": request_id, "chunk": f"\nError: command timed out after {timeout}s\n", "stream": "stdout"},
+                namespace="/stubs",
+            )
+            exit_code = -1
+        except Exception as e:
+            log.error("shell.exec: streaming error: %s", e)
+            exit_code = -1
+
+        await self.sio.emit(
+            "shell.done",
+            {"request_id": request_id, "exit_code": exit_code},
+            namespace="/stubs",
+        )
+
+    # ------------------------------------------------------------------ #
+    # ProcessManager callbacks                                             #
+    # ------------------------------------------------------------------ #
+
+    async def _on_task_started(self, task_id: str, pid: int) -> None:
+        jlog("info", "task.started", task_id=task_id, pid=pid)
+        await self._emit_reliable("task.started", {"task_id": task_id, "pid": pid})
+
+    async def _on_task_log(self, task_id: str, lines: list[str]) -> None:
+        if lines:
+            await self._emit("task.log", {"task_id": task_id, "lines": lines})
+
+    async def _on_task_completed(self, task_id: str, exit_code: int) -> None:
         self.last_task_time = time.time()
-        if self.registered:
-            payload: dict[str, Any] = {
-                "task_id": task_id,
-                "exit_code": exit_code,
-                "error": error,
-            }
-            if failure_reason:
-                payload["failure_reason"] = failure_reason
-            await self.sio.emit("task.failed", payload, namespace="/stubs")
+        jlog("info", "task.completed", task_id=task_id, exit_code=exit_code)
+        await self.task_socket_registry.remove(task_id)
+        await self._emit_reliable("task.completed", {"task_id": task_id, "exit_code": exit_code})
 
-    async def _heartbeat_loop(self):
+    async def _on_task_failed(self, task_id: str, exit_code: int, error: str) -> None:
+        self.last_task_time = time.time()
+        jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error)
+        await self.task_socket_registry.remove(task_id)
+        await self._emit_reliable(
+            "task.failed",
+            {"task_id": task_id, "exit_code": exit_code, "error": error},
+        )
+
+    async def _on_task_zombie(self, task_id: str) -> None:
+        if task_id in self._zombie_reported:
+            return  # Don't spam reliable channel with repeated zombie reports
+        self._zombie_reported.add(task_id)
+        jlog("warn", "task.zombie", task_id=task_id)
+        await self._emit_reliable("task.zombie", {"task_id": task_id})
+
+    # ------------------------------------------------------------------ #
+    # SDK socket callbacks                                                 #
+    # ------------------------------------------------------------------ #
+
+    async def _on_sdk_progress(
+        self,
+        task_id: str,
+        step: int,
+        total: int,
+        loss: float | None,
+        metrics: dict,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "step": step,
+            "total": total,
+        }
+        if loss is not None:
+            payload["loss"] = loss
+        if metrics:
+            payload["metrics"] = metrics
+        await self._emit("task.progress", payload)
+
+        # Also emit structured metrics via task.metrics for the metrics buffer
+        structured: dict[str, float] = {}
+        if loss is not None:
+            structured["loss"] = loss
+        if metrics:
+            structured.update(metrics)
+        if structured:
+            await self.emit_task_metrics(task_id, structured, step)
+
+    async def emit_task_metrics(self, task_id: str, metrics: dict, step: int) -> None:
+        """Emit structured metrics for a task (non-reliable, high-frequency).
+
+        Args:
+            task_id: The task UUID.
+            metrics: Dict of metric_key → float value (e.g. {"loss": 0.42, "reward": 1.5}).
+            step: Current training step.
+        """
+        await self._emit("task.metrics", {
+            "task_id": task_id,
+            "metrics": metrics,
+            "step": step,
+        })
+
+    async def _on_sdk_eval(self, task_id: str, metrics: dict) -> None:
+        await self._emit("task.eval", {"task_id": task_id, "metrics": metrics})
+
+    async def _on_sdk_checkpoint(self, task_id: str, path: str) -> None:
+        await self._emit_reliable("task.checkpoint", {"task_id": task_id, "path": path})
+
+    async def _on_sdk_config(self, task_id: str, config: dict) -> None:
+        await self._emit_reliable("task.config", {"task_id": task_id, "config": config})
+
+    async def _on_sdk_done(self, task_id: str, metrics: dict) -> None:
+        log.info("SDK done for task %s", task_id)
+
+    # ------------------------------------------------------------------ #
+    # Background loops                                                     #
+    # ------------------------------------------------------------------ #
+
+    async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(30)
-            if not self.registered:
-                if self.sio.connected:
-                    print("[daemon] Connected but not registered, re-registering")
-                    try:
-                        await self._register()
-                    except Exception as e:
-                        print(f"[daemon] Re-register failed: {e}")
+            if not self._connected:
                 continue
             try:
-                payload: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat()}
-
-                # GPU stats
-                gpu_stats = self.gpu_monitor.query()
-                await self.sio.emit("gpu_stats", gpu_stats, namespace="/stubs")
-
-                # Disk usage
-                disk_usage = get_disk_usage()
-                payload["disk_usage"] = disk_usage
-                disk_warnings = check_low_disk(threshold_gb=5.0)
-                if disk_warnings:
-                    payload["disk_warnings"] = disk_warnings
-
-                # Walltime
+                # Include walltime_remaining_s if in SLURM mode
+                heartbeat_payload: dict[str, Any] = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
                 if self.config.slurm_job_id:
-                    slurm_info = self._get_slurm_info()
-                    if slurm_info:
-                        payload["remaining_walltime_s"] = slurm_info.get("walltime_remaining_s", 0)
+                    remaining = get_remaining_walltime()
+                    if remaining is not None:
+                        heartbeat_payload["walltime_remaining_s"] = remaining
 
-                self.pong_received = False
-                await self.sio.emit("heartbeat", payload, namespace="/stubs")
+                # Send heartbeat FIRST — before any blocking monitoring calls
+                await self._emit("heartbeat", heartbeat_payload)
 
-                # Wait a bit for pong
-                await asyncio.sleep(5)
-                if not self.pong_received:
-                    self.missed_pongs += 1
-                    print(f"[daemon] Missed pong #{self.missed_pongs}")
-                    if self.missed_pongs >= 3:
-                        print("[daemon] 3 missed pongs, reconnecting")
-                        self.missed_pongs = 0
-                        await self.sio.disconnect()
+                # GPU/system stats with timeout — don't let nvidia-smi block heartbeat
+                async def _collect_and_emit_stats() -> None:
+                    # GPU stats (non-reliable)
+                    try:
+                        loop = asyncio.get_event_loop()
+                        gpu_stats = await loop.run_in_executor(None, self.gpu_monitor.query)
+                        await self._emit("gpu_stats", gpu_stats)
+                    except Exception as e:
+                        log.debug("gpu_stats error (skipping round): %s", e)
+
+                    # System stats (non-reliable)
+                    try:
+                        loop = asyncio.get_event_loop()
+                        pids = self.process_mgr.get_task_pids()
+                        sys_stats = await loop.run_in_executor(None, self.system_monitor.collect, pids)
+                        await self._emit("system_stats", sys_stats)
+                    except Exception as e:
+                        log.debug("system_stats error (skipping round): %s", e)
+
+                    # Per-task resource emit
+                    try:
+                        for task_id, pid in self.process_mgr.get_task_pids().items():
+                            gpu_mem = self.gpu_monitor.get_gpu_mem_for_pid(pid)
+                            per = self.system_monitor.collect({task_id: pid})
+                            task_per = per.get("per_task", {}).get(task_id, {})
+                            await self._emit(
+                                "task.resource",
+                                {
+                                    "task_id": task_id,
+                                    "gpu_mem_mb": gpu_mem,
+                                    "cpu_mem_mb": task_per.get("mem_mb", 0),
+                                    "gpu_util_pct": 0,
+                                },
+                            )
+                    except Exception as e:
+                        log.debug("task.resource error: %s", e)
+
+                try:
+                    await asyncio.wait_for(_collect_and_emit_stats(), timeout=20)
+                except asyncio.TimeoutError:
+                    log.warning("heartbeat_loop: stats collection timed out (20s)")
 
             except Exception as e:
-                print(f"[daemon] Heartbeat error: {e}")
+                log.warning("heartbeat_loop error: %s", e)
 
-    async def _log_cleanup_loop(self):
-        """Periodically clean up old log files."""
+    async def _walltime_check_loop(self) -> None:
+        """SLURM walltime sensing loop (spec §9).
+
+        Checks every 60s. When remaining < 10min, triggers drain:
+          1. Stop accepting new tasks.
+          2. Send should_checkpoint to all running tasks.
+          3. Wait 60s.
+          4. Send should_stop to all running tasks.
+          5. Wait for tasks to exit (up to walltime - 2min).
+          6. Emit draining:walltime status.
+        """
+        if not self.config.slurm_job_id:
+            return  # Not SLURM — skip
+
         while True:
-            await asyncio.sleep(3600)  # every hour
-            try:
-                self.process_mgr.cleanup_old_logs(max_age_hours=24)
-            except Exception as e:
-                print(f"[daemon] Log cleanup error: {e}")
+            await asyncio.sleep(CHECK_INTERVAL_S)
+            if self._walltime_draining:
+                continue
 
-    async def _idle_check_loop(self):
+            remaining = get_remaining_walltime()
+            if remaining is None:
+                continue
+
+            if remaining < DRAIN_THRESHOLD_S:
+                jlog("warn", "stub.walltime_drain",
+                     remaining_s=remaining,
+                     threshold_s=DRAIN_THRESHOLD_S)
+                self._walltime_draining = True
+                self.accepting_tasks = False
+
+                # Step 2: checkpoint all running tasks
+                for task_id in list(self.process_mgr.get_task_pids()):
+                    self.task_socket_registry.signal_task(task_id, "should_checkpoint")
+
+                # Step 3: wait 60s for checkpoint
+                await asyncio.sleep(60)
+
+                # Step 4: stop all running tasks
+                for task_id in list(self.process_mgr.get_task_pids()):
+                    self.task_socket_registry.signal_task(task_id, "should_stop")
+
+                # Step 5: wait up to (remaining - 120s)
+                grace = max(0, remaining - 120)
+                jlog("info", "stub.walltime_drain",
+                     detail="waiting_for_tasks",
+                     grace_s=grace,
+                     running=self.process_mgr.running_count())
+                deadline = time.monotonic() + grace
+                while self.process_mgr.running_count() > 0:
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(2)
+
+                # Step 6: notify server
+                jlog("info", "stub.walltime_drain",
+                     detail="drain_complete",
+                     remaining_running=self.process_mgr.running_count())
+                # Emit a system_stats update so server can see we're draining
+                if self._connected:
+                    await self._emit("system_stats", {"draining": "walltime"})
+
+    async def _idle_check_loop(self) -> None:
         if self.config.idle_timeout <= 0:
             return
         while True:
@@ -394,49 +695,62 @@ class StubDaemon:
             if self.process_mgr.running_count() == 0:
                 idle_s = time.time() - self.last_task_time
                 if idle_s >= self.config.idle_timeout:
-                    print(f"[daemon] Idle timeout ({idle_s:.0f}s), exiting")
+                    jlog("info", "stub.stop",
+                         reason="idle_timeout",
+                         idle_s=round(idle_s),
+                         timeout_s=self.config.idle_timeout)
                     os._exit(0)
 
-    async def _report_dead_tasks(self):
-        """Report tasks that died while stub was restarting."""
-        dead = getattr(self.process_mgr, '_dead_on_reattach', [])
-        if not dead:
-            return
-        # Wait until registered with server
-        for _ in range(30):
-            if self.registered:
-                break
-            await asyncio.sleep(1)
-        for task_id, pid in dead:
-            print(f"[daemon] Reporting dead task {task_id} (pid {pid}) as completed")
-            # We don't know the exit code, assume 0 (completed) since process exited cleanly
-            if self.registered:
-                await self.sio.emit("task.completed", {
-                    "task_id": task_id, "exit_code": 0,
-                }, namespace="/stubs")
+    async def _log_cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                self.process_mgr.cleanup_old_logs(max_age_hours=24)
+            except Exception as e:
+                log.debug("log cleanup error: %s", e)
 
-    async def run(self):
-        # Try to re-attach surviving tasks
+    # ------------------------------------------------------------------ #
+    # Main run                                                             #
+    # ------------------------------------------------------------------ #
+
+    async def run(self) -> None:
+        # Re-attach surviving task processes from previous run
         reattached = self.process_mgr.load_and_reattach()
         if reattached:
-            print(f"[daemon] Re-attached {len(reattached)} tasks")
+            log.info("Re-attached %d task(s) from previous run", len(reattached))
 
         # Start process monitoring
         self.process_mgr.start_monitoring()
 
-        # Start background loops
+        # Start background tasks
         asyncio.create_task(self._heartbeat_loop())
         asyncio.create_task(self._idle_check_loop())
         asyncio.create_task(self._log_cleanup_loop())
-        asyncio.create_task(self._report_dead_tasks())
+        asyncio.create_task(self._walltime_check_loop())
 
-        # Connect and run forever
-        server_url = self.config.server
+        # Connect and run forever (socket.io handles reconnection)
+        server = self.config.server
+        log.info("Connecting to %s", server)
         while True:
             try:
-                print(f"[daemon] Connecting to {server_url}")
-                await self.sio.connect(server_url, namespaces=["/stubs"])
+                await self.sio.connect(server, namespaces=["/stubs"])
                 await self.sio.wait()
-            except Exception as e:
-                print(f"[daemon] Connection error: {e}")
+            except socketio.exceptions.ConnectionError as e:
+                jlog("warn", "sio.reconnect", error=str(e))
                 await asyncio.sleep(5)
+            except Exception as e:
+                jlog("error", "sio.reconnect", error=str(e))
+                await asyncio.sleep(5)
+
+    async def graceful_drain(self, timeout: float = 300.0) -> None:
+        """Stop accepting tasks; wait for running tasks to finish (max timeout s)."""
+        self.accepting_tasks = False
+        log.info("Draining: waiting for %d task(s) to finish", self.process_mgr.running_count())
+        deadline = time.monotonic() + timeout
+        while self.process_mgr.running_count() > 0:
+            if time.monotonic() >= deadline:
+                log.warning("Drain timeout — %d tasks still running", self.process_mgr.running_count())
+                break
+            await asyncio.sleep(1)
+        await self.task_socket_registry.stop_all()
+        log.info("Drain complete")
