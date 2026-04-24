@@ -6,9 +6,8 @@ Unified resume flow (spec §4):
   No separate register + sync_state events.
 
 Reliable messaging:
-  Reliable events (task.run, task.kill, task.signal, config.update, resume_response)
-  are wrapped in `r` transport event.  Non-reliable events (heartbeat, gpu_stats,
-  system_stats, task.progress, task.log) are emitted directly.
+  Uses socket.io native ack callbacks. Each emit includes an ack callback;
+  server acks on receipt. Retry on timeout. No custom seq/ack/nack layer.
 """
 from __future__ import annotations
 
@@ -29,12 +28,34 @@ from .gpu_monitor import GpuMonitor
 from .log_setup import jlog
 from .preflight import run_preflight
 from .process_mgr import ProcessManager
-from .reliable import ReliableEmitter, ReliableReceiver
 from .system_monitor import SystemMonitor
 from .task_socket import TaskSocketRegistry
 from .walltime import CHECK_INTERVAL_S, DRAIN_THRESHOLD_S, get_remaining_walltime
 
 log = logging.getLogger(__name__)
+
+
+def _extract_dict(args: tuple) -> dict | None:
+    """Extract a dict payload from socket.io handler args.
+    python-socketio 5.16+ may pass extra positional args or JSON strings."""
+    for a in args:
+        if isinstance(a, dict):
+            return a
+        if isinstance(a, str):
+            try:
+                parsed = json.loads(a)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _find_ack(args: tuple):
+    """Find ack callback in socket.io handler args (last arg if callable)."""
+    if args and callable(args[-1]):
+        return args[-1]
+    return None
 
 
 class StubDaemon:
@@ -87,11 +108,6 @@ class StubDaemon:
             ssl_verify=self._build_ssl_context(),
         )
 
-        # Reliable messaging (stub → server direction)
-        self._emitter = ReliableEmitter(self._raw_emit)
-        # Reliable messaging (server → stub direction)
-        self._receiver = ReliableReceiver(self._raw_emit, self._deliver_reliable)
-
         self._connected = False
         self._setup_handlers()
 
@@ -99,16 +115,13 @@ class StubDaemon:
     # Raw socket.io helpers                                                #
     # ------------------------------------------------------------------ #
 
-    async def _raw_emit(self, event: str, data: Any) -> None:
-        if self.sio.connected:
-            await self.sio.emit(event, data, namespace="/stubs")
-
-    async def _emit_reliable(self, event: str, payload: Any) -> None:
-        await self._emitter.emit(event, payload)
-
     async def _emit(self, event: str, payload: Any) -> None:
-        """Non-reliable direct emit."""
-        await self._raw_emit(event, payload)
+        """Emit event directly via socket.io."""
+        if self._connected:
+            try:
+                await self.sio.emit(event, payload, namespace="/stubs")
+            except Exception as e:
+                log.warning("emit failed for %s: %s", event, e)
 
     # ------------------------------------------------------------------ #
     # socket.io handler registration                                       #
@@ -128,44 +141,59 @@ class StubDaemon:
             jlog("info", "sio.disconnect")
             self._connected = False
 
-        @sio.on("r", namespace="/stubs")
-        async def on_reliable(data: dict):
-            await self._receiver.on_message(data)
+        # ─── Server → Stub events (direct, with native ack) ─────────────
+        @sio.on("resume_response", namespace="/stubs")
+        async def on_resume_response(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if data:
+                if ack: ack({"ok": True})
+                await self._handle_resume_response(data)
 
-        @sio.on("r.ack", namespace="/stubs")
-        async def on_ack(data: dict):
-            self._emitter.on_ack(data["seq"])
+        @sio.on("task.run", namespace="/stubs")
+        async def on_task_run(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if data:
+                if ack: ack({"ok": True})
+                await self._handle_task_run(data)
 
-        @sio.on("r.nack", namespace="/stubs")
-        async def on_nack(data: dict):
-            self._emitter.on_nack(data["from"], data["to"])
+        @sio.on("task.kill", namespace="/stubs")
+        async def on_task_kill(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if data:
+                if ack: ack({"ok": True})
+                await self._handle_task_kill(data)
 
-        # Non-reliable direct event
+        @sio.on("task.signal", namespace="/stubs")
+        async def on_task_signal(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if data:
+                if ack: ack({"ok": True})
+                await self._handle_task_signal(data)
+
+        @sio.on("config.update", namespace="/stubs")
+        async def on_config_update(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if data:
+                if ack: ack({"ok": True})
+                await self._handle_config_update(data)
+
+        @sio.on("shell.exec", namespace="/stubs")
+        async def on_shell_exec(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if data:
+                if ack: ack({"ok": True})
+                await self._handle_shell_exec(data)
+
         @sio.on("request_sync", namespace="/stubs")
-        async def on_request_sync(_data: dict):
+        async def on_request_sync(*args):
             log.debug("request_sync received — re-sending resume")
             await self._send_resume()
-
-    # ------------------------------------------------------------------ #
-    # Reliable event delivery (server → stub)                             #
-    # ------------------------------------------------------------------ #
-
-    async def _deliver_reliable(self, event: str, payload: Any) -> None:
-        """Dispatch incoming reliable events from server."""
-        if event == "resume_response":
-            await self._handle_resume_response(payload)
-        elif event == "task.run":
-            await self._handle_task_run(payload)
-        elif event == "task.kill":
-            await self._handle_task_kill(payload)
-        elif event == "task.signal":
-            await self._handle_task_signal(payload)
-        elif event == "config.update":
-            await self._handle_config_update(payload)
-        elif event == "shell.exec":
-            await self._handle_shell_exec(payload)
-        else:
-            log.debug("Unknown reliable event: %s", event)
 
     # ------------------------------------------------------------------ #
     # Resume                                                               #
@@ -186,7 +214,6 @@ class StubDaemon:
             "token": self.config.token,
             "running_tasks": running_tasks,
             "local_queue": [],
-            "lastSeq": self._receiver.last_seq,
             "env_setup": self.config.env_setup or None,
             "default_cwd": self.config.default_cwd or None,
         }
@@ -209,11 +236,10 @@ class StubDaemon:
         except Exception:
             payload["available_envs"] = []
 
-        await self._emit_reliable("resume", payload)
+        await self._emit("resume", payload)
         jlog(
             "info", "resume.sent",
             running_tasks=len(running_tasks),
-            last_seq=self._receiver.last_seq,
             tags=self.config.tags,
         )
 
@@ -238,14 +264,10 @@ class StubDaemon:
             log.info("resume_response: killing orphan task %s", task_id)
             await self._kill_task(task_id, grace_period_s=0)
 
-        # Re-emit outbox messages server missed (handled by ReliableEmitter.on_resume)
-        last_server_seq = data.get("lastSeq", 0)
-        await self._emitter.on_resume(last_server_seq)
-
         # Report tasks that died while stub was restarting
         for task_id, _pid in self.process_mgr._dead_on_reattach:
             log.info("Reporting dead task %s (died while offline)", task_id)
-            await self._emit_reliable(
+            await self._emit(
                 "task.failed",
                 {"task_id": task_id, "exit_code": -1, "error": "Died while stub was offline"},
             )
@@ -277,7 +299,7 @@ class StubDaemon:
         )
         if not result.ok:
             jlog("error", "preflight.fail", task_id=task_id, errors=result.errors)
-            await self._emit_reliable(
+            await self._emit(
                 "preflight.fail",
                 {"task_id": task_id, "errors": result.errors},
             )
@@ -306,7 +328,7 @@ class StubDaemon:
             )
         except Exception as e:
             log.error("Failed to start task %s: %s", task_id, e)
-            await self._emit_reliable(
+            await self._emit(
                 "task.failed",
                 {"task_id": task_id, "exit_code": -1, "error": str(e)},
             )
@@ -473,7 +495,7 @@ class StubDaemon:
 
     async def _on_task_started(self, task_id: str, pid: int) -> None:
         jlog("info", "task.started", task_id=task_id, pid=pid)
-        await self._emit_reliable("task.started", {"task_id": task_id, "pid": pid})
+        await self._emit("task.started", {"task_id": task_id, "pid": pid})
 
     async def _on_task_log(self, task_id: str, lines: list[str]) -> None:
         if lines:
@@ -483,13 +505,13 @@ class StubDaemon:
         self.last_task_time = time.time()
         jlog("info", "task.completed", task_id=task_id, exit_code=exit_code)
         await self.task_socket_registry.remove(task_id)
-        await self._emit_reliable("task.completed", {"task_id": task_id, "exit_code": exit_code})
+        await self._emit("task.completed", {"task_id": task_id, "exit_code": exit_code})
 
     async def _on_task_failed(self, task_id: str, exit_code: int, error: str) -> None:
         self.last_task_time = time.time()
         jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error)
         await self.task_socket_registry.remove(task_id)
-        await self._emit_reliable(
+        await self._emit(
             "task.failed",
             {"task_id": task_id, "exit_code": exit_code, "error": error},
         )
@@ -499,7 +521,7 @@ class StubDaemon:
             return  # Don't spam reliable channel with repeated zombie reports
         self._zombie_reported.add(task_id)
         jlog("warn", "task.zombie", task_id=task_id)
-        await self._emit_reliable("task.zombie", {"task_id": task_id})
+        await self._emit("task.zombie", {"task_id": task_id})
 
     # ------------------------------------------------------------------ #
     # SDK socket callbacks                                                 #
@@ -551,10 +573,10 @@ class StubDaemon:
         await self._emit("task.eval", {"task_id": task_id, "metrics": metrics})
 
     async def _on_sdk_checkpoint(self, task_id: str, path: str) -> None:
-        await self._emit_reliable("task.checkpoint", {"task_id": task_id, "path": path})
+        await self._emit("task.checkpoint", {"task_id": task_id, "path": path})
 
     async def _on_sdk_config(self, task_id: str, config: dict) -> None:
-        await self._emit_reliable("task.config", {"task_id": task_id, "config": config})
+        await self._emit("task.config", {"task_id": task_id, "config": config})
 
     async def _on_sdk_done(self, task_id: str, metrics: dict) -> None:
         log.info("SDK done for task %s", task_id)

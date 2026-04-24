@@ -1,143 +1,116 @@
-"""Tests for GPU metrics collection in ThrottledReporter."""
-import subprocess
+"""Tests for GPU availability check in SDK preflight."""
+import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+import tempfile
 
-from alchemy_sdk.transport import ThrottledReporter, _query_gpu_metrics
+import pytest
 
-
-class TestQueryGpuMetrics:
-    def test_returns_none_when_nvidia_smi_missing(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError("nvidia-smi not found")):
-            result = _query_gpu_metrics()
-        assert result is None
-
-    def test_returns_none_when_nvidia_smi_fails(self):
-        mock_result = MagicMock()
-        mock_result.returncode = 1
-        with patch("subprocess.run", return_value=mock_result):
-            result = _query_gpu_metrics()
-        assert result is None
-
-    def test_parses_single_gpu_output(self):
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "0, 85, 20000, 49152, 72\n"
-        with patch("subprocess.run", return_value=mock_result):
-            result = _query_gpu_metrics()
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["index"] == 0
-        assert result[0]["utilization_pct"] == 85
-        assert result[0]["memory_used_mb"] == 20000
-        assert result[0]["memory_total_mb"] == 49152
-        assert result[0]["temperature_c"] == 72
-
-    def test_parses_multi_gpu_output(self):
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "0, 85, 20000, 49152, 72\n1, 30, 8000, 49152, 55\n"
-        with patch("subprocess.run", return_value=mock_result):
-            result = _query_gpu_metrics()
-        assert result is not None
-        assert len(result) == 2
-        assert result[1]["index"] == 1
-        assert result[1]["utilization_pct"] == 30
-
-    def test_skips_malformed_lines(self):
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = "0, 85, 20000, 49152, 72\nbad line\n"
-        with patch("subprocess.run", return_value=mock_result):
-            result = _query_gpu_metrics()
-        assert result is not None
-        assert len(result) == 1
-
-    def test_returns_none_on_exception(self):
-        with patch("subprocess.run", side_effect=Exception("unexpected")):
-            result = _query_gpu_metrics()
-        assert result is None
-
-    def test_timeout_kills_subprocess(self):
-        """Verify nvidia-smi is called with timeout=5."""
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = ""
-        with patch("subprocess.run", return_value=mock_result) as mock_run:
-            _query_gpu_metrics()
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs.get("timeout") == 5
+from alchemy_sdk.context import TrainingContext
+from alchemy_sdk.preflight import run_preflight
+from alchemy_sdk.client import Alchemy
 
 
-class TestThrottledReporterGpuCollection:
-    def _drain(self, reporter, mock_resp, mock_gpu=None):
-        """Simulate the flush loop's GPU-attachment logic and return the payload sent to _do_post."""
-        sent_payloads = []
+def _make_ctx(tmp_path: Path) -> TrainingContext:
+    """Create a TrainingContext with run_dir pointing to tmp_path."""
+    al = Alchemy()
+    with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+        ctx = TrainingContext(al=al)
+    return ctx
 
-        def fake_do_post(p):
-            sent_payloads.append(dict(p))  # copy before mutation
-            return mock_resp
 
-        with patch.object(reporter, "_do_post", side_effect=fake_do_post):
-            # Replicate _flush_loop logic for a single payload
-            with reporter._lock:
-                payload = reporter._pending
-                reporter._pending = None
-            if payload:
-                if reporter._collect_gpu and "step" in payload:
-                    with patch("alchemy_sdk.transport._query_gpu_metrics",
-                               return_value=mock_gpu or []):
-                        gpu = mock_gpu
-                        if gpu:
-                            payload["gpu_metrics"] = gpu
-                reporter._send(payload)
-        return sent_payloads
+class TestPreflightGpuCheck:
+    def test_raises_when_torch_available_but_no_cuda(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = False
 
-    def test_gpu_metrics_attached_to_payload_when_step_present(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-1", collect_gpu=True)
-        reporter.report(step=100, total=1000)
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
 
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.json.return_value = {"ok": True, "should_checkpoint": False, "should_stop": False}
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            with pytest.raises(RuntimeError, match="No GPU detected"):
+                run_preflight(ctx, reads=[])
 
-        mock_gpu = [{"index": 0, "utilization_pct": 70, "memory_used_mb": 10000,
-                     "memory_total_mb": 49152, "temperature_c": 65}]
+    def test_passes_when_torch_available_with_cuda(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = True
 
-        sent = self._drain(reporter, mock_resp, mock_gpu=mock_gpu)
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
 
-        assert len(sent) == 1
-        assert "gpu_metrics" in sent[0]
-        assert sent[0]["gpu_metrics"][0]["utilization_pct"] == 70
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            # Should not raise
+            run_preflight(ctx, reads=[])
 
-    def test_gpu_metrics_not_attached_when_collect_gpu_false(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-1", collect_gpu=False)
-        reporter.report(step=100, total=1000)
+    def test_skips_gpu_check_when_torch_not_installed(self, tmp_path):
+        al = Alchemy()
 
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.json.return_value = {"ok": True, "should_checkpoint": False, "should_stop": False}
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
 
-        mock_gpu = [{"index": 0, "utilization_pct": 70, "memory_used_mb": 10000,
-                     "memory_total_mb": 49152, "temperature_c": 65}]
+        with patch.dict("sys.modules", {"torch": None}):
+            # Should not raise even without torch
+            run_preflight(ctx, reads=[])
 
-        sent = self._drain(reporter, mock_resp, mock_gpu=mock_gpu)
+    def test_raises_on_missing_reads_path(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = True
 
-        assert len(sent) == 1
-        assert "gpu_metrics" not in sent[0]
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
 
-    def test_gpu_metrics_not_attached_when_no_step_in_payload(self):
-        """GPU metrics should only be queried when step is in the payload (training progress)."""
-        reporter = ThrottledReporter("http://localhost:3001", "task-1", collect_gpu=True)
-        reporter.report(checkpoint="/path/to/ckpt.pt")  # No "step"
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            with pytest.raises(FileNotFoundError, match="does not exist"):
+                run_preflight(ctx, reads=["/nonexistent/path/that/does/not/exist"])
 
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.json.return_value = {"ok": True, "should_checkpoint": False, "should_stop": False}
+    def test_sets_is_resume_when_checkpoint_exists(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = True
 
-        mock_gpu = [{"index": 0, "utilization_pct": 70, "memory_used_mb": 10000,
-                     "memory_total_mb": 49152, "temperature_c": 65}]
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
 
-        sent = self._drain(reporter, mock_resp, mock_gpu=mock_gpu)
+        # Create a fake checkpoint
+        ckpt_dir = tmp_path / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        fake_ckpt = ckpt_dir / "latest.pt"
+        fake_ckpt.write_bytes(b"fake")
 
-        assert len(sent) == 1
-        assert "gpu_metrics" not in sent[0]
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            run_preflight(ctx, reads=[])
+
+        assert ctx.is_resume is True
+
+    def test_is_resume_false_when_no_checkpoint(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = True
+
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            run_preflight(ctx, reads=[])
+
+        assert ctx.is_resume is False
+
+    def test_warns_on_low_disk_space(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = True
+
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
+
+        # Simulate very low disk space (100 bytes free)
+        mock_usage = MagicMock()
+        mock_usage.free = 100
+
+        with patch.dict("sys.modules", {"torch": mock_torch}), \
+             patch("shutil.disk_usage", return_value=mock_usage):
+            with pytest.warns(UserWarning, match="low disk space"):
+                run_preflight(ctx, reads=[])

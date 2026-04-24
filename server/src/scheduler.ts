@@ -1,368 +1,243 @@
 /**
- * Scheduler: smart task allocation + anomaly detection + migration suggestions.
+ * scheduler.ts — Constraint-aware task scheduler.
+ *
+ * Scoring: hard constraints (GPU mem, GPU type, CPU mem, online) → -Infinity.
+ * Soft scoring: idle ratio, queue depth, grid locality, VRAM waste.
+ *
+ * Triggers: new task in global queue, stub comes online, task completes, 30s periodic.
  */
+
+import path from "path";
 import { Namespace } from "socket.io";
-import { v4 as uuidv4 } from "uuid";
 import { store } from "./store";
-import { Task, Stub, AnomalyAlert, MigrationSuggestion } from "./types";
+import { Stub, Task } from "./types";
+import { reliableEmitToStub } from "./reliable";
+import { logger } from "./log";
 
-// Track last progress timestamps per task
-const lastProgressAt: Map<string, number> = new Map();
-// Track GPU idle start per stub
-const gpuIdleSince: Map<string, number> = new Map();
-// Track last log output per task
-const lastOutputAt: Map<string, number> = new Map();
+// ─── GPU name normalization ───────────────────────────────────────────────────
 
-export function updateTaskProgressTime(taskId: string): void {
-  lastProgressAt.set(taskId, Date.now());
+function normalizeGpuName(name: string): string {
+  return name.toLowerCase().replace(/[\s\-_]/g, "").replace("nvidia", "").replace("geforce", "");
 }
 
-export function updateTaskOutputTime(taskId: string): void {
-  lastOutputAt.set(taskId, Date.now());
+// ─── Available VRAM calculation ───────────────────────────────────────────────
+
+function availableVram(stub: Stub): number {
+  // Use GPU stats if available
+  if (stub.gpu_stats?.gpus && stub.gpu_stats.gpus.length > 0) {
+    return stub.gpu_stats.gpus.reduce((sum, g) => sum + (g.memory_total_mb - g.memory_used_mb), 0);
+  }
+  // Estimate from running tasks' requirements
+  const reservedMb = stub.tasks
+    .filter((t) => ["running", "dispatched"].includes(t.status))
+    .reduce((sum, t) => sum + (t.requirements?.gpu_mem_mb || 0), 0);
+  return Math.max(0, stub.gpu.vram_total_mb - reservedMb);
 }
 
-/**
- * Pick the best stub for a task based on VRAM, load, and GPU type preference.
- */
-export function pickBestStub(estimatedVramMb?: number, preferGpuType?: string): Stub | undefined {
-  const onlineStubs = store.getAllStubs().filter((s) => s.status === "online");
-  if (onlineStubs.length === 0) return undefined;
+function availableMem(stub: Stub): number {
+  if (stub.system_stats) {
+    return stub.system_stats.mem_total_mb - stub.system_stats.mem_used_mb;
+  }
+  return Infinity; // Unknown — don't block
+}
 
-  let candidates = onlineStubs;
+// ─── Scoring ─────────────────────────────────────────────────────────────────
 
-  // Filter by VRAM
-  if (estimatedVramMb && estimatedVramMb > 0) {
-    const fits = candidates.filter((s) => s.gpu.vram_total_mb >= estimatedVramMb);
-    if (fits.length > 0) candidates = fits;
+export function scoreStub(stub: Stub, task: Task): number {
+  // Hard constraints
+  if (stub.status !== "online") return -Infinity;
+
+  // Tag filter: stub must have ALL target_tags
+  if (task.target_tags && task.target_tags.length > 0) {
+    const stubTags = new Set(stub.tags || []);
+    if (!task.target_tags.every((tag) => stubTags.has(tag))) return -Infinity;
   }
 
-  // Sort: prefer same GPU type → prefer idle → prefer low load
-  candidates.sort((a, b) => {
-    const sameA = preferGpuType ? (a.gpu.name.includes(preferGpuType) ? 0 : 1) : 0;
-    const sameB = preferGpuType ? (b.gpu.name.includes(preferGpuType) ? 0 : 1) : 0;
-    if (sameA !== sameB) return sameA - sameB;
+  if (task.requirements?.gpu_mem_mb) {
+    if (availableVram(stub) < task.requirements.gpu_mem_mb) return -Infinity;
+  }
 
-    const aLoad = a.tasks.filter((t) => ["running", "queued", "dispatched"].includes(t.status)).length;
-    const bLoad = b.tasks.filter((t) => ["running", "queued", "dispatched"].includes(t.status)).length;
-    return aLoad - bLoad;
-  });
+  if (task.requirements?.gpu_type?.length) {
+    const stubNorm = normalizeGpuName(stub.gpu.name);
+    const matches = task.requirements.gpu_type.some(
+      (t) => normalizeGpuName(t) === stubNorm || stubNorm.includes(normalizeGpuName(t))
+    );
+    if (!matches) return -Infinity;
+  }
 
-  return candidates[0];
+  if (task.requirements?.cpu_mem_mb && stub.system_stats) {
+    if (availableMem(stub) < task.requirements.cpu_mem_mb) return -Infinity;
+  }
+
+  // Python env constraint
+  if (task.python_env) {
+    const envs = stub.available_envs || [];
+    if (!envs.some((e) => e.name === task.python_env)) return -Infinity;
+  }
+
+  // Concurrency hard constraint
+  const running = stub.tasks.filter((t) => ["running", "dispatched"].includes(t.status)).length;
+  const queued = stub.tasks.filter((t) => t.status === "queued").length;
+  if (running + queued >= stub.max_concurrent) return -Infinity;
+
+  // Soft scoring
+  let s = 0;
+
+  // Idle ratio bonus (0–40 points)
+  s += 40 * Math.max(0, stub.max_concurrent - running) / Math.max(1, stub.max_concurrent);
+  // Queue depth penalty
+  s -= 10 * queued;
+
+  // Grid locality: prefer stubs already running tasks from the same grid
+  if (task.grid_id) {
+    const gridTasks = store.getGridTasks(task.grid_id);
+    const gridStubIds = new Set(gridTasks.map((t) => t.stub_id).filter(Boolean));
+    if (gridStubIds.has(stub.id)) {
+      s += 20;
+    }
+  }
+
+  // VRAM waste penalty: avoid over-provisioning
+  if (task.requirements?.gpu_mem_mb) {
+    s -= (stub.gpu.vram_total_mb - task.requirements.gpu_mem_mb) / 1000;
+  }
+
+  return s;
 }
 
+// ─── Compute server-authoritative run_dir ────────────────────────────────────
+
 /**
- * Check DAG dependencies: transition waiting tasks to queued if deps are met,
- * or to blocked if a dependency failed.
+ * Compute run_dir for a task at dispatch time.
+ * Priority: task.run_dir > stub.default_output_dir > (stub.default_cwd or cwd) / "runs"
+ * Final path: base_output_dir / fingerprint[:12]
  */
-export function checkDagDependencies(webNs: Namespace, stubNs: Namespace): void {
-  const allTasks = store.getAllTasks();
-  const taskMap = new Map(allTasks.map((t) => [t.id, t]));
+export function computeRunDir(task: Task, stub: Stub): string {
+  // If task has an explicit run_dir set by user, use it as-is (treat as full path)
+  if (task.run_dir) {
+    return task.run_dir;
+  }
 
-  for (const task of allTasks) {
-    if (task.status !== "waiting") continue;
-    if (!task.depends_on || task.depends_on.length === 0) continue;
+  // Determine base_output_dir
+  let baseOutputDir: string;
+  if (stub.default_output_dir) {
+    baseOutputDir = stub.default_output_dir;
+  } else {
+    const base = task.cwd || stub.default_cwd || process.cwd();
+    baseOutputDir = path.join(base, "runs");
+  }
 
-    const deps = task.depends_on.map((id) => taskMap.get(id));
-    const anyMissing = deps.some((d) => d === undefined);
-    if (anyMissing) continue;
+  return path.join(baseOutputDir, task.fingerprint.slice(0, 12));
+}
 
-    // Helper: update task regardless of whether it's on a stub or in global queue
-    const updateTask = (update: Partial<Task>): Task | undefined => {
-      if (!task.stub_id) {
-        // Global queue task
-        return store.updateGlobalQueueTask(task.id, update);
-      }
-      return store.updateTask(task.stub_id, task.id, update);
-    };
+// ─── Build run payload ────────────────────────────────────────────────────────
 
-    const anyFailed = deps.some((d) => d && ["failed", "killed", "blocked"].includes(d.status));
-    if (anyFailed) {
-      const updated = updateTask({ status: "blocked" });
-      if (updated) webNs.emit("task.update", updated);
+/** Resolve python_env name to activation command using stub's available_envs. */
+function resolveEnvSetup(task: Task, stub: Stub): string | undefined {
+  if (!task.python_env) return task.env_setup;
+  const envs = stub.available_envs || [];
+  const match = envs.find((e) => e.name === task.python_env);
+  if (!match) return task.env_setup;
+
+  // Use the activate command from stub's env discovery if available
+  const activateCmd = match.activate
+    || (match.type === "venv" ? `source ${match.path}/bin/activate` : `micromamba activate ${match.path}`);
+
+  // Prepend to existing env_setup if any
+  return task.env_setup ? `${activateCmd} && ${task.env_setup}` : activateCmd;
+}
+
+export function buildRunPayload(task: Task, stub: Stub): object {
+  const run_dir = computeRunDir(task, stub);
+  return {
+    task_id: task.id,
+    command: task.command,
+    cwd: task.cwd,
+    env: task.env,
+    env_setup: resolveEnvSetup(task, stub),
+    run_dir,
+    params: task.param_overrides,
+  };
+}
+
+// ─── Dispatch queued tasks for a stub ────────────────────────────────────────
+
+export function maybeDispatch(stub: Stub): void {
+  if (stub.status !== "online") return;
+
+  const active = stub.tasks.filter((t) => ["running", "dispatched"].includes(t.status)).length;
+  const slots = stub.max_concurrent - active;
+  if (slots <= 0) return;
+
+  const queued = stub.tasks
+    .filter((t) => t.status === "queued")
+    .sort((a, b) => b.priority - a.priority || a.created_at.localeCompare(b.created_at));
+
+  logger.info("maybeDispatch", { stub: stub.name, active, slots, queued: queued.length, total_tasks: stub.tasks.length });
+
+  const toDispatch = queued.slice(0, slots);
+
+  for (const task of toDispatch) {
+    const run_dir = computeRunDir(task, stub);
+    // Persist computed run_dir into task so write lock and display work correctly
+    store.updateTask(stub.id, task.id, { status: "dispatched", run_dir });
+    reliableEmitToStub(stub.id, "task.run", buildRunPayload(task, stub));
+    logger.info("task.dispatch", { task_seq: task.seq, stub: stub.name, display_name: task.display_name, run_dir });
+  }
+}
+
+// ─── Main schedule loop ───────────────────────────────────────────────────────
+
+export function schedule(): void {
+  const stubs = store.getOnlineStubs();
+  if (stubs.length === 0) return;
+
+  // Dispatch any queued tasks already on stubs (e.g. after retry/status reset)
+  for (const stub of stubs) {
+    maybeDispatch(stub);
+  }
+
+  const queue = store.getGlobalQueue(); // sorted: priority desc, created_at asc
+  if (queue.length === 0) return;
+
+  for (const task of queue) {
+    const candidates = stubs
+      .map((s) => ({ stub: s, score: scoreStub(s, task) }))
+      .filter((c) => c.score > -Infinity)
+      .sort((a, b) => b.score - a.score);
+
+    if (candidates.length === 0) {
+      logger.info("scheduler.no_candidate", { task_seq: task.seq, display_name: task.display_name });
       continue;
     }
 
-    const allDone = deps.every((d) => d && ["completed", "completed_with_errors"].includes(d.status));
-    if (allDone) {
-      const updated = updateTask({ status: "queued" });
-      if (updated) {
-        webNs.emit("task.update", updated);
-        // Try to dispatch — use lazy require to break circular dependency
-        try {
-          const stubModule = require("./socket/stub");
-          if (task.stub_id) {
-            stubModule.dispatchQueuedTasks(task.stub_id, stubNs);
-          } else {
-            // Global queue task: pick best stub and dispatch
-            const bestStub = pickBestStub(task.estimated_vram_mb);
-            if (bestStub) stubModule.dispatchQueuedTasks(bestStub.id, stubNs);
-          }
-        } catch {
-          // Module not available yet (e.g. during tests before full init); skip dispatch
-        }
+    const best = candidates[0].stub;
+    logger.info("scheduler.assign", { task_seq: task.seq, stub: best.name, score: candidates[0].score });
+    const moved = store.moveToStubQueue(task.id, best.id);
+    if (moved) {
+      const updatedStub = store.getStub(best.id);
+      if (updatedStub) {
+        maybeDispatch(updatedStub);
       }
     }
   }
 }
 
-/**
- * Detect training anomalies: stalls, GPU idle, NaN loss, etc.
- */
-export function runAnomalyDetection(webNs: Namespace): void {
-  const cfg = store.getStallConfig();
-  if (!cfg.enabled) return;
+// ─── Trigger helpers ─────────────────────────────────────────────────────────
 
-  const now = Date.now();
-
-  for (const stub of store.getAllStubs()) {
-    if (stub.status !== "online") continue;
-
-    // GPU idle detection
-    const gpuStats = stub.gpu_stats?.gpus || [];
-    if (gpuStats.length > 0) {
-      const avgUtil = gpuStats.reduce((s, g) => s + g.utilization_pct, 0) / gpuStats.length;
-      const hasRunningTasks = stub.tasks.some((t) => t.status === "running");
-
-      if (hasRunningTasks && avgUtil < cfg.gpu_idle_threshold_pct) {
-        const idleSince = gpuIdleSince.get(stub.id);
-        if (!idleSince) {
-          gpuIdleSince.set(stub.id, now);
-        } else {
-          const idleMinutes = (now - idleSince) / 60_000;
-          if (idleMinutes >= cfg.gpu_idle_timeout_min) {
-            // Check if we already have a recent alert for this
-            const existingAlert = store.getAllAlerts().find(
-              (a) => a.stub_id === stub.id && a.type === "gpu_idle" && !a.resolved &&
-                (now - new Date(a.created_at).getTime()) < 60_000 * cfg.gpu_idle_timeout_min * 2
-            );
-            if (!existingAlert) {
-              emitAlert(stub.id, undefined, "gpu_idle",
-                `GPU on stub ${stub.name} has been idle (${avgUtil.toFixed(1)}% util) for ${idleMinutes.toFixed(0)} minutes`,
-                webNs);
-            }
-          }
-        }
-      } else {
-        gpuIdleSince.delete(stub.id);
-      }
-    }
-
-    // Per-task stall detection
-    for (const task of stub.tasks) {
-      if (task.status !== "running") continue;
-
-      // Progress stall (SDK mode)
-      if (task.progress) {
-        const lastProg = lastProgressAt.get(task.id);
-        if (lastProg) {
-          const staleMin = (now - lastProg) / 60_000;
-          if (staleMin >= cfg.no_progress_timeout_min) {
-            const existingAlert = store.getAllAlerts().find(
-              (a) => a.task_id === task.id && a.type === "stall" && !a.resolved
-            );
-            if (!existingAlert) {
-              emitAlert(stub.id, task.id, "stall",
-                `Task ${task.id} has not reported progress for ${staleMin.toFixed(0)} minutes`,
-                webNs);
-            }
-          }
-        } else {
-          // Initialize
-          lastProgressAt.set(task.id, now);
-        }
-      }
-
-      // No output stall (non-SDK mode)
-      if (!task.progress) {
-        const lastOut = lastOutputAt.get(task.id);
-        if (lastOut) {
-          const staleMin = (now - lastOut) / 60_000;
-          if (staleMin >= cfg.no_progress_timeout_min) {
-            const existingAlert = store.getAllAlerts().find(
-              (a) => a.task_id === task.id && a.type === "no_output" && !a.resolved
-            );
-            if (!existingAlert) {
-              emitAlert(stub.id, task.id, "no_output",
-                `Task ${task.id} has produced no log output for ${staleMin.toFixed(0)} minutes`,
-                webNs);
-            }
-          }
-        } else {
-          lastOutputAt.set(task.id, now);
-        }
-      }
-    }
+export function triggerSchedule(): void {
+  try {
+    schedule();
+  } catch (err) {
+    logger.error("scheduler.error", { error: String(err) });
   }
 }
 
-function emitAlert(
-  stubId: string,
-  taskId: string | undefined,
-  type: AnomalyAlert["type"],
-  message: string,
-  webNs: Namespace
-): void {
-  const alert: AnomalyAlert = {
-    id: uuidv4(),
-    stub_id: stubId,
-    task_id: taskId,
-    type,
-    message,
-    created_at: new Date().toISOString(),
-    resolved: false,
-  };
-  store.addAlert(alert);
-  webNs.emit("anomaly.alert", alert);
-  console.warn(`[anomaly] ${type}: ${message}`);
-}
+// ─── Periodic scheduling ─────────────────────────────────────────────────────
 
-/**
- * Check for loss anomalies reported from SDK (NaN/Inf or spike).
- * Called when a progress update arrives.
- */
-export function checkLossAnomaly(
-  stubId: string,
-  taskId: string,
-  loss: number | undefined,
-  previousLoss: number | undefined,
-  webNs: Namespace,
-  stubNs: Namespace
-): void {
-  if (loss === undefined) return;
-
-  // NaN or Inf → auto-pause
-  if (!isFinite(loss) || isNaN(loss)) {
-    const task = store.updateTask(stubId, taskId, { status: "paused" });
-    if (task) {
-      stubNs.to(`stub:${stubId}`).emit("task.pause", { task_id: taskId });
-      webNs.emit("task.update", task);
-    }
-    emitAlert(stubId, taskId, "loss_nan",
-      `Task ${taskId} reported loss=${loss} (NaN/Inf) — task auto-paused`,
-      webNs);
-    return;
-  }
-
-  // 10x spike → warning only
-  if (previousLoss !== undefined && previousLoss > 0 && loss > previousLoss * 10) {
-    emitAlert(stubId, taskId, "loss_spike",
-      `Task ${taskId} loss spiked from ${previousLoss.toFixed(4)} to ${loss.toFixed(4)} (${(loss / previousLoss).toFixed(1)}x jump)`,
-      webNs);
-  }
-}
-
-/**
- * Generate migration suggestions based on load imbalance.
- */
-export function generateMigrationSuggestions(webNs: Namespace): void {
-  const onlineStubs = store.getAllStubs().filter((s) => s.status === "online");
-  if (onlineStubs.length < 2) return;
-
-  const loads = onlineStubs.map((s) => ({
-    stub: s,
-    running: s.tasks.filter((t) => t.status === "running").length,
-    queued: s.tasks.filter((t) => t.status === "queued").length,
-  }));
-
-  const busy = loads.filter((l) => l.running >= 2 && l.queued > 0);
-  const idle = loads.filter((l) => l.running === 0 && l.queued === 0);
-
-  for (const busyStub of busy) {
-    for (const idleStub of idle) {
-      // Suggest migrating first queued task from busy to idle
-      const task = busyStub.stub.tasks.find((t) => t.status === "queued");
-      if (!task) continue;
-
-      // Don't duplicate existing suggestions
-      const existing = store.getAllMigrationSuggestions().find(
-        (s) => s.task_id === task.id && s.to_stub === idleStub.stub.id
-      );
-      if (existing) continue;
-
-      const suggestion: MigrationSuggestion = {
-        id: uuidv4(),
-        task_id: task.id,
-        from_stub: busyStub.stub.id,
-        to_stub: idleStub.stub.id,
-        reason: `Stub ${busyStub.stub.name} has ${busyStub.queued} queued tasks while ${idleStub.stub.name} is idle`,
-        created_at: new Date().toISOString(),
-      };
-
-      store.addMigrationSuggestion(suggestion);
-      webNs.emit("migration.suggestion", suggestion);
-    }
-  }
-}
-
-/**
- * Check running tasks for timeout violations. Kill any that have exceeded timeout_s.
- */
-export function checkTaskTimeouts(stubNs: Namespace, webNs: Namespace): void {
-  const now = Date.now();
-  for (const stub of store.getAllStubs()) {
-    for (const task of stub.tasks) {
-      if (task.status !== "running") continue;
-      if (!task.timeout_s || !task.started_at) continue;
-
-      const elapsed = now - new Date(task.started_at).getTime();
-      if (elapsed > task.timeout_s * 1000) {
-        // Kill the task
-        stubNs.to(`stub:${stub.id}`).emit("task.kill", { task_id: task.id, signal: "SIGTERM" });
-        const updated = store.updateTask(stub.id, task.id, {
-          status: "killed",
-          finished_at: new Date().toISOString(),
-        });
-        if (updated) webNs.emit("task.update", updated);
-
-        // Create a timeout alert
-        const alert: AnomalyAlert = {
-          id: uuidv4(),
-          stub_id: stub.id,
-          task_id: task.id,
-          type: "stall",
-          message: `Task ${task.id} exceeded timeout of ${task.timeout_s}s and was killed`,
-          created_at: new Date().toISOString(),
-          resolved: false,
-        };
-        store.addAlert(alert);
-        webNs.emit("anomaly.alert", alert);
-        console.warn(`[scheduler] Task ${task.id} timed out after ${task.timeout_s}s`);
-      }
-    }
-  }
-}
-
-/**
- * Drain global queue: dispatch queued tasks to stubs with available slots.
- */
-export function drainGlobalQueue(stubNs: Namespace): void {
-  const globalQueue = store.getGlobalQueue();
-  if (globalQueue.length === 0) return;
-
-  const onlineStubs = store.getAllStubs().filter((s) => s.status === "online");
-  for (const stub of onlineStubs) {
-    const running = stub.tasks.filter((t) => t.status === "running" || t.status === "dispatched").length;
-    if (running < stub.max_concurrent) {
-      try {
-        const stubModule = require("./socket/stub");
-        stubModule.dispatchQueuedTasks(stub.id, stubNs);
-      } catch {}
-    }
-  }
-}
-
-/**
- * Start background monitoring loops.
- */
-export function startScheduler(webNs: Namespace, stubNs: Namespace): void {
-  // DAG dependency check every 5s
-  setInterval(() => checkDagDependencies(webNs, stubNs), 5_000);
-  // Global queue drain every 10s
-  setInterval(() => drainGlobalQueue(stubNs), 10_000);
-  // Anomaly detection every 60s
-  setInterval(() => runAnomalyDetection(webNs), 60_000);
-  // Migration suggestions every 2 minutes
-  setInterval(() => generateMigrationSuggestions(webNs), 120_000);
-  // Task timeout enforcement every 30s
-  setInterval(() => checkTaskTimeouts(stubNs, webNs), 30_000);
+export function startScheduler(_webNs: Namespace, _stubNs: Namespace): void {
+  // Periodic schedule: every 30s
+  setInterval(() => triggerSchedule(), 30_000);
+  // Also drain immediately on startup (tasks may be pending)
+  setTimeout(() => triggerSchedule(), 1_000);
 }

@@ -4,8 +4,6 @@ import json
 import os
 import pickle
 import signal
-import sys
-import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -106,7 +104,7 @@ class ManagedTraining(ABC):
         if elapsed >= self._checkpoint_every_minutes * 60:
             return True
         # Server says checkpoint
-        if self._alchemy and self._alchemy.should_checkpoint:
+        if self._alchemy and self._alchemy.should_checkpoint():
             return True
         return False
 
@@ -170,16 +168,14 @@ class ManagedTraining(ABC):
         instance = training_class()
         instance._checkpoint_every_steps = args.checkpoint_every_steps
         instance._checkpoint_every_minutes = args.checkpoint_every_minutes
-        instance._checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else Path("/tmp/alchemy_checkpoints")
+        instance._checkpoint_dir = (
+            Path(args.checkpoint_dir) if args.checkpoint_dir
+            else Path("/tmp/alchemy_checkpoints")
+        )
         instance._last_checkpoint_time = time.time()
 
-        # Connect to Alchemy server
-        server_url = os.environ.get("ALCHEMY_SERVER", "")
-        task_id = os.environ.get("ALCHEMY_TASK_ID", "")
-        if server_url and task_id:
-            instance._alchemy = Alchemy(server=server_url, task_id=task_id)
-        else:
-            instance._alchemy = None
+        # Connect to Alchemy (auto-init from env vars)
+        instance._alchemy = Alchemy()
 
         # SIGUSR1 → immediate checkpoint
         def _sigusr1_handler(signum, frame):
@@ -212,7 +208,7 @@ class ManagedTraining(ABC):
             step = instance._current_step
 
             # Server-requested early stop
-            if instance._alchemy and instance._alchemy.should_stop:
+            if instance._alchemy and instance._alchemy.should_stop():
                 print("[ManagedTraining] Server requested stop, checkpointing and exiting.", flush=True)
                 instance._save_checkpoint()
                 break

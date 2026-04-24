@@ -1,5 +1,4 @@
 """Framework callbacks for PyTorch Lightning and HuggingFace Trainer."""
-import os
 from typing import Any, Optional
 
 from .client import Alchemy
@@ -13,14 +12,12 @@ class AlchemyPLCallback:
         trainer = pl.Trainer(callbacks=[AlchemyPLCallback()])
     """
 
-    def __init__(self, server: str = "", total_steps: Optional[int] = None):
-        self.server = server or os.environ.get("ALCHEMY_SERVER", "")
+    def __init__(self, total_steps: Optional[int] = None):
         self._total = total_steps
         self._al: Optional[Alchemy] = None
 
     def on_train_start(self, trainer: Any, pl_module: Any) -> None:
-        if self.server:
-            self._al = Alchemy(server=self.server)
+        self._al = Alchemy()
         if self._total is None:
             self._total = trainer.estimated_stepping_batches
 
@@ -34,7 +31,7 @@ class AlchemyPLCallback:
         metrics = {k: float(v) for k, v in trainer.callback_metrics.items() if k != "train_loss"}
         self._al.log(step=step, total=total, loss=loss_val, metrics=metrics or None)
 
-        if self._al.should_stop:
+        if self._al.should_stop():
             trainer.should_stop = True
 
     def on_save_checkpoint(self, trainer: Any, pl_module: Any, checkpoint: Any) -> None:
@@ -57,13 +54,11 @@ class AlchemyHFCallback:
         trainer = Trainer(..., callbacks=[AlchemyHFCallback()])
     """
 
-    def __init__(self, server: str = ""):
-        self.server = server or os.environ.get("ALCHEMY_SERVER", "")
+    def __init__(self):
         self._al: Optional[Alchemy] = None
 
     def on_train_begin(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
-        if self.server:
-            self._al = Alchemy(server=self.server)
+        self._al = Alchemy()
 
     def on_log(self, args: Any, state: Any, control: Any, logs: Optional[dict] = None, **kwargs: Any) -> None:
         if self._al is None or logs is None:
@@ -74,7 +69,7 @@ class AlchemyHFCallback:
         metrics = {k: v for k, v in logs.items() if k != "loss" and isinstance(v, (int, float))}
         self._al.log(step=step, total=total, loss=loss, metrics=metrics or None)
 
-        if self._al.should_stop:
+        if self._al.should_stop():
             control.should_training_stop = True
 
     def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:

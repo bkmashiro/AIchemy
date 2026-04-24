@@ -1,595 +1,797 @@
-import { Server, Namespace, Socket } from "socket.io";
+/**
+ * socket/stub.ts — Stub socket.io namespace handler.
+ *
+ * Unified resume flow: every connection (first / reconnect) uses a single
+ * `resume` event. Server reconciles and responds with `resume_response`.
+ *
+ * Reliable messaging: R-layer for critical S→Stub events.
+ */
+
+import { Namespace, Socket } from "socket.io";
+import { createHash } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 import { store } from "../store";
 import { metricsStore } from "../metrics";
 import {
-  RegisterPayload,
-  HeartbeatPayload,
-  TaskStartedPayload,
-  TaskProgressPayload,
-  TaskLogPayload,
-  TaskCompletedPayload,
-  TaskFailedPayload,
-  ShellResultPayload,
-  Stub,
+  Stub, Task, TaskStatus,
+  ResumePayload, HeartbeatPayload,
+  TaskStartedPayload, TaskProgressPayload, TaskLogPayload,
+  TaskCompletedPayload, TaskFailedPayload,
+  TaskConfigPayload, TaskCheckpointPayload, PreflightFailPayload,
+  TaskResourcePayload, TaskMetricsPayload,
 } from "../types";
-import { checkDagDependencies, checkLossAnomaly, updateTaskProgressTime, updateTaskOutputTime } from "../scheduler";
-import { sendDiscordNotification } from "../notifications";
+import { maybeDispatch, triggerSchedule, buildRunPayload, computeRunDir } from "../scheduler";
+import {
+  registerStubSocket, unregisterStubSocket,
+  reliableEmitToStub,
+} from "../reliable";
+import {
+  notifyTaskCompleted, notifyTaskFailed, notifyTaskLost,
+  notifyGridDone,
+} from "../notifications";
+import { notifyTaskEvent } from "../discord";
+import { writeLockTable } from "../dedup";
+import { logger } from "../log";
 
-const HEARTBEAT_INTERVAL = 30_000;
-const MISSED_HEARTBEAT_LIMIT = 3;
+const HEARTBEAT_TIMEOUT_MS = 180_000; // 6 missed × 30s — generous for CF tunnel latency
+const REQUEST_SYNC_INTERVAL_MS = 5 * 60_000;
 
-// Pending shell requests: id -> resolve fn
-const pendingShellRequests: Map<string, (result: ShellResultPayload) => void> = new Map();
+// Map: socket.id → stub_id (for the duration of the connection)
+const socketToStub: Map<string, string> = new Map();
 
-export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
-  // Heartbeat checker
-  setInterval(() => {
-    for (const stub of store.getAllStubs()) {
-      if (stub.status === "online") {
-        stub.missed_heartbeats = (stub.missed_heartbeats || 0) + 1;
-        if (stub.missed_heartbeats >= MISSED_HEARTBEAT_LIMIT) {
-          stub.status = "stale";
-          failStubTasks(stub, webNs);
-          store.setStub(stub);
-          webNs.emit("stub.offline", { stub_id: stub.id });
-          console.log(`[stub] ${stub.name} marked stale after ${stub.missed_heartbeats} missed heartbeats`);
-        }
+// ─── Stable stub ID ───────────────────────────────────────────────────────────
+
+function computeStubId(hostname: string, gpu: { name: string; count: number }, defaultCwd?: string): string {
+  const input = `${hostname}|${gpu.name}|${gpu.count}|${defaultCwd || ""}`;
+  return createHash("sha256").update(input).digest("hex").slice(0, 12);
+}
+
+// ─── Semantic name generation ─────────────────────────────────────────────────
+
+function generateStubName(hostname: string, gpuName: string, slurmJobId?: string): string {
+  const hostnameShort = hostname.split(".")[0];
+  // GPU short: "NVIDIA RTX 2080 Ti" → "2080ti", "A40" → "a40"
+  const gpuShort = gpuName
+    .toLowerCase()
+    .replace(/nvidia|geforce|quadro|tesla/gi, "")
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9]/g, "")
+    .replace(/^rtx/, "")
+    .replace(/^gtx/, "");
+  const base = `${hostnameShort}-${gpuShort}`;
+  return slurmJobId ? `${base}-${slurmJobId}` : base;
+}
+
+// ─── Command assembler (for display) ─────────────────────────────────────────
+
+export function assembleCommand(task: Partial<Task>): string {
+  const parts: string[] = [];
+  if (task.env_setup) {
+    parts.push(`${task.env_setup} &&`);
+  }
+  if (task.cwd) {
+    parts.push(`cd ${task.cwd} &&`);
+  }
+  if (task.env && Object.keys(task.env).length > 0) {
+    const envStr = Object.entries(task.env)
+      .map(([k, v]) => `export ${k}=${v}`)
+      .join(" && ");
+    parts.push(`${envStr} &&`);
+  }
+  parts.push(task.script || "");
+  if (task.args && Object.keys(task.args).length > 0) {
+    const argsStr = Object.entries(task.args)
+      .map(([k, v]) => `${k} ${v}`)
+      .join(" ");
+    parts.push(argsStr);
+  }
+  if (task.raw_args) {
+    parts.push(task.raw_args);
+  }
+  return parts.join(" ").trim();
+}
+
+// ─── Fail stub tasks → lost ───────────────────────────────────────────────────
+
+function markTasksLost(stub: Stub, webNs: Namespace): void {
+  const now = new Date().toISOString();
+  for (const task of stub.tasks) {
+    if (["running", "dispatched", "paused"].includes(task.status)) {
+      const prev = { ...task };
+      const updated = store.updateTask(stub.id, task.id, {
+        status: "lost",
+        finished_at: now,
+      });
+      if (updated) {
+        webNs.emit("task.update", updated);
+        // Release write lock
+        if (updated.run_dir) writeLockTable.release(updated.run_dir);
+        // Notify
+        logger.warn("task.lost", { task_seq: updated.seq, stub: stub.name, reason: "stub offline" });
+        notifyTaskLost({
+          seq: updated.seq,
+          display_name: updated.display_name,
+          stub_name: stub.name,
+        }).catch(() => {});
+        // Auto-retry for lost tasks
+        handleAutoRetry(updated, webNs);
       }
     }
-  }, HEARTBEAT_INTERVAL);
+  }
+}
+
+function handleAutoRetry(task: Task, webNs: Namespace): void {
+  if (task.max_retries > 0 && task.retry_count < task.max_retries) {
+    const retryTask: Task = {
+      ...task,
+      id: uuidv4(),
+      seq: store.nextSeq(),
+      status: "pending",
+      stub_id: undefined,
+      retry_count: task.retry_count + 1,
+      retry_of: task.retry_of || task.id,
+      created_at: new Date().toISOString(),
+      started_at: undefined,
+      finished_at: undefined,
+      exit_code: undefined,
+      pid: undefined,
+      log_buffer: [],
+      progress: undefined,
+    };
+    store.addToGlobalQueue(retryTask);
+    webNs.emit("task.update", retryTask);
+    logger.info("task.retry", { task_seq: task.seq, new_seq: retryTask.seq, attempt: retryTask.retry_count, max: task.max_retries });
+    triggerSchedule();
+  }
+}
+
+// ─── Check grid completion ────────────────────────────────────────────────────
+
+function checkGridCompletion(gridId: string, webNs: Namespace): void {
+  const grid = store.getGrid(gridId);
+  if (!grid) return;
+  store.updateGridStatus(gridId);
+  const updated = store.getGrid(gridId)!;
+  webNs.emit("grid.update", updated);
+
+  if (updated.status === "completed" || updated.status === "partial" || updated.status === "failed") {
+    const tasks = store.getGridTasks(gridId);
+    const completed = tasks.filter((t) => t.status === "completed").length;
+    const failed = tasks.filter((t) => ["failed", "killed", "lost"].includes(t.status)).length;
+    const bestLoss = tasks
+      .filter((t) => t.status === "completed" && t.progress?.loss !== undefined)
+      .reduce((best: { loss: number; params?: Record<string, any> } | null, t) => {
+        const loss = t.progress!.loss!;
+        if (!best || loss < best.loss) return { loss, params: t.param_overrides };
+        return best;
+      }, null);
+
+    notifyGridDone({
+      name: updated.display_name,
+      total: tasks.length,
+      completed,
+      failed,
+      best_loss: bestLoss?.loss,
+      best_params: bestLoss?.params,
+    }).catch(() => {});
+  }
+}
+
+// ─── Kill chain ───────────────────────────────────────────────────────────────
+
+const killTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+export function initiateKillChain(
+  stubId: string,
+  taskId: string,
+  gracePeriodS: number = 30
+): void {
+  // Step 1: signal should_stop
+  reliableEmitToStub(stubId, "task.signal", { task_id: taskId, signal: "should_stop" });
+  // Also set flag in store
+  store.updateTask(stubId, taskId, { should_stop: true });
+
+  // Step 2: after grace period, send task.kill
+  const timer = setTimeout(() => {
+    killTimers.delete(taskId);
+    const task = store.getTask(stubId, taskId);
+    if (!task || ["completed", "failed", "killed", "lost"].includes(task.status)) return;
+    reliableEmitToStub(stubId, "task.kill", { task_id: taskId, grace_period_s: 5 });
+  }, gracePeriodS * 1000);
+
+  killTimers.set(taskId, timer);
+}
+
+export function cancelKillChain(taskId: string): void {
+  const timer = killTimers.get(taskId);
+  if (timer) {
+    clearTimeout(timer);
+    killTimers.delete(taskId);
+  }
+}
+
+// ─── Setup stub namespace ─────────────────────────────────────────────────────
+
+export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
+  // Heartbeat timeout checker
+  setInterval(() => {
+    const now = Date.now();
+    for (const stub of store.getAllStubs()) {
+      if (stub.status !== "online") continue;
+      const lastHb = new Date(stub.last_heartbeat).getTime();
+      if (now - lastHb > HEARTBEAT_TIMEOUT_MS) {
+        logger.warn("stub.offline", { stub: stub.name, reason: "heartbeat_timeout", elapsed_s: Math.floor((now - lastHb) / 1000) });
+        stub.status = "offline";
+        markTasksLost(stub, webNs);
+        store.setStub(stub);
+        webNs.emit("stub.offline", { stub_id: stub.id });
+      }
+    }
+  }, 30_000);
 
   ns.on("connection", (socket: Socket) => {
-    console.log(`[stub] Socket connected: ${socket.id}`);
+    logger.info("sio.connect", { socket_id: socket.id });
 
-    socket.on("register", (payload: RegisterPayload) => {
-      const { hostname, gpu, slurm_job_id, max_concurrent, token, type, slurm, remaining_walltime_s, slurm_account_id } = payload;
-
-      // Auth check
-      const tokenRecord = store.getToken(token);
-      if (!tokenRecord) {
-        socket.emit("error", { message: "Invalid token" });
-        socket.disconnect();
-        return;
+    // ─── Resume ─────────────────────────────────────────────────────────────
+    socket.on("resume", (payload: ResumePayload, ack?: Function) => {
+      try {
+        handleResume(socket, payload, webNs, ns);
+        if (ack) ack({ ok: true });
+      } catch (err) {
+        logger.error("resume.handler_error", { error: String(err) });
       }
-
-      // Check for existing stub with same token + hostname + slurm_job_id (reconnect)
-      let stub = store.getStubByHostnameAndToken(hostname, token, slurm_job_id);
-
-      if (stub) {
-        // Reconnect: update socket
-        stub.socket_id = socket.id;
-        stub.status = "online";
-        stub.missed_heartbeats = 0;
-        stub.last_heartbeat = new Date().toISOString();
-        stub.max_concurrent = max_concurrent;
-        stub.gpu = gpu;
-        if (slurm_job_id) stub.slurm_job_id = slurm_job_id;
-        if (slurm_account_id) stub.slurm_account_id = slurm_account_id;
-        if (type) stub.type = type;
-        if (slurm) stub.slurm = slurm;
-        if (remaining_walltime_s !== undefined) stub.remaining_walltime_s = remaining_walltime_s;
-        // On reconnect: keep running/dispatched tasks as "running" (stub daemon likely still has them).
-        // Only reset paused/migrating/interrupted → queued for re-dispatch.
-        for (const task of stub.tasks) {
-          if (["paused", "migrating", "interrupted"].includes(task.status)) {
-            task.status = "queued";
-            task.pid = undefined;
-            task.started_at = undefined;
-            task.finished_at = undefined;
-            task.requeued_at = new Date().toISOString();
-          } else if (task.status === "dispatched") {
-            // Dispatched = sent to stub before disconnect; stub likely started it already
-            task.status = "running";
-          }
-        }
-        store.setStub(stub);
-        console.log(`[stub] Re-registered: ${stub.name} (${stub.id})`);
-      } else {
-        // New stub
-        const id = uuidv4();
-        const name = `${hostname}-${slurm_job_id || id.slice(0, 6)}`;
-        stub = {
-          id,
-          name,
-          hostname,
-          gpu,
-          slurm_job_id,
-          slurm_account_id,
-          status: "online",
-          type: type || (slurm_job_id ? "slurm" : "workstation"),
-          slurm,
-          connected_at: new Date().toISOString(),
-          last_heartbeat: new Date().toISOString(),
-          max_concurrent,
-          tasks: [],
-          gpu_stats: { timestamp: new Date().toISOString(), gpus: [] },
-          token,
-          socket_id: socket.id,
-          missed_heartbeats: 0,
-          remaining_walltime_s,
-        };
-        store.setStub(stub);
-        tokenRecord.used_by = id;
-        console.log(`[stub] New stub registered: ${name} (${id})`);
-      }
-
-      socket.data.stub_id = stub.id;
-      socket.join(`stub:${stub.id}`);
-
-      socket.emit("registered", { stub_id: stub.id });
-      webNs.emit("stub.online", sanitizeStub(stub));
-
-      // Dispatch queued tasks
-      dispatchQueuedTasks(stub.id, ns);
     });
 
-    socket.on("heartbeat", (payload: HeartbeatPayload) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const stub = store.getStub(stub_id);
-      if (!stub) return;
+    // ─── Stub→Server reliable events (direct, with native ack) ─────────────
 
+    socket.on("task.started", (payload: TaskStartedPayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handleTaskStarted(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("task.completed", (payload: TaskCompletedPayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handleTaskCompleted(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("task.failed", (payload: TaskFailedPayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handleTaskFailed(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("task.config", (payload: TaskConfigPayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handleTaskConfig(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("task.checkpoint", (payload: TaskCheckpointPayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handleTaskCheckpoint(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("preflight.fail", (payload: PreflightFailPayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handlePreflightFail(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("task.zombie", (payload: { task_id: string }, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) logger.warn("task.zombie", { stub: stubId, task_id: payload.task_id });
+      if (ack) ack({ ok: true });
+    });
+
+    // ─── Non-reliable events ────────────────────────────────────────────────
+
+    socket.on("heartbeat", (payload: HeartbeatPayload) => {
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      const stub = store.getStub(stubId);
+      if (!stub) return;
       stub.last_heartbeat = payload.timestamp || new Date().toISOString();
-      stub.missed_heartbeats = 0;
-      if (stub.status !== "online") {
-        stub.status = "online";
-        webNs.emit("stub.online", sanitizeStub(stub));
-      }
-      if (payload.remaining_walltime_s !== undefined) {
-        stub.remaining_walltime_s = payload.remaining_walltime_s;
-        // Check walltime warnings
-        checkWalltimeWarnings(stub, webNs);
-      }
       store.setStub(stub);
-      socket.emit("pong", { timestamp: new Date().toISOString() });
     });
 
     socket.on("gpu_stats", (payload: import("../types").GpuStats) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const stub = store.getStub(stub_id);
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      const stub = store.getStub(stubId);
       if (!stub) return;
       stub.gpu_stats = payload;
       store.setStub(stub);
-      webNs.emit("gpu_stats", { stub_id, stats: payload });
-      // Record to metrics ring buffer
-      if (payload.gpus && payload.gpus.length > 0) {
-        metricsStore.pushStubMetrics(stub_id, payload.gpus);
+      webNs.emit("gpu_stats", { stub_id: stubId, stats: payload });
+      if (payload.gpus?.length > 0) {
+        metricsStore.pushStubMetrics(stubId, payload.gpus);
       }
     });
 
-    socket.on("task.started", (payload: TaskStartedPayload) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const task = store.updateTask(stub_id, payload.task_id, {
-        status: "running",
-        started_at: new Date().toISOString(),
-        pid: payload.pid,
-      });
-      if (task) webNs.emit("task.update", task);
+    socket.on("system_stats", (payload: import("../types").SystemStats) => {
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      const stub = store.getStub(stubId);
+      if (!stub) return;
+      stub.system_stats = payload;
+      store.setStub(stub);
+      webNs.emit("system_stats", { stub_id: stubId, stats: payload });
     });
 
     socket.on("task.progress", (payload: TaskProgressPayload) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const existingTask = store.getTask(stub_id, payload.task_id);
-      const previousLoss = existingTask?.progress?.loss;
-      const task = store.updateTask(stub_id, payload.task_id, {
-        progress: {
-          step: payload.step,
-          total: payload.total,
-          loss: payload.loss,
-          metrics: payload.metrics,
-        },
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      const existing = store.getTask(stubId, payload.task_id);
+      if (!existing) return;
+      // Auto-promote dispatched → running
+      if (existing.status === "dispatched") {
+        store.updateTask(stubId, payload.task_id, {
+          status: "running",
+          started_at: new Date().toISOString(),
+        });
+      }
+      const updated = store.updateTask(stubId, payload.task_id, {
+        progress: { step: payload.step, total: payload.total, loss: payload.loss, metrics: payload.metrics },
       });
-      if (task) {
-        webNs.emit("task.update", task);
-        updateTaskProgressTime(payload.task_id);
-        // Record to metrics ring buffer
+      if (updated) {
+        webNs.emit("task.update", updated);
         metricsStore.pushTaskMetrics(payload.task_id, payload.step, payload.loss, payload.metrics);
-        // Check for loss anomalies
-        checkLossAnomaly(stub_id, payload.task_id, payload.loss, previousLoss, webNs, ns);
       }
     });
 
     socket.on("task.log", (payload: TaskLogPayload) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const task = store.getTask(stub_id, payload.task_id);
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      const task = store.getTask(stubId, payload.task_id);
       if (!task) return;
-
-      // Ring buffer: keep last 500 lines
-      const newBuf = [...task.log_buffer, ...payload.lines].slice(-500);
-      store.updateTask(stub_id, payload.task_id, { log_buffer: newBuf });
-
-      updateTaskOutputTime(payload.task_id);
-      const MAX_LOG_LINES_PER_EMIT = 50;
-      let lines = payload.lines;
-      if (lines.length > MAX_LOG_LINES_PER_EMIT) {
-        lines = [...lines.slice(0, MAX_LOG_LINES_PER_EMIT), `[truncated ${lines.length - MAX_LOG_LINES_PER_EMIT} lines]`];
-      }
-      webNs.emit("task.log", { stub_id, task_id: payload.task_id, lines });
-    });
-
-    socket.on("task.completed", (payload: TaskCompletedPayload & { metrics?: Record<string, number> }) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const task = store.updateTask(stub_id, payload.task_id, {
-        status: "completed",
-        exit_code: payload.exit_code,
-        finished_at: new Date().toISOString(),
-        metrics: payload.metrics,
-      });
-      if (task) {
-        webNs.emit("task.update", task);
-
-        // Update grid cell if applicable
-        if (task.grid_id && task.grid_cell_id) {
-          store.updateGridCell(task.grid_id, task.grid_cell_id, {
-            status: "completed",
-            metrics: payload.metrics,
-          });
-          const grid = store.getGrid(task.grid_id);
-          if (grid) webNs.emit("grid.update", grid);
-        }
-
-        // Dispatch post-hooks
-        if (task.post_hooks && task.post_hooks.length > 0) {
-          schedulePostHooks(stub_id, task, ns, webNs);
-        }
-
-        // Trigger DAG dependency check
-        checkDagDependencies(webNs, ns);
-
-        // Try to dispatch queued tasks
-        dispatchQueuedTasks(stub_id, ns);
-
-        // Auto-release: if all tasks on this stub are done, shut it down
-        checkAutoRelease(stub_id, ns);
-
-        // Discord notification
-        sendDiscordNotification(store.getNotificationConfig(), "task.completed", {
-          name: task.command.slice(0, 80),
-          id: task.id,
-          status: "completed",
-          stub_id,
-          started_at: task.started_at,
-          finished_at: task.finished_at,
-          exit_code: task.exit_code,
+      // Auto-promote dispatched → running
+      if (task.status === "dispatched") {
+        store.updateTask(stubId, payload.task_id, {
+          status: "running",
+          started_at: new Date().toISOString(),
         });
       }
+      const buf = task.log_buffer;
+      buf.push(...payload.lines);
+      if (buf.length > 500) buf.splice(0, buf.length - 500);
+      store.updateTask(stubId, payload.task_id, { log_buffer: buf });
+      webNs.emit("task.log", { stub_id: stubId, task_id: payload.task_id, lines: payload.lines });
     });
 
-    socket.on("task.failed", (payload: TaskFailedPayload) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-
-      // Check auto-retry before marking failed
-      const existingTask = store.getTask(stub_id, payload.task_id);
-      const retryCount = existingTask?.retry_count ?? 0;
-      const maxRetries = existingTask?.max_retries ?? 0;
-      // SIGTERM (exit_code -15) = intentional kill, never auto-retry
-      const isIntentionalKill = payload.exit_code === -15;
-
-      if (existingTask && !isIntentionalKill && retryCount < maxRetries) {
-        // Auto-retry: reset task back to queued
-        const updated = store.updateTask(stub_id, payload.task_id, {
-          status: "queued",
-          retry_count: retryCount + 1,
-          exit_code: undefined,
-          started_at: undefined,
-          finished_at: undefined,
-          pid: undefined,
-        });
-        if (updated) {
-          webNs.emit("task.update", updated);
-          console.log(`[stub] Auto-retrying task ${payload.task_id} (attempt ${retryCount + 1}/${maxRetries})`);
-          dispatchQueuedTasks(stub_id, ns);
-        }
-        return;
-      }
-
-      const updateFields: any = {
-        status: "failed",
-        exit_code: payload.exit_code,
-        finished_at: new Date().toISOString(),
-      };
-      if (payload.failure_reason) {
-        updateFields.failure_reason = payload.failure_reason;
-      }
-      const task = store.updateTask(stub_id, payload.task_id, updateFields);
-      if (task) {
-        webNs.emit("task.update", task);
-
-        // Update grid cell if applicable
-        if (task.grid_id && task.grid_cell_id) {
-          store.updateGridCell(task.grid_id, task.grid_cell_id, { status: "failed" });
-          const grid = store.getGrid(task.grid_id);
-          if (grid) webNs.emit("grid.update", grid);
-        }
-
-        // Trigger DAG: dependents may be blocked
-        checkDagDependencies(webNs, ns);
-
-        dispatchQueuedTasks(stub_id, ns);
-
-        // Auto-release: if all tasks on this stub are done, shut it down
-        checkAutoRelease(stub_id, ns);
-
-        // Discord notification
-        sendDiscordNotification(store.getNotificationConfig(), "task.failed", {
-          name: task.command.slice(0, 80),
-          id: task.id,
-          status: "failed",
-          stub_id,
-          started_at: task.started_at,
-          finished_at: task.finished_at,
-          exit_code: task.exit_code,
-          error: payload.error,
-        });
-      }
+    socket.on("task.resource", (payload: TaskResourcePayload) => {
+      // Resource stats — forward to web, no state update needed
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      webNs.emit("task.resource", { stub_id: stubId, ...payload });
     });
 
-    // Handle task.checkpoint_and_pause (ManagedTraining migration)
-    socket.on("task.checkpointed", (payload: { task_id: string; checkpoint_path: string }) => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const task = store.updateTask(stub_id, payload.task_id, {
-        checkpoint_path: payload.checkpoint_path,
-        status: "migrating",
-      });
-      if (task) webNs.emit("task.update", task);
+    socket.on("task.metrics", (payload: TaskMetricsPayload) => {
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) return;
+      const { task_id, metrics, step } = payload;
+      if (!task_id || !metrics || step === undefined) return;
+      // Buffer in metricsStore (ephemeral, not persisted)
+      metricsStore.pushTaskMetricsDirect(task_id, step, metrics);
+      // Forward to web clients
+      webNs.emit("task.metrics", { task_id, metrics, step });
     });
 
-    socket.on("shell.result", (payload: ShellResultPayload) => {
-      const resolve = pendingShellRequests.get(payload.id);
-      if (resolve) {
-        resolve(payload);
-        pendingShellRequests.delete(payload.id);
-      }
+    // ─── Shell relay: stub → web ────────────────────────────────────────────
+
+    socket.on("shell.output", (data: { request_id: string; chunk: string; stream: string }) => {
+      webNs.emit("shell.output", data);
+    });
+
+    socket.on("shell.done", (data: { request_id: string; exit_code: number }) => {
+      webNs.emit("shell.done", data);
     });
 
     socket.on("disconnect", () => {
-      const stub_id = socket.data.stub_id;
-      if (!stub_id) return;
-      const stub = store.getStub(stub_id);
+      const stubId = socketToStub.get(socket.id);
+      socketToStub.delete(socket.id);
+      if (!stubId) return;
+
+      unregisterStubSocket(stubId);
+
+      const stub = store.getStub(stubId);
       if (!stub) return;
+
+      // Only process disconnect if this socket is still the current one
+      if (stub.socket_id !== socket.id) return;
+
+      logger.info("stub.offline", { stub: stub.name, stub_id: stubId, reason: "disconnect" });
       stub.status = "offline";
-      failStubTasks(stub, webNs);
+      stub.socket_id = undefined;
+      markTasksLost(stub, webNs);
       store.setStub(stub);
-      webNs.emit("stub.offline", { stub_id });
-      console.log(`[stub] Disconnected: ${stub.name}`);
+      webNs.emit("stub.offline", { stub_id: stubId });
+      triggerSchedule();
     });
   });
 }
 
-/**
- * Schedule post-hooks to run sequentially on the same stub.
- */
-async function schedulePostHooks(
-  stubId: string,
-  task: import("../types").Task,
+// ─── Resume handler ───────────────────────────────────────────────────────────
+
+function handleResume(
+  socket: Socket,
+  payload: ResumePayload,
+  webNs: Namespace,
   ns: Namespace,
-  webNs: Namespace
-): Promise<void> {
-  const hooks = task.post_hooks || [];
-  let allPassed = true;
+): void {
+  const { hostname, gpu, slurm_job_id, max_concurrent, token, env_setup, default_cwd,
+    tags, running_tasks, local_queue, available_envs } = payload;
 
-  for (const hookTemplate of hooks) {
-    // Variable substitution
-    const command = hookTemplate
-      .replace(/\{run_dir\}/g, task.run_dir || "")
-      .replace(/\{task_id\}/g, task.id)
-      .replace(/\{stub_id\}/g, stubId);
+  // Auth check
+  const tokenRecord = store.getToken(token);
+  if (!tokenRecord) {
+    socket.emit("error", { message: "Invalid token" });
+    socket.disconnect();
+    return;
+  }
 
-    try {
-      const result = await execShell(stubId, command, 300, ns);
-      if (result.exit_code !== 0) {
-        allPassed = false;
-        console.warn(`[post-hook] Failed: ${command} (exit ${result.exit_code})`);
-        webNs.emit("task.log", {
-          stub_id: stubId,
-          task_id: task.id,
-          lines: [`[post-hook] FAILED: ${command}`, result.stderr],
-        });
-        break;
-      } else {
-        webNs.emit("task.log", {
-          stub_id: stubId,
-          task_id: task.id,
-          lines: [`[post-hook] OK: ${command}`],
-        });
-      }
-    } catch (err) {
-      allPassed = false;
-      console.warn(`[post-hook] Error: ${command}`, err);
-      break;
+  // Compute stable stub ID
+  const stubId = computeStubId(hostname, gpu, default_cwd);
+
+  // Kick any existing connection for this stub
+  const existingStub = store.getStub(stubId);
+  if (existingStub?.socket_id && existingStub.socket_id !== socket.id) {
+    const oldSocket = ns.sockets.get(existingStub.socket_id);
+    if (oldSocket) {
+      logger.info("stub.ghost_kicked", { stub_id: stubId, old_socket: existingStub.socket_id });
+      socketToStub.delete(existingStub.socket_id);
+      oldSocket.disconnect(true);
     }
   }
 
-  if (!allPassed) {
-    const updated = store.updateTask(stubId, task.id, { status: "completed_with_errors" });
-    if (updated) webNs.emit("task.update", updated);
+  // Determine stub type
+  const stubType: "slurm" | "workstation" = slurm_job_id ? "slurm" : "workstation";
+
+  let stub: Stub;
+  const now = new Date().toISOString();
+
+  if (existingStub) {
+    // Reconnect — update fields
+    stub = {
+      ...existingStub,
+      hostname,
+      gpu,
+      slurm_job_id,
+      status: "online",
+      type: stubType,
+      connected_at: now,
+      last_heartbeat: now,
+      socket_id: socket.id,
+      env_setup: env_setup ?? existingStub.env_setup,
+      default_cwd: default_cwd ?? existingStub.default_cwd,
+      // Always accept stub's max_concurrent on reconnect
+      max_concurrent: max_concurrent ?? existingStub.max_concurrent,
+      // Update tags from stub if provided, otherwise keep existing
+      tags: tags ?? existingStub.tags,
+      available_envs: available_envs ?? existingStub.available_envs,
+    };
+    logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length });
+  } else {
+    // New stub
+    const name = generateStubName(hostname, gpu.name, slurm_job_id);
+    stub = {
+      id: stubId,
+      name,
+      hostname,
+      gpu,
+      slurm_job_id,
+      status: "online",
+      type: stubType,
+      connected_at: now,
+      last_heartbeat: now,
+      socket_id: socket.id,
+      max_concurrent,
+      tasks: [],
+      env_setup,
+      default_cwd,
+      tags,
+      available_envs,
+    };
+    logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length, new: true });
   }
-}
 
-export function dispatchQueuedTasks(stubId: string, ns: Namespace): void {
-  const stub = store.getStub(stubId);
-  if (!stub || stub.status !== "online") return;
+  // ─── Reconciliation ───────────────────────────────────────────────────────
 
-  const running = stub.tasks.filter((t) => t.status === "running" || t.status === "dispatched").length;
-  let slots = stub.max_concurrent - running;
-  if (slots <= 0) return;
+  const reportedRunning = new Map(running_tasks.map((r) => [r.task_id, r]));
+  const reportedQueue = new Set(local_queue);
 
-  // Check walltime: don't dispatch if < 10min remaining (0 = unknown, treat as OK)
-  if (stub.remaining_walltime_s !== undefined && stub.remaining_walltime_s > 0 && stub.remaining_walltime_s < 600) return;
+  // Register socket for reliable emit
+  registerStubSocket(stubId, socket);
 
-  // Fill from stub-local queue first
-  const queued = stub.tasks.filter((t) => t.status === "queued");
-  const localToDispatch = queued.slice(0, slots);
-
-  // Mark local tasks as "dispatched" BEFORE emitting to prevent double-dispatch
-  for (const task of localToDispatch) {
-    store.updateTask(stubId, task.id, { status: "dispatched" });
-  }
-
-  for (const task of localToDispatch) {
-    if (stub.socket_id) {
-      ns.to(`stub:${stubId}`).emit("task.run", {
-        task_id: task.id,
-        command: task.command,
-        cwd: task.cwd,
-        env: task.env,
-        env_setup: task.env_setup,
-        param_overrides: task.param_overrides,
-        base_config: task.base_config,
-      });
-      console.log(`[stub] Dispatched local task ${task.id} to stub ${stubId}`);
-    }
-  }
-
-  slots -= localToDispatch.length;
-
-  // If we still have capacity, pull from the global queue
-  if (slots > 0) {
-    const globalQueue = store.getGlobalQueue();
-    const globalToDispatch = globalQueue.slice(0, slots);
-
-    for (const task of globalToDispatch) {
-      // Move task from global queue to this stub
-      store.removeFromGlobalQueue(task.id);
-      task.stub_id = stubId;
-      task.status = "dispatched";
-      stub.tasks.push(task);
-      store.setStub(stub);
-
-      if (stub.socket_id) {
-        ns.to(`stub:${stubId}`).emit("task.run", {
-          task_id: task.id,
-          command: task.command,
-          cwd: task.cwd,
-          env: task.env,
-          env_setup: task.env_setup,
-          param_overrides: task.param_overrides,
-          base_config: task.base_config,
-        });
-        console.log(`[stub] Dispatched global-queue task ${task.id} to stub ${stubId}`);
-      }
-    }
-  }
-}
-
-export function execShell(
-  stubId: string,
-  command: string,
-  timeout: number,
-  ns: Namespace
-): Promise<ShellResultPayload> {
-  return new Promise((resolve, reject) => {
-    const stub = store.getStub(stubId);
-    if (!stub || stub.status !== "online") {
-      reject(new Error("Stub not online"));
-      return;
-    }
-
-    const id = uuidv4();
-    const timer = setTimeout(() => {
-      pendingShellRequests.delete(id);
-      reject(new Error("Shell exec timeout"));
-    }, (timeout + 5) * 1000);
-
-    pendingShellRequests.set(id, (result) => {
-      clearTimeout(timer);
-      resolve(result);
-    });
-
-    ns.to(`stub:${stubId}`).emit("shell.exec", { id, command, timeout });
-  });
-}
-
-function checkAutoRelease(stubId: string, ns: Namespace): void {
-  const stub = store.getStub(stubId);
-  if (!stub || !stub.auto_release) return;
-
-  const activeStatuses = ["running", "queued", "dispatched", "paused", "waiting", "blocked", "migrating"];
-  const hasActive = stub.tasks.some((t) => activeStatuses.includes(t.status));
-  if (hasActive) return;
-
-  console.log(`[stub] Auto-releasing stub ${stub.name} — all tasks done`);
-  ns.to(`stub:${stubId}`).emit("shutdown", {});
-}
-
-function failStubTasks(stub: Stub, webNs: Namespace): void {
-  const toRemove: string[] = [];
+  // Case A: Server has task on this stub, stub didn't report → lost
+  const adoptTasks: string[] = [];
+  const killTasks: string[] = [];
 
   for (const task of stub.tasks) {
-    if (task.status === "running") {
-      // Mark interrupted — stub is offline. On reconnect the stub re-registers and
-      // the reconciliation loop (see register handler) will reset interrupted→queued.
-      task.status = "interrupted";
-      task.finished_at = new Date().toISOString();
-      webNs.emit("task.update", task);
-
-      if (task.grid_id && task.grid_cell_id) {
-        store.updateGridCell(task.grid_id, task.grid_cell_id, { status: "failed" });
-        const grid = store.getGrid(task.grid_id);
-        if (grid) webNs.emit("grid.update", grid);
-      }
-    } else if (["paused", "dispatched"].includes(task.status)) {
-      // Paused/dispatched: mark interrupted (state uncertain without socket)
-      task.status = "interrupted";
-      task.finished_at = new Date().toISOString();
-      webNs.emit("task.update", task);
-
-      if (task.grid_id && task.grid_cell_id) {
-        store.updateGridCell(task.grid_id, task.grid_cell_id, { status: "failed" });
-        const grid = store.getGrid(task.grid_id);
-        if (grid) webNs.emit("grid.update", grid);
-      }
-    } else if (task.status === "queued") {
-      // Queued tasks: return to global queue for reassignment
-      toRemove.push(task.id);
-      const requeuedTask = { ...task, stub_id: "", requeued_at: new Date().toISOString() };
-      store.addToGlobalQueue(requeuedTask);
-      console.log(`[stub] Requeued task ${task.id} from offline stub ${stub.name} to global queue`);
-      webNs.emit("task.update", { ...requeuedTask, status: "queued" });
-    }
-  }
-
-  // Remove requeued tasks from stub's task list
-  if (toRemove.length > 0) {
-    stub.tasks = stub.tasks.filter((t) => !toRemove.includes(t.id));
-  }
-}
-
-function sanitizeStub(stub: Stub) {
-  const { socket_id, ...rest } = stub;
-  return rest;
-}
-
-function checkWalltimeWarnings(stub: Stub, webNs: Namespace): void {
-  const rem = stub.remaining_walltime_s;
-  if (rem === undefined) return;
-
-  // 30 min warning
-  if (rem <= 1800 && rem > 1770) {
-    webNs.emit("walltime.warning", { stub_id: stub.id, remaining_s: rem, level: "warning" });
-    console.log(`[walltime] ${stub.name}: 30min remaining`);
-  }
-  // 5 min warning
-  if (rem <= 300 && rem > 270) {
-    webNs.emit("walltime.warning", { stub_id: stub.id, remaining_s: rem, level: "critical" });
-    console.log(`[walltime] ${stub.name}: 5min remaining`);
-
-    // Set should_checkpoint for running tasks with SDK
-    const stub_data = store.getStub(stub.id);
-    if (stub_data) {
-      for (const task of stub_data.tasks) {
-        if (task.status === "running") {
-          store.updateTask(stub.id, task.id, { progress: { ...task.progress, step: task.progress?.step || 0, total: task.progress?.total || 0 } });
+    if (["running", "dispatched", "paused"].includes(task.status)) {
+      if (!reportedRunning.has(task.id)) {
+        // Case A: server thinks it's running, stub doesn't know about it
+        const updated = store.updateTask(stubId, task.id, {
+          status: "lost",
+          finished_at: now,
+        });
+        if (updated) {
+          webNs.emit("task.update", updated);
+          if (updated.run_dir) writeLockTable.release(updated.run_dir);
+          notifyTaskLost({ seq: updated.seq, display_name: updated.display_name, stub_name: stub.name }).catch(() => {});
+          handleAutoRetry(updated, webNs);
         }
       }
+    } else if (task.status === "queued") {
+      // Case C: server has queued task, stub should have it — include in adopt
+      if (!reportedQueue.has(task.id)) {
+        adoptTasks.push(task.id);
+      }
+    } else if (task.status === "killed") {
+      // If stub reports it as running, tell it to kill
+      if (reportedRunning.has(task.id)) {
+        killTasks.push(task.id);
+      }
     }
   }
+
+  // Case B: Stub reports task, server doesn't know it → kill (orphan)
+  // Also: recover "lost" tasks that are actually still running on stub
+  for (const [reportedId, reported] of reportedRunning) {
+    const found = store.findTask(reportedId);
+    if (!found) {
+      killTasks.push(reportedId);
+    } else if (found.task.status === "killed") {
+      killTasks.push(reportedId);
+    } else if (found.task.status === "lost") {
+      // Task was marked lost during disconnect but stub says it's still running — recover
+      const update = { status: "running" as const, pid: reported.pid, finished_at: undefined };
+      const recovered = found.archived
+        ? store.unarchiveTask(stubId, reportedId, update)
+        : store.updateTask(stubId, reportedId, update);
+      if (recovered) {
+        logger.info("task.recovered", { task_seq: recovered.seq, stub: stub.name, from_archive: !!found.archived });
+        webNs.emit("task.update", recovered);
+      }
+    }
+  }
+
+  // Case D: max_concurrent mismatch — server authoritative
+  const maxConcurrent = stub.max_concurrent;
+
+  // Update stub in store
+  store.setStub(stub);
+  socketToStub.set(socket.id, stubId);
+  socket.join(`stub:${stubId}`);
+
+  // Build adopt task payloads — use server-computed run_dir
+  const adoptPayloads = adoptTasks.map((taskId) => {
+    const task = store.getTask(stubId, taskId);
+    if (!task) return null;
+    return buildRunPayload(task, stub);
+  }).filter(Boolean);
+
+  // Get queued tasks for the stub — use server-computed run_dir
+  const queuePayloads = stub.tasks
+    .filter((t) => t.status === "queued")
+    .map((t) => buildRunPayload(t, stub));
+
+  // Send resume_response via reliable emit (native ack)
+  reliableEmitToStub(stubId, "resume_response", {
+    stub_id: stubId,
+    name: stub.name,
+    adopt_tasks: adoptPayloads,
+    kill_tasks: killTasks,
+    queue: queuePayloads,
+    config: { max_concurrent: maxConcurrent },
+  });
+
+  // Notify web
+  webNs.emit("stub.online", sanitizeStub(stub));
+
+  // Rebuild write locks after reconnect
+  store.rebuildWriteLocks();
+
+  // Trigger scheduler to fill any new slots
+  triggerSchedule();
+
+  // Schedule periodic request_sync for this stub
+  const syncInterval = setInterval(() => {
+    const currentStub = store.getStub(stubId);
+    if (!currentStub || currentStub.status !== "online" || currentStub.socket_id !== socket.id) {
+      clearInterval(syncInterval);
+      return;
+    }
+    socket.emit("request_sync", {});
+  }, REQUEST_SYNC_INTERVAL_MS);
+
+  socket.on("disconnect", () => {
+    clearInterval(syncInterval);
+  });
+}
+
+function handleTaskStarted(stubId: string, payload: TaskStartedPayload, webNs: Namespace): void {
+  const updated = store.updateTask(stubId, payload.task_id, {
+    status: "running",
+    started_at: new Date().toISOString(),
+    pid: payload.pid,
+  });
+  if (updated) {
+    logger.info("task.started", { task_seq: updated.seq, stub: stubId, pid: payload.pid });
+    webNs.emit("task.update", updated);
+    // Acquire write lock if task has run_dir
+    if (updated.run_dir) {
+      writeLockTable.acquire(updated.run_dir, updated.id);
+    }
+    notifyTaskEvent(updated, "running").catch(() => {});
+  }
+}
+
+function handleTaskCompleted(stubId: string, payload: TaskCompletedPayload, webNs: Namespace): void {
+  const task = store.getTask(stubId, payload.task_id);
+  if (!task) return;
+
+  cancelKillChain(payload.task_id);
+
+  const updated = store.updateTask(stubId, payload.task_id, {
+    status: "completed",
+    exit_code: payload.exit_code,
+    finished_at: new Date().toISOString(),
+  });
+  if (!updated) return;
+
+  // Release write lock
+  if (updated.run_dir) writeLockTable.release(updated.run_dir);
+
+  logger.info("task.completed", { task_seq: updated.seq, stub: stubId, exit_code: payload.exit_code });
+  webNs.emit("task.update", updated);
+
+  // Notify
+  notifyTaskCompleted({
+    seq: updated.seq,
+    display_name: updated.display_name,
+    started_at: updated.started_at,
+    finished_at: updated.finished_at,
+    loss: updated.progress?.loss,
+  }).catch(() => {});
+  notifyTaskEvent(updated, "completed").catch(() => {});
+
+  // Update grid
+  if (updated.grid_id) {
+    checkGridCompletion(updated.grid_id, webNs);
+  }
+
+  // Trigger scheduling to fill the freed slot
+  const stub = store.getStub(stubId);
+  if (stub) {
+    maybeDispatch(stub);
+  }
+  triggerSchedule();
+}
+
+function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Namespace): void {
+  const task = store.getTask(stubId, payload.task_id);
+  if (!task) return;
+
+  cancelKillChain(payload.task_id);
+
+  // Classify failure
+  const isOom = payload.exit_code === 137;
+  const isKilled = task.should_stop && payload.exit_code !== 0;
+
+  // Auto-retry for OOM
+  if (isOom && task.max_retries > 0 && task.retry_count < task.max_retries) {
+    const bumpedMem = task.requirements?.gpu_mem_mb
+      ? Math.ceil(task.requirements.gpu_mem_mb * 1.2)
+      : undefined;
+
+    const retryTask: Task = {
+      ...task,
+      id: uuidv4(),
+      seq: store.nextSeq(),
+      status: "pending",
+      stub_id: undefined,
+      retry_count: task.retry_count + 1,
+      retry_of: task.retry_of || task.id,
+      created_at: new Date().toISOString(),
+      started_at: undefined,
+      finished_at: undefined,
+      exit_code: undefined,
+      pid: undefined,
+      log_buffer: [],
+      progress: undefined,
+      requirements: bumpedMem
+        ? { ...task.requirements, gpu_mem_mb: bumpedMem }
+        : task.requirements,
+    };
+
+    // Mark original as failed
+    const failed = store.updateTask(stubId, payload.task_id, {
+      status: "failed",
+      exit_code: payload.exit_code,
+      finished_at: new Date().toISOString(),
+    });
+    if (failed) {
+      if (failed.run_dir) writeLockTable.release(failed.run_dir);
+      webNs.emit("task.update", failed);
+    }
+
+    store.addToGlobalQueue(retryTask);
+    webNs.emit("task.update", retryTask);
+    logger.info("task.retry", { reason: "oom", task_seq: task.seq, new_seq: retryTask.seq, attempt: retryTask.retry_count, max: task.max_retries });
+    triggerSchedule();
+    return;
+  }
+
+  const updated = store.updateTask(stubId, payload.task_id, {
+    status: isKilled ? "killed" : "failed",
+    exit_code: payload.exit_code,
+    finished_at: new Date().toISOString(),
+  });
+  if (!updated) return;
+
+  if (updated.run_dir) writeLockTable.release(updated.run_dir);
+  webNs.emit("task.update", updated);
+
+  notifyTaskFailed({
+    seq: updated.seq,
+    display_name: updated.display_name,
+    exit_code: payload.exit_code,
+  }).catch(() => {});
+  notifyTaskEvent(updated, isKilled ? "killed" : "failed").catch(() => {});
+
+  if (updated.grid_id) {
+    checkGridCompletion(updated.grid_id, webNs);
+  }
+
+  const stub = store.getStub(stubId);
+  if (stub) {
+    maybeDispatch(stub);
+  }
+  triggerSchedule();
+}
+
+function handleTaskConfig(stubId: string, payload: TaskConfigPayload, webNs: Namespace): void {
+  const updated = store.updateTask(stubId, payload.task_id, {
+    config_snapshot: payload.config,
+  });
+  if (updated) webNs.emit("task.update", updated);
+}
+
+function handleTaskCheckpoint(stubId: string, payload: TaskCheckpointPayload, webNs: Namespace): void {
+  const updated = store.updateTask(stubId, payload.task_id, {
+    checkpoint_path: payload.path,
+  });
+  if (updated) webNs.emit("task.update", updated);
+}
+
+function handlePreflightFail(stubId: string, payload: PreflightFailPayload, webNs: Namespace): void {
+  const updated = store.updateTask(stubId, payload.task_id, {
+    status: "failed",
+    finished_at: new Date().toISOString(),
+    log_buffer: payload.errors,
+  });
+  if (updated) {
+    webNs.emit("task.update", updated);
+    notifyTaskFailed({ seq: updated.seq, display_name: updated.display_name }).catch(() => {});
+    if (updated.grid_id) checkGridCompletion(updated.grid_id, webNs);
+    const stub = store.getStub(stubId);
+    if (stub) maybeDispatch(stub);
+    triggerSchedule();
+  }
+}
+
+// ─── Public helpers ───────────────────────────────────────────────────────────
+
+/** Dispatch queued tasks for a stub (called by API handlers). */
+export function dispatchQueuedTasks(stubId: string, _ns: Namespace): void {
+  const stub = store.getStub(stubId);
+  if (!stub) return;
+  maybeDispatch(stub);
+}
+
+function sanitizeStub(stub: Stub): Omit<Stub, "socket_id"> {
+  const { socket_id, ...rest } = stub;
+  return rest;
 }

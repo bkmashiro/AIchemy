@@ -1,24 +1,19 @@
 import { useState, useEffect } from "react";
-import { Link } from "react-router-dom";
-import { Stub, Task, stubsApi, overviewApi, OverviewData } from "../lib/api";
+import { useNavigate } from "react-router-dom";
+import { Stub, Task, overviewApi, OverviewData } from "../lib/api";
+import { formatRelTime, generateDisplayName } from "../lib/format";
 import StubCard from "../components/StubCard";
+import TaskForm from "../components/TaskForm";
 
 interface Props {
   stubs: Stub[];
   globalQueue: Task[];
+  lossHistory: Map<string, number[]>;
+  logBuffers: Map<string, string[]>;
+  onTaskUpdate?: () => void;
 }
 
-function StatTile({
-  label,
-  value,
-  sub,
-  color,
-}: {
-  label: string;
-  value: number | string;
-  sub?: string;
-  color?: string;
-}) {
+function StatTile({ label, value, sub, color }: { label: string; value: number | string; sub?: string; color?: string }) {
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-1">
       <span className="text-xs text-gray-500 uppercase tracking-wider">{label}</span>
@@ -28,24 +23,58 @@ function StatTile({
   );
 }
 
-function GpuMiniBar({ used, total, label }: { used: number; total: number; label: string }) {
-  const pct = total > 0 ? Math.round((used / total) * 100) : 0;
-  const color = pct > 90 ? "bg-red-500" : pct > 70 ? "bg-yellow-500" : "bg-blue-500";
+function PendingTaskRow({ task, onClick }: { task: Task; onClick: () => void }) {
+  const displayName = generateDisplayName(task);
+  const statusColor: Record<string, string> = {
+    pending: "text-yellow-400",
+    queued: "text-yellow-400",
+    dispatched: "text-indigo-400",
+  };
   return (
-    <div className="flex items-center gap-2">
-      <span className="text-xs text-gray-500 w-20 truncate">{label}</span>
-      <div className="flex-1 h-1.5 bg-gray-800 rounded-full overflow-hidden">
-        <div className={`h-full ${color} rounded-full transition-all`} style={{ width: `${pct}%` }} />
-      </div>
-      <span className="text-xs text-gray-400 w-10 text-right">{pct}%</span>
+    <div className="flex items-center gap-3 py-1.5 border-b border-gray-800/50 last:border-0 cursor-pointer hover:bg-gray-800/30 transition-colors rounded px-1" onClick={onClick}>
+      <span className={`text-xs font-semibold ${statusColor[task.status] || "text-gray-400"}`}>
+        {task.status.toUpperCase()}
+      </span>
+      <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq}</span>
+      <span className="text-sm text-gray-300 truncate flex-1" title={displayName}>{displayName}</span>
+      {task.requirements?.gpu_mem_mb && (
+        <span className="text-xs text-gray-600 shrink-0">{Math.round(task.requirements.gpu_mem_mb / 1024)}G</span>
+      )}
+      <span className="text-xs text-gray-600 shrink-0">{formatRelTime(task.created_at)}</span>
     </div>
   );
 }
 
-export default function Dashboard({ stubs, globalQueue }: Props) {
+function RecentTaskRow({ task, onClick }: { task: Task; onClick: () => void }) {
+  const displayName = generateDisplayName(task);
+  const statusColors: Record<string, string> = {
+    completed: "text-green-400",
+    failed: "text-red-400",
+    killed: "text-gray-500",
+    lost: "text-orange-400",
+  };
+  return (
+    <div className="flex items-center gap-3 py-1.5 border-b border-gray-800/50 last:border-0 cursor-pointer hover:bg-gray-800/30 transition-colors rounded px-1" onClick={onClick}>
+      <span className={`text-xs font-semibold ${statusColors[task.status] || "text-gray-400"}`}>
+        {task.status.toUpperCase()}
+      </span>
+      <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq}</span>
+      <span className="text-sm text-gray-300 truncate flex-1" title={displayName}>{displayName}</span>
+      {task.exit_code !== undefined && task.status === "failed" && (
+        <span className="text-xs text-red-500 font-mono shrink-0">exit={task.exit_code}</span>
+      )}
+      {task.finished_at && (
+        <span className="text-xs text-gray-600 shrink-0">{formatRelTime(task.finished_at)}</span>
+      )}
+    </div>
+  );
+}
+
+export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers, onTaskUpdate }: Props) {
+  const [showForm, setShowForm] = useState(false);
   const [offlineOpen, setOfflineOpen] = useState(false);
-  const [purging, setPurging] = useState(false);
   const [overview, setOverview] = useState<OverviewData | null>(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     overviewApi.get().then(setOverview).catch(() => {});
@@ -56,15 +85,12 @@ export default function Dashboard({ stubs, globalQueue }: Props) {
   const onlineStubs = stubs.filter((s) => s.status === "online");
   const offlineStubs = stubs.filter((s) => s.status !== "online");
 
-  const totalRunning = stubs.reduce((acc, s) => acc + s.tasks.filter((t) => t.status === "running").length, 0);
-  const stubQueued = stubs.reduce((acc, s) => acc + s.tasks.filter((t) => t.status === "queued").length, 0);
-  const totalPaused = stubs.reduce((acc, s) => acc + s.tasks.filter((t) => t.status === "paused").length, 0);
-  const globalCount = globalQueue.filter((t) => t.status === "queued" || t.status === "waiting").length;
-  const totalQueued = stubQueued + globalCount;
+  const totalRunning = stubs.reduce((n, s) => n + s.tasks.filter((t) => t.status === "running").length, 0);
+  const totalQueued = stubs.reduce((n, s) => n + s.tasks.filter((t) => ["queued", "dispatched"].includes(t.status)).length, 0);
+  const totalPaused = stubs.reduce((n, s) => n + s.tasks.filter((t) => t.status === "paused").length, 0);
+  const globalPending = globalQueue.filter((t) => ["pending", "queued"].includes(t.status));
 
-  // Aggregate GPU stats from live data
-  let totalVram = 0;
-  let usedVram = 0;
+  let totalVram = 0, usedVram = 0;
   for (const s of onlineStubs) {
     if (!s.gpu_stats?.gpus) continue;
     for (const g of s.gpu_stats.gpus) {
@@ -74,51 +100,46 @@ export default function Dashboard({ stubs, globalQueue }: Props) {
   }
   const vramPct = totalVram > 0 ? Math.round((usedVram / totalVram) * 100) : 0;
 
-  const handlePurge = async () => {
-    if (!confirm("Purge all offline stubs with no active tasks? This cannot be undone.")) return;
-    setPurging(true);
-    try {
-      await stubsApi.purgeOffline();
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setPurging(false);
-    }
-  };
-
-  // Stubs with walltime warnings
-  const walltimeWarnings = onlineStubs.filter(
-    (s) => s.remaining_walltime_s !== undefined && s.remaining_walltime_s < 3600
-  );
+  // Recent terminal tasks from stubs
+  const recentTasks = stubs
+    .flatMap((s) => s.tasks.filter((t) => ["completed", "failed", "killed", "lost"].includes(t.status)))
+    .sort((a, b) => {
+      const aTime = a.finished_at || a.created_at;
+      const bTime = b.finished_at || b.created_at;
+      return new Date(bTime).getTime() - new Date(aTime).getTime();
+    })
+    .slice(0, 20);
 
   return (
     <div className="space-y-6">
-      {/* Walltime warnings */}
-      {walltimeWarnings.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {walltimeWarnings.map((s) => (
-            <div key={s.id} className="flex items-center gap-3 bg-yellow-900/20 border border-yellow-700/50 rounded-lg px-4 py-2.5 text-sm">
-              <span className="text-yellow-400">⚠</span>
-              <span className="text-yellow-200">
-                <Link to={`/stubs/${s.id}`} className="font-semibold hover:underline">{s.name}</Link>
-                {" "}walltime expiring in{" "}
-                <span className="font-mono font-bold">{Math.round(s.remaining_walltime_s! / 60)}m</span>
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-
       {/* Stat tiles */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-        <StatTile label="Online" value={onlineStubs.length} sub={`of ${stubs.length} stubs`} color="text-green-400" />
-        <StatTile label="Running" value={totalRunning} color={totalRunning > 0 ? "text-green-400" : "text-gray-500"} />
-        <StatTile label="Queued" value={totalQueued} sub={globalCount > 0 ? `${globalCount} global` : undefined} color="text-yellow-400" />
-        <StatTile label="Paused" value={totalPaused} color={totalPaused > 0 ? "text-orange-400" : "text-gray-500"} />
+        <StatTile
+          label="Online"
+          value={onlineStubs.length}
+          sub={`of ${stubs.length} stubs`}
+          color="text-green-400"
+        />
+        <StatTile
+          label="Running"
+          value={totalRunning}
+          color={totalRunning > 0 ? "text-blue-400" : "text-gray-500"}
+        />
+        <StatTile
+          label="Queued"
+          value={totalQueued + globalPending.length}
+          sub={globalPending.length > 0 ? `${globalPending.length} global` : undefined}
+          color="text-yellow-400"
+        />
+        <StatTile
+          label="Paused"
+          value={totalPaused}
+          color={totalPaused > 0 ? "text-orange-400" : "text-gray-500"}
+        />
         <StatTile
           label="VRAM"
           value={`${vramPct}%`}
-          sub={`${Math.round(usedVram / 1024)}/${Math.round(totalVram / 1024)} GB`}
+          sub={totalVram > 0 ? `${Math.round(usedVram / 1024)}/${Math.round(totalVram / 1024)}G` : undefined}
           color={vramPct > 90 ? "text-red-400" : vramPct > 70 ? "text-yellow-400" : "text-blue-400"}
         />
         <StatTile
@@ -129,20 +150,18 @@ export default function Dashboard({ stubs, globalQueue }: Props) {
         />
       </div>
 
-      {/* GPU VRAM per stub */}
-      {onlineStubs.length > 0 && (
-        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">VRAM Usage per Stub</h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-2">
-            {onlineStubs.map((s) => {
-              if (!s.gpu_stats?.gpus || s.gpu_stats.gpus.length === 0) return null;
-              const used = s.gpu_stats.gpus.reduce((n, g) => n + g.memory_used_mb, 0);
-              const total = s.gpu_stats.gpus.reduce((n, g) => n + g.memory_total_mb, 0);
-              return <GpuMiniBar key={s.id} used={used} total={total} label={s.name} />;
-            })}
-          </div>
-        </div>
-      )}
+      {/* Top actions */}
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+          Stubs ({onlineStubs.length} online)
+        </h2>
+        <button
+          onClick={() => setShowForm(true)}
+          className="px-4 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium"
+        >
+          + Submit Task
+        </button>
+      </div>
 
       {/* Online stubs grid */}
       {stubs.length === 0 ? (
@@ -154,74 +173,74 @@ export default function Dashboard({ stubs, globalQueue }: Props) {
       ) : (
         <>
           {onlineStubs.length > 0 && (
-            <>
-              <div className="flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
-                  Online Stubs ({onlineStubs.length})
-                </h2>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                {onlineStubs.map((stub) => (
-                  <StubCard key={stub.id} stub={stub} />
-                ))}
-              </div>
-            </>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+              {onlineStubs.map((stub) => (
+                <StubCard
+                  key={stub.id}
+                  stub={stub}
+                  lossHistory={lossHistory}
+                  logBuffers={logBuffers}
+                  onTaskUpdate={onTaskUpdate}
+                />
+              ))}
+            </div>
           )}
 
-          {/* Global queue summary */}
-          {globalQueue.length > 0 && (
+          {/* Global queue */}
+          {globalPending.length > 0 && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-sm font-semibold text-gray-300">
                   Global Queue
                   <span className="ml-2 bg-yellow-900/50 text-yellow-400 text-xs px-2 py-0.5 rounded-full">
-                    {globalQueue.length}
+                    {globalPending.length}
                   </span>
                 </h3>
-                <Link to="/tasks?filter=global" className="text-xs text-blue-400 hover:underline">
-                  View all →
-                </Link>
+                <span className="text-xs text-gray-600">pending → scheduler → stub</span>
               </div>
-              <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                {globalQueue.slice(0, 10).map((t) => (
-                  <div key={t.id} className="flex items-center gap-2 text-xs">
-                    <StatusDot status={t.status} />
-                    <span className="text-gray-400 font-mono truncate flex-1">{t.command}</span>
-                    <span className="text-gray-600 shrink-0">
-                      {t.estimated_vram_mb ? `${t.estimated_vram_mb}MB` : ""}
-                    </span>
-                  </div>
+              <div className="divide-y divide-gray-800/50">
+                {globalPending.slice(0, 15).map((t) => (
+                  <PendingTaskRow key={t.id} task={t} onClick={() => navigate(`/tasks/${t.id}`)} />
                 ))}
-                {globalQueue.length > 10 && (
-                  <p className="text-gray-600 text-xs">+{globalQueue.length - 10} more</p>
+                {globalPending.length > 15 && (
+                  <p className="text-gray-600 text-xs pt-2">+{globalPending.length - 15} more</p>
                 )}
               </div>
             </div>
           )}
 
-          {/* Offline stubs collapsible */}
+          {/* Recent completed / failed */}
+          {recentTasks.length > 0 && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+              <h3 className="text-sm font-semibold text-gray-300 mb-3">Recent Tasks</h3>
+              <div className="divide-y divide-gray-800/50">
+                {recentTasks.map((t) => (
+                  <RecentTaskRow key={t.id} task={t} onClick={() => navigate(`/tasks/${t.id}`)} />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Offline stubs */}
           {offlineStubs.length > 0 && (
             <div>
-              <div className="flex items-center gap-3 mb-3">
-                <button
-                  onClick={() => setOfflineOpen((v) => !v)}
-                  className="text-sm text-gray-500 hover:text-white transition flex items-center gap-1.5"
-                >
-                  <span className="text-xs">{offlineOpen ? "▼" : "▶"}</span>
-                  Offline / Stale Stubs ({offlineStubs.length})
-                </button>
-                <button
-                  onClick={handlePurge}
-                  disabled={purging}
-                  className="px-2.5 py-1 text-xs bg-gray-800 hover:bg-red-900/50 border border-gray-700 hover:border-red-700 rounded text-gray-400 hover:text-red-300 disabled:opacity-50 transition-colors"
-                >
-                  {purging ? "Purging..." : "Purge Offline"}
-                </button>
-              </div>
+              <button
+                onClick={() => setOfflineOpen((v) => !v)}
+                className="text-sm text-gray-500 hover:text-white transition flex items-center gap-1.5 mb-3"
+              >
+                <span className="text-xs">{offlineOpen ? "▼" : "▶"}</span>
+                Offline Stubs ({offlineStubs.length})
+              </button>
               {offlineOpen && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
                   {offlineStubs.map((stub) => (
-                    <StubCard key={stub.id} stub={stub} />
+                    <StubCard
+                      key={stub.id}
+                      stub={stub}
+                      lossHistory={lossHistory}
+                      logBuffers={logBuffers}
+                      onTaskUpdate={onTaskUpdate}
+                    />
                   ))}
                 </div>
               )}
@@ -229,21 +248,14 @@ export default function Dashboard({ stubs, globalQueue }: Props) {
           )}
         </>
       )}
-    </div>
-  );
-}
 
-function StatusDot({ status }: { status: string }) {
-  const color: Record<string, string> = {
-    queued: "bg-yellow-400",
-    waiting: "bg-cyan-400",
-    running: "bg-green-400",
-    paused: "bg-orange-400",
-    failed: "bg-red-500",
-    killed: "bg-gray-500",
-    completed: "bg-blue-400",
-  };
-  return (
-    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${color[status] || "bg-gray-600"}`} />
+      {showForm && (
+        <TaskForm
+          stubs={stubs}
+          onSubmit={onTaskUpdate}
+          onClose={() => setShowForm(false)}
+        />
+      )}
+    </div>
   );
 }

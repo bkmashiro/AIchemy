@@ -18,14 +18,11 @@ export interface LossDataPoint {
 interface SingleSeriesProps {
   data: number[];
   height?: number;
-  smooth?: boolean;
-  taskId?: string;
   startedAt?: string;
   totalSteps?: number;
 }
 
-/** Simple single-series loss chart from a number[] of loss values */
-export function LossChart({ data, height = 160, smooth = true, startedAt, totalSteps }: SingleSeriesProps) {
+export function LossChart({ data, height = 160, startedAt, totalSteps }: SingleSeriesProps) {
   if (!data || data.length < 2) return null;
 
   const chartData: LossDataPoint[] = data.map((v, i) => ({ step: i + 1, loss: v }));
@@ -33,24 +30,14 @@ export function LossChart({ data, height = 160, smooth = true, startedAt, totalS
   const maxLoss = Math.max(...data);
   const curLoss = data[data.length - 1];
 
-  // ETA estimate
   let eta: string | null = null;
   if (startedAt && totalSteps && data.length > 0) {
     const elapsed = Date.now() - new Date(startedAt).getTime();
-    const currentStep = data.length;
-    if (currentStep > 0 && elapsed > 0) {
-      const speed = currentStep / elapsed;
-      const remainMs = (totalSteps - currentStep) / speed;
-      if (remainMs > 0) {
-        const remainMin = Math.round(remainMs / 60000);
-        if (remainMin >= 60) {
-          const h = Math.floor(remainMin / 60);
-          const m = remainMin % 60;
-          eta = `~${h}h ${m}m`;
-        } else {
-          eta = `~${remainMin}m`;
-        }
-      }
+    if (elapsed > 0 && data.length < totalSteps) {
+      const speed = data.length / elapsed;
+      const remainMs = (totalSteps - data.length) / speed;
+      const m = Math.round(remainMs / 60000);
+      eta = m >= 60 ? `~${Math.floor(m / 60)}h${m % 60}m` : `~${m}m`;
     }
   }
 
@@ -76,7 +63,6 @@ export function LossChart({ data, height = 160, smooth = true, startedAt, totalS
             tick={{ fill: "#6b7280", fontSize: 10 }}
             tickLine={false}
             axisLine={false}
-            label={{ value: "step", position: "insideBottomRight", offset: -4, fill: "#4b5563", fontSize: 10 }}
           />
           <YAxis
             domain={[minLoss * 0.98, maxLoss * 1.02]}
@@ -87,14 +73,19 @@ export function LossChart({ data, height = 160, smooth = true, startedAt, totalS
             tickFormatter={(v: number) => v.toFixed(3)}
           />
           <Tooltip
-            contentStyle={{ backgroundColor: "#111827", border: "1px solid #374151", borderRadius: "6px", fontSize: "12px" }}
+            contentStyle={{
+              backgroundColor: "#111827",
+              border: "1px solid #374151",
+              borderRadius: "6px",
+              fontSize: "12px",
+            }}
             labelStyle={{ color: "#9ca3af" }}
             itemStyle={{ color: "#60a5fa" }}
             formatter={(v: number) => [v.toFixed(6), "loss"]}
             labelFormatter={(label) => `step ${label}`}
           />
           <Line
-            type={smooth ? "monotone" : "linear"}
+            type="monotone"
             dataKey="loss"
             stroke="#60a5fa"
             strokeWidth={1.5}
@@ -113,9 +104,8 @@ export interface MultiSeriesPoint {
 }
 
 interface MultiSeriesProps {
-  series: Array<{ id: string; label: string; color: string; data: number[] }>;
+  series: Array<{ id: string; label: string; color?: string; data: number[] }>;
   height?: number;
-  smooth?: boolean;
 }
 
 const SERIES_COLORS = [
@@ -124,13 +114,13 @@ const SERIES_COLORS = [
   "#f87171", // red
   "#a78bfa", // purple
   "#fbbf24", // amber
+  "#fb923c", // orange
+  "#22d3ee", // cyan
 ];
 
-/** Multi-series overlaid chart for task comparison */
-export function MultiLossChart({ series, height = 240, smooth = true }: MultiSeriesProps) {
+export function MultiLossChart({ series, height = 240 }: MultiSeriesProps) {
   if (!series || series.length === 0) return null;
 
-  // Build unified step array
   const maxLen = Math.max(...series.map((s) => s.data.length));
   const chartData: MultiSeriesPoint[] = Array.from({ length: maxLen }, (_, i) => {
     const point: MultiSeriesPoint = { step: i + 1 };
@@ -151,7 +141,6 @@ export function MultiLossChart({ series, height = 240, smooth = true }: MultiSer
             tick={{ fill: "#6b7280", fontSize: 10 }}
             tickLine={false}
             axisLine={false}
-            label={{ value: "step", position: "insideBottomRight", offset: -4, fill: "#4b5563", fontSize: 10 }}
           />
           <YAxis
             tick={{ fill: "#6b7280", fontSize: 10 }}
@@ -161,7 +150,12 @@ export function MultiLossChart({ series, height = 240, smooth = true }: MultiSer
             tickFormatter={(v: number) => v.toFixed(3)}
           />
           <Tooltip
-            contentStyle={{ backgroundColor: "#111827", border: "1px solid #374151", borderRadius: "6px", fontSize: "12px" }}
+            contentStyle={{
+              backgroundColor: "#111827",
+              border: "1px solid #374151",
+              borderRadius: "6px",
+              fontSize: "12px",
+            }}
             labelStyle={{ color: "#9ca3af" }}
             labelFormatter={(label) => `step ${label}`}
             formatter={(v: number, name: string) => {
@@ -179,7 +173,7 @@ export function MultiLossChart({ series, height = 240, smooth = true }: MultiSer
           {series.map((s, i) => (
             <Line
               key={s.id}
-              type={smooth ? "monotone" : "linear"}
+              type="monotone"
               dataKey={s.id}
               stroke={s.color || SERIES_COLORS[i % SERIES_COLORS.length]}
               strokeWidth={1.5}

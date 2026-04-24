@@ -1,16 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
-import { Stub, Task, GpuStats, AnomalyAlert, getStoredToken } from "../lib/api";
+import { Stub, Task, GpuStats, SystemStats, getStoredToken, clearToken } from "../lib/api";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "";
+const MAX_LOSS_POINTS = 200;
 
-export interface MigrationSuggestion {
-  id: string;
-  task_id: string;
-  from_stub_id: string;
-  to_stub_id: string;
-  reason: string;
-  created_at: string;
+export interface TaskMetricPoint {
+  step: number;
+  value: number;
+  ts: string;
 }
 
 export interface SocketState {
@@ -18,21 +16,18 @@ export interface SocketState {
   globalQueue: Task[];
   connected: boolean;
   lossHistory: Map<string, number[]>;
-  alerts: AnomalyAlert[];
-  migrationSuggestions: MigrationSuggestion[];
 }
-
-const MAX_LOSS_POINTS = 50;
 
 export function useSocket() {
   const [stubs, setStubs] = useState<Stub[]>([]);
   const [globalQueue, setGlobalQueue] = useState<Task[]>([]);
   const [connected, setConnected] = useState(false);
   const [lossHistory, setLossHistory] = useState<Map<string, number[]>>(new Map());
-  const [alerts, setAlerts] = useState<AnomalyAlert[]>([]);
-  const [migrationSuggestions, setMigrationSuggestions] = useState<MigrationSuggestion[]>([]);
   const socketRef = useRef<Socket | null>(null);
+  // Store log buffers in a ref to avoid triggering re-renders for every log line
   const logBuffersRef = useRef<Map<string, string[]>>(new Map());
+  // Store live metrics in a ref: task_id → metric_key → [{step, value, ts}]
+  const metricsBuffersRef = useRef<Map<string, Map<string, TaskMetricPoint[]>>>(new Map());
 
   const appendLoss = useCallback((taskId: string, loss: number) => {
     setLossHistory((prev) => {
@@ -46,43 +41,57 @@ export function useSocket() {
   }, []);
 
   useEffect(() => {
+    const token = getStoredToken();
     const socket = io(`${SERVER_URL}/web`, {
       transports: ["websocket", "polling"],
+      auth: { token },
     });
     socketRef.current = socket;
 
     socket.on("connect", () => {
       setConnected(true);
-      // Fetch global queue on connect
-      fetch("/api/tasks", {
-        headers: { Authorization: `Bearer ${getStoredToken()}` },
-      })
-        .then((r) => r.json())
-        .then((tasks: Task[]) =>
-          setGlobalQueue(tasks.filter((t) => !t.stub_id || t.stub_id === ""))
-        )
+      // Fetch initial stubs + global queue via REST on connect
+      const authFetch = (url: string) =>
+        fetch(url, { headers: { Authorization: `Bearer ${token}` } }).then((r) => {
+          if (r.status === 401) { clearToken(); window.location.reload(); throw new Error("401"); }
+          if (!r.ok) throw new Error(r.status + "");
+          return r.json();
+        });
+
+      authFetch("/api/stubs")
+        .then((data: Stub[]) => { if (Array.isArray(data)) setStubs(data); })
         .catch(() => {});
 
-      // Fetch initial alerts
-      fetch("/api/alerts", {
-        headers: { Authorization: `Bearer ${getStoredToken()}` },
-      })
-        .then((r) => r.json())
-        .then((data: AnomalyAlert[]) => setAlerts(data.filter((a) => !a.resolved)))
-        .catch(() => {});
-
-      // Fetch initial migration suggestions
-      fetch("/api/migrations/suggestions", {
-        headers: { Authorization: `Bearer ${getStoredToken()}` },
-      })
-        .then((r) => r.json())
-        .then((data: MigrationSuggestion[]) => setMigrationSuggestions(data))
+      authFetch("/api/tasks")
+        .then((data: Task[]) => {
+          if (Array.isArray(data)) setGlobalQueue(data.filter((t) => !t.stub_id || t.stub_id === ""));
+        })
         .catch(() => {});
     });
+
     socket.on("disconnect", () => setConnected(false));
 
-    socket.on("stubs.update", (data: Stub[]) => {
+    // Server → Web: stubs.snapshot — full state on connect
+    socket.on("stubs.snapshot", (data: Stub[]) => {
       setStubs(data);
+      // Track loss history for running tasks
+      for (const stub of data) {
+        for (const task of stub.tasks) {
+          if (task.progress?.loss !== undefined) {
+            appendLoss(task.id, task.progress.loss);
+          }
+        }
+      }
+      // Note: global queue (pending tasks with no stub) is fetched via REST on connect
+    });
+
+    // Server → Web: stub.update — full stub state
+    socket.on("stub.update", (stub: Stub) => {
+      setStubs((prev) => {
+        const exists = prev.find((s) => s.id === stub.id);
+        if (exists) return prev.map((s) => (s.id === stub.id ? stub : s));
+        return [...prev, stub];
+      });
     });
 
     socket.on("stub.online", (stub: Stub) => {
@@ -99,13 +108,14 @@ export function useSocket() {
       );
     });
 
+    // Server → Web: task.update — single task update
     socket.on("task.update", (task: Task) => {
-      // Track loss history
       if (task.progress?.loss !== undefined) {
         appendLoss(task.id, task.progress.loss);
       }
 
       if (!task.stub_id || task.stub_id === "") {
+        // No stub — belongs to global queue
         setGlobalQueue((prev) => {
           const exists = prev.find((t) => t.id === task.id);
           if (exists) return prev.map((t) => (t.id === task.id ? task : t));
@@ -113,7 +123,7 @@ export function useSocket() {
         });
         return;
       }
-      // Task has a stub_id — remove from globalQueue if it was there
+      // Remove from global queue when assigned to stub
       setGlobalQueue((prev) => prev.filter((t) => t.id !== task.id));
       setStubs((prev) =>
         prev.map((s) => {
@@ -127,41 +137,39 @@ export function useSocket() {
       );
     });
 
-    socket.on("task.deleted", ({ task_id }: { task_id: string }) => {
-      setGlobalQueue((prev) => prev.filter((t) => t.id !== task_id));
-      setStubs((prev) =>
-        prev.map((s) => ({ ...s, tasks: s.tasks.filter((t) => t.id !== task_id) }))
-      );
-    });
-
+    // Server → Web: gpu_stats
     socket.on("gpu_stats", ({ stub_id, stats }: { stub_id: string; stats: GpuStats }) => {
       setStubs((prev) =>
         prev.map((s) => (s.id === stub_id ? { ...s, gpu_stats: stats } : s))
       );
     });
 
-    // task.log is high-frequency; store in a separate ref to avoid re-rendering the whole tree
+    // Server → Web: system_stats
+    socket.on("system_stats", ({ stub_id, stats }: { stub_id: string; stats: SystemStats }) => {
+      setStubs((prev) =>
+        prev.map((s) => (s.id === stub_id ? { ...s, system_stats: stats } : s))
+      );
+    });
+
+    // Server → Web: task.log (high-frequency, store in ref only)
     socket.on("task.log", ({ task_id, lines }: { stub_id: string; task_id: string; lines: string[] }) => {
       const prev = logBuffersRef.current.get(task_id) || [];
       logBuffersRef.current.set(task_id, [...prev, ...lines].slice(-500));
     });
 
-    // Anomaly alerts
-    socket.on("anomaly.alert", (alert: AnomalyAlert) => {
-      setAlerts((prev) => {
-        const exists = prev.find((a) => a.id === alert.id);
-        if (exists) return prev.map((a) => (a.id === alert.id ? alert : a));
-        return [alert, ...prev];
-      });
-    });
-
-    // Migration suggestions
-    socket.on("migration.suggestion", (suggestion: MigrationSuggestion) => {
-      setMigrationSuggestions((prev) => {
-        const exists = prev.find((s) => s.id === suggestion.id);
-        if (exists) return prev;
-        return [suggestion, ...prev];
-      });
+    // Server → Web: task.metrics (high-frequency, store in ref only)
+    socket.on("task.metrics", ({ task_id, metrics, step }: { task_id: string; metrics: Record<string, number>; step: number }) => {
+      if (!metricsBuffersRef.current.has(task_id)) {
+        metricsBuffersRef.current.set(task_id, new Map());
+      }
+      const taskMap = metricsBuffersRef.current.get(task_id)!;
+      const ts = new Date().toISOString();
+      for (const [key, value] of Object.entries(metrics)) {
+        if (!taskMap.has(key)) taskMap.set(key, []);
+        const arr = taskMap.get(key)!;
+        arr.push({ step, value, ts });
+        if (arr.length > 500) arr.splice(0, arr.length - 500);
+      }
     });
 
     return () => {
@@ -169,16 +177,14 @@ export function useSocket() {
     };
   }, [appendLoss]);
 
-  const dismissAlert = useCallback((id: string) => {
-    setAlerts((prev) => prev.filter((a) => a.id !== id));
+  /** Get live log lines for a task (from WebSocket buffer) */
+  const getTaskLogs = useCallback((taskId: string): string[] => {
+    return logBuffersRef.current.get(taskId) || [];
   }, []);
 
-  const resolveAlert = useCallback((id: string) => {
-    setAlerts((prev) => prev.map((a) => (a.id === id ? { ...a, resolved: true } : a)));
-  }, []);
-
-  const dismissMigration = useCallback((id: string) => {
-    setMigrationSuggestions((prev) => prev.filter((s) => s.id !== id));
+  /** Get live metrics for a task (from WebSocket buffer) */
+  const getTaskMetricsBuffer = useCallback((taskId: string): Map<string, TaskMetricPoint[]> => {
+    return metricsBuffersRef.current.get(taskId) || new Map();
   }, []);
 
   return {
@@ -188,10 +194,7 @@ export function useSocket() {
     lossHistory,
     logBuffers: logBuffersRef.current,
     socket: socketRef.current,
-    alerts,
-    migrationSuggestions,
-    dismissAlert,
-    resolveAlert,
-    dismissMigration,
+    getTaskLogs,
+    getTaskMetricsBuffer,
   };
 }

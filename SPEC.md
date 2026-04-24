@@ -1,15 +1,13 @@
-# Alchemy v2 — Technical Specification
+# Alchemy v2.1 — Technical Specification
 
 ## Overview
 
-Alchemy v2 is a GPU job orchestration platform. It consists of four components:
+GPU job orchestration platform for ML training. Four components:
 
-1. **Server** — Node.js backend with REST API + socket.io
-2. **Web** — React dashboard for monitoring and control
-3. **Stub** — Python daemon that runs on GPU nodes, connects to server via socket.io
-4. **SDK** — Optional lightweight Python library for training code to report progress
-
-## Architecture
+1. **Server** — Node.js: REST API + socket.io + scheduler + state
+2. **Web** — React dashboard
+3. **Stub** — Python daemon on GPU nodes, connects to server via socket.io
+4. **SDK** — Python library in training code, reports progress + receives signals
 
 ```
 Browser ──► React Web App ──► Alchemy Server (Node.js)
@@ -19,987 +17,1697 @@ Browser ──► React Web App ──► Alchemy Server (Node.js)
                     ┌─────────────┼─────────────┐
                     ▼             ▼             ▼
                 Stub A        Stub B        Stub C
-              (SLURM A40)  (SLURM A100)  (Workstation)
+              (SLURM A40)  (SLURM A30)   (Workstation)
                  │               │             │
               train.py        train.py      train.py
-              (SDK opt)       (SDK opt)     (SDK opt)
+              (SDK ←→ Stub via Unix socket)
 ```
 
-Connection direction: Stub connects TO server (outbound only). This means stubs work behind NAT/firewalls without port forwarding.
+Stub connects TO server (outbound only). Works behind NAT/firewalls.
 
-## Repository Structure
+---
 
-```
-alchemy-v2/
-├── server/                 # Node.js + TypeScript
-│   ├── src/
-│   │   ├── index.ts        # Entry point
-│   │   ├── socket/         # socket.io handlers
-│   │   │   ├── stub.ts     # Stub namespace handlers
-│   │   │   └── web.ts      # Web client namespace
-│   │   ├── api/            # REST routes
-│   │   │   ├── stubs.ts
-│   │   │   └── tasks.ts
-│   │   ├── store/          # In-memory state (no DB for now)
-│   │   │   ├── index.ts
-│   │   │   ├── stubs.ts
-│   │   │   └── tasks.ts
-│   │   └── types.ts        # Shared types
-│   ├── package.json
-│   └── tsconfig.json
-├── web/                    # React + Vite
-│   ├── src/
-│   │   ├── App.tsx
-│   │   ├── pages/
-│   │   │   ├── Dashboard.tsx    # Overview: all stubs + tasks
-│   │   │   ├── StubDetail.tsx   # Single stub: GPU stats, tasks, logs
-│   │   │   └── TaskQueue.tsx    # Global task queue management
-│   │   ├── components/
-│   │   │   ├── StubCard.tsx
-│   │   │   ├── TaskRow.tsx
-│   │   │   ├── GpuChart.tsx     # GPU util/vram chart
-│   │   │   ├── LogViewer.tsx    # Real-time log tail
-│   │   │   └── TaskForm.tsx     # Submit new task form
-│   │   ├── hooks/
-│   │   │   └── useSocket.ts     # socket.io-client hook
-│   │   └── lib/
-│   │       └── api.ts           # REST client
-│   ├── package.json
-│   └── vite.config.ts
-├── stub/                   # Python
-│   ├── alchemy_stub/
-│   │   ├── __init__.py
-│   │   ├── __main__.py     # Entry: python -m alchemy_stub
-│   │   ├── daemon.py       # Main loop, socket.io connection
-│   │   ├── process_mgr.py  # Subprocess management
-│   │   ├── gpu_monitor.py  # nvidia-smi polling
-│   │   └── config.py       # CLI args + env config
-│   ├── pyproject.toml
-│   └── requirements.txt    # python-socketio[client], psutil
-├── sdk/                    # Python
-│   ├── alchemy_sdk/
-│   │   ├── __init__.py     # exports: Alchemy class
-│   │   ├── client.py       # Main SDK class
-│   │   └── transport.py    # HTTP reporter with throttling
-│   ├── pyproject.toml
-│   └── requirements.txt    # requests only
-├── tests/
-│   ├── e2e/
-│   │   ├── test_full_flow.py       # Full E2E: server + stub + tasks
-│   │   ├── test_concurrent.py      # Multiple stubs, parallel tasks
-│   │   ├── test_reconnect.py       # Stub disconnect/reconnect
-│   │   ├── test_task_lifecycle.py  # start/pause/resume/kill
-│   │   └── conftest.py            # Fixtures: start server, stubs
-│   └── mocks/
-│       ├── fake_train.py           # Simulates training: prints steps, sleeps
-│       ├── fake_train_crash.py     # Crashes after N steps
-│       ├── fake_train_slow.py      # Very slow, for testing kill
-│       └── fake_gpu_stats.py       # Mock nvidia-smi output
-└── docker-compose.yml              # Local dev: server + web
-```
-
-## Data Models
-
-### Stub
-
-```typescript
-interface Stub {
-  id: string;               // server-assigned UUID
-  name: string;             // human-readable, e.g. "gpuvm35-233597"
-  hostname: string;
-  gpu: {
-    name: string;           // "NVIDIA A40"
-    vram_total_mb: number;
-    count: number;
-  };
-  slurm_job_id?: string;
-  status: "online" | "offline" | "stale";  // stale = missed 3 heartbeats
-  connected_at: string;     // ISO timestamp
-  last_heartbeat: string;
-  max_concurrent: number;   // how many tasks can run in parallel
-  tasks: Task[];
-  gpu_stats: GpuStats;      // latest snapshot
-  token: string;            // auth token
-}
-```
+## 1. Data Models
 
 ### Task
 
 ```typescript
 interface Task {
-  id: string;               // UUID
-  stub_id: string;
-  command: string;          // shell command to execute
-  cwd?: string;             // working directory
-  env?: Record<string, string>;  // extra env vars
-  status: "queued" | "running" | "paused" | "completed" | "failed" | "killed";
-  exit_code?: number;
+  // === Identity ===
+  id: string;                    // UUID
+  seq: number;                   // Global auto-increment (#1, #2, ...)
+  fingerprint: string;           // sha256(script + args + params + cwd)[:16]
+  name?: string;                 // User-defined name
+  display_name: string;          // Auto-generated (see rules below)
+
+  // === Structured Command ===
+  script: string;                // "python train_atari.py"
+  args?: Record<string, string>; // {"--config": "configs/x.yaml", "--seed": "42"}
+  raw_args?: string;             // Unstructured fallback: "--verbose"
+
+  // === Environment ===
+  cwd?: string;                  // Working directory (inherits from stub)
+  env_setup?: string;            // Shell setup commands (inherits from stub)
+  env?: Record<string, string>;  // Extra env vars
+
+  // === Assembled (read-only, server builds) ===
+  command: string;               // Full shell command for stub to execute
+
+  // === Resources ===
+  requirements?: {
+    gpu_mem_mb?: number;
+    cpu_mem_mb?: number;
+    gpu_type?: string[];         // ["A40", "A30"]
+  };
+
+  // === Scheduling ===
+  status: TaskStatus;
+  priority: number;              // Default 5, higher = first
+  stub_id?: string;              // Assigned stub (null in global queue)
+  target_tags?: string[];        // Tag-based routing (scheduler filters stubs by tag)
+
+  // === Grid ===
+  grid_id?: string;
+  param_overrides?: Record<string, any>;
+
+  // === Lifecycle ===
   created_at: string;
   started_at?: string;
   finished_at?: string;
-  progress?: {              // from SDK or parsed from logs
-    step: number;
-    total: number;
-    loss?: number;
-    metrics?: Record<string, number>;
-  };
-  log_buffer: string[];     // last 500 lines
+  exit_code?: number;
+  pid?: number;
+
+  // === Progress ===
+  progress?: { step: number; total: number; loss?: number; metrics?: Record<string, number> };
+  log_buffer: string[];          // Ring buffer, last 500 lines
+  config_snapshot?: Record<string, any>;
+
+  // === Resume & Retry ===
+  run_dir?: string;
+  checkpoint_path?: string;
+  retry_count: number;
+  max_retries: number;           // Default 0
+  retry_of?: string;             // Original task ID if this is a retry
+
+  // === Server Signals ===
+  should_stop: boolean;
+  should_checkpoint: boolean;
+}
+
+type TaskStatus =
+  | "pending"      // In global queue, unassigned
+  | "queued"       // In stub local queue, waiting
+  | "dispatched"   // Sent to stub, awaiting task.started
+  | "running"      // Executing
+  | "paused"       // SIGSTOP
+  | "completed"    // Exit 0
+  | "failed"       // Non-zero exit
+  | "killed"       // User cancelled
+  | "lost";        // Stub disconnected, fate unknown
+```
+
+**display_name rules:**
+1. Has `name` → use it
+2. Has `script` + `args` → `basename(script) args_summary`
+   - e.g. `train_atari.py config=atari_ctx512_s42`
+3. Only `command` → extract last meaningful segment
+
+**command assembly (server):**
+```
+[env_setup &&] [cd cwd &&] [export K=V ...&&] script [--key value ...] [raw_args]
+```
+
+**fingerprint:**
+```typescript
+function fingerprint(task: TaskInput): string {
+  const parts = [
+    task.script,
+    JSON.stringify(sortKeys(task.args || {})),
+    JSON.stringify(sortKeys(task.param_overrides || {})),
+    task.cwd || "",
+  ];
+  return sha256(parts.join("\0")).slice(0, 16);
 }
 ```
 
-### GpuStats
+### Stub
 
 ```typescript
-interface GpuStats {
-  timestamp: string;
-  gpus: Array<{
-    index: number;
-    utilization_pct: number;
-    memory_used_mb: number;
-    memory_total_mb: number;
-    temperature_c: number;
-  }>;
+interface Stub {
+  id: string;                  // Stable: sha256(hostname + gpu_indices + default_cwd)[:12]
+  name: string;                // Semantic name, auto or user-set
+  hostname: string;
+  gpu: { name: string; vram_total_mb: number; count: number };
+  system_stats?: SystemStats;
+  slurm_job_id?: string;
+  status: "online" | "offline";
+  type: "slurm" | "workstation";   // Auto: has SLURM_JOB_ID → slurm
+  connected_at: string;
+  last_heartbeat: string;
+  max_concurrent: number;          // Server authoritative (persisted)
+  tasks: Task[];
+  gpu_stats?: GpuStats;
+  env_setup?: string;
+  default_cwd?: string;
+  idle_timeout_s?: number;         // SLURM mode: exit when idle. Default: Infinity
 }
 ```
 
-## Socket.io Protocol
+**Semantic name auto-generation:**
+- `{hostname_short}-{gpu_short}` → e.g. `gpu22-2080ti`, `clapper-a30`
+- SLURM stub appends job ID suffix: `clapper-a30-4412`
+- Customizable via `PATCH /stubs/:id`
 
-### Namespace: `/stubs` (Stub ↔ Server)
+### Grid
 
-#### Stub → Server events:
+```typescript
+interface Grid {
+  id: string;
+  name?: string;
+  display_name: string;
+  script: string;
+  base_args?: Record<string, string>;
+  param_space: Record<string, any[]>;  // {"seed": [42,123,789], "ctx": [256,512]}
+  task_ids: string[];
+  status: "pending" | "running" | "partial" | "completed" | "failed";
+  created_at: string;
+  max_retries: number;                 // Applied to each generated task
+  requirements?: Task["requirements"];
+}
+```
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `register` | `{ hostname, gpu, slurm_job_id?, max_concurrent, token }` | First event after connect |
-| `heartbeat` | `{ timestamp }` | Every 30s |
-| `gpu_stats` | `GpuStats` | Every 30s (with heartbeat) |
-| `task.started` | `{ task_id, pid }` | Subprocess launched |
-| `task.progress` | `{ task_id, step, total, loss?, metrics? }` | From SDK or log parsing |
-| `task.log` | `{ task_id, lines: string[] }` | Batched, every 2s |
-| `task.completed` | `{ task_id, exit_code }` | Subprocess exited |
-| `task.failed` | `{ task_id, exit_code, error? }` | Non-zero exit |
+Grid generates tasks = cartesian product of `param_space`. Each task gets `param_overrides` from its cell. Grid status derived from task statuses:
+- All completed → completed
+- Any running → running
+- Mix of completed + failed → partial
+- All failed → failed
 
-#### Server → Stub events:
+---
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `registered` | `{ stub_id }` | Confirm registration |
-| `task.run` | `{ task_id, command, cwd?, env? }` | Execute this task |
-| `task.kill` | `{ task_id, signal?: "SIGTERM" \| "SIGKILL" }` | Kill task |
-| `task.pause` | `{ task_id }` | SIGSTOP |
-| `task.resume` | `{ task_id }` | SIGCONT |
-| `config.update` | `{ max_concurrent? }` | Update runtime config |
+## 2. Task Dedup & Write Lock
 
-### Namespace: `/web` (Dashboard ↔ Server)
+### Fingerprint Dedup
 
-#### Server → Web (real-time push):
+Submit 时 server 检查:
+- Same fingerprint + status in `{pending, queued, dispatched, running, paused}` → **reject**, return existing task
+- Same fingerprint + status in `{completed, failed, killed, lost}` → **allow** (re-run)
+- API also accepts `idempotency_key` (client UUID), same key within 60s → idempotent return
 
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `stubs.update` | `Stub[]` | Full state on connect, then diffs |
-| `stub.online` | `Stub` | New stub connected |
-| `stub.offline` | `{ stub_id }` | Stub disconnected |
-| `task.update` | `Task` | Any task state change |
-| `gpu_stats` | `{ stub_id, stats: GpuStats }` | Forward GPU stats |
-| `task.log` | `{ stub_id, task_id, lines }` | Forward logs |
+### Write Lock Table
 
-## REST API
+Server maintains `Map<normalized_path, task_id>` for all running tasks' `run_dir`.
 
-All routes prefixed with `/api`.
+- Submit → check `run_dir` not in lock table → add entry
+- Task terminates → remove entry
+- Path normalization: resolve `..`, trailing slash, canonicalize
+- Prefix match: `runs/exp1/` conflicts with `runs/exp1/sub/`
 
-### Stubs
+Lock table rebuilt from running tasks on server restart (after stubs resume).
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/stubs` | List all stubs |
-| `GET` | `/stubs/:id` | Get stub detail |
-| `DELETE` | `/stubs/:id` | Disconnect stub |
-| `PATCH` | `/stubs/:id` | Update config (max_concurrent) |
+### Disk Flag (.alchemy_owner)
+
+Last-resort safety net on shared filesystem. Stub writes flag when starting task:
+
+```json
+// {run_dir}/.alchemy_owner
+{"stub_id": "gpu22-2080ti", "task_id": "xxx", "fingerprint": "a1b2c3...", "ts": 1745...}
+```
+
+Written atomically (tmp + rename).
+
+**Decision tree on task start:**
+
+```
+No flag         → write flag, execute
+Flag exists:
+  Same fingerprint + own stub  → resume (own restart)
+  Same fingerprint + other stub → ask server: original task alive?
+    Server: dead  → overwrite flag, resume
+    Server: alive → preflight.fail "directory occupied"
+    Server: unreachable → preflight.fail "cannot verify"
+  Different fingerprint → preflight.fail "directory belongs to different task"
+```
+
+#### Test Cases — Dedup & Write Lock
+
+```
+T1: Submit task A (fp=abc). Submit task B (fp=abc) while A running.
+    → B rejected, response contains A's task_id.
+
+T2: Submit task A (fp=abc). A completes. Submit task B (fp=abc).
+    → B accepted (re-run allowed).
+
+T3: Submit task A (run_dir=/x/y). Submit task B (run_dir=/x/y) while A running.
+    → B rejected with "path conflict".
+
+T4: Server restart. Stub resumes with A running (run_dir=/x/y). Submit B (run_dir=/x/y).
+    → Lock table rebuilt from resume → B rejected.
+
+T5: Stub-1 starts task A (fp=abc, run_dir=/shared/r). Stub-1 crashes.
+    Stub-2 assigned retry of A (fp=abc, run_dir=/shared/r).
+    → Stub-2 sees .alchemy_owner, fingerprint matches, server confirms A dead.
+    → Stub-2 overwrites flag, resumes from checkpoint.
+
+T6: Same as T5 but server unreachable.
+    → Stub-2 refuses to start (preflight.fail).
+
+T7: Double-click submit button.
+    → First request creates task. Second request within 60s with same idempotency_key → returns same task.
+```
+
+---
+
+## 3. Dual Queue Scheduling
+
+```
+                    ┌─────────────────────────┐
+                    │  Global Queue (pending)  │
+                    │  sorted: priority desc,  │
+                    │  then created_at asc     │
+                    └────────────┬────────────┘
+                                 │
+                   constraint-aware scheduler
+                                 │
+              ┌──────────────────┼──────────────────┐
+              ▼                  ▼                   ▼
+     ┌──────────────┐  ┌──────────────┐   ┌──────────────┐
+     │ Stub A queue │  │ Stub B queue │   │ Stub C queue │
+     │  (queued)    │  │  (queued)    │   │  (queued)    │
+     └──────┬───────┘  └──────┬───────┘   └──────┬───────┘
+            │                  │                   │
+      max_concurrent=2    max_concurrent=3     max_concurrent=1
+```
+
+- **Global queue**: Unassigned tasks. `POST /api/tasks` enters here.
+- **Stub local queue**: Assigned. `POST /api/stubs/:id/tasks` enters directly (bypass scheduler).
+- **Stub offline**: Local queue preserved. Resumes on reconnect.
+
+### Scheduler
+
+```typescript
+function schedule(): void {
+  const stubs = store.getOnlineStubs();
+  const queue = store.getGlobalQueue(); // sorted by priority desc, created_at asc
+
+  for (const task of queue) {
+    const best = stubs
+      .map(s => ({ stub: s, score: score(s, task) }))
+      .filter(c => c.score > -Infinity)
+      .sort((a, b) => b.score - a.score)[0];
+
+    if (best) {
+      store.moveToStubQueue(task.id, best.stub.id);
+      maybeDispatch(best.stub);
+    }
+  }
+}
+
+function score(stub: Stub, task: Task): number {
+  // Hard constraints (any fail → -Infinity)
+  if (stub.status !== "online") return -Infinity;
+  if (task.requirements?.gpu_mem_mb) {
+    if (availableVram(stub) < task.requirements.gpu_mem_mb) return -Infinity;
+  }
+  if (task.requirements?.gpu_type?.length) {
+    if (!task.requirements.gpu_type.includes(normalize(stub.gpu.name))) return -Infinity;
+  }
+  if (task.requirements?.cpu_mem_mb && stub.system_stats) {
+    if (availableMem(stub) < task.requirements.cpu_mem_mb) return -Infinity;
+  }
+
+  // Soft scoring
+  let s = 0;
+  const running = stub.tasks.filter(t => t.status === "running").length;
+  const queued = stub.tasks.filter(t => t.status === "queued").length;
+  s += 40 * Math.max(0, stub.max_concurrent - running) / Math.max(1, stub.max_concurrent);
+  s -= 10 * queued;
+
+  // Grid locality: same GPU type for fair comparison
+  if (task.grid_id) {
+    const gridStubs = store.getGridTasks(task.grid_id)
+      .map(t => t.stub_id).filter(Boolean).map(id => store.getStub(id));
+    if (gridStubs.some(gs => normalize(gs.gpu.name) === normalize(stub.gpu.name))) {
+      s += 20;
+    }
+  }
+
+  // VRAM waste penalty
+  if (task.requirements?.gpu_mem_mb) {
+    s -= (stub.gpu.vram_total_mb - task.requirements.gpu_mem_mb) / 1000;
+  }
+
+  return s;
+}
+```
+
+**Triggers:** New task in global queue, stub comes online, task finishes (slot opens), 30s periodic.
+
+### Dispatch
+
+```typescript
+function maybeDispatch(stub: Stub): void {
+  const active = stub.tasks.filter(t => ["running", "dispatched"].includes(t.status)).length;
+  const slots = stub.max_concurrent - active;
+  const queued = stub.tasks.filter(t => t.status === "queued")
+    .sort((a, b) => (b.priority - a.priority) || (a.created_at - b.created_at));
+
+  for (let i = 0; i < Math.min(slots, queued.length); i++) {
+    store.updateTask(queued[i].id, { status: "dispatched" });
+    reliableEmit(stub.socketId, "task.run", buildRunPayload(queued[i]));
+  }
+}
+```
+
+#### Test Cases — Scheduling
+
+```
+T1: Submit task requiring A40. Only A30 stubs online.
+    → Task stays in global queue. No dispatch.
+
+T2: Submit task requiring A40. A40 stub comes online.
+    → Scheduler triggers → task moves to A40 stub queue → dispatched.
+
+T3: Two stubs: A (0/3 running), B (2/3 running). Submit task.
+    → A scores higher (more idle) → assigned to A.
+
+T4: Grid with seed=[42,123,789]. Stub A has A40, Stub B has A30.
+    First task goes to A. Second task: A40 locality bonus → also goes to A if slots available.
+
+T5: Submit to specific stub via POST /stubs/:id/tasks.
+    → Bypasses global queue. Goes directly to stub's local queue.
+
+T6: Stub goes offline. Its local queue preserved.
+    Stub reconnects. → queued tasks still there, dispatch resumes.
+```
+
+---
+
+## 4. Socket Protocol
+
+### Reliable Messaging Layer
+
+Application-level reliability over socket.io. Transparent ack + retransmit.
+
+```typescript
+interface ReliableMessage {
+  seq: number;      // Monotonic per-connection
+  event: string;
+  payload: any;
+  ts: number;
+}
+```
+
+Transport events: `r` (message), `r.ack` (cumulative ack), `r.nack` (gap retransmit request).
+
+```typescript
+class ReliableEmitter {
+  private seq = 0;
+  private outbox: ReliableMessage[] = [];
+
+  emit(event: string, payload: any): void {
+    const msg = { seq: ++this.seq, event, payload, ts: Date.now() };
+    this.outbox.push(msg);
+    this.socket.emit("r", msg);
+    this.scheduleRetry(msg, 5000);
+  }
+
+  onAck(ackSeq: number): void {
+    this.outbox = this.outbox.filter(m => m.seq > ackSeq);
+  }
+
+  onResume(lastSeq: number): void {
+    for (const msg of this.outbox.filter(m => m.seq > lastSeq)) {
+      this.socket.emit("r", msg);
+    }
+  }
+}
+
+class ReliableReceiver {
+  private lastSeq = 0;
+  private pending = new Map<number, ReliableMessage>();
+
+  onMessage(msg: ReliableMessage): void {
+    if (msg.seq <= this.lastSeq) return; // dedup
+    if (msg.seq === this.lastSeq + 1) {
+      this.deliver(msg);
+      this.lastSeq = msg.seq;
+      while (this.pending.has(this.lastSeq + 1)) {
+        const next = this.pending.get(this.lastSeq + 1)!;
+        this.pending.delete(this.lastSeq + 1);
+        this.deliver(next);
+        this.lastSeq = next.seq;
+      }
+      this.socket.emit("r.ack", { seq: this.lastSeq });
+    } else {
+      this.pending.set(msg.seq, msg);
+      this.socket.emit("r.nack", { from: this.lastSeq + 1, to: msg.seq - 1 });
+    }
+  }
+}
+```
+
+**Reliable vs non-reliable events:**
+
+| Direction | Event | Reliable | Reason |
+|-----------|-------|----------|--------|
+| S→Stub | `task.run` | ✅ | Lost = task never starts |
+| S→Stub | `task.kill` | ✅ | Lost = unkillable |
+| S→Stub | `task.signal` | ✅ | Lost = signal ignored |
+| S→Stub | `resume_response` | ✅ | Must arrive |
+| S→Stub | `config.update` | ✅ | Config drift |
+| S→Stub | `request_sync` | ❌ | Next one covers it |
+| Stub→S | `resume` | ✅ | Must arrive |
+| Stub→S | `task.started` | ✅ | Status update |
+| Stub→S | `task.completed/failed` | ✅ | Status update |
+| Stub→S | `task.checkpoint` | ✅ | Checkpoint path |
+| Stub→S | `preflight.fail` | ✅ | Status update |
+| Stub→S | `heartbeat` | ❌ | Next one covers it |
+| Stub→S | `gpu_stats/system_stats` | ❌ | Next one covers it |
+| Stub→S | `task.progress` | ❌ | Next one covers it |
+| Stub→S | `task.log` | ❌ | Few lines lost OK |
+
+### Stub → Server Events
+
+| Event | Payload |
+|-------|---------|
+| `resume` | `{ hostname, gpu, slurm_job_id?, max_concurrent, token, env_setup?, default_cwd?, running_tasks: [{task_id, pid, step?, status}], local_queue: [task_id...], lastSeq }` |
+| `heartbeat` | `{ timestamp }` |
+| `gpu_stats` | `GpuStats` |
+| `system_stats` | `SystemStats` |
+| `task.started` | `{ task_id, pid }` |
+| `task.progress` | `{ task_id, step, total, loss?, metrics? }` |
+| `task.log` | `{ task_id, lines: string[] }` |
+| `task.completed` | `{ task_id, exit_code }` |
+| `task.failed` | `{ task_id, exit_code, error? }` |
+| `task.config` | `{ task_id, config }` |
+| `task.checkpoint` | `{ task_id, path }` |
+| `task.resource` | `{ task_id, gpu_mem_mb, cpu_mem_mb, gpu_util_pct }` |
+| `preflight.fail` | `{ task_id, errors: string[] }` |
+
+### Server → Stub Events
+
+| Event | Payload |
+|-------|---------|
+| `resume_response` | `{ stub_id, name, adopt_tasks, kill_tasks, queue, config }` |
+| `task.run` | `{ task_id, command, cwd?, env?, env_setup?, run_dir, params? }` |
+| `task.kill` | `{ task_id, grace_period_s? }` |
+| `task.signal` | `{ task_id, signal: "should_stop" \| "should_checkpoint" \| "should_eval" }` |
+| `config.update` | `{ max_concurrent? }` |
+| `request_sync` | `{}` |
+
+### Server → Web Events
+
+| Event | Payload |
+|-------|---------|
+| `stubs.snapshot` | `Stub[]` |
+| `stub.update` | `Stub` |
+| `stub.online/offline` | `Stub / { stub_id }` |
+| `task.update` | `Task` |
+| `gpu_stats` | `{ stub_id, stats }` |
+| `system_stats` | `{ stub_id, stats }` |
+| `task.log` | `{ stub_id, task_id, lines }` |
+
+### Connection = Resume (Unified)
+
+Every stub connection (first / reconnect / hot-restart) uses **one resume flow**. First connect = resume with empty state.
+
+```
+Stub connects:
+  1. TCP established
+  2. Stub → resume {
+       hostname, gpu, ...,
+       running_tasks: [...],     // empty on first connect
+       local_queue: [...],       // empty on first connect
+       lastSeq: 0               // 0 on first connect
+     }
+
+Server handles resume:
+  1. Identify stub (hostname + gpu → stable id)
+     Known → update connection
+     Unknown → create record
+
+  2. Reconcile (server records vs stub report):
+     A: Server has task X on this stub, stub didn't report → lost
+     B: Stub reports task Y, server doesn't know → kill (orphan)
+     C: Server queue has task Z, stub doesn't → adopt (re-send)
+     D: max_concurrent differs → server authoritative
+
+  3. Reliable layer: replay outbox messages after stub's lastSeq
+
+  4. Server → resume_response { stub_id, name, adopt_tasks, kill_tasks, queue, config }
+```
+
+**Periodic reconcile:** Every 5min server → `request_sync`, stub responds with `resume`.
+
+#### Test Cases — Resume
+
+```
+T1: Fresh stub connects. running_tasks=[], lastSeq=0.
+    → Server creates stub record. resume_response has empty adopt/kill, full queue if any pending.
+
+T2: Stub disconnects, reconnects 30s later. Had 2 running tasks.
+    → Stub sends resume with running_tasks=[A,B]. Server matches. No adopt/kill.
+
+T3: Stub disconnects. Server kills task A via API while disconnected.
+    Stub reconnects, reports A still running.
+    → resume_response.kill_tasks includes A.
+
+T4: Stub crashes (loses tasks). Reconnects with running_tasks=[].
+    Server had A,B assigned. → A,B marked "lost". If max_retries > 0, requeued.
+
+T5: Server restarts. Stub reconnects. Server loads state.json, matches stub by stable id.
+    → Full reconciliation as normal.
+
+T6: Same stub identity connects while old connection alive (ghost).
+    → Server kicks old connection, accepts new one.
+```
+
+---
+
+## 5. Graceful Kill Chain
+
+```
+User clicks "Cancel" or API PATCH status=killed
+  → Server emits task.signal { signal: "should_stop" }     // SDK gets it
+  → Wait grace_period (default 30s)                         // Let training save checkpoint
+  → Server emits task.kill { grace_period_s: 5 }           // Stub sends SIGTERM
+  → Stub: SIGTERM to process
+  → Wait 5s
+  → Stub: SIGKILL if still alive
+  → Stub emits task.failed or task.completed
+```
+
+AOP mode: `ctx.should_stop()` returns true → training loop breaks → `__exit__` auto-saves checkpoint → clean exit.
+
+Manual mode: User may not check `should_stop()`. SIGTERM handles it.
+
+#### Test Cases — Kill Chain
+
+```
+T1: Kill task using AOP SDK. Task checks should_stop() every step.
+    → should_stop becomes true → loop breaks → checkpoint saved → exit 0 → completed.
+
+T2: Kill task not using SDK. No should_stop check.
+    → 30s grace passes → SIGTERM → process exits → failed (exit 143).
+
+T3: Kill task, process ignores SIGTERM.
+    → SIGTERM → 5s → SIGKILL → failed (exit 137).
+
+T4: Kill task that's already completed before signal arrives.
+    → No-op. Task already completed.
+```
+
+---
+
+## 6. Failure & Retry
+
+### Failure Classification
+
+```typescript
+function classifyFailure(task: Task): "oom" | "error" | "lost" | "killed" {
+  if (task.status === "killed") return "killed";
+  if (task.status === "lost") return "lost";
+  if (task.exit_code === 137) return "oom";       // SIGKILL (OOM killer)
+  return "error";                                  // Everything else
+}
+```
+
+### Retry Policy
+
+```
+max_retries > 0 AND retry_count < max_retries AND failure is "oom" or "lost":
+  → Create new task (same fingerprint), retry_count + 1, retry_of = original.id
+  → New task enters global queue (scheduler may pick different stub)
+  → OOM retry: if original had gpu_mem_mb requirement, bump by 20%
+
+failure is "error" → no auto-retry (script bug, fix code first)
+failure is "killed" → no auto-retry (user intent)
+```
+
+#### Test Cases — Retry
+
+```
+T1: Task exits 137 (OOM), max_retries=2, retry_count=0.
+    → New task created, retry_count=1, gpu_mem_mb bumped 20%.
+
+T2: Same task OOMs again, retry_count=1.
+    → New task, retry_count=2. Bumped again.
+
+T3: Same task OOMs third time, retry_count=2, max_retries=2.
+    → No more retries. Final status: failed.
+
+T4: Task exits 1 (script error), max_retries=3.
+    → No retry. Script errors don't auto-retry.
+
+T5: Stub disconnects, task marked "lost", max_retries=1.
+    → Requeued to global queue for re-dispatch.
+```
+
+---
+
+## 7. REST API
+
+All routes: `/api/*`. Auth: `Authorization: Bearer <token>`.
 
 ### Tasks
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/stubs/:id/tasks` | List tasks on stub |
-| `POST` | `/stubs/:id/tasks` | Submit new task `{ command, cwd?, env? }` |
-| `PATCH` | `/stubs/:id/tasks/:tid` | Update: `{ action: "pause" \| "resume" \| "kill" }` |
-| `DELETE` | `/stubs/:id/tasks/:tid` | Kill and remove task |
-| `GET` | `/stubs/:id/tasks/:tid/logs` | Get log buffer |
+| `GET` | `/tasks` | All tasks |
+| `POST` | `/tasks` | Submit to global queue |
+| `GET` | `/tasks/:id` | Task detail |
+| `PATCH` | `/tasks/:id` | Update status/priority/name/should_stop |
+| `POST` | `/tasks/:id/retry` | Manual retry (new task, same fingerprint) |
+| `POST` | `/tasks/batch` | Batch action `{ action: "kill"\|"retry"\|"requeue"\|"delete", task_ids }` |
 
-### Tokens
+### Stubs
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/tokens` | Generate new stub auth token |
-| `GET` | `/tokens` | List active tokens |
-| `DELETE` | `/tokens/:token` | Revoke token |
+| `GET` | `/stubs` | All stubs |
+| `GET` | `/stubs/:id` | Stub detail |
+| `PATCH` | `/stubs/:id` | Update name/max_concurrent |
+| `POST` | `/stubs/:id/tasks` | Submit directly to stub queue |
 
-## SDK API
+### Grids
 
-```python
-from alchemy_sdk import Alchemy
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/grids` | Create grid `{ script, base_args, param_space, ... }` |
+| `GET` | `/grids` | List grids |
+| `GET` | `/grids/:id` | Grid detail + all tasks |
+| `POST` | `/grids/:id/cancel` | Cancel all running tasks in grid |
+| `POST` | `/grids/:id/retry-failed` | Retry all failed tasks in grid |
 
-# Initialize — connects to server via HTTP
-al = Alchemy(
-    server="https://alchemy.example.com",
-    task_id="auto",          # auto-detect from ALCHEMY_TASK_ID env var
-)
+### Metrics
 
-# Log progress — throttled to 1 request per 10s internally
-al.log(step=1000, total=500000, loss=0.342, metrics={"silhouette": 0.55})
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/overview` | Global stats snapshot (cached 10s) |
+| `GET` | `/stubs/:id/metrics` | GPU/CPU/MEM time series (1h ring buffer) |
+| `GET` | `/tasks/:id/metrics` | Loss/step time series |
+| `GET` | `/tasks/:id/logs?tail=100` | Task log tail |
 
-# Mark checkpoint
-al.checkpoint("runs/jema_ctx256_s42/checkpoint_50000.pt")
+### SDK Fallback
 
-# Done (auto-called on context manager exit)
-al.done()
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/sdk/report` | SDK HTTP fallback `{ task_id, type, ... }` |
 
-# Context manager usage
-with Alchemy(server="...") as al:
-    for step in range(500000):
-        loss = train_step()
-        al.log(step=step, total=500000, loss=loss)
-# auto al.done()
-```
+---
 
-The SDK communicates via HTTP `POST /api/sdk/report` with:
-```json
-{
-  "task_id": "xxx",
-  "step": 1000,
-  "total": 500000,
-  "loss": 0.342,
-  "metrics": {"silhouette": 0.55},
-  "checkpoint": null
-}
-```
+## 8. SDK
 
-SDK is **optional**. If not used, the stub still works — progress can be parsed from log output (regex for tqdm patterns), or just shown as running/completed.
+### Design Principles
 
-## Stub Daemon Details
+1. **Pure / side-effect isolation**: Reads have no IO. Reports don't modify training state.
+2. **Optional**: No SDK = everything works, just no progress/signals.
+3. **Zero intrusion**: Doesn't touch model/optimizer/dataloader. Signal channel only.
+4. **Graceful degradation**: Unix socket → HTTP fallback → silent no-op.
 
-### Process Manager
+### Core API
 
 ```python
-class ProcessManager:
-    """Manages concurrent subprocesses for tasks."""
-    
-    def __init__(self, max_concurrent: int = 3):
-        self.max_concurrent = max_concurrent
-        self.processes: dict[str, subprocess.Popen] = {}
-    
-    def start(self, task_id: str, command: str, cwd: str, env: dict):
-        """Start task as subprocess. Queue if at max_concurrent."""
-        
-    def kill(self, task_id: str, signal: str = "SIGTERM"):
-        """Send signal to task. SIGTERM first, SIGKILL after 10s timeout."""
-        
-    def pause(self, task_id: str):
-        """Send SIGSTOP."""
-        
-    def resume(self, task_id: str):
-        """Send SIGCONT."""
+class Alchemy:
+    def __init__(self):
+        """Auto-init from env vars:
+        ALCHEMY_TASK_ID, ALCHEMY_STUB_SOCKET, ALCHEMY_SERVER, ALCHEMY_PARAMS.
+
+        Two modes:
+        - Managed (ALCHEMY_TASK_ID present): strict, zero tolerance.
+          param() rejects defaults — typo = crash, not silent wrong experiment.
+          ALCHEMY_RUN_DIR must exist — missing = crash.
+        - Standalone (no env vars): noop transport, permissive.
+          param() accepts defaults. run_dir falls back to cwd/runs/.
+          Training script runs normally without alchemy infrastructure."""
+
+    @property
+    def is_managed(self) -> bool:
+        """True when running under alchemy. Strict mode."""
+
+    # === Pure reads (no IO) ===
+    def params(self) -> dict:
+        """ALCHEMY_PARAMS parsed. Same value every call."""
+    def param(self, key: str, default=_MISSING) -> any:
+        """Single param.
+        Managed: default FORBIDDEN. Missing key = KeyError (prevents silent typos).
+        Standalone: default allowed for convenience."""
+
+    # === Signal queries (pure, reads cached signal from stub) ===
+    def should_stop(self) -> bool
+    def should_checkpoint(self) -> bool
+    def should_eval(self) -> bool
+
+    # === Reports (side effects: sends to stub, never modifies training state) ===
+    def log(self, step: int, total: int, loss: float = None, metrics: dict = None) -> None
+        """Throttled to 1/10s. Non-blocking."""
+    def log_eval(self, metrics: dict) -> None
+    def log_config(self, config: dict) -> None
+    def checkpoint(self, path: str) -> None
+        """Declares checkpoint path. Does NOT torch.save — user does that."""
+    def done(self, metrics: dict = None) -> None
+
+    # === Context manager ===
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.done()
 ```
 
-### GPU Monitor
+### SDK ↔ Stub Communication
+
+```
+SDK ←→ Stub:  Unix socket /tmp/alchemy_task_{id}.sock (JSON lines)
+Stub ←→ Server:  socket.io (reliable layer)
+```
+
+**Stub sets up per-task:**
+1. Create Unix socket: `/tmp/alchemy_task_{task_id}.sock`
+2. Set env: `ALCHEMY_STUB_SOCKET`, `ALCHEMY_TASK_ID`, `ALCHEMY_PARAMS`
+3. Spawn subprocess
+
+**Protocol (JSON lines):**
+
+```
+SDK → Stub:
+  { "type": "progress", "step": N, "total": N, "loss": F, "metrics": {} }
+  { "type": "eval", "metrics": {} }
+  { "type": "checkpoint", "path": "..." }
+  { "type": "config", "config": {} }
+  { "type": "done", "metrics": {} }
+  { "type": "heartbeat" }
+
+Stub → SDK:
+  { "type": "signal", "signal": "should_stop" }
+  { "type": "signal", "signal": "should_checkpoint" }
+  { "type": "signal", "signal": "should_eval" }
+```
+
+**Fallback chain:** Unix socket → HTTP POST `/api/sdk/report` → silent no-op.
+
+### SDK Heartbeat & Zombie Detection
+
+SDK sends `heartbeat` every 10s over Unix socket. Stub monitors:
+- 60s no heartbeat but PID alive → mark task `zombie` (may be deadlocked/hung)
+- Server notifies frontend ⚠️, user can manually kill
+- PID dead + no `done`/`failed` → process crashed, stub emits `task.failed`
+
+### AOP Training Runtime (Optional)
+
+AOP decorator wraps manual SDK calls. Every `ctx` method maps to an explicit `al.*` call.
+
+#### Core Principle: Idempotency & Side-Effect Isolation
+
+In AOP mode, user training function is a **pure function**: `(params, data) → metrics`. All IO managed by framework:
+
+```
+Framework manages (user does NOT touch):
+  ✗ Path selection — no hardcoded run_dir / checkpoint_path
+  ✗ File creation — no makedirs / open
+  ✗ Param source — no yaml / argparse
+  ✗ Resume logic — no "if resume: load else: init"
+
+User code only does:
+  ✓ Read params from ctx → build model
+  ✓ Training loop → produce loss / metrics
+  ✓ Use ctx-provided paths for checkpoint save/load
+  ✓ Respond to ctx signals (eval / stop / checkpoint)
+```
+
+**Idempotency guarantee**: Same task re-run N times → framework provides same params, same run_dir, auto-detects existing checkpoint → resume. User code doesn't know if it's run #1 or #5.
+
+#### TrainingContext
 
 ```python
-class GpuMonitor:
-    """Polls nvidia-smi for GPU stats."""
-    
-    def query(self) -> GpuStats:
-        """Run nvidia-smi --query-gpu=... and parse output."""
-        # Falls back to mock data if nvidia-smi not available (for testing)
+class TrainingContext:
+    # === Pure reads ===
+    params: dict                # Immutable, from ALCHEMY_PARAMS
+    run_dir: Path               # Framework-allocated, deterministic
+    checkpoint_dir: Path        # run_dir / "checkpoints"
+    is_resume: bool             # True if existing checkpoint found
+
+    # === Path allocation ===
+    def output(self, name: str) -> Path:
+        """run_dir / name. Auto makedirs + umask 002. Idempotent."""
+    def artifact(self, name: str) -> Path:
+        """run_dir / artifacts / name."""
+
+    # === Checkpoint lifecycle ===
+    def latest_checkpoint(self) -> Path | None:
+        """Scan checkpoint_dir, return latest. None if fresh."""
+    def save_checkpoint(self, state_dict, tag: str = "latest") -> Path:
+        """torch.save to framework path + notify stub. Same tag = overwrite."""
+
+    # === Training loop ===
+    def steps(self, start: int = 0) -> Iterator[int]:
+        """Step iterator. Auto al.log(). Resume: start from checkpoint step."""
+
+    # === Signals (pure queries) ===
+    def should_eval(self) -> bool      # step % eval_every or server signal
+    def should_checkpoint(self) -> bool # step % ckpt_every or server signal
+    def should_stop(self) -> bool       # server signal
+
+    # === Reports ===
+    def log(self, **metrics) -> None
+    def log_eval(self, metrics: dict) -> None
 ```
 
-### Log Capture
+#### run_dir Allocation
 
-Each subprocess stdout/stderr is captured line-by-line:
-- Last 500 lines kept in memory ring buffer
-- Batched and sent to server every 2s via socket.io
-- Server forwards to web clients watching that task
+**Server-computed, single source of truth.** Server 在 dispatch 时计算 run_dir 并通过 `task.run` 事件下发。Stub 注入 `ALCHEMY_RUN_DIR` env var。SDK 读取该 env var，不独立计算。
 
-### Walltime Awareness
+```
+run_dir = {base_output_dir} / {fingerprint[:12]}
 
-SLURM 有 hard walltime（通常 72h），到期整个 job 被 SIGTERM → SIGKILL。
-
-1. **Stub 启动时记录 walltime**: 从 `SLURM_JOB_ID` 读取 `scontrol show job $SLURM_JOB_ID` 的 `TimeLimit` 和 `StartTime`，算出 deadline
-2. **剩余时间上报**: heartbeat 中包含 `remaining_walltime_s`，dashboard 显示倒计时
-3. **预警机制**:
-   - 剩余 30min: server 发 Discord 通知 + dashboard 高亮
-   - 剩余 10min: 不再接受新任务
-   - 剩余 5min: Discord 通知。如果 task 用了 SDK → 设 `should_checkpoint` flag；否则发 SIGUSR1（task 可选注册 handler）
-4. **自动续命（可选）**: 如果配置了 SLURM 脚本模板，server 可在 walltime 到期前自动 `sbatch` 新 job，新 stub 启动后接管任务队列
-5. **非 SLURM 模式**: workstation 上跑的 stub 没有 walltime 限制，跳过此逻辑
-
-### Environment Management
-
-Stub 不假设全局 conda 环境。每个 task 可以独立配置环境。
-
-```typescript
-interface Task {
-  // ... existing fields ...
-  env_setup?: string;    // shell commands to run BEFORE command, e.g. "source activate myenv"
-}
+base_output_dir priority (server-side):
+  1. Task's run_dir field (user explicitly set)
+  2. Stub's default output_dir
+  3. cwd / "runs"
 ```
 
-**三层环境模型:**
-
-1. **Stub 默认环境**: 启动时通过 `--env-setup` 配置，所有 task 继承
-   ```bash
-   python -m alchemy_stub --server wss://... --token xxx \
-     --env-setup "export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:\$PATH"
-   ```
-
-2. **Task 级环境**: 提交 task 时可覆盖
-   ```json
-   {
-     "command": "python train.py --config cfg.yaml",
-     "env_setup": "source /opt/conda/envs/other/bin/activate",
-     "env": {"CUDA_VISIBLE_DEVICES": "0", "WANDB_MODE": "offline"}
-   }
-   ```
-
-3. **执行顺序**: stub 默认 env_setup → task env_setup → task env vars → command
-
-**实现:** 每个 task 实际执行的是:
-```bash
-bash -c '
-  ${stub_env_setup}
-  ${task_env_setup}
-  export KEY1=VAL1
-  export KEY2=VAL2
-  exec ${command}
-'
-```
-
-这样不同 task 可以用不同 conda env，互不干扰。Dashboard 的 TaskForm 里加 env_setup 输入框。
-
-### Reconnection
-
-- socket.io-client handles automatic reconnect with exponential backoff
-- On reconnect, stub re-sends `register` event
-- Server matches by token + hostname, restores stub state
-- Running tasks continue — stub re-reports their PIDs and status
-
-## React Dashboard Pages
-
-### 1. Dashboard (/)
-
-Overview page:
-- Grid of StubCards showing: hostname, GPU name, utilization bar, task count, online/offline badge
-- Summary stats: total GPUs, total tasks running, tasks queued
-- Click card → StubDetail
-
-### 2. StubDetail (/stubs/:id)
-
-- GPU stats chart (line chart, last 30 min: util% and VRAM%)
-- Task list: status badge, command (truncated), progress bar, duration
-- Actions per task: pause/resume/kill buttons
-- "New Task" button → TaskForm modal
-- Log viewer: select task → real-time log tail
-
-### 3. TaskQueue (/tasks)
-
-- Global view of all tasks across all stubs
-- Filterable by status, stub
-- Bulk actions: kill selected, resubmit failed
-- Task submission: pick stub (or auto-assign to least busy)
-
-## Tech Stack
-
-| Component | Stack |
-|-----------|-------|
-| Server | Node.js, TypeScript, Express, socket.io, tsx |
-| Web | React 18, Vite, TailwindCSS, socket.io-client, recharts (GPU charts) |
-| Stub | Python 3.10+, python-socketio[asyncio_client], psutil |
-| SDK | Python 3.10+, requests (zero heavy deps) |
-| Tests | pytest (E2E + stub + sdk), vitest (server unit tests) |
-
-## E2E Test Plan
-
-Tests run locally. `conftest.py` fixture:
-1. Start alchemy server on random port
-2. Start N stub daemons pointing to that server (with mock GPU monitor)
-3. Tests use REST API to submit tasks and assert state transitions
-
-### Test Cases
-
-#### `test_full_flow.py`
-1. Start server
-2. Start 1 stub → assert stub appears in `GET /stubs` with status "online"
-3. Submit `fake_train.py` (runs 10 steps, prints progress, exits 0) → assert task transitions: queued → running → completed
-4. Assert exit_code == 0
-5. Assert log buffer contains expected output
-6. Disconnect stub → assert status "offline"
-
-#### `test_concurrent.py`
-1. Start stub with max_concurrent=2
-2. Submit 3 tasks (fake_train_slow.py, sleeps 5s each)
-3. Assert 2 running + 1 queued
-4. When first completes → queued one starts
-5. All complete → assert 3 completed
-
-#### `test_task_lifecycle.py`
-1. Submit fake_train_slow.py (runs 60s)
-2. Pause → assert status "paused", process stopped
-3. Resume → assert status "running"
-4. Kill → assert status "killed"
-
-#### `test_reconnect.py`
-1. Start stub, submit long task
-2. Kill stub process (simulate network drop)
-3. Assert server marks stub "stale" after missed heartbeats
-4. Restart stub with same token
-5. Assert stub re-registers, task still shows as running (subprocess survived parent reconnect? or mark as unknown)
-
-#### `test_sdk_reporting.py`
-1. Start server + stub
-2. Submit task that uses SDK to report progress
-3. Assert progress updates appear in task state via REST API
-4. Assert log throttling works (not flooded)
-
-### Mock Scripts
-
-**`fake_train.py`**
+SDK 侧：
 ```python
-import time, sys, os
-steps = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-for i in range(steps):
-    print(f"Training: {i+1}/{steps} loss={1.0/(i+1):.4f}")
-    sys.stdout.flush()
-    time.sleep(0.5)
-print("Done!")
+run_dir = os.environ["ALCHEMY_RUN_DIR"]  # Always set by stub
+# SDK never computes run_dir independently — server is authoritative
 ```
 
-**`fake_train_crash.py`**
-```python
-import time, sys
-for i in range(5):
-    print(f"Step {i}")
-    time.sleep(0.3)
-raise RuntimeError("CUDA OOM (fake)")
-```
+Fingerprint-based → same params always map to same directory → checkpoint reuse automatic.
 
-**`fake_train_slow.py`**
-```python
-import time, signal, sys
-signal.signal(signal.SIGTERM, lambda s,f: (print("Got SIGTERM, exiting"), sys.exit(0)))
-duration = int(sys.argv[1]) if len(sys.argv) > 1 else 60
-start = time.time()
-while time.time() - start < duration:
-    print(f"Running... {time.time()-start:.0f}s/{duration}s")
-    sys.stdout.flush()
-    time.sleep(1)
-```
-
-## Resilience & Fault Tolerance
-
-### Stub: Never Dies
-
-Stub 的设计原则：**除非收到显式 shutdown 指令或 SLURM walltime 到期，永不退出。**
-
-1. **顶层 try-catch-restart**: main loop 被 try/except 包裹，任何未捕获异常只打日志不退出，sleep 5s 重来
-2. **socket.io 断连**: 自动重连，指数退避（1s → 2s → 4s → ... → 60s cap），永不放弃
-3. **子进程崩溃不影响 stub**: task 挂了就标记 failed，stub 继续活着等下一个任务
-4. **GPU monitor 异常**: nvidia-smi 超时/报错 → 跳过本轮上报，不影响任务执行
-5. **磁盘满**: 日志 buffer 在内存，不写本地文件（可选写），不会因磁盘满挂掉
-6. **OOM 防护**: stub 自身内存极小（< 50MB），log buffer 有上限（500行 ring buffer）
-
-### Server: 可重启
-
-1. **State snapshot**: 每 60s 将 stubs/tasks 状态写到 `state.json`，重启时恢复
-2. **Server 重启后**: stub 自动重连 → re-register → server 从 snapshot + stub 上报重建状态
-3. **Graceful shutdown**: SIGTERM → 通知所有 stub "server restarting" → stub 保持任务运行，等重连
-4. **Server crash**: stub 检测到断连，继续跑任务，持续尝试重连。任务不中断。
-
-### Stub 重启恢复
-
-如果 stub 进程本身被 kill 了（不是 SLURM job 结束）：
-1. 子进程是独立的 process group，不会随 stub 死亡 — 使用 `setsid` / `start_new_session=True`
-2. Stub 重启后扫描自己的 PID 文件（`/tmp/alchemy_stub_tasks.json`），尝试 re-attach 存活的进程
-3. 能 attach → 标记 running，继续监控
-4. 不能 attach → 标记 unknown，报给 server，让用户决定
-
-### 双向心跳
-
-- Stub → Server: heartbeat 每 30s
-- Server → Stub: pong 确认
-- Stub 连续 3 次没收到 pong → 主动断开重连（防止半开连接）
-- Server 连续 3 次没收到 heartbeat → 标记 stub stale（但不 kill 任务）
-
-### 幂等操作
-
-- 所有 task 操作幂等: 重复 kill 已 killed 的 task → no-op
-- 重复 register → 更新信息，不创建新 stub
-- 重复 task.run 同一 task_id → 忽略（防止重连后重复下发）
-
-## Security Notes
-
-- Stub auth via token (generated by server, passed as CLI arg or env var)
-- Invalid token → connection rejected
-- Rate limit on socket events to prevent abuse
-- Commands are plain strings — trusted environment (internal cluster only)
-- Task commands: use shlex.split, no shell=True
-- Remote shell: shell=True, 仅限 escape 模式（见下）
-
-### Remote Shell (Escape Hatch)
-
-Stub 支持远程执行任意 shell 命令，用于调试和紧急操作。
-
-**Server → Stub event:**
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `shell.exec` | `{ id, command, timeout? }` | 执行 shell 命令 |
-
-**Stub → Server event:**
-| Event | Payload | Description |
-|-------|---------|-------------|
-| `shell.result` | `{ id, stdout, stderr, exit_code, timed_out }` | 执行结果 |
-
-- 默认 timeout 30s，可配
-- `shell=True`，能跑任何命令（cd、pip install、nvidia-smi、kill 等）
-- Dashboard 提供 terminal-like UI：输入框 + 输出区域
-- REST API: `POST /api/stubs/:id/shell` `{ command, timeout? }` → 同步返回结果
-
-**用途:** 紧急修环境、查文件、装依赖、手动 kill 进程、排查问题。相当于远程 SSH 的替代品。
-
-## Deployment
-
-For now (our use case):
-- Server runs in existing container (alongside current alchemy or replaces it)
-- Cloudflare tunnel exposes server
-- Stub is launched inside SLURM job: `python -m alchemy_stub --server wss://... --token ...`
-- SDK is pip-installed in training conda env
-
-## Stub Types
-
-Stub 统一架构，不区分 SLURM / workstation。只是元数据不同：
-
-```typescript
-interface Stub {
-  // ... existing fields ...
-  type: "slurm" | "workstation";  // 自动检测：有 SLURM_JOB_ID 就是 slurm
-  slurm?: {
-    job_id: string;
-    partition: string;       // a40, a30, a100
-    walltime_remaining_s: number;
-    node: string;
-  };
-}
-```
-
-Dashboard 上两种 stub 同一页面展示，可按 type 过滤。
-
-## SLURM Auto-Queue (占坑机)
-
-Server 自动维持 SLURM GPU 占用率，确保 QOS 上限打满。
-
-### 配置
-
-```typescript
-interface SlurmPoolConfig {
-  enabled: boolean;
-  ssh_target: string;           // "gpucluster2" or "hw2025@gpucluster2"
-  submit_script: string;        // path to submit script on cluster
-  max_concurrent_jobs: number;  // QOS 上限，e.g. 3
-  partitions: string[];         // ["a40", "a30", "a100"]，优先级从左到右
-  default_walltime: string;     // "72:00:00"
-  default_mem: string;          // "64G"
-  stub_command: string;         // stub 启动命令模板
-  min_queue_ahead: number;      // 至少保持 N 个 pending job，默认 1
-}
-```
-
-### 逻辑
-
-```
-每 60s 检查:
-  active_stubs = online SLURM stubs 数量
-  pending_jobs = squeue 中 PENDING 的我们的 job 数量
-  total = active_stubs + pending_jobs
-
-  if total < max_concurrent_jobs + min_queue_ahead:
-    # 需要补坑
-    sbatch 新 job → 启动 stub → 自动连回 server
-    # 新 stub 连上后从 task queue 拉任务
-```
-
-### 流程
-
-1. Server 通过 SSH 执行 `squeue -u ys25` 检查当前 job 状态
-2. 发现空位 → `sbatch` 提交新 job（job 内容就是启动 stub）
-3. SLURM 分配到 GPU → stub 启动 → 连接 server → 从全局 task queue 拉任务
-4. 任务跑完 → stub 空闲 → 自动拉下一个
-5. 全局 queue 空了 → stub idle
-6. **Idle 超时释放**: stub 空闲超过 `idle_timeout`（默认 10min）→ stub 自行退出 → SLURM job 结束，释放 GPU
-7. Server 检测到 stub 减少 → 如果还有 pending tasks → 补新 job
-8. **不排新坑条件**: 全局 task queue 为空 → 不提交新 job，避免浪费配额
-
-### SLURM Job 模板
-
-Server 动态生成的 sbatch 脚本：
-```bash
-#!/bin/bash
-#SBATCH --gres=gpu:1
-#SBATCH --mem=64G
-#SBATCH --time=72:00:00
-#SBATCH --partition=a40
-#SBATCH --job-name=alchemy-stub
-
-export PATH="/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH"
-python -m alchemy_stub \
-  --server wss://alchemy.example.com \
-  --token ${TOKEN} \
-  --env-setup "export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:\$PATH"
-```
-
-### Dashboard UI
-
-- SLURM Pool 面板：当前 active/pending/max，一键开关
-- 手动触发排队按钮
-- 历史：GPU 占用率时间线
-
-## Grid Tasks（参数网格）
-
-批量参数扫描，一次定义，自动展开为多个 task。
-
-### 数据模型
-
-```typescript
-interface GridTask {
-  id: string;
-  name: string;                    // e.g. "ctx_ablation"
-  command_template: string;        // "python train.py --config {config_path}"
-  parameters: Record<string, any[]>;  // {"context_len": [1,2,4,...], "seed": [42,123,789]}
-  cells: GridCell[];               // 自动展开的每个组合
-  status: "pending" | "running" | "completed" | "partial";
-  created_at: string;
-}
-
-interface GridCell {
-  id: string;
-  grid_id: string;
-  params: Record<string, any>;     // {"context_len": 128, "seed": 42}
-  task_id?: string;                // 关联的 task
-  status: "pending" | "running" | "completed" | "failed";
-  metrics?: Record<string, number>; // 从 run_dir/metrics.json 读取
-}
-```
-
-### 参数传递：双模式
-
-#### 模式 B: SDK Param API（新代码推荐）
-
-Server 通过环境变量 `ALCHEMY_PARAMS` 注入参数，SDK 读取：
+#### Example
 
 ```python
-from aichemy_sdk import Alchemy
 al = Alchemy()
 
-ctx = al.param("context_len")       # 单个参数
-seed = al.param("seed", default=42) # 带默认值
-config = al.params()                # 整个 dict: {"context_len": 128, "seed": 42}
+@al.managed(total_steps=500000, eval_every=10000, checkpoint_every=50000,
+            reads=["data/atari/"])
+def train(ctx: TrainingContext):
+    model = build_model(ctx.params)
+    optimizer = make_optimizer(model, ctx.params)
+
+    if ckpt := ctx.latest_checkpoint():
+        state = torch.load(ckpt)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        start = state["step"]
+    else:
+        start = 0
+
+    for step in ctx.steps(start=start):
+        loss = train_step(model, batch)
+        ctx.log(loss=loss)
+        if ctx.should_eval():
+            ctx.log_eval(evaluate(model))
+        if ctx.should_checkpoint():
+            ctx.save_checkpoint({"model": model.state_dict(),
+                                 "optimizer": optimizer.state_dict(),
+                                 "step": step})
+        if ctx.should_stop():
+            break
+
+    return {"final_loss": loss}  # auto al.done()
 ```
 
-Stub 启动 task 时设置环境变量：
+**TrainingContext is not magic:**
+- `ctx.steps()` → iterator + `al.log(step=i, total=total_steps)`
+- `ctx.should_eval()` → `step % eval_every == 0 or al.should_eval()`
+- `ctx.should_checkpoint()` → `step % checkpoint_every == 0 or al.should_checkpoint()`
+- `ctx.save_checkpoint(sd)` → `torch.save(sd, path)` + `al.checkpoint(path)`
+
+### Preflight
+
+**AOP preflight** (runs before training function):
+
+| Check | Action | On fail |
+|-------|--------|---------|
+| `reads` exist | `os.access(path, R_OK)` | raise immediately |
+| `run_dir` writable | `os.access(parent, W_OK)` | raise immediately |
+| Directories | `os.makedirs(path, exist_ok=True)` | auto-create, umask 002 |
+| Disk space | `shutil.disk_usage(path)` | warning if < 1G |
+| Checkpoint | existing ckpt in checkpoint_dir | set `ctx.is_resume = True` |
+| GPU | `torch.cuda.is_available()` | raise |
+
+**Stub preflight** (runs before any task, AOP or not):
+
+- `cwd` exists and accessible
+- `script` file exists (for `python xxx.py` form)
+- `run_dir` parent writable (if declared)
+- `.alchemy_owner` check (see §2)
+- Fail → emit `preflight.fail`, task → failed, no subprocess spawned.
+
+#### Test Cases — SDK & AOP
+
+```
+T1: SDK initialized without env vars. al.params() returns {}.
+    al.log() does nothing. al.should_stop() returns False. → No crash, no IO.
+
+T2: AOP mode, first run. No checkpoint exists.
+    → ctx.is_resume = False. ctx.latest_checkpoint() = None. Training from scratch.
+
+T3: AOP mode, same fingerprint re-run. Checkpoint exists from previous run.
+    → ctx.is_resume = True. ctx.latest_checkpoint() returns path. Resumes.
+
+T4: AOP mode, preflight: reads=["data/nonexistent/"].
+    → Raises before GPU allocation. Task fails with clear error.
+
+T5: SDK heartbeat stops for 60s but PID alive.
+    → Stub marks task "zombie". Frontend shows warning.
+
+T6: Unix socket unavailable. ALCHEMY_SERVER set.
+    → SDK falls back to HTTP POST. should_* always false.
+
+T7: Both socket and HTTP unavailable.
+    → SDK no-op. Training runs normally, just no reporting.
+```
+
+---
+
+## 9. Stub
+
+### Startup
+
 ```bash
-ALCHEMY_PARAMS='{"context_len":128,"seed":42}' python train.py
+python -m alchemy_stub \
+  --server wss://alchemy-v2.yuzhes.com \
+  --token <token> \
+  --max-concurrent 3 \
+  --env-setup "export PATH=/.../bin:\$PATH" \
+  --default-cwd /vol/bitbucket/ys25/jema \
+  --idle-timeout 600    # SLURM: exit when idle 10min. Default: infinity.
 ```
 
-SDK 实现：
+### Singleton (flock)
+
+One stub per identity (hostname + GPU config) per machine:
+
 ```python
-def param(self, key: str, default=None):
-    params = json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
-    if key not in params and default is None:
-        raise KeyError(f"Parameter '{key}' not found. Available: {list(params.keys())}")
-    return params.get(key, default)
+import fcntl
 
-def params(self) -> dict:
-    return json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
+lock_path = f"/tmp/alchemy_stub_{identity_hash}.lock"
+lock_fd = open(lock_path, "w")
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    lock_fd.write(f"{os.getpid()}\n")
+    lock_fd.flush()
+except BlockingIOError:
+    sys.exit("Another stub is already running with this identity")
+# lock_fd held open for process lifetime. Kernel releases on any exit.
 ```
 
-#### 模式 C: Config 生成（现有代码兼容）
+Different GPU configs (e.g., one stub for gpu0, another for gpu1) = different identity hash = can coexist.
 
-Server 拿 base YAML + grid 参数 → 生成临时 config 文件 → 通过 `{generated_config_path}` 传给命令。
+### Self-Check (on startup)
+
+```python
+def stub_self_check():
+    assert os.access("/tmp", os.W_OK), "/tmp not writable"
+    assert test_connection(server_url), "Cannot reach server"
+```
+
+Passes → stub environment OK. Stub itself only writes to `/tmp` (lock file + Unix sockets). Task output goes to user-specified paths, checked per-task by preflight.
+
+### Environment Model
+
+```
+Execution order: stub env_setup → task env_setup → task env vars → ALCHEMY_* → command
+```
+
+1. **Stub default**: `--env-setup`, inherited by all tasks
+2. **Task level**: `env_setup` field overrides
+3. **Auto-injected**: `ALCHEMY_TASK_ID`, `ALCHEMY_STUB_SOCKET`, `ALCHEMY_PARAMS`
+
+### umask
+
+`os.umask(0o002)` on stub startup. All subprocesses inherit. Output files are group-writable.
+
+### Metrics Collection
+
+Every 30s with heartbeat, via psutil:
+
+```python
+def collect_system_stats(tasks: dict[str, int]) -> SystemStats:
+    return {
+        "cpu_pct": psutil.cpu_percent(),
+        "mem_used_mb": psutil.virtual_memory().used // (1024**2),
+        "mem_total_mb": psutil.virtual_memory().total // (1024**2),
+        "per_task": {
+            task_id: {
+                "cpu_pct": proc.cpu_percent(),
+                "mem_mb": proc.memory_info().rss // (1024**2),
+                "gpu_mem_mb": get_gpu_mem_for_pid(proc.pid),
+            }
+            for task_id, pid in tasks.items()
+            if (proc := psutil.Process(pid)) and proc.is_running()
+        }
+    }
+```
+
+### Unix Socket Server
+
+Per running task: `/tmp/alchemy_task_{task_id}.sock`
+
+- `os.chmod(sock_path, 0o666)` — allow different users to connect
+- SDK → Stub: progress/eval/checkpoint/config/done/heartbeat
+- Stub → SDK: should_stop/should_checkpoint/should_eval signals
+- Task ends → socket cleaned up
+
+### Hot Update (Graceful Restart)
+
+```python
+def handle_sigusr1(signum, frame):
+    stub.accepting_tasks = False
+    stub.notify_server("draining")
+    await wait_for_tasks(timeout=300)  # Wait up to 5min
+    sys.exit(0)  # Outer loop restarts new version
+
+signal.signal(signal.SIGUSR1, handle_sigusr1)
+```
+
+Outer loop (SLURM):
+```bash
+while true; do
+    python -m alchemy_stub --server ... --token ...
+    echo "Restarting in 5s..."
+    sleep 5
+done
+```
+
+New stub process → resume with running state from previous instance.
+
+### SLURM Walltime 感知
+
+Stub 检测 SLURM 剩余 walltime，自动优雅排空：
+
+```python
+def get_remaining_walltime() -> int | None:
+    """返回剩余秒数。非 SLURM 环境返回 None。"""
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        return None
+    result = subprocess.run(
+        ["squeue", "-j", job_id, "-h", "-o", "%L"],
+        capture_output=True, text=True
+    )
+    return parse_slurm_time(result.stdout.strip())
+```
+
+**排空策略：**
+```
+剩余 walltime < drain_threshold (默认 10min):
+  1. 停止接受新任务 (accepting_tasks = False)
+  2. 所有 running tasks 发 should_checkpoint 信号
+  3. 等 60s 让 checkpoint 完成
+  4. 所有 running tasks 发 should_stop 信号
+  5. 等 tasks 退出（最多等到 walltime - 2min）
+  6. 通知 server: "draining:walltime"
+  7. 未完成的 tasks → server 标记 lost，自动 requeue
+
+每 60s 检查一次 walltime。
+```
+
+### Stub 标签
+
+Stub 支持 tags，用于任务路由到一组 stub 而非特定 stub：
+
+```bash
+python -m alchemy_stub --server ... --tags a40-cluster,ys25
+```
+
+Task 提交时可指定 `target_tags`：
+```bash
+alchemy submit train.py --tag a40-cluster
+```
+
+Scheduler 只考虑包含该 tag 的 stubs。无 tag 约束 = 所有 stub 都参与。
+
+Tags 持久化在 stub 记录中，`PATCH /stubs/:id` 可修改。
+
+### Resilience
+
+- Top-level try/catch: uncaught exception → log + sleep 5s → restart
+- socket.io disconnect: auto-reconnect, exponential backoff 1s→60s, never give up
+- Subprocess crash: mark failed, stub continues
+- GPU monitor error: skip round, no impact on tasks
+- OOM protection: stub itself < 50MB, log ring buffer 500 lines
+
+#### Test Cases — Stub
+
+```
+T1: Start two stubs with same identity on same machine.
+    → Second one fails immediately: "Another stub is already running".
+
+T2: Stub crashes (kill -9). Start another.
+    → flock released by kernel. New stub acquires lock. Starts normally.
+
+T3: Stub starts, /tmp is writable, server reachable. Self-check passes.
+    → Connects, sends resume, receives resume_response.
+
+T4: Stub idle for 600s, --idle-timeout=600.
+    → Stub exits. SLURM job ends.
+
+T5: SIGUSR1 sent to stub with 2 running tasks.
+    → Stops accepting new tasks. Waits for tasks to finish. Exits. Outer loop restarts.
+
+T6: Stub subprocess exits 137 (OOM). Stub itself still running.
+    → task.failed emitted. Next queued task dispatched.
+
+T7: SDK heartbeat missing for 60s, PID alive. Stub marks task zombie.
+    → Server notified. Frontend shows warning.
+```
+
+---
+
+## 10. Web Frontend
+
+### TaskRow
+
+```
+#42  train_atari.py  config=atari_ctx512_s42
+     RUNNING  3h22m  15000/300000 (5%)  loss=0.034  ETA 2h
+     gpu22-2080ti
+```
+
+- Main: `#{seq} {display_name}`
+- Sub: status badge, duration, progress bar, loss, ETA
+- Right: stub name, action buttons
+- `command` only in expanded detail panel
+
+### StubCard
+
+```
+┌─────────────────────────────┐
+│ gpu22-2080ti          🟢    │
+│ RTX 2080 Ti  11G           │
+│ ████████░░ 80% GPU         │
+│ ████░░░░░░ 4.2/11G VRAM   │
+│ 1/2 tasks  ⏳ 3 queued     │
+└─────────────────────────────┘
+```
+
+### TaskForm
+
+```
+┌─────────────────────────────────────────┐
+│ Script:   [python train_atari.py      ] │
+│ Args:     [--config] [configs/xxx.yaml] │
+│           [--seed  ] [42              ] │
+│ Name:     [atari_ctx512_s42           ] │  ← optional
+│ cwd:      [(inherit from stub)        ] │
+│ GPU mem:  [15000] MB                    │  ← optional
+│                                         │
+│ [Submit to Queue]  [Submit to Stub ▼]   │
+└─────────────────────────────────────────┘
+```
+
+### Pages
+
+- **Dashboard**: All stubs + running tasks + global queue
+- **Grid view**: Tasks grouped by grid, comparison table (params × metrics)
+- **Resources** (`/resources`): All stubs GPU/CPU/MEM, global queue depth, online/offline count
+
+### Load Strategy
+
+Frontend opens → REST fetch cached data → render immediately → WebSocket for incremental updates.
+
+```typescript
+const overview = await api.get("/overview");
+const stubs = await api.get("/stubs");
+// then WebSocket overlay
+```
+
+---
+
+## 11. Notifications
+
+Discord webhook. Plain text only (no embeds).
+
+Three events:
+- `completed`: `✅ #42 train_atari.py config=ctx512_s42 completed (3h22m, loss=0.034)`
+- `failed`: `❌ #42 train_atari.py config=ctx512_s42 failed (exit 137, OOM)`
+- `lost`: `⚠️ #42 train_atari.py config=ctx512_s42 lost (stub gpu22-2080ti disconnected)`
+
+Grid summary when all tasks finish:
+`📊 Grid "atari_expansion" done: 15/18 completed, 3 failed. Best loss: 0.028 (seed=42, ctx=512)`
+
+---
+
+## 12. CLI
+
+```bash
+# Single task
+alchemy submit python train_atari.py --config configs/x.yaml --seed 42
+
+# With options
+alchemy submit python train.py --seed 42 \
+  --alchemy-name "my_experiment" \
+  --alchemy-gpu-mem 15000 \
+  --alchemy-stub gpu22-2080ti    # direct to stub, bypass global queue
+
+# Grid
+alchemy grid python train.py \
+  --seed 42,123,789 \
+  --ctx 256,512
+
+# Status
+alchemy status              # overview
+alchemy status 42            # task #42 detail
+alchemy logs 42              # stream task #42 logs
+alchemy cancel 42            # cancel task #42
+alchemy cancel --grid 5      # cancel all tasks in grid #5
+```
+
+All CLI commands are thin wrappers over REST API.
+
+### 项目配置文件 `alchemy.yaml`
+
+放项目根目录，CLI 自动向上查找并加载，不用每次重复 flag：
 
 ```yaml
-# base_ctx_ablation.yaml
-hidden_dim: 512
-total_steps: 500000
-# ... 其他固定参数
+server: wss://alchemy-v2.yuzhes.com
+token: tk_a1b2c3...                     # 或 env: ALCHEMY_TOKEN
+default_cwd: /vol/bitbucket/ys25/jema
+env_setup: "export PATH=/vol/.../bin:$PATH"
+
+deploy:
+  slurm:
+    ssh_host: gpucluster2
+    ssh_user: ys25
+    partition: gpu
+    mem: 60G
+    time: "8:00:00"
+    python_path: /vol/.../bin/python
+  workstations:
+    gpu22:
+      ssh_user: ys25
+      python_path: ~/miniconda/envs/jema/bin/python
+      max_concurrent: 2
+    dipper:
+      ssh_user: ys25
+      python_path: ~/miniconda/envs/jema/bin/python
+      max_concurrent: 5
 ```
 
-Grid 提交时：
-```json
-{
-  "name": "ctx_ablation",
-  "base_config": "configs/base_ctx_ablation.yaml",
-  "parameters": {
-    "context_len": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-    "seed": [42, 123, 789]
-  },
-  "command_template": "python train.py --config {generated_config_path}"
-}
+CLI flag 优先级: 显式 flag > alchemy.yaml > 默认值。
+
+### Metrics 导出
+
+```bash
+# Grid 结果导出
+alchemy export --grid 5 --format csv > results.csv
+alchemy export --grid 5 --format json
+
+# 单任务 metrics
+alchemy export --task 42 --metrics loss,eval_acc --format csv
+
+# 输出示例 (CSV):
+# seed,ctx,final_loss,eval_acc,duration,status
+# 42,256,0.034,0.78,3h22m,completed
+# 123,256,0.041,0.75,3h18m,completed
+# 789,256,0.039,0.76,2h45m,failed
 ```
 
-生成流程：
-1. Stub 收到 `task.run` 时，如果 task 有 `base_config` + `param_overrides`
-2. Stub 读取 base YAML → deep merge 参数覆盖 → 写到临时文件 `{workdir}/.aichemy_configs/{task_id}.yaml`
-3. 命令中 `{generated_config_path}` 替换为临时文件路径
-4. 任务完成后清理临时文件（可选保留）
+Grid 导出自动包含 param_overrides 各字段作为列 + 最终 metrics + 状态。
 
-这样训练代码零修改，只要原来支持 `--config xxx.yaml` 就行。
+### Deploy
 
-#### 两种模式共存
+从本地一键部署 stub 到 SLURM 集群或 workstation。用户需预先配好目标机器的 SSH 和 Python 环境。
 
-- `ALCHEMY_PARAMS` 环境变量**始终注入**（不管哪种模式）
-- 模式 C 额外生成 config 文件
-- 训练代码可以两种都用，也可以只用一种
+```bash
+# SLURM — 通过 SSH 提交 sbatch
+alchemy deploy slurm \
+  --ssh-host gpucluster2 \
+  --ssh-user ys25 \
+  --partition gpu \
+  --gres gpu:a40:1 \
+  --mem 60G \
+  --time 8:00:00 \
+  --qos high \
+  --max-concurrent 3 \
+  --env-setup "export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:\$PATH" \
+  --default-cwd /vol/bitbucket/ys25/jema \
+  --python-path /vol/bitbucket/ys25/conda-envs/jema/bin/python
 
-### Dashboard: 矩阵视图
+# Workstation — SSH 直连启动
+alchemy deploy workstation \
+  --ssh-host gpu22 \
+  --ssh-user ys25 \
+  --max-concurrent 2 \
+  --env-setup "source ~/miniconda/bin/activate jema" \
+  --default-cwd /home/ys25/jema \
+  --python-path ~/miniconda/envs/jema/bin/python
+```
 
-- 热力图矩阵：x=context_len, y=seed
-- 颜色 = status（灰=pending, 蓝=running, 绿=completed, 红=failed）或 metric 值
-- 点击格子 → 跳转到 task 详情
-- 操作：重跑单格、批量 kill、筛选失败的重提交
-- 自动检测缺失格子，一键补提交
+**SLURM 部署流程：**
 
-### REST API
+```
+1. CLI 向 server 请求 stub token (POST /api/tokens)
+2. 组装 sbatch 脚本:
+   #!/bin/bash
+   #SBATCH --partition={partition}
+   #SBATCH --gres={gres}
+   #SBATCH --mem={mem}
+   #SBATCH --time={time}
+   #SBATCH --qos={qos}
+   #SBATCH --job-name=train_{hash[:6]}
+   #SBATCH --output=/tmp/alchemy_stub_%j.out
+
+   while true; do
+       {python_path} -m alchemy_stub \
+           --server {server_url} \
+           --token {token} \
+           --max-concurrent {max_concurrent} \
+           --env-setup "{env_setup}" \
+           --default-cwd {default_cwd}
+       echo "Stub exited, restarting in 5s..."
+       sleep 5
+   done
+
+3. SSH 到 login node，写 sbatch 脚本到 /tmp，执行 sbatch
+4. 返回 SLURM job ID
+5. Stub 上线后自动 resume 到 server
+```
+
+**Workstation 部署流程：**
+
+```
+1. CLI 向 server 请求 stub token
+2. SSH 到目标机器
+3. 在 tmux session (alchemy-stub) 里启动:
+   {python_path} -m alchemy_stub \
+       --server {server_url} --token {token} \
+       --max-concurrent {max_concurrent} ...
+4. 返回确认
+```
+
+**SSH 连接复用：**
+
+CLI 启动 SSH ControlMaster，后续操作复用同一连接，零延迟：
+
+```
+~/.ssh/alchemy/
+  ├── ctrl-gpucluster2    # ControlMaster socket
+  ├── ctrl-gpu22
+  └── ctrl-dipper
+```
+
+```bash
+# deploy 时自动建立 ControlMaster（后台持久连接）
+alchemy deploy slurm --ssh-host gpucluster2 ...
+# → ssh -M -S ~/.ssh/alchemy/ctrl-gpucluster2 -fN gpucluster2
+
+# 后续所有 CLI 操作复用连接，瞬间执行
+alchemy ssh gpucluster2 squeue          # 相当于直接在集群上跑
+alchemy ssh gpu22 nvidia-smi            # workstation 也一样
+alchemy logs 42 --tail                  # 实际是 SSH 过去 tail -f 日志文件
+
+# 手动管理
+alchemy ssh list                        # 列出活跃连接
+alchemy ssh close gpucluster2           # 关闭连接
+```
+
+CLI 内部所有 SSH 调用自动加 `-S ~/.ssh/alchemy/ctrl-{host} -o ControlMaster=auto`。连接不存在时自动建立。
+
+**Stub 自动上传/更新：**
+
+Deploy 时 CLI 将 stub 源码目录 rsync 到目标机器，直接用 `python -m alchemy_stub` 运行，不动用户环境：
+
+```
+1. rsync stub/alchemy_stub/ → {host}:{remote_dir}/alchemy_stub/
+   remote_dir 默认 ~/.alchemy/stub/
+2. 远程检查: {python_path} -c "import socketio, psutil" → 缺依赖则报错提示用户装
+3. 启动: {python_path} -m alchemy_stub --server ... --token ...
+```
+
+不执行 pip install，不改环境。依赖缺了只报错，用户自己装。`--remote-dir` 可自定义上传位置。
+
+**前提条件（用户负责）：**
+- 目标机器 SSH 可达（读 `~/.ssh/config`）
+- Python 环境已装好 stub 依赖（socketio, psutil, aiohttp）
+- `--python-path` 指定正确的 Python 解释器
+
+**凭证管理：**
+
+```bash
+alchemy token list                   # 列出所有 token
+alchemy token create --name gpu22    # 创建 token
+alchemy token revoke gpu22           # 吊销 token
+```
+
+Server 持久化 tokens 到 state.json。每个 token 可绑定到特定 stub name。
+
+### Deploy REST API
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/grids` | 创建 grid task |
-| `GET` | `/api/grids` | 列出所有 grids |
-| `GET` | `/api/grids/:id` | Grid 详情 + 所有 cells |
-| `POST` | `/api/grids/:id/retry-failed` | 重跑所有失败的 cell |
-| `POST` | `/api/grids/:id/cells/:cid/retry` | 重跑单个 cell |
-| `DELETE` | `/api/grids/:id` | Kill 所有 cell 任务 |
+| `GET` | `/tokens` | 列出所有 token |
+| `POST` | `/tokens` | 创建 token `{ name }` → `{ name, token }` |
+| `DELETE` | `/tokens/:name` | 吊销 token |
+
+### SLURM 自动续命
+
+Stub 的 SLURM job 即将到期 + 全局/本地队列仍有 pending tasks → 自动续命。
+
+**触发条件（全部满足）：**
+1. Stub 类型 = slurm
+2. 剩余 walltime < 15min
+3. 存在 pending/queued tasks（本地队列或全局队列有匹配 tag 的任务）
+4. Server 侧 `auto_renew` 标记为 true（deploy 时 `--auto-renew` 开启）
+
+**流程：**
+```
+1. Server 检测到 stub 即将过期 + 有待处理任务
+2. 检查: 该 stub 的 deploy_config 是否保存（deploy 时持久化到 state.json）
+3. 检查: SLURM quota 是否允许 → SSH 到 login node 执行 squeue -u {user} 计数
+4. 检查: 同一 identity 是否已有 pending sbatch job → 有则不重复提交
+5. 全部通过 → SSH 提交新 sbatch（用保存的 deploy_config）
+6. 日志: {"event": "slurm.auto_renew", "old_job": "12345", "new_job": "12346"}
+7. 新 stub 上线后 resume，pending tasks 自动调度
+
+任何检查失败 → 不续命，只告警:
+  {"event": "slurm.renew_skipped", "reason": "quota_exceeded"}
+  Discord: ⚠️ Stub gpu22-a40 SLURM job expiring, auto-renew failed: quota exceeded
+```
+
+**SSH 访问方式：方案 A — Server 容器挂载 SSH Key**
+- Server 部署时挂载 SSH private key（如 `-v ~/.ssh/id_ed25519:/app/ssh_key:ro`）
+- 配置 `ALCHEMY_SSH_KEY_PATH` 指向 key 文件
+- Server 直接 SSH 到 SLURM login node 执行 sbatch/squeue
+- 简单直接，server 跑在受信环境内，无安全顾虑
+
+**安全保证：**
+- flock 防止新旧 stub 同时运行
+- 新 job 只用保存的 deploy_config，不即兴生成
+- 提交前 squeue 验证无重复 pending job
+- 失败只告警不操作，宁可不续也不 corrupt
+- SSH key 权限 600，容器内只读挂载
+
+#### Test Cases — Deploy
+
+```
+T1: alchemy deploy slurm with valid SSH config.
+    → sbatch script generated with correct SLURM directives.
+    → SSH connects, submits job, returns job ID.
+
+T2: alchemy deploy workstation with valid SSH.
+    → SSH connects, starts tmux session, stub starts.
+    → Stub appears online in server within 10s.
+
+T3: Deploy with --python-path pointing to nonexistent path.
+    → SSH succeeds but stub fails to start. User sees error in deploy output.
+
+T4: Token create + revoke.
+    → Created token works for stub auth. Revoked token → stub rejected (401).
+
+T5: Deploy twice to same workstation.
+    → Second deploy detects existing tmux session, asks to replace or abort.
+
+T6: SLURM stub walltime < 15min, pending tasks exist, auto_renew=true.
+    → Server SSH submits new sbatch. New stub starts after old one exits.
+
+T7: Auto-renew but SLURM quota full.
+    → squeue shows max jobs. Renew skipped. Discord alert sent.
+
+T8: Auto-renew but same identity already has pending sbatch.
+    → Duplicate detected. Renew skipped. No action.
+
+T9: Auto-renew, deploy_config not saved (manual deploy without CLI).
+    → Cannot renew. Warning logged.
+```
 
 ---
 
-## Task DAG 编排
+## 13. Observability
 
-Task 之间可以有依赖关系。
+Alchemy 自身的日志，不是训练任务的日志。
 
-### 数据模型
+### Server 日志
 
-```typescript
-interface Task {
-  // ... existing fields ...
-  depends_on?: string[];           // task IDs that must complete before this starts
-  post_hooks?: string[];           // commands to run after task completes successfully
-}
-```
-
-### 逻辑
-
-- Task 有 `depends_on` → 状态为 `waiting`，不下发给 stub
-- 所有前置 task completed → 状态变 `queued` → 正常调度
-- 任一前置 failed → 状态变 `blocked`，通知用户
-- Server 维护拓扑排序，检测循环依赖
-
-### Post-hooks（轻量版 DAG）
-
-大部分场景不需要完整 DAG，只需要"训练完自动跑 eval"：
+结构化 JSON 日志输出到 stdout：
 
 ```json
-{
-  "command": "python train.py --config ctx128_s42.yaml",
-  "post_hooks": [
-    "python eval_silhouette.py --run {run_dir}",
-    "python probe_multiworld.py --checkpoint {run_dir}/final.pt"
-  ]
-}
+{"ts":"2026-04-24T08:30:00Z","level":"info","event":"stub.resume","stub":"gpu22-2080ti","running":2,"queued":3}
+{"ts":"...","level":"info","event":"task.dispatch","task_seq":42,"stub":"gpu22-2080ti","display_name":"train_atari.py ctx512_s42"}
+{"ts":"...","level":"warn","event":"task.lost","task_seq":42,"stub":"gpu22-2080ti","reason":"stub disconnected"}
+{"ts":"...","level":"error","event":"reliable.gap","stub":"gpu22-2080ti","expected":5,"got":8}
 ```
 
-- `{run_dir}` 等变量由 server 自动替换
-- post_hooks 在同一个 stub 上顺序执行
-- 任一 hook 失败 → 标记 task 为 `completed_with_errors`，不影响主任务状态
+**日志事件分类：**
 
-### Dashboard
+| Category | Events |
+|----------|--------|
+| Lifecycle | `server.start`, `server.stop` |
+| Stub | `stub.resume`, `stub.offline`, `stub.identity_match`, `stub.ghost_kicked` |
+| Task | `task.submit`, `task.dedup_reject`, `task.dispatch`, `task.started`, `task.completed`, `task.failed`, `task.killed`, `task.lost`, `task.retry` |
+| Scheduler | `scheduler.run`, `scheduler.assign`, `scheduler.no_candidate` |
+| Reliable | `reliable.send`, `reliable.ack`, `reliable.nack`, `reliable.gap`, `reliable.retry` |
+| Dedup | `dedup.reject`, `writelock.conflict`, `writelock.acquire`, `writelock.release` |
+| Persistence | `state.save`, `state.backup`, `state.load` |
 
-- DAG 可视化：节点 = task，边 = 依赖
-- Grid 可以作为 DAG 的一个节点（等所有 cell 完成 → 触发后续）
+Level 规则：正常流程 = info，异常但可恢复 = warn，数据丢失/不一致 = error。
 
----
+### Stub 日志
 
-## ManagedTraining SDK（可恢复任务）
-
-SDK 提供 `ManagedTraining` 基类，用户实现 4 个方法，AIchemy 管理其余一切。
-
-### 用户接口
-
-```python
-from aichemy_sdk import ManagedTraining
-
-class MyTraining(ManagedTraining):
-    def setup(self, config: dict):
-        """初始化模型、优化器。首次启动或恢复时调用。"""
-        self.model = build_model(config)
-        self.optimizer = Adam(self.model.parameters())
-        
-    def state(self) -> dict:
-        """导出全部可序列化状态。AIchemy 调用此方法做 checkpoint。"""
-        return {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "step": self.step,
-            "rng": torch.get_rng_state(),
-        }
-    
-    def load_state(self, state: dict):
-        """从 state dict 恢复。"""
-        self.model.load_state_dict(state["model"])
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.step = state["step"]
-        torch.set_rng_state(state["rng"])
-    
-    def step_fn(self, batch) -> dict:
-        """单步训练，返回 metrics。纯计算，无副作用。"""
-        loss = self.model(batch)
-        loss.backward()
-        self.optimizer.step()
-        return {"loss": loss.item()}
-
-# 启动
-if __name__ == "__main__":
-    ManagedTraining.run(MyTraining, config="ctx128_s42.yaml")
-```
-
-### AIchemy 管理的事
-
-- **自动 checkpoint**: 按策略存（每 N 步 / 每 M 分钟 / 收到迁移请求时）
-- **自动上报**: `step_fn` 返回的 metrics 自动通过 SDK 上报
-- **自动恢复**: 启动时检测已有 checkpoint → `setup()` + `load_state()` → 继续
-- **迁移支持**: 收到迁移请求 → `state()` → 序列化到共享存储 → 暂停
-
-### 迁移流程（人工触发）
-
-Dashboard 上显示"建议迁移到 gpu31"，用户点确认后：
-
-1. Server → Stub(旧): `task.checkpoint_and_pause`
-2. Stub(旧): 调 `state()` → 存到共享存储 `{shared_path}/migrate_{task_id}.pt`
-3. Stub(旧): 报告 checkpoint 路径 → task 状态变 `migrating`
-4. Server → Stub(新): `task.run --resume-from {path}`
-5. Stub(新): `setup()` + `load_state()` → 继续训练
-6. 确认新 stub 正常后 → Server → Stub(旧): `task.kill`
-
-**迁移和调度不自动执行，只给建议 + 一键操作。**
-
-### Task 元数据
-
-```typescript
-interface Task {
-  // ... existing fields ...
-  resumable: boolean;              // SDK ManagedTraining 标记
-  checkpoint_path?: string;        // 最新 state 路径
-  run_dir?: string;                // 训练输出目录
-  migration_history?: Array<{
-    from_stub: string;
-    to_stub: string;
-    at_step: number;
-    timestamp: string;
-  }>;
-}
-```
-
----
-
-## 训练异常检测
-
-Stub 和 Server 配合检测训练异常。
-
-### Stall 检测
-
-```typescript
-interface StallConfig {
-  enabled: boolean;
-  no_progress_timeout_min: number;   // 默认 30min — 无新 checkpoint 且无 step 增长
-  gpu_idle_threshold_pct: number;    // GPU 利用率低于此值视为 idle，默认 5%
-  gpu_idle_timeout_min: number;      // GPU 连续 idle N 分钟 → 告警，默认 10min
-}
-```
-
-- Stub 上报 GPU stats，server 检测连续 idle
-- SDK 模式: step 不增长 N 分钟 → 告警
-- 非 SDK 模式: 监控 log 输出频率，长时间无输出 → 告警
-
-### Loss 异常
-
-SDK 模式下：
-- `step_fn` 返回 loss = NaN / Inf → 自动暂停 + Discord 通知
-- loss 突然跳升 10x → 警告（不暂停，可能是正常波动）
-
-### 通知
-
-所有告警发 Discord webhook + dashboard 高亮。**只告警不自动处理**（除了 NaN 暂停）。
-
----
-
-## 智能分配（Heterogeneous-Aware）
-
-提交 task 时可以不指定 stub，server 根据任务需求自动选。
-
-### 显存估算
-
-```typescript
-interface TaskRequirements {
-  estimated_vram_mb?: number;      // 用户手动指定
-  auto_estimate?: boolean;         // 或根据 config 自动估算
-}
-```
-
-自动估算逻辑（基于 config 参数）：
-- `context_len` × `hidden_dim` × `batch_size` → 粗略 VRAM 估算
-- 用历史数据校准（同类 task 实际用了多少显存）
-
-### 分配策略
-
-1. 过滤：VRAM 够的 stub
-2. 优先：空闲 > 低负载 > 高负载
-3. 同类 GPU 优先（避免速度差异影响 seed 间对比）
-4. 如果无合适 stub → 进全局 queue，等 stub 空闲或 SLURM auto-queue 补坑
-
-### 迁移建议（不自动执行）
-
-Server 定期检查：
-- stub 上多个 task 共享 GPU，速度明显慢于单任务 → 建议拆分
-- 有空闲 stub 但繁忙 stub 排了队列 → 建议迁移
-- Dashboard 上显示建议，带"一键迁移"按钮
-
----
-
-## 任务输出目录管理
-
-AIchemy 不管实验逻辑，但帮助 task 维护好输出。
-
-### 约定
-
-- 每个 task 有 `run_dir`（由命令行或 config 决定）
-- Task 完成后 stub 扫描 `{run_dir}/metrics.json`（如果存在）→ 读取 metrics 上报
-- Dashboard 展示 metrics，但不存中心数据库
-- Grid 视图的矩阵颜色可以用 metrics.json 中的值
-
-### metrics.json 格式（约定，不强制）
+同样结构化 JSON，输出到 stderr（stdout 留给子进程）：
 
 ```json
-{
-  "silhouette_l2": 0.543,
-  "nmi": 0.771,
-  "ari": 0.567,
-  "final_loss": 0.023
-}
+{"ts":"...","level":"info","event":"stub.start","identity":"gpu22-2080ti","server":"wss://..."}
+{"ts":"...","level":"info","event":"task.run","task_id":"abc","command":"python train.py ..."}
+{"ts":"...","level":"warn","event":"task.zombie","task_id":"abc","no_heartbeat_s":65}
+{"ts":"...","level":"info","event":"preflight.pass","task_id":"abc"}
+{"ts":"...","level":"error","event":"preflight.fail","task_id":"abc","errors":["cwd not found"]}
+{"ts":"...","level":"info","event":"owner.verified","task_id":"abc","action":"resume"}
 ```
 
-训练代码在结束时写这个文件就行。SDK 模式下可自动生成。
+| Category | Events |
+|----------|--------|
+| Lifecycle | `stub.start`, `stub.stop`, `stub.self_check`, `stub.flock` |
+| Connection | `sio.connect`, `sio.disconnect`, `sio.reconnect`, `resume.sent`, `resume_response` |
+| Task | `task.run`, `task.started`, `task.completed`, `task.failed`, `task.kill_chain`, `task.zombie` |
+| Preflight | `preflight.pass`, `preflight.fail`, `owner.verified`, `owner.conflict` |
+| Reliable | `reliable.send`, `reliable.ack`, `reliable.gap` |
+
+### SDK 日志
+
+SDK 默认静默。设 `ALCHEMY_LOG_LEVEL=debug` 开启，输出到 stderr：
+
+```json
+{"ts":"...","level":"debug","event":"sdk.init","mode":"unix_socket","task_id":"abc"}
+{"ts":"...","level":"debug","event":"sdk.log","step":1000,"total":500000}
+{"ts":"...","level":"warn","event":"sdk.transport_fail","transport":"unix_socket","fallback":"http"}
+```
+
+### CLI 日志
+
+人类可读格式（非 JSON），带颜色：
+
+```
+[10:23:01] ✓ Token created: gpu22-stub (tk_a1b2c3...)
+[10:23:02] ✓ SSH connected: gpu22 (ControlMaster)
+[10:23:03] ✓ Stub uploaded: ~/.alchemy/stub/
+[10:23:04] ✓ Dep check: socketio ✓ psutil ✓ aiohttp ✓
+[10:23:05] ✓ Stub started in tmux session: alchemy-stub
+[10:23:08] ✓ Stub online: gpu22-2080ti
+```
+
+### Server 日志 REST API
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/logs?level=warn&limit=100` | Server 自身日志（内存 ring buffer，最近 10000 条） |
+
+前端可看 server 日志，方便远程调试。
 
 ---
 
-## Out of Scope (for now)
+## 14. State Persistence
 
-- Persistent database（in-memory + JSON snapshot 够用）
-- Multi-user / auth on dashboard
-- 自动迁移 / 自动降级（只给建议，人工确认）
-- 中心化结果数据库（metrics 留在 run_dir）
-- 自动生成论文 figure（耦合太强）
+- **In-memory**: All state in Maps (stubs, tasks, grids, seq counter, write lock table)
+- **Snapshot**: `startPersistence()` called after `listen()` succeeds
+  - Every 60s: atomic write `state.json` (tmp + rename)
+  - Every 30min: backup to `backups/` (keep last 48)
+- **Startup**: Load `state.json` → stubs resume → reconcile
+- **What's persisted**: tasks, stubs (config only, not connection state), grids, seq counter
+- **What's NOT persisted**: write lock table (rebuilt from resume), reliable messaging outbox (reset, resume covers it), metrics ring buffers (ephemeral)
+
+---
+
+## 14. Repository Structure
+
+```
+alchemy-v2/
+├── server/
+│   ├── src/
+│   │   ├── index.ts
+│   │   ├── types.ts              # All interfaces
+│   │   ├── scheduler.ts          # Constraint-aware scheduler
+│   │   ├── reliable.ts           # ReliableEmitter/Receiver
+│   │   ├── dedup.ts              # Fingerprint + write lock
+│   │   ├── notifications.ts     # Discord webhook
+│   │   ├── socket/
+│   │   │   ├── stub.ts           # Stub namespace + resume
+│   │   │   └── web.ts
+│   │   ├── api/
+│   │   │   ├── tasks.ts
+│   │   │   ├── stubs.ts
+│   │   │   ├── grids.ts
+│   │   │   ├── metrics.ts
+│   │   │   └── sdk.ts            # SDK HTTP fallback
+│   │   └── store/
+│   │       ├── index.ts
+│   │       └── backup.ts
+│   ├── package.json
+│   └── tsconfig.json
+├── web/
+│   ├── src/
+│   │   ├── App.tsx
+│   │   ├── pages/
+│   │   │   ├── Dashboard.tsx
+│   │   │   ├── GridView.tsx
+│   │   │   └── Resources.tsx
+│   │   ├── components/
+│   │   │   ├── StubCard.tsx
+│   │   │   ├── TaskRow.tsx
+│   │   │   └── TaskForm.tsx
+│   │   ├── hooks/useSocket.ts
+│   │   └── lib/api.ts
+│   └── package.json
+├── stub/
+│   ├── alchemy_stub/
+│   │   ├── __main__.py
+│   │   ├── daemon.py
+│   │   ├── reliable.py
+│   │   ├── process_mgr.py
+│   │   ├── preflight.py
+│   │   ├── task_socket.py        # Unix socket per task
+│   │   ├── gpu_monitor.py
+│   │   ├── system_monitor.py
+│   │   └── config.py
+│   ├── pyproject.toml
+│   └── requirements.txt
+├── sdk/
+│   ├── alchemy_sdk/
+│   │   ├── __init__.py
+│   │   ├── client.py             # Alchemy class
+│   │   ├── transport.py          # Unix socket + HTTP fallback
+│   │   ├── context.py            # TrainingContext (AOP)
+│   │   └── preflight.py
+│   ├── pyproject.toml
+│   └── requirements.txt
+├── cli/
+│   ├── bin/alchemy               # Entry point
+│   ├── commands/
+│   │   ├── submit.ts
+│   │   ├── grid.ts
+│   │   ├── status.ts
+│   │   ├── cancel.ts
+│   │   ├── deploy.ts             # deploy slurm / deploy workstation
+│   │   └── token.ts              # token create/list/revoke
+│   └── package.json
+├── tests/
+│   ├── server/
+│   │   ├── test_scheduler.ts
+│   │   ├── test_dedup.ts
+│   │   ├── test_reliable.ts
+│   │   └── test_resume.ts
+│   ├── stub/
+│   │   ├── test_preflight.py
+│   │   ├── test_singleton.py
+│   │   └── test_process_mgr.py
+│   ├── sdk/
+│   │   ├── test_client.py
+│   │   ├── test_context.py
+│   │   └── test_transport.py
+│   └── e2e/
+│       ├── test_full_flow.py
+│       ├── test_reconnect.py
+│       └── test_kill_chain.py
+└── docker-compose.yml
+```
+
+---
+
+## 15. Out of Scope (v2.1)
+
+- Persistent database (in-memory + JSON snapshot is enough)
+- Multi-user auth
+- Auto-migration between stubs (manual only)
+- MCP agent interface (v2.2+)
+- Task DAG / dependencies (v2.2+)
+- Centralized result database (metrics stay in run_dir)

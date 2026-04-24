@@ -1,18 +1,21 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "alchemy-stub"
-version = "2.0.0"
-description = "Alchemy v2 GPU job orchestration stub daemon"
+version = "2.1.0"
+description = "Alchemy v2.1 GPU job orchestration stub daemon"
 requires-python = ">=3.10"
 dependencies = [
     "python-socketio[asyncio_client]>=5.10.0",
     "aiohttp>=3.9.0",
     "psutil>=5.9.0",
-    "pyyaml>=6.0",
 ]
+
+[project.optional-dependencies]
+# Install for pynvml-based GPU monitoring (alternative to nvidia-smi subprocess)
+pynvml = ["nvidia-ml-py3>=7.352.0"]
 
 [project.scripts]
 alchemy-stub = "alchemy_stub.__main__:main"

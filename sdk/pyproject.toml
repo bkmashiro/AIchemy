@@ -1,15 +1,21 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "alchemy-sdk"
-version = "2.0.0"
-description = "Alchemy v2 SDK for training scripts"
+version = "2.1.0"
+description = "Alchemy v2.1 SDK — training script integration library"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "requests>=2.28.0",
-]
+# No hard dependencies: requests is optional (HTTP fallback), torch is optional (AOP checkpoint).
+# Both are imported lazily at runtime with graceful degradation.
+dependencies = []
+
+[project.optional-dependencies]
+http = ["requests>=2.28.0"]
+torch = ["torch>=2.0.0"]
+all = ["requests>=2.28.0", "torch>=2.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]

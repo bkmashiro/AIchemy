@@ -1,3 +1,7 @@
+// ============================================================
+// Alchemy v2.1 Types
+// ============================================================
+
 export interface GpuInfo {
   name: string;
   vram_total_mb: number;
@@ -17,91 +21,88 @@ export interface GpuStats {
   gpus: GpuStatEntry[];
 }
 
-export interface TaskProgress {
-  step: number;
-  total: number;
-  loss?: number;
-  metrics?: Record<string, number>;
+export interface SystemStats {
+  cpu_pct: number;
+  mem_used_mb: number;
+  mem_total_mb: number;
+  per_task?: Record<string, { cpu_pct: number; mem_mb: number; gpu_mem_mb?: number }>;
 }
 
 export type TaskStatus =
-  | "queued"
-  | "running"
-  | "paused"
-  | "completed"
-  | "failed"
-  | "killed"
-  | "waiting"
-  | "blocked"
-  | "completed_with_errors"
-  | "migrating"
-  | "interrupted"
-  | "dispatched";
-
-export interface MigrationRecord {
-  from_stub: string;
-  to_stub: string;
-  at_step: number;
-  timestamp: string;
-}
+  | "pending"      // In global queue, unassigned
+  | "queued"       // In stub local queue, waiting
+  | "dispatched"   // Sent to stub, awaiting task.started
+  | "running"      // Executing
+  | "paused"       // SIGSTOP
+  | "completed"    // Exit 0
+  | "failed"       // Non-zero exit
+  | "killed"       // User cancelled
+  | "lost";        // Stub disconnected, fate unknown
 
 export interface Task {
+  // === Identity ===
   id: string;
-  stub_id: string;  // empty string "" when task is in global queue (no stub assigned yet)
-  command: string;
+  seq: number;
+  fingerprint: string;
+  name?: string;
+  display_name: string;
+
+  // === Structured Command ===
+  script: string;
+  args?: Record<string, string>;
+  raw_args?: string;
+
+  // === Environment ===
   cwd?: string;
-  env?: Record<string, string>;
   env_setup?: string;
+  env?: Record<string, string>;
+  python_env?: string;           // e.g. "jema", "base", "~/venv" — resolved to activate command
+
+  // === Assembled (read-only, server builds) ===
+  command: string;
+
+  // === Resources ===
+  requirements?: {
+    gpu_mem_mb?: number;
+    cpu_mem_mb?: number;
+    gpu_type?: string[];
+  };
+
+  // === Scheduling ===
   status: TaskStatus;
-  exit_code?: number;
+  priority: number;
+  stub_id?: string;
+  target_tags?: string[];        // Tag-based routing (scheduler filters stubs by tag)
+
+  // === Grid ===
+  grid_id?: string;
+  param_overrides?: Record<string, any>;
+
+  // === Lifecycle ===
   created_at: string;
   started_at?: string;
   finished_at?: string;
-  progress?: TaskProgress;
-  log_buffer: string[];
+  exit_code?: number;
   pid?: number;
-  // DAG
-  depends_on?: string[];
-  post_hooks?: string[];
-  // Run dir / metrics
-  run_dir?: string;
-  metrics?: Record<string, number>;
-  // ManagedTraining
-  resumable?: boolean;
-  checkpoint_path?: string;
-  migration_history?: MigrationRecord[];
-  // VRAM requirements
-  estimated_vram_mb?: number;
-  auto_estimate?: boolean;
-  // Grid cell reference
-  grid_id?: string;
-  grid_cell_id?: string;
-  // Param passing (Mode B+C)
-  param_overrides?: Record<string, any>;
-  base_config?: string;  // base YAML content for config generation
-  requeued_at?: string;  // timestamp when auto-requeued on reconnect
-  // Retry
-  retry_of?: string;     // original task ID this is a retry of
-  retry_count?: number;  // how many times this task has been auto-retried
-  max_retries?: number;  // max auto-retries (0 = disabled)
-  // Priority queue (0-9, lower = higher priority, default 5)
-  priority?: number;
-  // should_stop flag: set by server to signal SDK tasks to stop gracefully
-  should_stop?: boolean;
-  // Timeout enforcement
-  timeout_s?: number;    // if set, kill task after this many seconds
-  // Failure classification (set by stub via error_classifier)
-  failure_reason?: {
-    reason: string;
-    detail?: string;
-  };
-}
 
-export interface SlurmInfo {
-  job_id: string;
-  partition: string;
-  walltime_remaining_s: number;
-  node: string;
+  // === Progress ===
+  progress?: { step: number; total: number; loss?: number; metrics?: Record<string, number> };
+  log_buffer: string[];
+  config_snapshot?: Record<string, any>;
+
+  // === Metrics buffer (ephemeral, not persisted) ===
+  metrics_buffer?: Record<string, Array<{ step: number; value: number; ts: string }>>;
+
+  // === Resume & Retry ===
+  run_dir?: string;
+  checkpoint_path?: string;
+  retry_count: number;
+  max_retries: number;
+  retry_of?: string;
+
+  // === Server Signals ===
+  should_stop: boolean;
+  should_checkpoint: boolean;
 }
 
 export interface Stub {
@@ -109,156 +110,101 @@ export interface Stub {
   name: string;
   hostname: string;
   gpu: GpuInfo;
+  system_stats?: SystemStats;
   slurm_job_id?: string;
-  slurm_account_id?: string;
-  status: "online" | "offline" | "stale";
+  status: "online" | "offline";
   type: "slurm" | "workstation";
-  slurm?: SlurmInfo;
   connected_at: string;
   last_heartbeat: string;
   max_concurrent: number;
   tasks: Task[];
-  gpu_stats: GpuStats;
-  token: string;
+  gpu_stats?: GpuStats;
+  env_setup?: string;
+  default_cwd?: string;
+  idle_timeout_s?: number;
+  tags?: string[];                 // Stub tags for task routing
+  available_envs?: Array<{ name: string; type: string; path: string; activate?: string }>;  // Python envs on this stub
+  auto_renew?: boolean;            // SLURM: auto-submit new sbatch when walltime < 15min
+  deploy_config?: DeployConfig;    // Persisted deploy config for auto-renew
+  default_output_dir?: string;     // Base dir for server-computed run_dir
+  // Internal — not serialized to API
   socket_id?: string;
-  missed_heartbeats: number;
-  remaining_walltime_s?: number;
-  // Server-side controls
-  auto_release?: boolean;        // shut down stub when all tasks are done
-  idle_timeout_s?: number;       // server-side idle timeout override (seconds)
+}
+
+export interface DeployConfig {
+  type: "slurm" | "workstation";
+  ssh_host: string;
+  ssh_user?: string;
+  partition?: string;
+  gres?: string;
+  mem?: string;
+  time?: string;
+  qos?: string;
+  max_concurrent?: number;
+  env_setup?: string;
+  default_cwd?: string;
+  python_path?: string;
+  server_url?: string;
+  token?: string;
+}
+
+export interface Grid {
+  id: string;
+  name?: string;
+  display_name: string;
+  script: string;
+  base_args?: Record<string, string>;
+  param_space: Record<string, any[]>;
+  task_ids: string[];
+  status: "pending" | "running" | "partial" | "completed" | "failed";
+  created_at: string;
+  max_retries: number;
+  requirements?: Task["requirements"];
+  target_tags?: string[];          // Propagated to all tasks in this grid
 }
 
 export interface Token {
   token: string;
+  name: string;                  // Semantic name (required)
   created_at: string;
-  label?: string;
-  used_by?: string; // stub id
-}
-
-export interface SlurmPoolConfig {
-  enabled: boolean;
-  ssh_target: string;
-  submit_script?: string;
-  max_concurrent_jobs: number;
-  partitions: string[];
-  default_walltime: string;
-  default_mem: string;
-  stub_command: string;
-  min_queue_ahead: number;
-}
-
-// Grid Tasks
-export interface GridCell {
-  id: string;
-  grid_id: string;
-  params: Record<string, any>;
-  task_id?: string;
-  status: "pending" | "running" | "completed" | "failed";
-  metrics?: Record<string, number>;
-}
-
-export interface GridTask {
-  id: string;
-  name: string;
-  command_template: string;
-  base_config?: string;       // base YAML content
-  parameters: Record<string, any[]>;
-  cells: GridCell[];
-  status: "pending" | "running" | "completed" | "partial";
-  created_at: string;
-  stub_id?: string;           // optional target stub
-}
-
-// Anomaly alerts
-export interface AnomalyAlert {
-  id: string;
-  stub_id: string;
-  task_id?: string;
-  type: "stall" | "gpu_idle" | "loss_nan" | "loss_spike" | "no_output";
-  message: string;
-  created_at: string;
-  resolved: boolean;
-}
-
-// Migration suggestion
-export interface MigrationSuggestion {
-  id: string;
-  task_id: string;
-  from_stub: string;
-  to_stub: string;
-  reason: string;
-  created_at: string;
-}
-
-// SLURM Accounts
-export interface SlurmAccount {
-  id: string;
-  name: string;                // e.g. "ys25", "hw2025"
-  ssh_target: string;          // e.g. "ys25@gpucluster2"
-  qos_limit: number;           // max concurrent jobs
-  partitions: string[];        // e.g. ["a40", "a30", "a100"]
-  default_walltime: string;
-  default_mem: string;
-  stub_command: string;        // template for stub launch
-  ssh_key_path?: string;       // path to SSH private key
-}
-
-// SLURM Auto-Queue
-export interface AutoQueueConfig {
-  id: string;
-  account_id: string;
-  max_running: number;         // a: target active/running stubs
-  max_pending: number;         // b: target pending/queued SLURM jobs
-  qos_running_limit: number;   // c: QOS max concurrent running jobs
-  qos_pending_limit: number;   // d: QOS max pending jobs allowed
-  idle_timeout_min: number;    // don't renew if idle this long
-  check_interval_s: number;
-  enabled: boolean;
-}
-
-export interface StallConfig {
-  enabled: boolean;
-  no_progress_timeout_min: number;
-  gpu_idle_threshold_pct: number;
-  gpu_idle_timeout_min: number;
-}
-
-export interface NotificationConfig {
-  discord_webhook_url?: string;
-  enabled: boolean;
-  events: string[];  // "task.completed", "task.failed", "workflow.completed", "workflow.failed", "node.failed"
 }
 
 export interface ServerState {
   stubs: Stub[];
   tokens: Token[];
-  global_queue?: Task[];      // tasks not yet assigned to any stub
-  slurm_pool?: SlurmPoolConfig;
-  grids?: GridTask[];
-  stall_config?: StallConfig;
-  slurm_accounts?: SlurmAccount[];
-  autoqueue_configs?: AutoQueueConfig[];
-  workflows?: Workflow[];
-  workflow_runs?: WorkflowRun[];
-  notification_config?: NotificationConfig;
+  grids: Grid[];
+  seq_counter: number;
+  archive?: Task[];
 }
 
-// Socket event payloads
-export interface RegisterPayload {
+// ─── Reliable Messaging ──────────────────────────────────────────────────────
+
+export interface ReliableMessage {
+  seq: number;
+  event: string;
+  payload: any;
+  ts: number;
+}
+
+// ─── Socket Payloads ─────────────────────────────────────────────────────────
+
+export interface ResumePayload {
   hostname: string;
   gpu: GpuInfo;
   slurm_job_id?: string;
-  slurm_account_id?: string;
   max_concurrent: number;
   token: string;
-  type?: "slurm" | "workstation";
-  slurm?: SlurmInfo;
-  remaining_walltime_s?: number;
+  env_setup?: string;
+  default_cwd?: string;
+  tags?: string[];
+  running_tasks: Array<{ task_id: string; pid: number; step?: number; status: string }>;
+  local_queue: string[];
+  lastSeq: number;
+  available_envs?: Array<{ name: string; type: string; path: string }>;
 }
 
 export interface HeartbeatPayload {
   timestamp: string;
-  remaining_walltime_s?: number;
 }
 
 export interface TaskStartedPayload {
@@ -288,95 +234,32 @@ export interface TaskFailedPayload {
   task_id: string;
   exit_code: number;
   error?: string;
-  failure_reason?: {
-    reason: string;
-    detail?: string;
-  };
 }
 
-export interface ShellResultPayload {
-  id: string;
-  stdout: string;
-  stderr: string;
-  exit_code: number;
-  timed_out: boolean;
+export interface TaskConfigPayload {
+  task_id: string;
+  config: Record<string, any>;
 }
 
-// Workflow Engine
-export type PortType = "dir" | "file" | "checkpoint" | "metrics" | "params" | "bool" | "string" | "number" | "any";
-
-export interface Port {
-  id: string;
-  name: string;
-  type: PortType;
-  required: boolean;
-  value?: any;
+export interface TaskCheckpointPayload {
+  task_id: string;
+  path: string;
 }
 
-export type WorkflowNodeType = "compute" | "copy" | "filter" | "branch" | "merge" | "transform" | "checkpoint_select";
-
-export interface WorkflowNode {
-  id: string;
-  type: WorkflowNodeType;
-  label: string;
-  config: Record<string, any>;  // may include timeout_s for compute nodes
-  position: { x: number; y: number };
-  inputs: Port[];
-  outputs: Port[];
+export interface PreflightFailPayload {
+  task_id: string;
+  errors: string[];
 }
 
-export interface WorkflowEdge {
-  id: string;
-  source_node: string;
-  source_port: string;
-  target_node: string;
-  target_port: string;
+export interface TaskResourcePayload {
+  task_id: string;
+  gpu_mem_mb: number;
+  cpu_mem_mb: number;
+  gpu_util_pct: number;
 }
 
-export interface WorkflowVariable {
-  name: string;
-  type: "string" | "number" | "bool" | "path";
-  description?: string;
-  default?: any;
-  required?: boolean;
-}
-
-export type WorkflowStatus = "draft" | "validating" | "ready";
-
-export interface Workflow {
-  id: string;
-  name: string;
-  description?: string;
-  nodes: WorkflowNode[];
-  edges: WorkflowEdge[];
-  variables?: WorkflowVariable[];
-  status: WorkflowStatus;
-  created_at: string;
-}
-
-// WorkflowRun — execution instance of a Workflow template
-export interface WorkflowRunNode {
-  node_id: string;
-  status: "pending" | "ready" | "running" | "completed" | "failed" | "skipped";
-  task_id?: string;
-  result?: any;
-  started_at?: string;
-  finished_at?: string;
-  exit_code?: number;
-  error?: string;
-  log_buffer?: string[];
-}
-
-export type WorkflowRunStatus = "running" | "completed" | "failed" | "paused" | "cancelled";
-
-export interface WorkflowRun {
-  id: string;
-  workflow_id: string;
-  workflow_snapshot: Workflow;  // snapshot of workflow definition at run creation time
-  variables: Record<string, any>;
-  nodes: WorkflowRunNode[];
-  status: WorkflowRunStatus;
-  created_at: string;
-  started_at: string;
-  finished_at?: string;
+export interface TaskMetricsPayload {
+  task_id: string;
+  metrics: Record<string, number>;
+  step: number;
 }

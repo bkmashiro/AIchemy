@@ -1,125 +1,286 @@
-"""HTTP reporter with throttling — max 1 request per 10s."""
-import subprocess
+"""Transport layer: Unix socket → HTTP fallback → Noop."""
+from __future__ import annotations
+
+import json
+import os
+import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 
-def _query_gpu_metrics() -> list[dict] | None:
-    """Query nvidia-smi for GPU metrics from the training process side."""
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-        gpus = []
-        for line in result.stdout.strip().split("\n"):
-            if not line.strip():
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 5:
-                continue
-            gpus.append({
-                "index": int(parts[0]),
-                "utilization_pct": int(parts[1]),
-                "memory_used_mb": int(parts[2]),
-                "memory_total_mb": int(parts[3]),
-                "temperature_c": int(parts[4]),
-            })
-        return gpus
-    except Exception:
-        return None
+# ---------------------------------------------------------------------------
+# Base / Noop
+# ---------------------------------------------------------------------------
+
+class NoopTransport:
+    """Silent no-op. Used when no stub and no server are available."""
+
+    def send(self, msg: dict) -> None:
+        pass
+
+    def should_stop(self) -> bool:
+        return False
+
+    def should_checkpoint(self) -> bool:
+        return False
+
+    def should_eval(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
 
 
-class ThrottledReporter:
-    """Batches progress reports and sends at most once per THROTTLE_S seconds."""
+# ---------------------------------------------------------------------------
+# HTTP fallback
+# ---------------------------------------------------------------------------
 
-    THROTTLE_S = 10
+class HttpTransport:
+    """POST to /api/sdk/report. Signals always False (no back-channel)."""
 
-    def __init__(self, server: str, task_id: str, collect_gpu: bool = True):
-        self.server = server.rstrip("/")
-        self.task_id = task_id
-        self._collect_gpu = collect_gpu
-        self._pending: dict[str, Any] | None = None
-        self._lock = threading.Lock()
-        self._last_sent = 0.0
-        self._thread = threading.Thread(target=self._flush_loop, daemon=True)
-        self._thread.start()
-        self.should_checkpoint = False
-        self.should_stop = False
+    def __init__(self, server: str, task_id: str) -> None:
+        self._server = server.rstrip("/")
+        self._task_id = task_id
+        self._url = f"{self._server}/api/sdk/report"
 
-    def report(self, **kwargs: Any):
-        """Queue a report. Will be sent on next flush cycle."""
-        with self._lock:
-            self._pending = {"task_id": self.task_id, **kwargs}
-
-    def flush(self):
-        """Force immediate send."""
-        with self._lock:
-            payload = self._pending
-            self._pending = None
-        if payload:
-            self._send(payload)
-
-    def _flush_loop(self):
-        while True:
-            time.sleep(0.5)
-            now = time.time()
-            if now - self._last_sent < self.THROTTLE_S:
-                continue
-            with self._lock:
-                payload = self._pending
-                self._pending = None
-            if payload:
-                # Attach GPU metrics if enabled
-                if self._collect_gpu and "step" in payload:
-                    gpu = _query_gpu_metrics()
-                    if gpu:
-                        payload["gpu_metrics"] = gpu
-                self._send(payload)
-
-    def _send(self, payload: dict[str, Any]):
+    def send(self, msg: dict) -> None:
+        payload = {"task_id": self._task_id, **msg}
         try:
-            resp = self._do_post(payload)
-            if resp.ok:
-                data = resp.json()
-                self.should_checkpoint = data.get("should_checkpoint", False)
-                self.should_stop = data.get("should_stop", False)
-            self._last_sent = time.time()
+            self._post(payload)
         except Exception:
-            pass  # silently fail — don't crash training
+            pass  # never crash training
 
-    def _do_post(self, payload: dict[str, Any]):
-        """HTTP POST with fallback for environments where requests fails (e.g. A30 certs)."""
-        url = f"{self.server}/api/sdk/report"
+    def _post(self, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        headers = {"Content-Type": "application/json"}
         try:
-            import requests
-            return requests.post(url, json=payload, timeout=5)
+            import requests  # type: ignore
+            requests.post(self._url, data=body, headers=headers, timeout=5)
         except Exception:
-            # Fallback: use urllib3 with system certs (works on A30 VMs)
-            import json as _json
+            # Fallback to urllib (works when requests CA certs broken on A30)
             import ssl
             import urllib.request
             ctx = ssl.create_default_context()
-            req = urllib.request.Request(
-                url,
-                data=_json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            resp = urllib.request.urlopen(req, timeout=5, context=ctx)
-            # Return a minimal response-like object
-            class _Resp:
-                ok = 200 <= resp.status < 300
-                status_code = resp.status
-                def json(self_):
-                    return _json.loads(resp.read().decode())
-            return _Resp()
+            req = urllib.request.Request(self._url, data=body, headers=headers, method="POST")
+            urllib.request.urlopen(req, timeout=5, context=ctx)
+
+    def should_stop(self) -> bool:
+        return False
+
+    def should_checkpoint(self) -> bool:
+        return False
+
+    def should_eval(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Unix socket
+# ---------------------------------------------------------------------------
+
+class UnixSocketTransport:
+    """
+    Connect to /tmp/alchemy_task_{task_id}.sock.
+    Sends JSON-line messages to stub; receives signal messages in background thread.
+    Sends heartbeat every 10s.
+    """
+
+    HEARTBEAT_INTERVAL = 10  # seconds
+    RECONNECT_DELAY = 2       # seconds between reconnect attempts
+
+    def __init__(self, sock_path: str, task_id: str) -> None:
+        self._sock_path = sock_path
+        self._task_id = task_id
+
+        # Signal state — written by recv thread, read by main thread
+        self._signals: dict[str, bool] = {
+            "should_stop": False,
+            "should_checkpoint": False,
+            "should_eval": False,
+        }
+        self._signals_lock = threading.Lock()
+
+        # Socket state
+        self._sock: Optional[socket.socket] = None
+        self._sock_lock = threading.Lock()
+        self._closed = False
+
+        # Try initial connection
+        self._connect()
+
+        # Background threads
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True, name="alchemy-recv")
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True, name="alchemy-hb")
+        self._recv_thread.start()
+        self._heartbeat_thread.start()
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> bool:
+        """Try to (re)connect. Returns True on success."""
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(self._sock_path)
+            s.settimeout(None)
+            with self._sock_lock:
+                if self._sock is not None:
+                    try:
+                        self._sock.close()
+                    except Exception:
+                        pass
+                self._sock = s
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Send
+    # ------------------------------------------------------------------
+
+    def send(self, msg: dict) -> None:
+        """Send a JSON-line message. Silently drops if not connected."""
+        line = (json.dumps(msg) + "\n").encode()
+        with self._sock_lock:
+            sock = self._sock
+        if sock is None:
+            return
+        try:
+            sock.sendall(line)
+        except Exception:
+            # Connection broken; clear socket so recv_loop can reconnect
+            with self._sock_lock:
+                self._sock = None
+
+    # ------------------------------------------------------------------
+    # Receive loop
+    # ------------------------------------------------------------------
+
+    def _recv_loop(self) -> None:
+        buf = ""
+        while not self._closed:
+            with self._sock_lock:
+                sock = self._sock
+            if sock is None:
+                time.sleep(self.RECONNECT_DELAY)
+                self._connect()
+                buf = ""
+                continue
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    # Server closed connection
+                    with self._sock_lock:
+                        self._sock = None
+                    buf = ""
+                    continue
+                buf += chunk.decode(errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._handle_message(line)
+            except Exception:
+                with self._sock_lock:
+                    self._sock = None
+                buf = ""
+
+    def _handle_message(self, line: str) -> None:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            return
+        if msg.get("type") == "signal":
+            sig = msg.get("signal", "")
+            with self._signals_lock:
+                if sig in self._signals:
+                    self._signals[sig] = True
+
+    # ------------------------------------------------------------------
+    # Heartbeat loop
+    # ------------------------------------------------------------------
+
+    def _heartbeat_loop(self) -> None:
+        while not self._closed:
+            time.sleep(self.HEARTBEAT_INTERVAL)
+            if not self._closed:
+                self.send({"type": "heartbeat"})
+
+    # ------------------------------------------------------------------
+    # Signal queries (pure — no IO)
+    # ------------------------------------------------------------------
+
+    def should_stop(self) -> bool:
+        with self._signals_lock:
+            return self._signals["should_stop"]
+
+    def should_checkpoint(self) -> bool:
+        with self._signals_lock:
+            return self._signals["should_checkpoint"]
+
+    def should_eval(self) -> bool:
+        with self._signals_lock:
+            return self._signals["should_eval"]
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        self._closed = True
+        with self._sock_lock:
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+
+# ---------------------------------------------------------------------------
+# Auto-select transport
+# ---------------------------------------------------------------------------
+
+def make_transport(
+    task_id: Optional[str],
+    stub_socket: Optional[str],
+    server: Optional[str],
+) -> "NoopTransport | HttpTransport | UnixSocketTransport":
+    """
+    Auto-select transport:
+      1. Unix socket if ALCHEMY_STUB_SOCKET is set and connectable
+      2. HTTP if ALCHEMY_SERVER is set
+      3. Noop otherwise
+    """
+    if not task_id:
+        return NoopTransport()
+
+    # Try Unix socket first — probe before constructing to allow fallback
+    if stub_socket:
+        if _probe_unix_socket(stub_socket):
+            return UnixSocketTransport(stub_socket, task_id)
+        # Socket path set but not reachable — fall through to HTTP
+
+    # Try HTTP fallback
+    if server:
+        return HttpTransport(server, task_id)
+
+    return NoopTransport()
+
+
+def _probe_unix_socket(path: str) -> bool:
+    """Return True if the Unix socket at path is connectable right now."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        s.connect(path)
+        s.close()
+        return True
+    except Exception:
+        return False

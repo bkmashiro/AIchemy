@@ -1,7 +1,18 @@
+/**
+ * metrics.ts — In-memory metrics ring buffer.
+ *
+ * Stub GPU metrics: ~1h at 30s intervals = 120 points (use 360 for safety).
+ * Task metrics: 1000 points per task.
+ * Task direct metrics (task.metrics event): 500 points per metric key per task.
+ * Not persisted (ephemeral).
+ */
+
+export const TASK_METRICS_BUFFER_SIZE = 500;
+
 import { GpuStatEntry } from "./types";
 
 export interface MetricPoint {
-  timestamp: number; // Date.now()
+  timestamp: number;
   values: Record<string, number>;
 }
 
@@ -27,8 +38,7 @@ export class RingBuffer {
     if (this.count < this.maxSize) {
       return this.buffer.slice(0, this.count);
     }
-    // Full: return in chronological order starting from oldest
-    const start = this.head; // head points to oldest when full
+    const start = this.head;
     const result: MetricPoint[] = [];
     for (let i = 0; i < this.maxSize; i++) {
       result.push(this.buffer[(start + i) % this.maxSize]);
@@ -45,9 +55,14 @@ export class RingBuffer {
   }
 }
 
+// Per-key task metrics buffer: task_id → metric_key → [{step, value, ts}]
+type TaskMetricsBuffer = Map<string, Map<string, Array<{ step: number; value: number; ts: string }>>>;
+
 class MetricsStore {
   private stubMetrics: Map<string, RingBuffer> = new Map();
   private taskMetrics: Map<string, RingBuffer> = new Map();
+  // Direct task metrics (from task.metrics event) — keyed per metric name
+  private taskMetricsDirect: TaskMetricsBuffer = new Map();
 
   pushStubMetrics(stubId: string, gpuStats: GpuStatEntry[]): void {
     if (!this.stubMetrics.has(stubId)) {
@@ -59,7 +74,9 @@ class MetricsStore {
       values[`${prefix}.utilization_pct`] = gpu.utilization_pct;
       values[`${prefix}.memory_used_mb`] = gpu.memory_used_mb;
       values[`${prefix}.memory_total_mb`] = gpu.memory_total_mb;
-      values[`${prefix}.temperature_c`] = gpu.temperature_c;
+      if (gpu.temperature_c !== undefined) {
+        values[`${prefix}.temperature_c`] = gpu.temperature_c;
+      }
     }
     this.stubMetrics.get(stubId)!.push({ timestamp: Date.now(), values });
   }
@@ -91,7 +108,36 @@ class MetricsStore {
     return buf.getAll();
   }
 
-  /** Returns latest metric point for each online stub */
+  /** Push structured metrics from the task.metrics socket event. */
+  pushTaskMetricsDirect(taskId: string, step: number, metrics: Record<string, number>): void {
+    if (!this.taskMetricsDirect.has(taskId)) {
+      this.taskMetricsDirect.set(taskId, new Map());
+    }
+    const taskMap = this.taskMetricsDirect.get(taskId)!;
+    const ts = new Date().toISOString();
+    for (const [key, value] of Object.entries(metrics)) {
+      if (!taskMap.has(key)) {
+        taskMap.set(key, []);
+      }
+      const arr = taskMap.get(key)!;
+      arr.push({ step, value, ts });
+      if (arr.length > TASK_METRICS_BUFFER_SIZE) {
+        arr.splice(0, arr.length - TASK_METRICS_BUFFER_SIZE);
+      }
+    }
+  }
+
+  /** Get structured metrics buffer for a task. */
+  getTaskMetricsDirect(taskId: string): Record<string, Array<{ step: number; value: number; ts: string }>> {
+    const taskMap = this.taskMetricsDirect.get(taskId);
+    if (!taskMap) return {};
+    const result: Record<string, Array<{ step: number; value: number; ts: string }>> = {};
+    for (const [key, arr] of taskMap.entries()) {
+      result[key] = [...arr];
+    }
+    return result;
+  }
+
   getLatestStubMetrics(): Record<string, MetricPoint | null> {
     const result: Record<string, MetricPoint | null> = {};
     for (const [stubId, buf] of this.stubMetrics.entries()) {
@@ -99,17 +145,6 @@ class MetricsStore {
       result[stubId] = all.length > 0 ? all[all.length - 1] : null;
     }
     return result;
-  }
-
-  cleanup(activeStubIds: string[], activeTaskIds: string[]): void {
-    const activeStubSet = new Set(activeStubIds);
-    const activeTaskSet = new Set(activeTaskIds);
-    for (const id of this.stubMetrics.keys()) {
-      if (!activeStubSet.has(id)) this.stubMetrics.delete(id);
-    }
-    for (const id of this.taskMetrics.keys()) {
-      if (!activeTaskSet.has(id)) this.taskMetrics.delete(id);
-    }
   }
 }
 

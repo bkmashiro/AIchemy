@@ -1,102 +1,66 @@
+/**
+ * store/index.ts — In-memory state management with JSON persistence.
+ *
+ * State: tasks (inside stubs + global pending queue), stubs, grids, seq counter.
+ * Persistence: atomic write to state.json (tmp + rename) every 60s.
+ *              Backup to backups/ every 30min, keep last 48.
+ */
+
 import fs from "fs";
 import fsp from "fs/promises";
 import path from "path";
-import { Stub, Task, Token, ServerState, SlurmPoolConfig, GridTask, GridCell, AnomalyAlert, MigrationSuggestion, StallConfig, SlurmAccount, AutoQueueConfig, Workflow, WorkflowRun, NotificationConfig } from "../types";
-import { resetAuditLog } from "../audit";
+import { Stub, Task, Grid, Token, ServerState, TaskStatus } from "../types";
+import { writeLockTable } from "../dedup";
+import { backupState, pruneBackups } from "./backup";
+import { logger } from "../log";
 
 const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), "state.json");
 const SNAPSHOT_INTERVAL = 60_000;
-const BACKUP_INTERVAL = 30 * 60_000; // 30 minutes
-const BACKUP_KEEP_COUNT = 48;        // 24 hours at 30-min intervals
+const BACKUP_INTERVAL = 30 * 60_000;
+const BACKUP_KEEP_COUNT = 48;
 export const BACKUPS_DIR = path.join(path.dirname(STATE_FILE), "backups");
+
+// Fingerprint index: fingerprint → task_id (for active tasks only)
+type FingerprintIndex = Map<string, string>;
 
 class Store {
   private stubs: Map<string, Stub> = new Map();
   private tokens: Map<string, Token> = new Map();
-  private globalQueue: Task[] = [];  // tasks not assigned to any stub yet
-  private grids: Map<string, GridTask> = new Map();
-  private alerts: Map<string, AnomalyAlert> = new Map();
-  private migrationSuggestions: Map<string, MigrationSuggestion> = new Map();
-  private slurmAccounts: Map<string, SlurmAccount> = new Map();
-  private autoqueueConfigs: Map<string, AutoQueueConfig> = new Map();
-  private workflows: Map<string, Workflow> = new Map();
-  private workflowRuns: Map<string, WorkflowRun> = new Map();
-  private slurmPool: SlurmPoolConfig = {
-    enabled: false,
-    ssh_target: "gpucluster2",
-    max_concurrent_jobs: 3,
-    partitions: ["a40", "a30", "a100"],
-    default_walltime: "72:00:00",
-    default_mem: "64G",
-    stub_command: "python -m alchemy_stub",
-    min_queue_ahead: 1,
-  };
-  private stallConfig: StallConfig = {
-    enabled: true,
-    no_progress_timeout_min: 30,
-    gpu_idle_threshold_pct: 5,
-    gpu_idle_timeout_min: 10,
-  };
-  private notificationConfig: NotificationConfig = {
-    enabled: false,
-    events: ["task.completed", "task.failed", "workflow.completed", "workflow.failed", "node.failed"],
-  };
+  // Global queue: tasks with no stub assigned (status="pending")
+  private globalQueue: Task[] = [];
+  private grids: Map<string, Grid> = new Map();
+  private seqCounter: number = 0;
+  // Fingerprint index: fingerprint → task_id for active tasks
+  private fingerprintIndex: FingerprintIndex = new Map();
+  // Archive: terminal tasks moved here so they don't clutter stub.tasks
+  private archive: Task[] = [];
 
   constructor() {
     this.load();
-    setInterval(() => this.saveAsync(), SNAPSHOT_INTERVAL);
-    // Auto-backup every 30 minutes
-    setInterval(() => this.autoBackup(), BACKUP_INTERVAL);
   }
 
-  private async autoBackup(): Promise<void> {
-    try {
-      // Save current state first, then back it up
-      await this.saveAsync();
-      const { backupState, pruneBackups } = await import("./backup");
-      await backupState(STATE_FILE, BACKUPS_DIR);
-      await pruneBackups(BACKUPS_DIR, BACKUP_KEEP_COUNT);
-      console.log("[store] Auto-backup completed");
-    } catch (err) {
-      console.error("[store] Auto-backup failed:", err);
-    }
+  // ─── Seq Counter ───────────────────────────────────────────────────────────
+
+  nextSeq(): number {
+    return ++this.seqCounter;
   }
 
-  getStateFile(): string {
-    return STATE_FILE;
+  getSeqCounter(): number {
+    return this.seqCounter;
   }
 
-  getBackupsDir(): string {
-    return BACKUPS_DIR;
-  }
+  // ─── Stubs ─────────────────────────────────────────────────────────────────
 
-  // Stubs
   getStub(id: string): Stub | undefined {
     return this.stubs.get(id);
   }
 
-  getStubByToken(token: string): Stub | undefined {
-    for (const stub of this.stubs.values()) {
-      if (stub.token === token) return stub;
-    }
-    return undefined;
-  }
-
-  getStubByHostnameAndToken(hostname: string, token: string, slurm_job_id?: string): Stub | undefined {
-    for (const stub of this.stubs.values()) {
-      if (stub.token !== token || stub.hostname !== hostname) continue;
-      // For SLURM stubs, match by job ID to allow multiple stubs per host
-      if (slurm_job_id) {
-        if (stub.slurm_job_id === slurm_job_id) return stub;
-      } else if (!stub.slurm_job_id) {
-        return stub;
-      }
-    }
-    return undefined;
-  }
-
   getAllStubs(): Stub[] {
     return Array.from(this.stubs.values());
+  }
+
+  getOnlineStubs(): Stub[] {
+    return Array.from(this.stubs.values()).filter((s) => s.status === "online");
   }
 
   setStub(stub: Stub): void {
@@ -107,9 +71,17 @@ class Store {
     this.stubs.delete(id);
   }
 
-  // Tokens
+  // ─── Tokens ────────────────────────────────────────────────────────────────
+
   getToken(token: string): Token | undefined {
     return this.tokens.get(token);
+  }
+
+  getTokenByName(name: string): Token | undefined {
+    for (const token of this.tokens.values()) {
+      if (token.name === name) return token;
+    }
+    return undefined;
   }
 
   getAllTokens(): Token[] {
@@ -124,50 +96,79 @@ class Store {
     this.tokens.delete(token);
   }
 
-  // SLURM Pool
-  getSlurmPool(): SlurmPoolConfig {
-    return this.slurmPool;
-  }
-
-  setSlurmPool(config: Partial<SlurmPoolConfig>): void {
-    this.slurmPool = { ...this.slurmPool, ...config };
-  }
-
-  // Tasks helpers
-  getTask(stubId: string, taskId: string): Task | undefined {
-    const stub = this.stubs.get(stubId);
-    if (!stub) return undefined;
-    return stub.tasks.find((t) => t.id === taskId);
-  }
+  // ─── Tasks ─────────────────────────────────────────────────────────────────
 
   getAllTasks(): Task[] {
-    const tasks: Task[] = [];
+    const tasks: Task[] = [...this.globalQueue];
     for (const stub of this.stubs.values()) {
       tasks.push(...stub.tasks);
     }
-    // Include global queue tasks
-    tasks.push(...this.globalQueue);
+    tasks.push(...this.archive);
     return tasks;
   }
 
-  // Global Queue
-  getGlobalQueue(): Task[] {
-    return this.globalQueue;
+  /** Active tasks only (no archive). Used by dashboard/stubs. */
+  getActiveTasks(): Task[] {
+    const tasks: Task[] = [...this.globalQueue];
+    for (const stub of this.stubs.values()) {
+      tasks.push(...stub.tasks);
+    }
+    return tasks;
   }
 
-  addToGlobalQueue(task: Task): void {
-    task.stub_id = "";
-    this.globalQueue.push(task);
-    // Maintain sorted order: by priority (lower number = higher priority, default 5), then by created_at
-    this.globalQueue.sort((a, b) => {
-      const pa = a.priority ?? 5;
-      const pb = b.priority ?? 5;
-      if (pa !== pb) return pa - pb;
+  getArchive(): Task[] {
+    return this.archive;
+  }
+
+  setArchive(tasks: Task[]): void {
+    this.archive = tasks;
+  }
+
+  removeFromArchive(taskId: string): Task | undefined {
+    const idx = this.archive.findIndex((t) => t.id === taskId);
+    if (idx === -1) return undefined;
+    const [task] = this.archive.splice(idx, 1);
+    return task;
+  }
+
+  /** Move a terminal task to archive. Removes from stub.tasks. */
+  private _archiveTask(stubId: string, taskId: string, task: Task): void {
+    const stub = this.stubs.get(stubId);
+    if (stub) {
+      stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
+    }
+    this.archive.push(task);
+  }
+
+  /** Move a task from archive back to a stub's task list (for lost→running recovery). */
+  unarchiveTask(stubId: string, taskId: string, update: Partial<Task>): Task | undefined {
+    const idx = this.archive.findIndex((t) => t.id === taskId);
+    if (idx === -1) return undefined;
+    const stub = this.stubs.get(stubId);
+    if (!stub) return undefined;
+    const [task] = this.archive.splice(idx, 1);
+    const recovered = { ...task, ...update };
+    stub.tasks.push(recovered);
+    this._reindexTask(task, recovered);
+    return recovered;
+  }
+
+  getGlobalQueue(): Task[] {
+    // Sorted: priority desc, created_at asc
+    return [...this.globalQueue].sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
       return a.created_at.localeCompare(b.created_at);
     });
   }
 
-  /** Remove a task from the global queue by id. Returns the task if found. */
+  addToGlobalQueue(task: Task): void {
+    task.stub_id = undefined;
+    this.globalQueue.push(task);
+    if (task.fingerprint) {
+      this._indexFingerprint(task);
+    }
+  }
+
   removeFromGlobalQueue(taskId: string): Task | undefined {
     const idx = this.globalQueue.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
@@ -175,24 +176,37 @@ class Store {
     return task;
   }
 
-  /** Update a task in the global queue. */
   updateGlobalQueueTask(taskId: string, update: Partial<Task>): Task | undefined {
     const idx = this.globalQueue.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
-    this.globalQueue[idx] = { ...this.globalQueue[idx], ...update };
-    return this.globalQueue[idx];
+    const prev = this.globalQueue[idx];
+    this.globalQueue[idx] = { ...prev, ...update };
+    const updated = this.globalQueue[idx];
+    this._reindexTask(prev, updated);
+    // Auto-archive: move to archive when transitioning to terminal status
+    if (this._isActive(prev.status) && !this._isActive(updated.status)) {
+      this.globalQueue.splice(idx, 1);
+      this.archive.push(updated);
+    }
+    return updated;
   }
 
-  /** Find a task by id across all stubs AND the global queue. */
-  findTask(taskId: string): { task: Task; stubId: string | null } | undefined {
-    // Search stubs first
+  getTask(stubId: string, taskId: string): Task | undefined {
+    const stub = this.stubs.get(stubId);
+    if (!stub) return undefined;
+    return stub.tasks.find((t) => t.id === taskId);
+  }
+
+  /** Find a task by id across global queue, all stubs, and archive. */
+  findTask(taskId: string): { task: Task; stubId: string | null; archived?: boolean } | undefined {
     for (const stub of this.stubs.values()) {
       const task = stub.tasks.find((t) => t.id === taskId);
       if (task) return { task, stubId: stub.id };
     }
-    // Search global queue
     const gq = this.globalQueue.find((t) => t.id === taskId);
     if (gq) return { task: gq, stubId: null };
+    const arch = this.archive.find((t) => t.id === taskId);
+    if (arch) return { task: arch, stubId: arch.stub_id || null, archived: true };
     return undefined;
   }
 
@@ -201,20 +215,98 @@ class Store {
     if (!stub) return undefined;
     const idx = stub.tasks.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
-    stub.tasks[idx] = { ...stub.tasks[idx], ...update };
-    return stub.tasks[idx];
+    const prev = stub.tasks[idx];
+    stub.tasks[idx] = { ...prev, ...update };
+    const updated = stub.tasks[idx];
+    this._reindexTask(prev, updated);
+    // Auto-archive: move to archive when transitioning to terminal status
+    if (this._isActive(prev.status) && !this._isActive(updated.status)) {
+      this._archiveTask(stubId, taskId, updated);
+    }
+    return updated;
   }
 
-  // Grid Tasks
-  getGrid(id: string): GridTask | undefined {
+  /** Move a task from global queue to a stub's local queue. */
+  moveToStubQueue(taskId: string, stubId: string): Task | undefined {
+    const task = this.removeFromGlobalQueue(taskId);
+    if (!task) return undefined;
+    const stub = this.stubs.get(stubId);
+    if (!stub) {
+      // Put back
+      this.globalQueue.push(task);
+      return undefined;
+    }
+    task.stub_id = stubId;
+    task.status = "queued";
+    stub.tasks.push(task);
+    return task;
+  }
+
+  // ─── Fingerprint Index ─────────────────────────────────────────────────────
+
+  private _activeStatuses: Set<TaskStatus> = new Set([
+    "pending", "queued", "dispatched", "running", "paused",
+  ]);
+
+  private _isActive(status: TaskStatus): boolean {
+    return this._activeStatuses.has(status);
+  }
+
+  private _indexFingerprint(task: Task): void {
+    if (task.fingerprint && this._isActive(task.status)) {
+      this.fingerprintIndex.set(task.fingerprint, task.id);
+    }
+  }
+
+  private _reindexTask(prev: Task, updated: Task): void {
+    // Remove old index entry if status changed to terminal
+    if (prev.fingerprint && this._isActive(prev.status) && !this._isActive(updated.status)) {
+      if (this.fingerprintIndex.get(prev.fingerprint) === prev.id) {
+        this.fingerprintIndex.delete(prev.fingerprint);
+      }
+    }
+    // Add new index entry if status is active
+    if (updated.fingerprint && this._isActive(updated.status)) {
+      this.fingerprintIndex.set(updated.fingerprint, updated.id);
+    }
+    // Handle write lock on terminal transitions
+    if (!this._isActive(updated.status) && updated.run_dir) {
+      writeLockTable.release(updated.run_dir);
+    }
+  }
+
+  /**
+   * Check if a task with the given fingerprint is currently active.
+   * Returns the task_id if found, undefined otherwise.
+   */
+  findActiveByFingerprint(fingerprint: string): string | undefined {
+    return this.fingerprintIndex.get(fingerprint);
+  }
+
+  rebuildFingerprintIndex(): void {
+    this.fingerprintIndex.clear();
+    for (const task of this.getAllTasks()) {
+      if (task.fingerprint && this._isActive(task.status)) {
+        this.fingerprintIndex.set(task.fingerprint, task.id);
+      }
+    }
+  }
+
+  rebuildWriteLocks(): void {
+    writeLockTable.rebuild(this.getAllTasks());
+  }
+
+  // ─── Grids ─────────────────────────────────────────────────────────────────
+
+  getGrid(id: string): Grid | undefined {
     return this.grids.get(id);
   }
 
-  getAllGrids(): GridTask[] {
+  getAllGrids(): Grid[] {
     return Array.from(this.grids.values());
   }
 
-  setGrid(grid: GridTask): void {
+  setGrid(grid: Grid): void {
     this.grids.set(grid.id, grid);
   }
 
@@ -222,202 +314,91 @@ class Store {
     this.grids.delete(id);
   }
 
-  updateGridCell(gridId: string, cellId: string, update: Partial<GridCell>): GridCell | undefined {
+  getGridTasks(gridId: string): Task[] {
+    return this.getAllTasks().filter((t) => t.grid_id === gridId);
+  }
+
+  updateGridStatus(gridId: string): void {
     const grid = this.grids.get(gridId);
-    if (!grid) return undefined;
-    const idx = grid.cells.findIndex((c) => c.id === cellId);
-    if (idx === -1) return undefined;
-    grid.cells[idx] = { ...grid.cells[idx], ...update };
-    // Update grid status
-    const statuses = grid.cells.map((c) => c.status);
-    if (statuses.every((s) => s === "completed")) grid.status = "completed";
-    else if (statuses.some((s) => s === "running")) grid.status = "running";
-    else if (statuses.some((s) => s === "failed") && statuses.every((s) => s === "failed" || s === "completed")) grid.status = "partial";
-    else if (statuses.some((s) => s === "failed")) grid.status = "partial";
-    else if (statuses.some((s) => s === "completed")) grid.status = "running";
+    if (!grid) return;
+    const tasks = this.getGridTasks(gridId);
+    if (tasks.length === 0) return;
+
+    const statuses = tasks.map((t) => t.status);
+    const allCompleted = statuses.every((s) => s === "completed");
+    const anyRunning = statuses.some((s) => ["running", "dispatched", "queued"].includes(s));
+    const anyFailed = statuses.some((s) => ["failed", "killed", "lost"].includes(s));
+    const anyCompleted = statuses.some((s) => s === "completed");
+
+    if (allCompleted) {
+      grid.status = "completed";
+    } else if (anyRunning) {
+      grid.status = "running";
+    } else if (anyFailed && anyCompleted) {
+      grid.status = "partial";
+    } else if (anyFailed && !anyCompleted) {
+      grid.status = "failed";
+    } else {
+      grid.status = "pending";
+    }
+
     this.grids.set(gridId, grid);
-    return grid.cells[idx];
   }
 
-  // Alerts
-  addAlert(alert: AnomalyAlert): void {
-    this.alerts.set(alert.id, alert);
+  // ─── Persistence ───────────────────────────────────────────────────────────
+
+  startPersistence(): void {
+    setInterval(() => this.saveAsync(), SNAPSHOT_INTERVAL);
+    setInterval(() => this._autoBackup(), BACKUP_INTERVAL);
   }
 
-  getAlert(id: string): AnomalyAlert | undefined {
-    return this.alerts.get(id);
-  }
-
-  getAllAlerts(): AnomalyAlert[] {
-    return Array.from(this.alerts.values());
-  }
-
-  resolveAlert(id: string): void {
-    const alert = this.alerts.get(id);
-    if (alert) {
-      alert.resolved = true;
-      this.alerts.set(id, alert);
+  private async _autoBackup(): Promise<void> {
+    try {
+      await this.saveAsync();
+      const filename = await backupState(STATE_FILE, BACKUPS_DIR);
+      await pruneBackups(BACKUPS_DIR, BACKUP_KEEP_COUNT);
+      logger.info("state.backup", { filename });
+    } catch (err) {
+      logger.error("state.backup_failed", { error: String(err) });
     }
   }
 
-  // Migration suggestions
-  addMigrationSuggestion(s: MigrationSuggestion): void {
-    this.migrationSuggestions.set(s.id, s);
-  }
-
-  getAllMigrationSuggestions(): MigrationSuggestion[] {
-    return Array.from(this.migrationSuggestions.values());
-  }
-
-  deleteMigrationSuggestion(id: string): void {
-    this.migrationSuggestions.delete(id);
-  }
-
-  // SLURM Accounts
-  getSlurmAccount(id: string): SlurmAccount | undefined {
-    return this.slurmAccounts.get(id);
-  }
-
-  getAllSlurmAccounts(): SlurmAccount[] {
-    return Array.from(this.slurmAccounts.values());
-  }
-
-  setSlurmAccount(account: SlurmAccount): void {
-    this.slurmAccounts.set(account.id, account);
-  }
-
-  deleteSlurmAccount(id: string): void {
-    this.slurmAccounts.delete(id);
-  }
-
-  // Auto-Queue Configs
-  getAutoQueueConfig(id: string): AutoQueueConfig | undefined {
-    return this.autoqueueConfigs.get(id);
-  }
-
-  getAllAutoQueueConfigs(): AutoQueueConfig[] {
-    return Array.from(this.autoqueueConfigs.values());
-  }
-
-  setAutoQueueConfig(config: AutoQueueConfig): void {
-    this.autoqueueConfigs.set(config.id, config);
-  }
-
-  deleteAutoQueueConfig(id: string): void {
-    this.autoqueueConfigs.delete(id);
-  }
-
-  // Workflows
-  getWorkflow(id: string): Workflow | undefined {
-    return this.workflows.get(id);
-  }
-
-  getWorkflows(): Workflow[] {
-    return Array.from(this.workflows.values());
-  }
-
-  setWorkflow(w: Workflow): void {
-    this.workflows.set(w.id, w);
-  }
-
-  deleteWorkflow(id: string): void {
-    this.workflows.delete(id);
-  }
-
-  // Workflow Runs
-  getWorkflowRun(id: string): WorkflowRun | undefined {
-    return this.workflowRuns.get(id);
-  }
-
-  getWorkflowRuns(workflow_id?: string): WorkflowRun[] {
-    const all = Array.from(this.workflowRuns.values());
-    if (workflow_id) return all.filter((r) => r.workflow_id === workflow_id);
-    return all;
-  }
-
-  setWorkflowRun(run: WorkflowRun): void {
-    this.workflowRuns.set(run.id, run);
-  }
-
-  deleteWorkflowRun(id: string): void {
-    this.workflowRuns.delete(id);
-  }
-
-  // Store reset (for testing)
-  reset(): void {
-    this.stubs.clear();
-    this.tokens.clear();
-    this.globalQueue = [];
-    this.grids.clear();
-    this.alerts.clear();
-    this.migrationSuggestions.clear();
-    this.slurmAccounts.clear();
-    this.autoqueueConfigs.clear();
-    this.workflows.clear();
-    this.workflowRuns.clear();
-    // Reset audit log
-    resetAuditLog();
-  }
-
-  // Stall config
-  getStallConfig(): StallConfig {
-    return this.stallConfig;
-  }
-
-  setStallConfig(cfg: Partial<StallConfig>): void {
-    this.stallConfig = { ...this.stallConfig, ...cfg };
-  }
-
-  // Notification config
-  getNotificationConfig(): NotificationConfig {
-    return this.notificationConfig;
-  }
-
-  setNotificationConfig(cfg: Partial<NotificationConfig>): void {
-    this.notificationConfig = { ...this.notificationConfig, ...cfg };
-  }
-
-  // Persistence
-  private serializeState(): string {
+  private _serializeState(): string {
     const state: ServerState = {
       stubs: Array.from(this.stubs.values()).map((s) => ({
         ...s,
-        socket_id: undefined, // don't persist socket ids
-        status: s.status === "online" ? "offline" : s.status,
+        socket_id: undefined,
+        status: "offline" as const,
       })),
       tokens: Array.from(this.tokens.values()),
-      global_queue: this.globalQueue,
-      slurm_pool: this.slurmPool,
       grids: Array.from(this.grids.values()),
-      stall_config: this.stallConfig,
-      slurm_accounts: Array.from(this.slurmAccounts.values()),
-      autoqueue_configs: Array.from(this.autoqueueConfigs.values()),
-      workflows: Array.from(this.workflows.values()),
-      workflow_runs: Array.from(this.workflowRuns.values()),
-      notification_config: this.notificationConfig,
+      seq_counter: this.seqCounter,
+      archive: this.archive,
     };
     return JSON.stringify(state, null, 2);
   }
 
-  /** Sync save — used by shutdown signal handlers only. */
+  /** Sync save — used only by shutdown handlers. */
   save(): void {
     try {
-      fs.writeFileSync(STATE_FILE, this.serializeState());
+      fs.writeFileSync(STATE_FILE, this._serializeState());
+      logger.info("state.save", { file: STATE_FILE, sync: true });
     } catch (err) {
-      console.error("[store] Failed to save state:", err);
+      logger.error("state.save_failed", { error: String(err) });
     }
   }
 
-  /** Async save — atomic write via temp file + rename. */
+  /** Async atomic save via tmp file + rename. */
   async saveAsync(): Promise<void> {
     try {
-      const data = this.serializeState();
+      const data = this._serializeState();
       const dir = path.dirname(STATE_FILE);
       const tmpFile = path.join(dir, `.state.tmp.${process.pid}`);
       await fsp.writeFile(tmpFile, data);
       await fsp.rename(tmpFile, STATE_FILE);
+      logger.info("state.save", { file: STATE_FILE });
     } catch (err) {
-      console.error("[store] Failed to save state:", err);
+      logger.error("state.save_failed", { error: String(err) });
     }
   }
 
@@ -426,65 +407,17 @@ class Store {
       if (!fs.existsSync(STATE_FILE)) return;
       const raw = fs.readFileSync(STATE_FILE, "utf-8");
       const state: ServerState = JSON.parse(raw);
-
-      for (const stub of state.stubs || []) {
-        stub.missed_heartbeats = 0;
-        stub.status = "offline";
-        this.stubs.set(stub.id, stub);
-      }
-
-      for (const token of state.tokens || []) {
-        this.tokens.set(token.token, token);
-      }
-
-      if (state.global_queue) {
-        this.globalQueue = state.global_queue;
-      }
-
-      if (state.slurm_pool) {
-        this.slurmPool = state.slurm_pool;
-      }
-
-      for (const grid of state.grids || []) {
-        this.grids.set(grid.id, grid);
-      }
-
-      if (state.stall_config) {
-        this.stallConfig = state.stall_config;
-      }
-
-      for (const account of state.slurm_accounts || []) {
-        this.slurmAccounts.set(account.id, account);
-      }
-
-      for (const config of state.autoqueue_configs || []) {
-        this.autoqueueConfigs.set(config.id, config);
-      }
-
-      for (const wf of state.workflows || []) {
-        this.workflows.set(wf.id, wf);
-      }
-
-      for (const run of state.workflow_runs || []) {
-        this.workflowRuns.set(run.id, run);
-      }
-
-      if (state.notification_config) {
-        this.notificationConfig = state.notification_config;
-      }
-
-      console.log(`[store] Loaded state: ${this.stubs.size} stubs, ${this.tokens.size} tokens, ${this.grids.size} grids, ${this.slurmAccounts.size} slurm accounts`);
+      this._applyState(state);
+      logger.info("state.load", { stubs: this.stubs.size, tokens: this.tokens.size, grids: this.grids.size, seq: this.seqCounter });
     } catch (err) {
-      console.error("[store] Failed to load state:", err);
+      logger.error("state.load_failed", { error: String(err) });
     }
   }
 
-  /** Load state from a pre-parsed object (used by restore-from-backup). */
-  loadFromState(state: ServerState): void {
-    this.reset();
-
+  private _applyState(state: ServerState): void {
+    // Load stubs — mark offline, preserve tasks
     for (const stub of state.stubs || []) {
-      stub.missed_heartbeats = 0;
+      stub.socket_id = undefined;
       stub.status = "offline";
       this.stubs.set(stub.id, stub);
     }
@@ -493,18 +426,61 @@ class Store {
       this.tokens.set(token.token, token);
     }
 
-    if (state.global_queue) this.globalQueue = state.global_queue;
-    if (state.slurm_pool) this.slurmPool = state.slurm_pool;
+    for (const grid of state.grids || []) {
+      this.grids.set(grid.id, grid);
+    }
 
-    for (const grid of state.grids || []) this.grids.set(grid.id, grid);
-    if (state.stall_config) this.stallConfig = state.stall_config;
-    for (const account of state.slurm_accounts || []) this.slurmAccounts.set(account.id, account);
-    for (const config of state.autoqueue_configs || []) this.autoqueueConfigs.set(config.id, config);
-    for (const wf of state.workflows || []) this.workflows.set(wf.id, wf);
-    for (const run of state.workflow_runs || []) this.workflowRuns.set(run.id, run);
-    if (state.notification_config) this.notificationConfig = state.notification_config;
+    if (state.archive) {
+      this.archive = state.archive;
+    }
 
-    console.log(`[store] Restored state from backup: ${this.stubs.size} stubs, ${this.tokens.size} tokens`);
+    if (state.seq_counter) {
+      this.seqCounter = state.seq_counter;
+    }
+
+    // On load, move any terminal tasks from stubs to archive
+    for (const stub of this.stubs.values()) {
+      const terminal = stub.tasks.filter((t) => !this._isActive(t.status));
+      if (terminal.length > 0) {
+        stub.tasks = stub.tasks.filter((t) => this._isActive(t.status));
+        this.archive.push(...terminal);
+      }
+    }
+
+    // Rebuild indices after loading
+    this.rebuildFingerprintIndex();
+  }
+
+  loadFromState(state: ServerState): void {
+    this.stubs.clear();
+    this.tokens.clear();
+    this.globalQueue = [];
+    this.grids.clear();
+    this.fingerprintIndex.clear();
+    this.archive = [];
+    this.seqCounter = 0;
+    this._applyState(state);
+    logger.info("state.restore", { stubs: this.stubs.size });
+  }
+
+  getStateFile(): string {
+    return STATE_FILE;
+  }
+
+  getBackupsDir(): string {
+    return BACKUPS_DIR;
+  }
+
+  /** For testing. */
+  reset(): void {
+    this.stubs.clear();
+    this.tokens.clear();
+    this.globalQueue = [];
+    this.grids.clear();
+    this.fingerprintIndex.clear();
+    this.archive = [];
+    this.seqCounter = 0;
+    writeLockTable.clear();
   }
 }
 

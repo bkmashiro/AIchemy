@@ -1,99 +1,191 @@
-"""Tests for should_stop signal propagation through SDK."""
+"""Tests for should_stop/should_checkpoint/should_eval signal handling."""
+import os
 import threading
 import time
 from unittest.mock import MagicMock, patch
+
 import pytest
 
-from alchemy_sdk.transport import ThrottledReporter
+from alchemy_sdk.transport import UnixSocketTransport, NoopTransport, HttpTransport, make_transport
 from alchemy_sdk.client import Alchemy
 
 
-class TestThrottledReporterShouldStop:
-    def test_should_stop_initially_false(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-123", collect_gpu=False)
-        assert reporter.should_stop is False
+class TestNoopTransportSignals:
+    def test_should_stop_false(self):
+        t = NoopTransport()
+        assert t.should_stop() is False
 
-    def test_should_checkpoint_initially_false(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-123", collect_gpu=False)
-        assert reporter.should_checkpoint is False
+    def test_should_checkpoint_false(self):
+        t = NoopTransport()
+        assert t.should_checkpoint() is False
 
-    def test_should_stop_set_from_server_response(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-123", collect_gpu=False)
+    def test_should_eval_false(self):
+        t = NoopTransport()
+        assert t.should_eval() is False
 
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.json.return_value = {"ok": True, "should_checkpoint": False, "should_stop": True}
-
-        with patch.object(reporter, "_do_post", return_value=mock_resp):
-            reporter._send({"task_id": "task-123", "step": 100})
-
-        assert reporter.should_stop is True
-
-    def test_should_checkpoint_set_from_server_response(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-123", collect_gpu=False)
-
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.json.return_value = {"ok": True, "should_checkpoint": True, "should_stop": False}
-
-        with patch.object(reporter, "_do_post", return_value=mock_resp):
-            reporter._send({"task_id": "task-123", "step": 100})
-
-        assert reporter.should_checkpoint is True
-        assert reporter.should_stop is False
-
-    def test_server_error_does_not_change_should_stop(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-123", collect_gpu=False)
-        reporter.should_stop = True  # was True before
-
-        mock_resp = MagicMock()
-        mock_resp.ok = False
-        mock_resp.status_code = 500
-
-        with patch.object(reporter, "_do_post", return_value=mock_resp):
-            reporter._send({"task_id": "task-123", "step": 100})
-
-        # Stays True — server error doesn't clear it
-        assert reporter.should_stop is True
-
-    def test_network_exception_does_not_crash(self):
-        reporter = ThrottledReporter("http://localhost:3001", "task-123", collect_gpu=False)
-
-        with patch.object(reporter, "_do_post", side_effect=Exception("connection refused")):
-            # Should not raise
-            reporter._send({"task_id": "task-123", "step": 1})
-
-        assert reporter.should_stop is False
+    def test_send_noop(self):
+        t = NoopTransport()
+        t.send({"type": "progress", "step": 1, "total": 100})  # must not raise
 
 
-class TestAlchemyClientShouldStop:
-    def test_should_stop_false_without_task_id(self):
-        al = Alchemy(server="http://localhost:3001", task_id="")
-        assert al.should_stop is False
+class TestHttpTransportSignals:
+    def test_should_stop_always_false(self):
+        t = HttpTransport("http://localhost:3001", "task-123")
+        assert t.should_stop() is False
 
-    def test_should_stop_delegates_to_reporter(self):
-        al = Alchemy(server="http://localhost:3001", task_id="task-abc")
-        assert al._reporter is not None
-        al._reporter.should_stop = True
-        assert al.should_stop is True
+    def test_should_checkpoint_always_false(self):
+        t = HttpTransport("http://localhost:3001", "task-123")
+        assert t.should_checkpoint() is False
 
-    def test_should_checkpoint_delegates_to_reporter(self):
-        al = Alchemy(server="http://localhost:3001", task_id="task-abc")
-        assert al._reporter is not None
-        al._reporter.should_checkpoint = True
-        assert al.should_checkpoint is True
+    def test_should_eval_always_false(self):
+        t = HttpTransport("http://localhost:3001", "task-123")
+        assert t.should_eval() is False
 
-    def test_log_does_nothing_without_task_id(self):
-        al = Alchemy(server="http://localhost:3001", task_id="")
-        # Should not raise
-        al.log(step=1, total=100, loss=0.5)
 
-    def test_done_does_nothing_without_task_id(self):
-        al = Alchemy(server="http://localhost:3001", task_id="")
-        al.done()  # no-op, should not raise
+class TestUnixSocketTransportSignals:
+    def test_signals_initially_false(self):
+        """Signal flags start False before any message received."""
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            assert t.should_stop() is False
+            assert t.should_checkpoint() is False
+            assert t.should_eval() is False
+
+    def test_handle_should_stop_signal(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            t._handle_message('{"type": "signal", "signal": "should_stop"}')
+            assert t.should_stop() is True
+            assert t.should_checkpoint() is False
+
+    def test_handle_should_checkpoint_signal(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            t._handle_message('{"type": "signal", "signal": "should_checkpoint"}')
+            assert t.should_checkpoint() is True
+            assert t.should_stop() is False
+
+    def test_handle_should_eval_signal(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            t._handle_message('{"type": "signal", "signal": "should_eval"}')
+            assert t.should_eval() is True
+
+    def test_handle_unknown_signal_ignored(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            t._handle_message('{"type": "signal", "signal": "unknown_signal"}')
+            assert t.should_stop() is False
+
+    def test_handle_malformed_json_ignored(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            t._handle_message("not valid json{{{")
+            # Must not crash, signals stay False
+            assert t.should_stop() is False
+
+    def test_signals_thread_safe(self):
+        """Signals can be set from recv thread and read from main thread."""
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+
+            def set_signal():
+                time.sleep(0.01)
+                t._handle_message('{"type": "signal", "signal": "should_stop"}')
+
+            thread = threading.Thread(target=set_signal)
+            thread.start()
+            thread.join()
+            assert t.should_stop() is True
+
+
+class TestMakeTransport:
+    def test_noop_when_no_task_id(self):
+        t = make_transport(None, None, None)
+        assert isinstance(t, NoopTransport)
+
+    def test_noop_when_task_id_only(self):
+        t = make_transport("task-123", None, None)
+        assert isinstance(t, NoopTransport)
+
+    def test_http_when_server_set(self):
+        t = make_transport("task-123", None, "http://localhost:3001")
+        assert isinstance(t, HttpTransport)
+
+    def test_unix_socket_when_socket_connectable(self):
+        with patch("alchemy_sdk.transport._probe_unix_socket", return_value=True), \
+             patch.object(UnixSocketTransport, "__init__", return_value=None):
+            t = make_transport("task-123", "/tmp/test.sock", None)
+            # _probe returned True, so UnixSocketTransport was constructed
+            assert isinstance(t, UnixSocketTransport)
+
+    def test_http_fallback_when_socket_not_connectable(self):
+        with patch("alchemy_sdk.transport._probe_unix_socket", return_value=False):
+            t = make_transport("task-123", "/tmp/test.sock", "http://localhost:3001")
+        assert isinstance(t, HttpTransport)
+
+    def test_noop_fallback_when_socket_unreachable_and_no_server(self):
+        with patch("alchemy_sdk.transport._probe_unix_socket", return_value=False):
+            t = make_transport("task-123", "/tmp/test.sock", None)
+        assert isinstance(t, NoopTransport)
+
+
+class TestAlchemyClientSignals:
+    def test_should_stop_false_in_noop_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
+                os.environ.pop(k, None)
+            al = Alchemy()
+        assert al.should_stop() is False
+
+    def test_should_checkpoint_false_in_noop_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
+                os.environ.pop(k, None)
+            al = Alchemy()
+        assert al.should_checkpoint() is False
+
+    def test_should_eval_false_in_noop_mode(self):
+        with patch.dict(os.environ, {}, clear=True):
+            for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
+                os.environ.pop(k, None)
+            al = Alchemy()
+        assert al.should_eval() is False
+
+    def test_delegates_should_stop_to_transport(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        al._transport.should_stop.return_value = True
+        assert al.should_stop() is True
+
+    def test_delegates_should_checkpoint_to_transport(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        al._transport.should_checkpoint.return_value = True
+        assert al.should_checkpoint() is True
+
+    def test_delegates_should_eval_to_transport(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        al._transport.should_eval.return_value = True
+        assert al.should_eval() is True
 
     def test_context_manager_calls_done(self):
-        al = Alchemy(server="http://localhost:3001", task_id="")
+        al = Alchemy()
         with patch.object(al, "done") as mock_done:
             with al:
                 pass

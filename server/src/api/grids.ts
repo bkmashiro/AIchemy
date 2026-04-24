@@ -1,311 +1,235 @@
+/**
+ * api/grids.ts — Grid CRUD.
+ *
+ * POST /grids — create grid, generate tasks from cartesian product of param_space.
+ * GET /grids/:id — grid detail + all tasks.
+ * POST /grids/:id/cancel — cancel all running tasks.
+ * POST /grids/:id/retry-failed — retry all failed tasks.
+ */
+
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
+import path from "path";
 import { store } from "../store";
-import { GridTask, GridCell, Task } from "../types";
+import { Grid, Task } from "../types";
 import { Namespace } from "socket.io";
-import { dispatchQueuedTasks } from "../socket/stub";
-import { pickBestStub } from "../scheduler";
-import { logAudit } from "../audit";
+import { createTask, generateDisplayName } from "./tasks";
+import { triggerSchedule } from "../scheduler";
+import { maybeDispatch } from "../scheduler";
+import { initiateKillChain } from "../socket/stub";
+import { computeFingerprint } from "../dedup";
 
-/**
- * Generate all combinations (cartesian product) of parameter values.
- */
-function cartesian(params: Record<string, any[]>): Record<string, any>[] {
+// ─── Cartesian product ────────────────────────────────────────────────────────
+
+function cartesianProduct(params: Record<string, any[]>): Record<string, any>[] {
   const keys = Object.keys(params);
   if (keys.length === 0) return [{}];
 
-  const [first, ...rest] = keys;
-  const restCombinations = cartesian(Object.fromEntries(rest.map((k) => [k, params[k]])));
-
-  const result: Record<string, any>[] = [];
-  for (const val of params[first]) {
-    for (const combo of restCombinations) {
-      result.push({ [first]: val, ...combo });
+  return keys.reduce((results: Record<string, any>[], key) => {
+    const values = params[key];
+    const expanded: Record<string, any>[] = [];
+    for (const result of results) {
+      for (const value of values) {
+        expanded.push({ ...result, [key]: value });
+      }
     }
-  }
-  return result;
+    return expanded;
+  }, [{}]);
 }
 
-/**
- * Substitute {key} placeholders in a template string.
- */
-function interpolate(template: string, vars: Record<string, any>): string {
-  return template.replace(/\{(\w+)\}/g, (_, key) => {
-    return key in vars ? String(vars[key]) : `{${key}}`;
-  });
+// ─── Grid display name ────────────────────────────────────────────────────────
+
+function gridDisplayName(name: string | undefined, script: string, paramSpace: Record<string, any[]>): string {
+  if (name) return name;
+  const base = path.basename(script);
+  const paramSummary = Object.keys(paramSpace)
+    .map((k) => `${k}=[${paramSpace[k].join(",")}]`)
+    .join(" ");
+  return `${base} ${paramSummary}`;
 }
 
-export function createGridsRouter(stubNs: Namespace, webNs: Namespace): Router {
+// ─── Grid status derivation ───────────────────────────────────────────────────
+
+function deriveGridStatus(tasks: Task[]): Grid["status"] {
+  if (tasks.length === 0) return "pending";
+  const statuses = tasks.map((t) => t.status);
+  if (statuses.every((s) => s === "completed")) return "completed";
+  if (statuses.some((s) => ["running", "dispatched", "queued"].includes(s))) return "running";
+  if (statuses.some((s) => ["failed", "killed", "lost"].includes(s)) &&
+      statuses.some((s) => s === "completed")) return "partial";
+  if (statuses.every((s) => ["failed", "killed", "lost"].includes(s))) return "failed";
+  return "pending";
+}
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+
+export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router {
   const router = Router();
 
-  // POST /api/grids — create grid task
+  // POST /grids
   router.post("/", (req: Request, res: Response) => {
-    const { name, command_template, parameters, base_config, stub_id, force } = req.body;
+    const {
+      name, script, base_args, param_space,
+      max_retries, requirements, target_tags,
+    } = req.body;
 
-    if (!name || !command_template || !parameters) {
-      res.status(400).json({ error: "name, command_template, and parameters required" });
-      return;
+    if (!script) { res.status(400).json({ error: "script required" }); return; }
+    if (!param_space || typeof param_space !== "object") {
+      res.status(400).json({ error: "param_space required (object of arrays)" }); return;
     }
-
-    if (typeof parameters !== "object" || Object.values(parameters).some((v) => !Array.isArray(v))) {
-      res.status(400).json({ error: "parameters must be an object of arrays" });
-      return;
-    }
-
-    // Conflict detection: check for existing grid with same name that has completed cells
-    if (!force) {
-      const existingGrid = store.getAllGrids().find((g) => g.name === name);
-      if (existingGrid) {
-        const completedCells = existingGrid.cells.filter((c) => c.status === "completed");
-        if (completedCells.length > 0) {
-          res.status(409).json({
-            error: "Grid with this name already has completed cells",
-            existing_grid_id: existingGrid.id,
-            completed_count: completedCells.length,
-            hint: "Use force: true to override",
-          });
-          return;
-        }
-      }
-    }
-
-    // Pre-check: if stub_id is specified, verify it's online; otherwise check any stub is available
-    if (stub_id) {
-      const requestedStub = store.getStub(stub_id);
-      if (!requestedStub || requestedStub.status !== "online") {
-        res.status(503).json({ error: "Requested stub is offline or not found", stub_id });
-        return;
-      }
-    } else {
-      const anyOnline = store.getAllStubs().some((s) => s.status === "online");
-      if (!anyOnline) {
-        res.status(503).json({ error: "No stubs available to schedule grid cells" });
-        return;
-      }
+    if (Object.values(param_space).some((v) => !Array.isArray(v))) {
+      res.status(400).json({ error: "param_space values must be arrays" }); return;
     }
 
     const gridId = uuidv4();
-    const combinations = cartesian(parameters);
+    const display_name = gridDisplayName(name, script, param_space);
+    const combinations = cartesianProduct(param_space);
 
-    const cells: GridCell[] = combinations.map((params) => ({
-      id: uuidv4(),
-      grid_id: gridId,
-      params,
-      status: "pending",
-    }));
-
-    const grid: GridTask = {
+    const grid: Grid = {
       id: gridId,
       name,
-      command_template,
-      base_config,
-      parameters,
-      cells,
+      display_name,
+      script,
+      base_args,
+      param_space,
+      task_ids: [],
       status: "pending",
       created_at: new Date().toISOString(),
-      stub_id,
+      max_retries: max_retries ?? 0,
+      requirements,
+      target_tags,
     };
 
     store.setGrid(grid);
 
-    // Create tasks for each cell
-    for (const cell of cells) {
-      const command = interpolate(command_template, {
-        ...cell.params,
-        config_path: base_config || "",
-        generated_config_path: base_config || "",
-      });
-
-      // Determine target stub
-      let targetStub = stub_id ? store.getStub(stub_id) : pickBestStub(0);
-      if (!targetStub) {
-        // No stub available — tasks stay in limbo (grid cell pending)
-        continue;
+    // Create one task per combination
+    const taskIds: string[] = [];
+    for (const combo of combinations) {
+      // Merge base_args with param_space params (as string args)
+      const mergedArgs: Record<string, string> = { ...(base_args || {}) };
+      // Add param_space values as args (e.g. --seed 42)
+      for (const [k, v] of Object.entries(combo)) {
+        mergedArgs[`--${k}`] = String(v);
       }
 
-      const task: Task = {
-        id: uuidv4(),
-        stub_id: targetStub.id,
-        command,
-        status: "queued",
-        created_at: new Date().toISOString(),
-        log_buffer: [],
+      const task = createTask({
+        script,
+        args: mergedArgs,
+        requirements,
+        max_retries: max_retries ?? 0,
         grid_id: gridId,
-        grid_cell_id: cell.id,
-        param_overrides: cell.params,
-        base_config,
-        env: { ALCHEMY_PARAMS: JSON.stringify(cell.params) },
-      };
+        param_overrides: combo,
+        target_tags,
+      });
+      task.status = "pending";
 
-      targetStub.tasks.push(task);
-      store.setStub(targetStub);
-
-      // Link cell to task
-      store.updateGridCell(gridId, cell.id, { task_id: task.id, status: "pending" });
-
+      store.addToGlobalQueue(task);
       webNs.emit("task.update", task);
-      dispatchQueuedTasks(targetStub.id, stubNs);
+      taskIds.push(task.id);
     }
 
-    const created = store.getGrid(gridId);
-    logAudit("grid.create", { grid_id: gridId, name, cells: cells.length });
-    res.status(201).json(created);
+    // Update grid with task IDs
+    grid.task_ids = taskIds;
+    store.setGrid(grid);
+
+    triggerSchedule();
+
+    webNs.emit("grid.update", grid);
+    res.status(201).json(grid);
   });
 
-  // GET /api/grids
+  // GET /grids
   router.get("/", (_req: Request, res: Response) => {
-    res.json(store.getAllGrids());
+    const grids = store.getAllGrids().map((g) => ({
+      ...g,
+      status: deriveGridStatus(store.getGridTasks(g.id)),
+    }));
+    res.json(grids);
   });
 
-  // GET /api/grids/:id
+  // GET /grids/:id
   router.get("/:id", (req: Request, res: Response) => {
     const grid = store.getGrid(req.params.id);
-    if (!grid) {
-      res.status(404).json({ error: "Grid not found" });
-      return;
-    }
+    if (!grid) { res.status(404).json({ error: "Grid not found" }); return; }
 
-    // Enrich cells with task status
-    const enriched = {
-      ...grid,
-      cells: grid.cells.map((cell) => {
-        if (cell.task_id) {
-          // Find task across stubs
-          const task = findTask(cell.task_id);
-          if (task) {
-            return {
-              ...cell,
-              status: mapTaskStatusToCell(task.status),
-              metrics: task.metrics,
-            };
-          }
-        }
-        return cell;
-      }),
-    };
+    const tasks = store.getGridTasks(grid.id);
+    const status = deriveGridStatus(tasks);
 
-    res.json(enriched);
+    res.json({ ...grid, status, tasks });
   });
 
-  // POST /api/grids/:id/retry-failed
-  router.post("/:id/retry-failed", (req: Request, res: Response) => {
+  // POST /grids/:id/cancel
+  router.post("/:id/cancel", (req: Request, res: Response) => {
     const grid = store.getGrid(req.params.id);
-    if (!grid) {
-      res.status(404).json({ error: "Grid not found" });
-      return;
+    if (!grid) { res.status(404).json({ error: "Grid not found" }); return; }
+
+    const tasks = store.getGridTasks(grid.id);
+    const now = new Date().toISOString();
+    let cancelled = 0;
+
+    for (const task of tasks) {
+      if (["running", "dispatched", "queued", "pending"].includes(task.status)) {
+        if (task.stub_id && (task.status === "running" || task.status === "dispatched")) {
+          initiateKillChain(task.stub_id, task.id);
+        } else if (task.stub_id) {
+          const updated = store.updateTask(task.stub_id, task.id, { status: "killed", finished_at: now });
+          if (updated) webNs.emit("task.update", updated);
+        } else {
+          const updated = store.updateGlobalQueueTask(task.id, { status: "killed", finished_at: now });
+          if (updated) webNs.emit("task.update", updated);
+        }
+        cancelled++;
+      }
     }
 
+    res.json({ ok: true, cancelled });
+  });
+
+  // POST /grids/:id/retry-failed
+  router.post("/:id/retry-failed", (req: Request, res: Response) => {
+    const grid = store.getGrid(req.params.id);
+    if (!grid) { res.status(404).json({ error: "Grid not found" }); return; }
+
+    const tasks = store.getGridTasks(grid.id);
     let retried = 0;
-    for (const cell of grid.cells) {
-      const task = cell.task_id ? findTask(cell.task_id) : undefined;
-      if (task && (task.status === "failed" || task.status === "killed")) {
-        resubmitCell(grid, cell, stubNs, webNs);
+
+    for (const task of tasks) {
+      if (["failed", "killed", "lost"].includes(task.status)) {
+        const seq = store.nextSeq();
+        const retryTask: Task = {
+          ...task,
+          id: uuidv4(),
+          seq,
+          status: "pending",
+          stub_id: undefined,
+          retry_count: task.retry_count + 1,
+          retry_of: task.retry_of || task.id,
+          created_at: new Date().toISOString(),
+          started_at: undefined,
+          finished_at: undefined,
+          exit_code: undefined,
+          pid: undefined,
+          log_buffer: [],
+          progress: undefined,
+          should_stop: false,
+          should_checkpoint: false,
+        };
+        store.addToGlobalQueue(retryTask);
+        // Update grid task_ids
+        const idx = grid.task_ids.indexOf(task.id);
+        if (idx !== -1) grid.task_ids[idx] = retryTask.id;
+        webNs.emit("task.update", retryTask);
         retried++;
       }
+    }
+
+    if (retried > 0) {
+      store.setGrid(grid);
+      triggerSchedule();
     }
 
     res.json({ ok: true, retried });
   });
 
-  // POST /api/grids/:id/cells/:cid/retry
-  router.post("/:id/cells/:cid/retry", (req: Request, res: Response) => {
-    const grid = store.getGrid(req.params.id);
-    if (!grid) {
-      res.status(404).json({ error: "Grid not found" });
-      return;
-    }
-
-    const cell = grid.cells.find((c) => c.id === req.params.cid);
-    if (!cell) {
-      res.status(404).json({ error: "Cell not found" });
-      return;
-    }
-
-    resubmitCell(grid, cell, stubNs, webNs);
-    res.json({ ok: true });
-  });
-
-  // DELETE /api/grids/:id — kill all cells
-  router.delete("/:id", (req: Request, res: Response) => {
-    const grid = store.getGrid(req.params.id);
-    if (!grid) {
-      res.status(404).json({ error: "Grid not found" });
-      return;
-    }
-
-    for (const cell of grid.cells) {
-      if (cell.task_id) {
-        const task = findTask(cell.task_id);
-        if (task && (task.status === "running" || task.status === "paused" || task.status === "queued")) {
-          stubNs.to(`stub:${task.stub_id}`).emit("task.kill", { task_id: task.id, signal: "SIGTERM" });
-          store.updateTask(task.stub_id, task.id, { status: "killed", finished_at: new Date().toISOString() });
-          webNs.emit("task.update", { ...task, status: "killed" });
-        }
-      }
-    }
-
-    store.deleteGrid(grid.id);
-    logAudit("grid.delete", { grid_id: grid.id, name: grid.name });
-    res.json({ ok: true });
-  });
-
   return router;
-}
-
-function findTask(taskId: string): Task | undefined {
-  for (const stub of store.getAllStubs()) {
-    const task = stub.tasks.find((t) => t.id === taskId);
-    if (task) return task;
-  }
-  return undefined;
-}
-
-function mapTaskStatusToCell(status: string): GridCell["status"] {
-  switch (status) {
-    case "completed":
-    case "completed_with_errors":
-      return "completed";
-    case "failed":
-    case "killed":
-    case "interrupted":
-      return "failed";
-    case "running":
-    case "paused":
-      return "running";
-    default:
-      return "pending";
-  }
-}
-
-
-function resubmitCell(grid: GridTask, cell: GridCell, stubNs: Namespace, webNs: Namespace): void {
-  const command = interpolate(grid.command_template, {
-    ...cell.params,
-    config_path: grid.base_config || "",
-    generated_config_path: grid.base_config || "",
-  });
-
-  const targetStub = grid.stub_id ? store.getStub(grid.stub_id) : pickBestStub(0);
-  if (!targetStub) return;
-
-  const task: Task = {
-    id: uuidv4(),
-    stub_id: targetStub.id,
-    command,
-    status: "queued",
-    created_at: new Date().toISOString(),
-    log_buffer: [],
-    grid_id: grid.id,
-    grid_cell_id: cell.id,
-    param_overrides: cell.params,
-    base_config: grid.base_config,
-    env: { ALCHEMY_PARAMS: JSON.stringify(cell.params) },
-  };
-
-  targetStub.tasks.push(task);
-  store.setStub(targetStub);
-  store.updateGridCell(grid.id, cell.id, { task_id: task.id, status: "pending" });
-
-  webNs.emit("task.update", task);
-  dispatchQueuedTasks(targetStub.id, stubNs);
 }
