@@ -111,9 +111,9 @@ async def _check_server_reachable(server_url: str) -> None:
                     jlog("warn", "stub.self_check", check="server_reachable",
                          url=health_url, status=resp.status)
     except Exception as e:
-        jlog("error", "stub.self_check", check="server_reachable",
+        jlog("warn", "stub.self_check", check="server_reachable",
              url=health_url, error=str(e))
-        sys.exit(f"Self-check failed: Cannot reach server at {health_url}: {e}")
+        # Don't exit — websocket may still work even if HTTP health check fails
 
 
 async def _run_self_check(server_url: str) -> None:
