@@ -1,11 +1,14 @@
 # Alchemy v2 设计解析
 
+> **Code First.** 代码即实验，约定优于配置。
+
 > 架构师视角的深度设计文档。不是 API 手册，是设计决策背后的思维。
 
 ---
 
 ## 目录
 
+0. [Code First：设计纲领](#0-code-first设计纲领)
 1. [系统全貌](#1-系统全貌)
 2. [纯函数与副作用隔离](#2-纯函数与副作用隔离)
 3. [生命周期：状态机](#3-生命周期状态机)
@@ -17,6 +20,104 @@
 9. [SDK 设计：控制反转与语言特性](#9-sdk-设计控制反转与语言特性)
 10. [Managed Values：零侵入的状态托管](#10-managed-values零侵入的状态托管)
 11. [Experiment：假说驱动的实验管理](#11-experiment假说驱动的实验管理)
+
+---
+
+## 0. Code First：设计纲领
+
+Alchemy 的设计哲学用三个词概括：**Code First**。
+
+### 从面向过程到面向实验
+
+传统 ML 训练脚本是**面向过程**的——一个 Python 文件从头到尾执行，所有决策散落在代码各处：
+
+```python
+# 传统：面向过程
+parser = argparse.ArgumentParser()
+parser.add_argument("--lr", type=float, default=1e-3)
+parser.add_argument("--epochs", type=int, default=100)
+args = parser.parse_args()
+
+model = MyModel()
+optimizer = Adam(model.parameters(), lr=args.lr)
+
+if os.path.exists("checkpoint.pt"):           # 手动 resume 逻辑
+    ckpt = torch.load("checkpoint.pt")
+    model.load_state_dict(ckpt["model"])
+    start_epoch = ckpt["epoch"]
+else:
+    start_epoch = 0
+
+for epoch in range(start_epoch, args.epochs):  # 手动训练循环
+    for batch in dataloader:
+        loss = model(batch)
+        loss.backward()
+        optimizer.step()
+    if epoch % 10 == 0:                        # 手动 checkpoint
+        torch.save({"model": model.state_dict(), "epoch": epoch}, "checkpoint.pt")
+```
+
+Alchemy 把同一段代码变成**面向实验**的：
+
+```python
+# Alchemy：面向实验
+from alchemy_sdk import Alchemy, managed
+
+al = Alchemy()
+
+class train:
+    model     = managed.Torch(MyModel)
+    optimizer = managed.Torch()
+    
+@al.experiment("lr_sweep",
+    criteria={"val_loss": "< 0.5"},
+    matrix={"lr": [1e-2, 1e-3, 1e-4], "seed": [42, 123, 789]})
+@al.managed(total_steps=100_000, checkpoint_every=10_000)
+def train(ctx):
+    ctx.model = MyModel(hidden=ctx.param("hidden"))
+    ctx.optimizer = Adam(ctx.model.parameters(), lr=ctx.param("lr"))
+    for step in ctx.steps():
+        loss = ctx.model(batch)
+        ctx.log(loss=loss)
+        if ctx.should_checkpoint():
+            ctx.save()
+```
+
+行数更少，但信息密度更高。因为 scope 缩小到了 ML 实验，大量 boilerplate 变成了 convention。
+
+### 三层 Code First
+
+| 层次 | 含义 | 对比 |
+|------|------|------|
+| **代码即配置** | Python class 声明就是实验定义 | 不写 YAML/TOML/JSON config |
+| **约定优于配置** | `ctx.steps()` 约定训练循环，`ctx.save()` 约定 checkpoint 格式 | 不暴露选项，框架决定 |
+| **面向实验** | `@exp.task` + `criteria` + `matrix` 声明假说 | 不写 for 循环和 if/else |
+
+### 从 Imperative 到 Declarative
+
+```
+传统：   "我要跑 18 个训练任务，每个手动检查 loss < 0.5"
+         → 18 个 sbatch + 手动 grep + 手动判断
+
+Alchemy："这个假说需要 6×3 矩阵验证，成功标准是 val_loss < 0.5"
+         → 自动展开 → 自动调度 → 自动校验 → 自动汇报
+```
+
+用户声明的是**"我要验证什么"**，而不是**"我要做什么"**。过程是框架的责任。
+
+### Convention 清单
+
+Alchemy 做出的约定，用户不需要（也不应该）自己实现：
+
+| 约定 | 传统做法 | Alchemy |
+|------|---------|---------|
+| 参数来源 | `argparse` / yaml / env | `ctx.param()` — 服务器注入 |
+| Checkpoint 格式 | 自定义 dict | `managed.Torch()` — descriptor 自动序列化 |
+| Resume 逻辑 | `if os.path.exists(...)` | 赋值即恢复 — `__set__` 自动 `load_state_dict` |
+| 输出目录 | 手动命名 | `ctx.run_dir` — 服务器分配，fingerprint 去重 |
+| 训练循环 | `for epoch in range(N)` | `ctx.steps()` — 内置进度汇报 + 抢占检测 |
+| 成功判定 | 人工看数字 | `criteria` — 声明式自动校验 |
+| 实验矩阵 | 手写 shell 嵌套 for | `matrix` — 笛卡尔积自动展开 |
 
 ---
 
