@@ -15,6 +15,7 @@
 7. [并发模型](#7-并发模型)
 8. [训练即纯函数：核心抽象](#8-训练即纯函数alchemy-的核心抽象)
 9. [SDK 设计：控制反转与语言特性](#9-sdk-设计控制反转与语言特性)
+10. [Managed Values：零侵入的状态托管](#10-managed-values零侵入的状态托管)
 
 ---
 
@@ -782,6 +783,126 @@ SDK 刻意不做以下事情：
 4. **不抛影响训练的异常** — `transport.send()` 吞掉所有异常
 
 这意味着：从 SDK 的角度看，训练代码是纯的。SDK 只是一个单向的观测通道（report out）加两个控制信号（`param()` in, `should_stop()` in）。训练的正确性不依赖 SDK 的正确性。
+
+---
+
+## 10. Managed Values：零侵入的状态托管
+
+### 核心洞察
+
+训练代码里有两类状态：**配置**（param，只读）和**产出**（权重/指标/图片，可变）。`param()` 解决了配置注入，但产出的保存和恢复仍然是用户的负担——每个项目都在重复写 `if resume: load_state_dict(...)` 的样板代码。
+
+Managed values 的设计目标：**让用户写出来的代码，和没有 alchemy 时几乎一样。**
+
+### Descriptor 协议
+
+```python
+from alchemy_sdk import Alchemy, managed
+
+al = Alchemy()
+
+class train:
+    model     = managed.Torch()       # nn.Module / Optimizer / 任何有 state_dict 的对象
+    optimizer = managed.Torch()
+    step      = managed.State(int, default=0)   # 任意 Python 对象
+    scores    = managed.Json()         # dict/list → JSON 序列化
+    fig       = managed.Image()        # PIL Image → artifact
+    data      = managed.Numpy()        # ndarray → .npy
+    pretrain  = managed.Input("pretrain.model")  # 跨任务引用
+```
+
+每种类型只是序列化策略不同：
+
+| Descriptor | 存 | 恢复 | 适用对象 |
+|-----------|-----|------|---------|
+| `Torch()` | `state_dict()` | `load_state_dict()` | nn.Module, Optimizer, Scheduler, GradScaler |
+| `State()` | pickle | pickle.load | int, dict, 自定义类 |
+| `Json()` | `json.dump` | `json.load` | 可 JSON 序列化的数据 |
+| `Numpy()` | `np.save` | `np.load` | ndarray |
+| `Image()` | `PIL.save` | — (artifact, 只存不恢复) |
+| `Input()` | — | 从另一个 task 的输出读 | 跨 task DAG |
+
+### Python Descriptor 实现
+
+```python
+class Torch:
+    def __set_name__(self, owner, name):
+        self.name = name   # Python 自动注入属性名
+
+    def __get__(self, obj, objtype=None):
+        return obj._managed_values[self.name]
+
+    def __set__(self, obj, value):
+        obj._managed_values[self.name] = value
+        obj._try_restore(self.name, value)  # 有 checkpoint → 自动恢复
+```
+
+`__set_name__` 是关键——Python 在 class 定义时自动调用，把 `"model"`、`"optimizer"` 等属性名注入 descriptor。用户不需要写任何字符串映射。
+
+### 对比：有 alchemy vs 没有 alchemy
+
+```python
+# ── 没有 alchemy ──────────────────────────────────
+model = MyModel(hidden=256)
+optimizer = Adam(model.parameters(), lr=1e-3)
+if resume_path:
+    ckpt = torch.load(resume_path)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    start = ckpt["step"]
+else:
+    start = 0
+
+for step in range(start, 500_000):
+    loss = train_step(model, batch)
+    if step % 50_000 == 0:
+        torch.save({"model": model.state_dict(),
+                     "optimizer": optimizer.state_dict(),
+                     "step": step}, f"ckpt_{step}.pt")
+
+
+# ── 有 alchemy ────────────────────────────────────
+@al.managed(total_steps=500_000, checkpoint_every=50_000)
+def train(ctx):
+    ctx.model = MyModel(hidden=ctx.param("hidden"))
+    ctx.optimizer = Adam(ctx.model.parameters(), lr=ctx.param("lr"))
+    # 没了。resume 是透明的。
+
+    for step in ctx.steps(ctx.step):
+        loss = train_step(ctx.model, batch)
+        ctx.log(loss=loss)
+
+        if ctx.should_checkpoint():
+            ctx.save()   # 自动存所有 managed values，原子写入
+
+train()
+```
+
+差异只有 `ctx.` 前缀和 `ctx.param()`。心智负担接近零。
+
+### 赋值即注册
+
+`__set__` 触发两件事：
+
+1. **注册到托管表**——`ctx.save()` 时自动遍历所有已注册对象，各自用自己的序列化协议存储
+2. **尝试恢复**——如果 checkpoint 目录存在该属性名对应的文件，立即调用 `load_state_dict()`（Torch）或反序列化（State/Json/Numpy）
+
+用户不需要知道 resume 的存在。赋值的瞬间，alchemy 已经决定了这是新建还是恢复。
+
+### `Input()`：跨任务的 managed value 引用
+
+```python
+class eval:
+    model = managed.Input("train.model")   # 读取 train 任务的 model 输出
+```
+
+`Input("train.model")` 声明了一条 DAG 边：eval 任务的 `model` 来自 train 任务的 `model` 输出。调度器看到这条依赖后，自动：
+
+1. 确保 train 完成后再调度 eval
+2. 把 train 的 checkpoint 路径注入 eval 的环境
+3. eval 的 `ctx.model` 拿到的是 train 产出的权重
+
+训练产出 → eval 输入，DAG 自动成型。
 
 ---
 
