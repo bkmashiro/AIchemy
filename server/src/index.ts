@@ -14,11 +14,13 @@ import { v4 as uuidv4 } from "uuid";
 import { store } from "./store";
 import { setupStubNamespace } from "./socket/stub";
 import { setupWebNamespace } from "./socket/web";
+import { setupControllerNamespace } from "./socket/controller";
 import { createGlobalTasksRouter } from "./api/tasks";
 import { createStubsRouter } from "./api/stubs";
 import { createGridsRouter } from "./api/grids";
 import { createMetricsRouter } from "./api/metrics";
 import { createSdkRouter } from "./api/sdk";
+import { createClusterRouter } from "./api/cluster";
 import { startScheduler, triggerSchedule } from "./scheduler";
 import { Token } from "./types";
 import { backupState, listBackups, restoreFromBackup, pruneBackups } from "./store/backup";
@@ -47,9 +49,11 @@ const io = new Server(httpServer, {
 
 const stubNs = io.of("/stubs");
 const webNs = io.of("/web");
+const controllerNs = io.of("/controller");
 
 setupWebNamespace(webNs);
 setupStubNamespace(stubNs, webNs);
+setupControllerNamespace(controllerNs, webNs);
 startScheduler(webNs, stubNs);
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
@@ -159,6 +163,24 @@ api.post("/cleanup", (req, res) => {
 api.use("/tasks", createGlobalTasksRouter(stubNs, webNs));
 api.use("/stubs", createStubsRouter(stubNs, webNs));
 api.use("/grids", createGridsRouter(stubNs, webNs));
+api.use("/cluster", createClusterRouter());
+
+// Health check — no auth required
+app.get("/api/health", (_req, res) => {
+  const allStubs = store.getAllStubs();
+  const online = allStubs.filter(s => s.status === "online").length;
+  const running = allStubs.reduce((n, s) => n + s.tasks.filter(t =>
+    ["running", "dispatched"].includes(t.status)).length, 0);
+  const pending = store.getGlobalQueue().length;
+  res.json({
+    status: "ok",
+    uptime_s: Math.floor(process.uptime()),
+    stubs_online: online,
+    stubs_total: allStubs.length,
+    tasks_running: running,
+    tasks_pending: pending,
+  });
+});
 
 // Public routes (no auth) — overview is read-only stats, SDK uses task_id as credential
 const metricsRouter = createMetricsRouter();

@@ -13,6 +13,8 @@ import { store } from "./store";
 import { Stub, Task } from "./types";
 import { reliableEmitToStub } from "./reliable";
 import { logger } from "./log";
+import { dispatchTask } from "./task-actions";
+import { notifyDispatched } from "./discord";
 
 // ─── GPU name normalization ───────────────────────────────────────────────────
 
@@ -39,6 +41,30 @@ function availableMem(stub: Stub): number {
     return stub.system_stats.mem_total_mb - stub.system_stats.mem_used_mb;
   }
   return Infinity; // Unknown — don't block
+}
+
+/** Return human-readable reason why a stub can't run a task, or null if it can. */
+function rejectReason(stub: Stub, task: Task): string | null {
+  if (stub.status !== "online") return "offline";
+  if (task.target_tags?.length) {
+    const stubTags = new Set(stub.tags || []);
+    if (!task.target_tags.every(t => stubTags.has(t))) return "tag_mismatch";
+  }
+  if (task.requirements?.gpu_mem_mb && availableVram(stub) < task.requirements.gpu_mem_mb) {
+    return `vram_insufficient(need=${task.requirements.gpu_mem_mb},avail=${Math.floor(availableVram(stub))})`;
+  }
+  if (task.requirements?.gpu_type?.length) {
+    if (!task.requirements.gpu_type.some(t => normalizeGpuName(stub.gpu.name).includes(normalizeGpuName(t)))) {
+      return "gpu_type_mismatch";
+    }
+  }
+  if (task.python_env && stub.available_envs) {
+    if (!stub.available_envs.some(e => e.name === task.python_env)) return "python_env_missing";
+  }
+  const running = stub.tasks.filter(t => ["running", "dispatched"].includes(t.status)).length;
+  const queued = stub.tasks.filter(t => t.status === "queued").length;
+  if (running + queued >= stub.max_concurrent) return `slots_full(${running}+${queued}>=${stub.max_concurrent})`;
+  return null;
 }
 
 // ─── Scoring ─────────────────────────────────────────────────────────────────
@@ -180,9 +206,10 @@ export function maybeDispatch(stub: Stub): void {
   for (const task of toDispatch) {
     const run_dir = computeRunDir(task, stub);
     // Persist computed run_dir into task so write lock and display work correctly
-    store.updateTask(stub.id, task.id, { status: "dispatched", run_dir });
+    const updated = dispatchTask(stub.id, task.id, run_dir);
     reliableEmitToStub(stub.id, "task.run", buildRunPayload(task, stub));
     logger.info("task.dispatch", { task_seq: task.seq, stub: stub.name, display_name: task.display_name, run_dir });
+    if (updated) notifyDispatched(updated).catch(() => {});
   }
 }
 
@@ -201,13 +228,20 @@ export function schedule(): void {
   if (queue.length === 0) return;
 
   for (const task of queue) {
-    const candidates = stubs
+    // Re-fetch stubs each iteration — previous assignment mutates store
+    const freshStubs = store.getOnlineStubs();
+    const candidates = freshStubs
       .map((s) => ({ stub: s, score: scoreStub(s, task) }))
       .filter((c) => c.score > -Infinity)
       .sort((a, b) => b.score - a.score);
 
     if (candidates.length === 0) {
-      logger.info("scheduler.no_candidate", { task_seq: task.seq, display_name: task.display_name });
+      const reasons = freshStubs.map(s => `${s.name}:${rejectReason(s, task) || "?"}`).join(", ");
+      logger.info("scheduler.no_candidate", {
+        task_seq: task.seq,
+        display_name: task.display_name,
+        reasons,
+      });
       continue;
     }
 

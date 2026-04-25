@@ -145,16 +145,32 @@ async def run_preflight(
         errors.append(f"Working directory does not exist: {cwd}")
 
     # 2. If command looks like "python <script>", verify script exists
-    script = task.get("script", "")
-    if script:
-        parts = script.strip().split()
-        # e.g. ["python", "train.py"] or ["python3", "train.py"]
-        if len(parts) >= 2 and parts[0] in ("python", "python3", "python3.10", "python3.11", "python3.12"):
-            candidate_script = parts[1]
-            if not os.path.isabs(candidate_script):
-                candidate_script = os.path.join(cwd or ".", candidate_script)
-            if not os.path.exists(candidate_script):
-                errors.append(f"Script file does not exist: {candidate_script}")
+    #    Check both the explicit "script" field and the actual "command" field.
+    _PYTHON_BINS = ("python", "python3", "python3.10", "python3.11", "python3.12")
+
+    def _check_script_exists(raw: str) -> str | None:
+        """Return error string if script file not found, else None."""
+        parts = raw.strip().split()
+        if len(parts) < 2 or parts[0] not in _PYTHON_BINS:
+            return None
+        candidate = parts[1]
+        # Skip flags like -u, -m, etc.
+        if candidate.startswith("-"):
+            return None
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(cwd or ".", candidate)
+        if not os.path.exists(candidate):
+            return f"Script not found: {candidate} (cwd: {cwd or '.'})"
+        if not os.access(candidate, os.R_OK):
+            return f"Script not readable: {candidate}"
+        return None
+
+    for source in (task.get("script", ""), command):
+        if source:
+            err = _check_script_exists(source)
+            if err:
+                errors.append(err)
+                break  # one error is enough
 
     # 3. run_dir parent writable (if declared)
     if run_dir:

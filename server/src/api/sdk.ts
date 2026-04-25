@@ -8,6 +8,8 @@
 import { Router, Request, Response } from "express";
 import { store } from "../store";
 import { metricsStore } from "../metrics";
+import { notifyTaskMessage } from "../discord";
+import { logger } from "../log";
 import { Namespace } from "socket.io";
 
 export function createSdkRouter(webNs: Namespace): Router {
@@ -15,7 +17,7 @@ export function createSdkRouter(webNs: Namespace): Router {
 
   // POST /sdk/report — no auth; task_id is the credential
   router.post("/report", (req: Request, res: Response) => {
-    const { task_id, type, step, total, loss, metrics, path: checkpointPath, config } = req.body;
+    const { task_id, type, step, total, loss, metrics, path: checkpointPath, config, message, level } = req.body;
 
     if (!task_id) {
       res.status(400).json({ error: "task_id required" });
@@ -74,6 +76,30 @@ export function createSdkRouter(webNs: Namespace): Router {
             },
           });
           if (updated) webNs.emit("task.update", updated);
+        }
+        break;
+      }
+      case "notify": {
+        const validLevels = ["debug", "info", "warning", "critical"];
+        const safeLevel = validLevels.includes(level) ? level : "info";
+        logger.info("task.notify", { task_seq: task.seq, level: safeLevel, message: String(message || "").slice(0, 200) });
+
+        // Always store in log_buffer
+        const logLine = `[notify:${safeLevel}] ${message}`;
+        const buf = task.log_buffer;
+        buf.push(logLine);
+        if (buf.length > 500) buf.splice(0, buf.length - 500);
+        if (stubId) store.updateTask(stubId, task_id, { log_buffer: buf });
+        else store.updateGlobalQueueTask(task_id, { log_buffer: buf });
+
+        // info/warning/critical: emit to web frontend
+        if (safeLevel !== "debug") {
+          webNs.emit("task.notify", { task_id, message, level: safeLevel });
+        }
+
+        // warning/critical: Discord
+        if (safeLevel === "warning" || safeLevel === "critical") {
+          notifyTaskMessage(task, String(message || ""), safeLevel as "warning" | "critical").catch(() => {});
         }
         break;
       }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task, TaskStatus, tasksApi } from "../lib/api";
 import { formatRelTime, taskDuration, generateDisplayName } from "../lib/format";
@@ -19,33 +19,39 @@ const STATUS_COLORS: Record<string, string> = {
 
 type Filter = "all" | "active" | "terminal";
 
+const PAGE_LIMIT = 50;
+
 export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<Filter>("all");
   const [acting, setActing] = useState<Set<string>>(new Set());
   const navigate = useNavigate();
 
-  const fetchTasks = () => {
-    tasksApi.list().then((t) => { setTasks(t); setLoading(false); }).catch(() => setLoading(false));
-  };
+  const fetchTasks = useCallback(() => {
+    const params: { page: number; limit: number; status?: string } = { page, limit: PAGE_LIMIT };
+    // For active/terminal filters we don't pass a single status — we fetch all and rely on page
+    tasksApi.list(params)
+      .then((r) => { setTasks(r.tasks); setTotal(r.total); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [page]);
 
   useEffect(() => {
     fetchTasks();
     const t = setInterval(fetchTasks, 5000);
     return () => clearInterval(t);
-  }, []);
+  }, [fetchTasks]);
+
+  // Reset to page 1 when filter changes
+  useEffect(() => { setPage(1); }, [filter]);
 
   const filtered = useMemo(() => {
     let list = tasks;
     if (filter === "active") list = list.filter((t) => ["running", "dispatched", "queued", "pending", "paused"].includes(t.status));
     if (filter === "terminal") list = list.filter((t) => ["completed", "failed", "killed", "lost"].includes(t.status));
-    return list.sort((a, b) => {
-      const ai = STATUS_ORDER.indexOf(a.status as TaskStatus);
-      const bi = STATUS_ORDER.indexOf(b.status as TaskStatus);
-      if (ai !== bi) return ai - bi;
-      return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-    });
+    return list;
   }, [tasks, filter]);
 
   const counts = useMemo(() => {
@@ -53,6 +59,8 @@ export default function TasksPage() {
     for (const t of tasks) c[t.status] = (c[t.status] || 0) + 1;
     return c;
   }, [tasks]);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_LIMIT));
 
   const doAction = async (id: string, action: () => Promise<any>, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -92,7 +100,7 @@ export default function TasksPage() {
             {s} {counts[s]}
           </span>
         ) : null)}
-        <span className="text-xs text-gray-600 ml-2">{tasks.length} total</span>
+        <span className="text-xs text-gray-600 ml-2">{total} total</span>
       </div>
 
       {/* Filters */}
@@ -118,6 +126,7 @@ export default function TasksPage() {
               <th className="text-left px-4 py-2 w-24">Status</th>
               <th className="text-left px-4 py-2 w-20 hidden sm:table-cell">Duration</th>
               <th className="text-left px-4 py-2 w-20 hidden md:table-cell">Progress</th>
+              <th className="text-left px-4 py-2 w-24 hidden lg:table-cell">Stub</th>
               <th className="text-left px-4 py-2 w-24 hidden lg:table-cell">Created</th>
               <th className="text-right px-4 py-2 w-28">Actions</th>
             </tr>
@@ -150,6 +159,7 @@ export default function TasksPage() {
                   <td className="px-4 py-2 text-gray-500 text-xs font-mono hidden md:table-cell">
                     {pct !== null ? `${pct}%` : "—"}
                   </td>
+                  <td className="px-4 py-2 text-gray-600 text-xs font-mono hidden lg:table-cell">{t.stub_name ?? "—"}</td>
                   <td className="px-4 py-2 text-gray-600 text-xs hidden lg:table-cell">{formatRelTime(t.created_at)}</td>
                   <td className="px-4 py-2 text-right" onClick={(e) => e.stopPropagation()}>
                     <div className="flex items-center justify-end gap-1">
@@ -178,6 +188,23 @@ export default function TasksPage() {
           <div className="text-center py-12 text-gray-600">No tasks</div>
         )}
       </div>
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-center gap-2 pt-2">
+          <button
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            disabled={page <= 1}
+            className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-gray-400 disabled:opacity-40"
+          >Prev</button>
+          <span className="text-xs text-gray-500">Page {page} / {totalPages}</span>
+          <button
+            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            disabled={page >= totalPages}
+            className="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded text-gray-400 disabled:opacity-40"
+          >Next</button>
+        </div>
+      )}
     </div>
   );
 }

@@ -18,7 +18,9 @@ import {
   isActiveStatus,
 } from "../dedup";
 import { triggerSchedule, maybeDispatch } from "../scheduler";
+import { notifySubmitted } from "../discord";
 import { initiateKillChain } from "../socket/stub";
+import { killTask, killGlobalTask, pauseTask, resumeTask } from "../task-actions";
 import { reliableEmitToStub } from "../reliable";
 import { logger } from "../log";
 
@@ -174,9 +176,37 @@ const TERMINAL_STATUSES = ["completed", "failed", "killed", "lost"];
 export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): Router {
   const router = Router();
 
-  // GET /tasks
-  router.get("/", (_req: Request, res: Response) => {
-    res.json(store.getAllTasks());
+  // GET /tasks — paginated: ?page=1&limit=50&status=running
+  router.get("/", (req: Request, res: Response) => {
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+    const statusFilter = req.query.status ? String(req.query.status) : undefined;
+    const includeLogs = req.query.logs === "true";
+
+    let tasks = store.getAllTasks();
+
+    if (statusFilter) {
+      tasks = tasks.filter((t) => t.status === statusFilter);
+    }
+
+    // Sort: newest first by seq
+    tasks = tasks.sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0));
+
+    const total = tasks.length;
+    const start = (page - 1) * limit;
+    const paginated = tasks.slice(start, start + limit);
+
+    const enriched = paginated.map((t) => {
+      const stub = t.stub_id ? store.getStub(t.stub_id) : undefined;
+      const stub_name = stub ? (stub.name || stub.hostname) : undefined;
+      if (includeLogs) {
+        return stub_name ? { ...t, stub_name } : t;
+      }
+      const { log_buffer, ...rest } = t;
+      return stub_name ? { ...rest, stub_name } : rest;
+    });
+
+    res.json({ tasks: enriched, total, page, limit });
   });
 
   // POST /tasks/batch — must be before /:id routes
@@ -188,7 +218,6 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     const results: Array<{ id: string; ok: boolean; new_task_id?: string; error?: string }> = [];
-    const now = new Date().toISOString();
 
     for (const taskId of task_ids) {
       const found = store.findTask(taskId);
@@ -203,10 +232,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           if (stubId && (task.status === "running" || task.status === "dispatched")) {
             initiateKillChain(stubId, taskId);
           } else if (stubId) {
-            const updated = store.updateTask(stubId, taskId, { status: "killed", finished_at: now });
+            const updated = killTask(stubId, taskId);
             if (updated) webNs.emit("task.update", updated);
           } else {
-            store.updateGlobalQueueTask(taskId, { status: "killed", finished_at: now });
+            killGlobalTask(taskId);
             const updated = store.findTask(taskId)?.task;
             if (updated) webNs.emit("task.update", updated);
           }
@@ -337,6 +366,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     store.addToGlobalQueue(task);
     if (webNs) webNs.emit("task.update", task);
     logger.info("task.submit", { task_seq: task.seq, fingerprint: task.fingerprint, display_name: task.display_name });
+    notifySubmitted(task).catch(() => {});
 
     if (idempotency_key) {
       idempotencyCache.set(idempotency_key, task.id);
@@ -388,12 +418,31 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused"].includes(task.status)) {
         if (stubId && (task.status === "running" || task.status === "dispatched")) {
           initiateKillChain(stubId, task.id);
+        } else if (stubId) {
+          const killed = killTask(stubId, task.id);
+          if (killed) webNs.emit("task.update", killed);
+          res.json(killed || task);
+          return;
         } else {
-          update.status = "killed";
-          update.finished_at = new Date().toISOString();
+          killGlobalTask(task.id);
+          const killed = store.findTask(task.id)?.task;
+          if (killed) webNs.emit("task.update", killed);
+          res.json(killed || task);
+          return;
         }
+      } else if (status === "paused" && stubId) {
+        const paused = pauseTask(stubId, task.id);
+        if (paused) webNs.emit("task.update", paused);
+        res.json(paused || task);
+        return;
+      } else if (status === "running" && task.status === "paused" && stubId) {
+        const resumed = resumeTask(stubId, task.id);
+        if (resumed) webNs.emit("task.update", resumed);
+        res.json(resumed || task);
+        return;
       } else {
-        update.status = status;
+        res.status(400).json({ error: `Unsupported status transition: ${task.status} → ${status}` });
+        return;
       }
     }
 

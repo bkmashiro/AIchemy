@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 from typing import Any, Optional
 
 from .transport import make_transport, NoopTransport, HttpTransport, UnixSocketTransport
 
 _MISSING = object()
+
+# Valid notification levels
+_NOTIFY_LEVELS = ("debug", "info", "warning", "critical")
 
 
 class Alchemy:
@@ -67,6 +71,21 @@ class Alchemy:
         # Throttle state for log()
         self._last_log_time: float = 0.0
 
+        # SIGTERM-based stop flag — set by signal handler, read by should_stop()
+        self._stop_flag: bool = False
+        self._install_sigterm_handler()
+
+    def _install_sigterm_handler(self) -> None:
+        """Install SIGTERM handler that sets the stop flag."""
+        try:
+            def _handler(signum: int, frame: Any) -> None:
+                self._stop_flag = True
+
+            signal.signal(signal.SIGTERM, _handler)
+        except (OSError, ValueError):
+            # Can't install in some environments (e.g. non-main thread) — silently skip
+            pass
+
     # ------------------------------------------------------------------
     # Pure reads (no IO)
     # ------------------------------------------------------------------
@@ -102,20 +121,12 @@ class Alchemy:
         return default
 
     # ------------------------------------------------------------------
-    # Signal queries (pure — reads cached signals, no IO)
+    # Signal queries
     # ------------------------------------------------------------------
 
     def should_stop(self) -> bool:
-        """Return True if the server/stub requests graceful stop."""
-        return self._transport.should_stop()
-
-    def should_checkpoint(self) -> bool:
-        """Return True if the server/stub requests an immediate checkpoint."""
-        return self._transport.should_checkpoint()
-
-    def should_eval(self) -> bool:
-        """Return True if the server/stub requests an evaluation pass."""
-        return self._transport.should_eval()
+        """Return True if SIGTERM was received (SLURM preemption, manual kill, server kill)."""
+        return self._stop_flag
 
     # ------------------------------------------------------------------
     # Reports (side-effects only — never modify training state)
@@ -158,6 +169,20 @@ class Alchemy:
         Does NOT call torch.save — caller is responsible for saving.
         """
         self._transport.send({"type": "checkpoint", "path": path})
+
+    def notify(self, msg: str, level: str = "info") -> None:
+        """
+        Send a user-defined notification via the transport.
+
+        Levels:
+          "debug"    — stored in task log only
+          "info"     — stored + emitted to web frontend
+          "warning"  — stored + emitted + Discord notification
+          "critical" — stored + emitted + Discord mention (emphasis)
+        """
+        if level not in _NOTIFY_LEVELS:
+            level = "info"
+        self._transport.send({"type": "notify", "message": msg, "level": level})
 
     def done(self, metrics: Optional[dict[str, Any]] = None) -> None:
         """Signal that training is complete. Sends final metrics if provided."""

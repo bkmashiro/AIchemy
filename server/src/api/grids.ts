@@ -18,6 +18,7 @@ import { triggerSchedule } from "../scheduler";
 import { maybeDispatch } from "../scheduler";
 import { initiateKillChain } from "../socket/stub";
 import { computeFingerprint } from "../dedup";
+import { killTask, killGlobalTask } from "../task-actions";
 
 // ─── Cartesian product ────────────────────────────────────────────────────────
 
@@ -121,8 +122,6 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
         param_overrides: combo,
         target_tags,
       });
-      task.status = "pending";
-
       store.addToGlobalQueue(task);
       webNs.emit("task.update", task);
       taskIds.push(task.id);
@@ -164,7 +163,6 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
     if (!grid) { res.status(404).json({ error: "Grid not found" }); return; }
 
     const tasks = store.getGridTasks(grid.id);
-    const now = new Date().toISOString();
     let cancelled = 0;
 
     for (const task of tasks) {
@@ -172,10 +170,10 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
         if (task.stub_id && (task.status === "running" || task.status === "dispatched")) {
           initiateKillChain(task.stub_id, task.id);
         } else if (task.stub_id) {
-          const updated = store.updateTask(task.stub_id, task.id, { status: "killed", finished_at: now });
+          const updated = killTask(task.stub_id!, task.id);
           if (updated) webNs.emit("task.update", updated);
         } else {
-          const updated = store.updateGlobalQueueTask(task.id, { status: "killed", finished_at: now });
+          const updated = killGlobalTask(task.id);
           if (updated) webNs.emit("task.update", updated);
         }
         cancelled++;

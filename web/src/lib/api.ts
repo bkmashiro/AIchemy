@@ -40,6 +40,15 @@ api.interceptors.response.use(
   }
 );
 
+// ─── Paginated response ────────────────────────────────────────────────────────
+
+export interface PaginatedTasks {
+  tasks: Task[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
 // ─── Data Models (spec §1) ────────────────────────────────────────────────────
 
 export type TaskStatus =
@@ -94,6 +103,7 @@ export interface Task {
   status: TaskStatus;
   priority: number;
   stub_id?: string;
+  stub_name?: string;            // Enriched by server: stub.name or stub.hostname
   target_tags?: string[];        // Tag-based routing
 
   // Grid
@@ -214,7 +224,8 @@ export interface TaskSubmitPayload {
 // ─── API client functions ──────────────────────────────────────────────────────
 
 export const tasksApi = {
-  list: () => api.get<Task[]>("/tasks").then((r) => r.data),
+  list: (params?: { page?: number; limit?: number; status?: string }) =>
+    api.get<PaginatedTasks>("/tasks", { params }).then((r) => r.data),
   get: (id: string) => api.get<Task>(`/tasks/${id}`).then((r) => r.data),
   submit: (data: TaskSubmitPayload) => api.post<Task>("/tasks", data).then((r) => r.data),
   patch: (id: string, data: { status?: TaskStatus; priority?: number; name?: string; should_stop?: boolean }) =>
@@ -232,6 +243,8 @@ export const stubsApi = {
   get: (id: string) => api.get<Stub>(`/stubs/${id}`).then((r) => r.data),
   patch: (id: string, data: { name?: string; max_concurrent?: number; tags?: string[]; idle_timeout_s?: number }) =>
     api.patch<{ ok: boolean; stub: Stub }>(`/stubs/${id}`, data).then((r) => r.data.stub),
+  release: (id: string) =>
+    api.post<{ ok: boolean }>(`/stubs/${id}/release`).then((r) => r.data),
   submitTask: (id: string, data: TaskSubmitPayload) =>
     api.post<Task>(`/stubs/${id}/tasks`, data).then((r) => r.data),
   metrics: (id: string, hours = 1) =>

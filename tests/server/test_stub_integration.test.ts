@@ -128,24 +128,93 @@ function waitForEvent(socket: Socket, event: string, timeoutMs = 5000): Promise<
   });
 }
 
+// Server uses socket.io native ack callbacks. The server emits an event and
+// expects the client to call the ack callback. We register a one-time listener
+// that acks automatically and resolves with the payload.
 function waitForReliableEvent(socket: Socket, eventName: string, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      socket.off("r", handler);
+      socket.off(eventName, handler);
       reject(new Error(`Timed out waiting for reliable event '${eventName}' after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    function handler(msg: any) {
-      if (msg.event === eventName) {
-        clearTimeout(timer);
-        socket.off("r", handler);
-        // Send ack
-        socket.emit("r.ack", { seq: msg.seq });
-        resolve(msg.payload);
-      }
+    function handler(payload: any, ack?: Function) {
+      clearTimeout(timer);
+      socket.off(eventName, handler);
+      // Send ack back to server (native socket.io ack)
+      if (typeof ack === "function") ack({ ok: true });
+      resolve(payload);
     }
 
-    socket.on("r", handler);
+    socket.on(eventName, handler);
+  });
+}
+
+// Buffered task.run listener: starts collecting task.run events immediately,
+// acking all of them. Call waitForTask(taskId) to get the payload for a specific task.
+// This solves the race condition where the server dispatches before we submit the task.
+class TaskRunBuffer {
+  private buffer: Array<{ payload: any }> = [];
+  private waiters: Map<string, (payload: any) => void> = new Map();
+  private socket: Socket;
+
+  constructor(socket: Socket) {
+    this.socket = socket;
+    socket.on("task.run", (payload: any, ack?: Function) => {
+      if (typeof ack === "function") ack({ ok: true });
+      const waiter = this.waiters.get(payload.task_id);
+      if (waiter) {
+        this.waiters.delete(payload.task_id);
+        waiter(payload);
+      } else {
+        this.buffer.push({ payload });
+      }
+    });
+  }
+
+  waitForTask(taskId: string, timeoutMs = 8000): Promise<any> {
+    // Check if already buffered
+    const idx = this.buffer.findIndex((e) => e.payload.task_id === taskId);
+    if (idx !== -1) {
+      const [entry] = this.buffer.splice(idx, 1);
+      return Promise.resolve(entry.payload);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.waiters.delete(taskId);
+        reject(new Error(`Timed out waiting for task.run for task ${taskId} after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.waiters.set(taskId, (payload) => {
+        clearTimeout(timer);
+        resolve(payload);
+      });
+    });
+  }
+
+  destroy() {
+    this.socket.off("task.run");
+  }
+}
+
+// Like waitForReliableEvent but filters for a specific task_id (acks others and keeps waiting).
+// Use this when setting up the listener BEFORE submitting the task.
+function waitForReliableTaskRun(socket: Socket, taskId: string, timeoutMs = 8000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off("task.run", handler);
+      reject(new Error(`Timed out waiting for task.run for task ${taskId} after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    function handler(payload: any, ack?: Function) {
+      if (typeof ack === "function") ack({ ok: true });
+      if (payload.task_id === taskId) {
+        clearTimeout(timer);
+        socket.off("task.run", handler);
+        resolve(payload);
+      }
+      // else: ack other tasks but keep waiting
+    }
+    socket.on("task.run", handler);
   });
 }
 
@@ -276,12 +345,12 @@ describe("Task dispatch", () => {
     const resumeP = waitForReliableEvent(socket, "resume_response");
     sendResume(socket, {
       serverUrl: BASE_URL, token: TOKEN,
-      hostname, gpuName: "A40", maxConcurrent: 2,
+      hostname, gpuName: "A40", maxConcurrent: 20,
     });
     await resumeP;
 
-    // Set up listener for task.run BEFORE submitting
-    const taskRunP = waitForReliableEvent(socket, "task.run", 8000);
+    // Start buffering task.run events immediately (before submit, to avoid race)
+    const buf = new TaskRunBuffer(socket);
 
     // Submit task to global queue
     const script = `python dispatch_test_${Date.now()}.py`;
@@ -289,7 +358,8 @@ describe("Task dispatch", () => {
     expect(r.status).toBe(201);
     const task = await r.json();
 
-    const runPayload = await taskRunP;
+    // Wait for this specific task (buffer catches event even if fired before this line)
+    const runPayload = await buf.waitForTask(task.id, 8000);
     expect(runPayload.task_id).toBe(task.id);
     expect(runPayload.command).toBeTruthy();
 
@@ -312,17 +382,18 @@ describe("Task lifecycle", () => {
     const resumeP = waitForReliableEvent(socket, "resume_response");
     sendResume(socket, {
       serverUrl: BASE_URL, token: TOKEN,
-      hostname, gpuName: "A30", maxConcurrent: 2,
+      hostname, gpuName: "A30", maxConcurrent: 20,
     });
     await resumeP;
 
+    const buf = new TaskRunBuffer(socket);
+
     // Submit task
-    const taskRunP = waitForReliableEvent(socket, "task.run", 8000);
     const script = `python lifecycle_test_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await r.json();
 
-    const runPayload = await taskRunP;
+    const runPayload = await buf.waitForTask(task.id, 8000);
     const taskId = runPayload.task_id;
 
     // Get stub_id from server
@@ -333,12 +404,7 @@ describe("Task lifecycle", () => {
     const stubId = stub.id;
 
     // Simulate: task.started (reliable)
-    socket.emit("r", {
-      seq: 1,
-      event: "task.started",
-      payload: { task_id: taskId, pid: 12345 },
-      ts: Date.now(),
-    });
+    socket.emit("task.started", { task_id: taskId, pid: 12345 });
     await sleep(300);
 
     // Verify running status
@@ -362,12 +428,7 @@ describe("Task lifecycle", () => {
     expect(t2.progress?.loss).toBe(0.5);
 
     // Simulate: task.completed (reliable)
-    socket.emit("r", {
-      seq: 2,
-      event: "task.completed",
-      payload: { task_id: taskId, exit_code: 0 },
-      ts: Date.now(),
-    });
+    socket.emit("task.completed", { task_id: taskId, exit_code: 0 });
     await sleep(300);
 
     const taskR3 = await apiGet(`${BASE_URL}/api/tasks/${taskId}`, TOKEN);
@@ -391,16 +452,17 @@ describe("Task lifecycle", () => {
     const resumeP = waitForReliableEvent(socket, "resume_response");
     sendResume(socket, {
       serverUrl: BASE_URL, token: TOKEN,
-      hostname, gpuName: "A40", maxConcurrent: 2,
+      hostname, gpuName: "A40", maxConcurrent: 20,
     });
     await resumeP;
 
+    const buf = new TaskRunBuffer(socket);
+
     // Submit task and wait for dispatch
-    const taskRunP = waitForReliableEvent(socket, "task.run", 8000);
     const script = `python autopromote_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
-    const runPayload = await taskRunP;
+    const runPayload = await buf.waitForTask(task.id, 8000);
     const taskId = runPayload.task_id;
 
     // Verify dispatched status
@@ -427,7 +489,7 @@ describe("Task lifecycle", () => {
 // ─── 4. Reliable messaging ────────────────────────────────────────────────────
 
 describe("Reliable messaging", () => {
-  it("Server sends r.ack for received stub messages", async () => {
+  it("Server acks task.started via native socket.io ack callback", async () => {
     const hostname = `reliable-test-${Date.now()}`;
     const socket = createMockStub({ serverUrl: BASE_URL, token: TOKEN });
 
@@ -443,18 +505,11 @@ describe("Reliable messaging", () => {
     });
     await resumeP;
 
-    // Listen for ack
+    // Server listens on "task.started" directly with native ack callback support
     const ackP = new Promise<any>((resolve) => {
-      socket.once("r.ack", resolve);
-    });
-
-    // Send a reliable heartbeat-like message (use task.started which always acks)
-    // We can use a dummy task ID — it won't find it but will still ack the seq
-    socket.emit("r", {
-      seq: 1,
-      event: "task.started",
-      payload: { task_id: "nonexistent-task-id", pid: 9999 },
-      ts: Date.now(),
+      socket.emit("task.started", { task_id: "nonexistent-task-id", pid: 9999 }, (ack: any) => {
+        resolve(ack);
+      });
     });
 
     const ack = await Promise.race([
@@ -462,15 +517,15 @@ describe("Reliable messaging", () => {
       sleep(3000).then(() => null),
     ]);
 
-    // Ack should come back
+    // Server calls ack({ ok: true }) for every task.started
     expect(ack).not.toBeNull();
-    expect(ack.seq).toBeGreaterThanOrEqual(1);
+    expect(ack.ok).toBe(true);
 
     socket.disconnect();
   }, 10_000);
 
-  it("Out-of-order messages trigger r.nack", async () => {
-    const hostname = `nack-test-${Date.now()}`;
+  it("Server acks task.completed via native socket.io ack callback", async () => {
+    const hostname = `ack-completed-${Date.now()}`;
     const socket = createMockStub({ serverUrl: BASE_URL, token: TOKEN });
 
     await new Promise<void>((r, j) => {
@@ -485,26 +540,19 @@ describe("Reliable messaging", () => {
     });
     await resumeP;
 
-    // Listen for nack
-    const nackP = new Promise<any>((resolve) => {
-      socket.once("r.nack", resolve);
+    const ackP = new Promise<any>((resolve) => {
+      socket.emit("task.completed", { task_id: "nonexistent-task-id", exit_code: 0 }, (ack: any) => {
+        resolve(ack);
+      });
     });
 
-    // Send seq=3 skipping 1 and 2 — server receiver should nack
-    socket.emit("r", {
-      seq: 3,
-      event: "task.started",
-      payload: { task_id: "nonce", pid: 1 },
-      ts: Date.now(),
-    });
-
-    const nack = await Promise.race([
-      nackP,
+    const ack = await Promise.race([
+      ackP,
       sleep(3000).then(() => null),
     ]);
 
-    expect(nack).not.toBeNull();
-    expect(nack.from).toBe(1);
+    expect(ack).not.toBeNull();
+    expect(ack.ok).toBe(true);
 
     socket.disconnect();
   }, 10_000);
@@ -522,34 +570,32 @@ describe("Reconciliation on reconnect", () => {
     await new Promise<void>((r, j) => { socket1.on("connect", r); socket1.on("connect_error", j); });
 
     const resumeP1 = waitForReliableEvent(socket1, "resume_response");
-    sendResume(socket1, { serverUrl: BASE_URL, token: TOKEN, hostname, gpuName, maxConcurrent: 1 });
+    sendResume(socket1, { serverUrl: BASE_URL, token: TOKEN, hostname, gpuName, maxConcurrent: 20 });
     const resp1 = await resumeP1;
     const stubId = resp1.stub_id;
 
+    const buf1 = new TaskRunBuffer(socket1);
+
     // Submit a task and dispatch it
-    const taskRunP = waitForReliableEvent(socket1, "task.run", 8000);
     const script = `python reconcile_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
-    const runPayload = await taskRunP;
+    const runPayload = await buf1.waitForTask(task.id, 8000);
     const taskId = runPayload.task_id;
 
-    // Mark task as running (so it's not lost on disconnect)
-    socket1.emit("r", {
-      seq: 1,
-      event: "task.started",
-      payload: { task_id: taskId, pid: 55555 },
-      ts: Date.now(),
+    // Mark task as running
+    await new Promise<void>((resolve) => {
+      socket1.emit("task.started", { task_id: taskId, pid: 55555 }, () => resolve());
+      setTimeout(resolve, 500); // fallback
     });
-    await sleep(300);
 
-    // Disconnect stub
-    socket1.disconnect();
-    await sleep(500);
-
-    // Kill the task via API while stub is offline
+    // Kill the task via API BEFORE disconnecting (task is running → kill valid)
     await apiPatch(`${BASE_URL}/api/tasks/${taskId}`, TOKEN, { status: "killed" });
     await sleep(200);
+
+    // Disconnect stub (simulating it going offline after kill was issued)
+    socket1.disconnect();
+    await sleep(500);
 
     // Reconnect with running task still reported
     const socket2 = createMockStub({ serverUrl: BASE_URL, token: TOKEN });
@@ -581,24 +627,20 @@ describe("Reconciliation on reconnect", () => {
     await new Promise<void>((r, j) => { socket1.on("connect", r); socket1.on("connect_error", j); });
 
     const resumeP1 = waitForReliableEvent(socket1, "resume_response");
-    sendResume(socket1, { serverUrl: BASE_URL, token: TOKEN, hostname, gpuName, maxConcurrent: 1 });
+    sendResume(socket1, { serverUrl: BASE_URL, token: TOKEN, hostname, gpuName, maxConcurrent: 20 });
     await resumeP1;
 
+    const buf1 = new TaskRunBuffer(socket1);
+
     // Submit + dispatch
-    const taskRunP = waitForReliableEvent(socket1, "task.run", 8000);
     const script = `python crash_test_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
-    const runPayload = await taskRunP;
+    const runPayload = await buf1.waitForTask(task.id, 8000);
     const taskId = runPayload.task_id;
 
     // Mark running
-    socket1.emit("r", {
-      seq: 1,
-      event: "task.started",
-      payload: { task_id: taskId, pid: 77777 },
-      ts: Date.now(),
-    });
+    socket1.emit("task.started", { task_id: taskId, pid: 77777 });
     await sleep(300);
 
     // Disconnect without reporting task end
@@ -640,35 +682,31 @@ describe("Kill chain", () => {
     await new Promise<void>((r, j) => { socket.on("connect", r); socket.on("connect_error", j); });
 
     const resumeP = waitForReliableEvent(socket, "resume_response");
-    sendResume(socket, { serverUrl: BASE_URL, token: TOKEN, hostname, gpuName: "A40", maxConcurrent: 1 });
+    sendResume(socket, { serverUrl: BASE_URL, token: TOKEN, hostname, gpuName: "A40", maxConcurrent: 20 });
     await resumeP;
 
+    const buf = new TaskRunBuffer(socket);
+
     // Submit + dispatch task
-    const taskRunP = waitForReliableEvent(socket, "task.run", 8000);
     const script = `python kill_test_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
-    const runPayload = await taskRunP;
+    const runPayload = await buf.waitForTask(task.id, 8000);
     const taskId = runPayload.task_id;
 
     // Mark running
-    socket.emit("r", {
-      seq: 1,
-      event: "task.started",
-      payload: { task_id: taskId, pid: 33333 },
-      ts: Date.now(),
-    });
+    socket.emit("task.started", { task_id: taskId, pid: 33333 });
     await sleep(300);
 
-    // Listen for should_stop signal
-    const signalP = waitForReliableEvent(socket, "task.signal", 6000);
+    // Listen for task.kill signal (server sends this via reliableEmitToStub)
+    const killP = waitForReliableEvent(socket, "task.kill", 6000);
 
     // Cancel the task via API
     await apiPatch(`${BASE_URL}/api/tasks/${taskId}`, TOKEN, { status: "killed" });
 
-    const signal = await signalP;
-    expect(signal.task_id).toBe(taskId);
-    expect(signal.signal).toBe("should_stop");
+    const killPayload = await killP;
+    expect(killPayload.task_id).toBe(taskId);
+    expect(killPayload.grace_period_s).toBeGreaterThan(0);
 
     socket.disconnect();
   }, 15_000);

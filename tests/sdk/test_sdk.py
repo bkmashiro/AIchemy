@@ -63,13 +63,19 @@ class TestNoopMode:
         al = Alchemy()
         assert al.should_stop() is False
 
-    def test_should_checkpoint_returns_false(self):
+    def test_should_checkpoint_deprecated_returns_false(self):
+        import warnings
         al = Alchemy()
-        assert al.should_checkpoint() is False
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            assert al.should_checkpoint() is False
 
-    def test_should_eval_returns_false(self):
+    def test_should_eval_deprecated_returns_false(self):
+        import warnings
         al = Alchemy()
-        assert al.should_eval() is False
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            assert al.should_eval() is False
 
     def test_log_no_crash(self):
         al = Alchemy()
@@ -264,13 +270,14 @@ class TestTransportSelection:
         assert isinstance(transport, HttpTransport)
 
 
-# ─── 4. UnixSocketTransport — signal handling ─────────────────────────────────
+# ─── 4. UnixSocketTransport — send/connect ───────────────────────────────────
 
-class TestUnixSocketSignals:
-    """UnixSocketTransport receives signals from stub side."""
+class TestUnixSocketTransport:
+    """UnixSocketTransport connects and sends messages."""
 
-    def test_signal_should_stop(self):
-        """Sending signal JSON over socket sets should_stop=True."""
+    def test_send_when_connected(self):
+        """Transport sends JSON-line messages when connected."""
+        import json as _json
         sock_path = f"/tmp/alchemy_sig_test_{os.getpid()}.sock"
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
@@ -282,38 +289,16 @@ class TestUnixSocketSignals:
             # Accept connection from transport
             conn, _ = server_sock.accept()
 
-            # Initially should_stop is False
-            assert transport.should_stop() is False
+            # Send a progress message
+            transport.send({"type": "progress", "step": 1, "total": 100})
+            time.sleep(0.1)  # let send thread run
 
-            # Send signal
-            conn.sendall(json.dumps({"type": "signal", "signal": "should_stop"}).encode() + b"\n")
-            time.sleep(0.2)  # let recv thread process
+            conn.settimeout(1.0)
+            data = conn.recv(4096)
+            msg = _json.loads(data.decode().strip())
+            assert msg["type"] == "progress"
+            assert msg["step"] == 1
 
-            assert transport.should_stop() is True
-            transport.close()
-            conn.close()
-        finally:
-            server_sock.close()
-            try:
-                os.unlink(sock_path)
-            except FileNotFoundError:
-                pass
-
-    def test_signal_should_checkpoint(self):
-        sock_path = f"/tmp/alchemy_ckpt_test_{os.getpid()}.sock"
-        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            server_sock.bind(sock_path)
-            server_sock.listen(1)
-
-            transport = UnixSocketTransport(sock_path=sock_path, task_id="t2")
-            conn, _ = server_sock.accept()
-
-            assert transport.should_checkpoint() is False
-            conn.sendall(json.dumps({"type": "signal", "signal": "should_checkpoint"}).encode() + b"\n")
-            time.sleep(0.2)
-
-            assert transport.should_checkpoint() is True
             transport.close()
             conn.close()
         finally:
@@ -513,13 +498,9 @@ class TestTrainingContext:
         sent = []
         al._transport = MagicMock()
         al._transport.send.side_effect = lambda m: sent.append(m)
-        al._transport.should_stop.return_value = False
-        al._transport.should_checkpoint.return_value = False
-        al._transport.should_eval.return_value = False
 
         ctx = TrainingContext(al=al, total_steps=100)
         ctx._current_step = 5
-        ctx._last_log_time = 0  # reset throttle via al
 
         # Force throttle reset
         al._last_log_time = 0.0
@@ -533,12 +514,6 @@ class TestTrainingContext:
 # ─── 6. NoopTransport ─────────────────────────────────────────────────────────
 
 class TestNoopTransport:
-    def test_all_signals_false(self):
-        t = NoopTransport()
-        assert t.should_stop() is False
-        assert t.should_checkpoint() is False
-        assert t.should_eval() is False
-
     def test_send_no_crash(self):
         t = NoopTransport()
         t.send({"type": "progress", "step": 1, "total": 100})
@@ -551,12 +526,6 @@ class TestNoopTransport:
 # ─── 7. HttpTransport ────────────────────────────────────────────────────────
 
 class TestHttpTransport:
-    def test_signals_always_false(self):
-        t = HttpTransport(server="http://localhost:9999", task_id="test")
-        assert t.should_stop() is False
-        assert t.should_checkpoint() is False
-        assert t.should_eval() is False
-
     def test_send_silently_fails_if_server_down(self):
         """HTTP transport should not raise even if server is unreachable."""
         t = HttpTransport(server="http://localhost:19876", task_id="test")

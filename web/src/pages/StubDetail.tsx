@@ -148,10 +148,10 @@ export default function StubDetailPage() {
             onClick={() => {
               if (hasRunningTasks) { alert("Cannot release: stub has running tasks."); return; }
               if (confirm(`Mark stub "${stub.name}" offline?`)) {
-                doAction(() => stubsApi.patch(stub.id, { max_concurrent: 0 }));
+                doAction(() => stubsApi.release(stub.id));
               }
             }}
-            disabled={acting || isOnline && hasRunningTasks}
+            disabled={acting || (isOnline && hasRunningTasks)}
             title="Mark stub offline (only if no running tasks)"
             className="px-3 py-1.5 text-sm bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-40 transition-colors"
           >

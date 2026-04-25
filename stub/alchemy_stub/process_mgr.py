@@ -26,8 +26,8 @@ from .task_socket import task_socket_path
 log = logging.getLogger(__name__)
 
 _LOG_DIR_ENV = "ALCHEMY_LOG_DIR"
-_PID_FILE_DEFAULT = "/tmp/alchemy_stub_tasks.json"
-_LOG_DIR_DEFAULT = "/tmp/alchemy_task_logs"
+_PID_FILE_DEFAULT = os.path.join(os.path.expanduser("~"), ".alchemy", "stub_tasks.json")
+_LOG_DIR_DEFAULT = os.path.join(os.path.expanduser("~"), ".alchemy", "task_logs")
 
 
 def _log_dir() -> str:
@@ -167,40 +167,27 @@ class ProcessManager:
         self,
         task_id: str,
         grace_period_s: float = 5.0,
-        task_socket_registry=None,
     ) -> None:
-        """Graceful kill chain per spec §5:
-        1. Send should_stop via Unix socket (handled externally by caller via task_socket_registry).
+        """Graceful kill chain:
+        1. SIGTERM to process group (triggers SIGTERM handler in SDK → sets stop flag).
         2. Wait grace_period_s.
-        3. SIGTERM.
-        4. Wait 5s.
-        5. SIGKILL.
+        3. SIGKILL if still alive.
         """
         info = self._procs.get(task_id)
         if not info:
             return
 
-        # Step 1: signal via Unix socket
-        if task_socket_registry is not None:
-            task_socket_registry.signal_task(task_id, "should_stop")
+        # Step 1: SIGTERM — SDK's SIGTERM handler sets should_stop() = True
+        self._send_signal_to_group(info.pid, signal.SIGTERM)
 
         # Step 2: wait grace period
         deadline = time.monotonic() + grace_period_s
         while time.monotonic() < deadline:
             if info.poll() is not None:
-                return  # exited cleanly
+                return  # exited cleanly after SIGTERM
             await asyncio.sleep(0.5)
 
-        # Step 3: SIGTERM
-        self._send_signal_to_group(info.pid, signal.SIGTERM)
-
-        # Step 4: wait 5s
-        for _ in range(10):
-            await asyncio.sleep(0.5)
-            if info.poll() is not None:
-                return
-
-        # Step 5: SIGKILL
+        # Step 3: SIGKILL
         self._send_signal_to_group(info.pid, signal.SIGKILL)
 
     def kill_immediate(self, task_id: str) -> None:

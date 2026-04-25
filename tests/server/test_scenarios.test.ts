@@ -106,22 +106,88 @@ function sendResume(socket: Socket, opts: {
   });
 }
 
+// Server uses socket.io native ack callbacks. Register a one-time listener
+// that auto-acks and resolves with the payload.
 function waitReliable(socket: Socket, event: string, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      socket.off("r", handler);
+      socket.off(event, handler);
       reject(new Error(`Timed out waiting for '${event}' after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    function handler(msg: any) {
-      if (msg.event === event) {
-        clearTimeout(timer);
-        socket.off("r", handler);
-        socket.emit("r.ack", { seq: msg.seq });
-        resolve(msg.payload);
-      }
+    function handler(payload: any, ack?: Function) {
+      clearTimeout(timer);
+      socket.off(event, handler);
+      if (typeof ack === "function") ack({ ok: true });
+      resolve(payload);
     }
-    socket.on("r", handler);
+    socket.on(event, handler);
+  });
+}
+
+// Buffered task.run listener — starts collecting task.run events immediately, acking all.
+// Call waitForTask(taskId) to get the payload for a specific task even if it arrived before calling.
+class TaskRunBuffer {
+  private buffer: Array<{ payload: any }> = [];
+  private waiters: Map<string, (payload: any) => void> = new Map();
+  private socket: Socket;
+
+  constructor(socket: Socket) {
+    this.socket = socket;
+    socket.on("task.run", (payload: any, ack?: Function) => {
+      if (typeof ack === "function") ack({ ok: true });
+      const waiter = this.waiters.get(payload.task_id);
+      if (waiter) {
+        this.waiters.delete(payload.task_id);
+        waiter(payload);
+      } else {
+        this.buffer.push({ payload });
+      }
+    });
+  }
+
+  waitForTask(taskId: string, timeoutMs = 8000): Promise<any> {
+    const idx = this.buffer.findIndex((e) => e.payload.task_id === taskId);
+    if (idx !== -1) {
+      const [entry] = this.buffer.splice(idx, 1);
+      return Promise.resolve(entry.payload);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.waiters.delete(taskId);
+        reject(new Error(`Timed out waiting for task.run for task ${taskId} after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.waiters.set(taskId, (payload) => {
+        clearTimeout(timer);
+        resolve(payload);
+      });
+    });
+  }
+
+  destroy() {
+    this.socket.off("task.run");
+  }
+}
+
+// Wait for a task.run event for a specific task_id (acks all other task.run events too).
+// Only use this when starting the listener BEFORE submitting (no race condition).
+function waitReliableTaskRun(socket: Socket, taskId: string, timeoutMs = 8000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off("task.run", handler);
+      reject(new Error(`Timed out waiting for task.run for task ${taskId} after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    function handler(payload: any, ack?: Function) {
+      if (typeof ack === "function") ack({ ok: true });
+      if (payload.task_id === taskId) {
+        clearTimeout(timer);
+        socket.off("task.run", handler);
+        resolve(payload);
+      }
+      // else: ack but keep waiting for the right task
+    }
+    socket.on("task.run", handler);
   });
 }
 
@@ -257,10 +323,10 @@ describe("Tag-based routing", () => {
 
     // Stub B should NOT get anything (give it a moment)
     let stubBGotTask = false;
-    const bListener = (msg: any) => { if (msg.event === "task.run") stubBGotTask = true; };
-    stubB.on("r", bListener);
+    const bListener = (msg: any) => { stubBGotTask = true; };
+    stubB.on("task.run", bListener);
     await sleep(500);
-    stubB.off("r", bListener);
+    stubB.off("task.run", bListener);
     expect(stubBGotTask).toBe(false);
 
     stubA.disconnect();
@@ -324,9 +390,9 @@ describe("Task failure", () => {
     const runPayload = await taskRunP;
 
     // started → failed
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: runPayload.task_id, pid: 111 }, ts: Date.now() });
+    socket.emit("task.started", { task_id: runPayload.task_id, pid: 111 });
     await sleep(200);
-    socket.emit("r", { seq: 2, event: "task.failed", payload: { task_id: runPayload.task_id, exit_code: 137, error: "OOM killed" }, ts: Date.now() });
+    socket.emit("task.failed", { task_id: runPayload.task_id, exit_code: 137, error: "OOM killed" });
     await sleep(300);
 
     const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
@@ -354,9 +420,9 @@ describe("Task failure", () => {
     const payload1 = await run1P;
 
     // Mark failed
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: payload1.task_id, pid: 222 }, ts: Date.now() });
+    socket.emit("task.started", { task_id: payload1.task_id, pid: 222 });
     await sleep(200);
-    socket.emit("r", { seq: 2, event: "task.failed", payload: { task_id: payload1.task_id, exit_code: 1 }, ts: Date.now() });
+    socket.emit("task.failed", { task_id: payload1.task_id, exit_code: 1 });
     await sleep(300);
 
     // Re-submit same script → should succeed (dedup allows re-run of failed)
@@ -410,9 +476,9 @@ describe("run_dir computed by server", () => {
     const p1 = await run1P;
 
     // Complete it
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: p1.task_id, pid: 333 }, ts: Date.now() });
+    socket.emit("task.started", { task_id: p1.task_id, pid: 333 });
     await sleep(200);
-    socket.emit("r", { seq: 2, event: "task.completed", payload: { task_id: p1.task_id, exit_code: 0 }, ts: Date.now() });
+    socket.emit("task.completed", { task_id: p1.task_id, exit_code: 0 });
     await sleep(300);
 
     // Second task with same script
@@ -492,21 +558,21 @@ describe("max_concurrent enforcement", () => {
     const p1 = await run1P;
 
     // Mark running
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: p1.task_id, pid: 444 }, ts: Date.now() });
+    socket.emit("task.started", { task_id: p1.task_id, pid: 444 });
     await sleep(200);
 
     // Submit second task — should NOT be dispatched to this stub (at capacity)
     await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python mc1_b_${ts}.py` });
 
     let gotSecondTask = false;
-    const handler = (msg: any) => { if (msg.event === "task.run") gotSecondTask = true; };
-    socket.on("r", handler);
+    const handler = (msg: any) => { gotSecondTask = true; };
+    socket.on("task.run", handler);
     await sleep(800);
-    socket.off("r", handler);
+    socket.off("task.run", handler);
     expect(gotSecondTask).toBe(false);
 
     // Complete first task
-    socket.emit("r", { seq: 2, event: "task.completed", payload: { task_id: p1.task_id, exit_code: 0 }, ts: Date.now() });
+    socket.emit("task.completed", { task_id: p1.task_id, exit_code: 0 });
 
     // Now second task should get dispatched
     const run2P = waitReliable(socket, "task.run", 5000);
@@ -559,15 +625,19 @@ describe("Stub disconnect during task lifecycle", () => {
   it("Stub disconnects with running task → task marked lost", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `disclost-${ts}`, gpuName: "A40",
+      hostname: `disclost-${ts}`, gpuName: "A40", maxConcurrent: 20,
     });
 
-    const runP = waitReliable(socket, "task.run", 5000);
+    const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python disclost_${ts}.py` });
     const task = await r.json();
-    const payload = await runP;
+    const payload = await buf.waitForTask(task.id);
 
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: payload.task_id, pid: 555 }, ts: Date.now() });
+    // Wait for server to confirm task.started before disconnecting
+    await new Promise<void>((resolve) => {
+      socket.emit("task.started", { task_id: payload.task_id, pid: 555 }, () => resolve());
+      setTimeout(resolve, 500); // fallback
+    });
     await sleep(200);
 
     // Disconnect abruptly
@@ -586,13 +656,13 @@ describe("Stub disconnect during task lifecycle", () => {
   it("Stub disconnects with dispatched (not started) task → task goes back to pending", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `discpend-${ts}`, gpuName: "A40",
+      hostname: `discpend-${ts}`, gpuName: "A40", maxConcurrent: 20,
     });
 
-    const runP = waitReliable(socket, "task.run", 5000);
+    const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python discpend_${ts}.py` });
     const task = await r.json();
-    await runP; // dispatched but NOT started
+    await buf.waitForTask(task.id); // dispatched but NOT started
 
     // Disconnect without ever sending task.started
     socket.disconnect();
@@ -746,26 +816,29 @@ describe("Task kill via API", () => {
   it("PATCH task to killed → stub receives should_stop signal (kill chain start)", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `kill-${ts}`, gpuName: "A40",
+      hostname: `kill-${ts}`, gpuName: "A40", maxConcurrent: 20,
     });
 
-    const runP = waitReliable(socket, "task.run", 5000);
+    const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python kill_${ts}.py` });
     const task = await r.json();
-    const payload = await runP;
+    const payload = await buf.waitForTask(task.id);
 
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: payload.task_id, pid: 666 }, ts: Date.now() });
-    await sleep(200);
+    // Wait for server to confirm task.started (so task is in "running" state before kill)
+    await new Promise<void>((resolve) => {
+      socket.emit("task.started", { task_id: payload.task_id, pid: 666 }, () => resolve());
+      setTimeout(resolve, 500); // fallback
+    });
 
-    // Kill chain: first sends task.signal should_stop, then task.kill after 30s grace
-    const signalP = waitReliable(socket, "task.signal", 5000);
+    // Kill chain: server sends task.kill with grace_period_s
+    const killP = waitReliable(socket, "task.kill", 5000);
 
     // Kill via API
     await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
 
-    const signalPayload = await signalP;
-    expect(signalPayload.task_id).toBe(task.id);
-    expect(signalPayload.signal).toBe("should_stop");
+    const killPayload = await killP;
+    expect(killPayload.task_id).toBe(task.id);
+    expect(killPayload.grace_period_s).toBeGreaterThan(0);
 
     socket.disconnect();
   }, 10_000);
@@ -836,10 +909,7 @@ describe("Multiple stubs load balancing", () => {
 
     // Mark first task as running so that stub is at capacity
     const firstSocket = first === await run1 ? s1 : s2;
-    firstSocket.emit("r", {
-      seq: 1, event: "task.started",
-      payload: { task_id: first.task_id, pid: 8888 }, ts: Date.now(),
-    });
+    firstSocket.emit("task.started", { task_id: first.task_id, pid: 8888 });
     await sleep(300);
 
     // Submit second task — should go to the other stub
@@ -866,16 +936,18 @@ describe("Log buffer", () => {
   it("task.log lines accumulate in buffer", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `logbuf-${ts}`, gpuName: "A40",
+      hostname: `logbuf-${ts}`, gpuName: "A40", maxConcurrent: 20,
     });
 
-    const runP = waitReliable(socket, "task.run", 5000);
+    const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python logbuf_${ts}.py` });
     const task = await r.json();
-    const payload = await runP;
+    const payload = await buf.waitForTask(task.id);
 
-    socket.emit("r", { seq: 1, event: "task.started", payload: { task_id: payload.task_id, pid: 777 }, ts: Date.now() });
-    await sleep(200);
+    await new Promise<void>((resolve) => {
+      socket.emit("task.started", { task_id: payload.task_id, pid: 777 }, () => resolve());
+      setTimeout(resolve, 500); // fallback
+    });
 
     // Send log lines
     socket.emit("task.log", { task_id: payload.task_id, lines: ["epoch 1 loss=0.5", "epoch 2 loss=0.3"] });

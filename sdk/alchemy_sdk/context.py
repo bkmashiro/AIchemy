@@ -205,25 +205,23 @@ class TrainingContext:
     # ------------------------------------------------------------------
 
     def should_eval(self) -> bool:
-        """True if step % eval_every == 0 or server requested eval."""
-        step_trigger = (
+        """True if step % eval_every == 0."""
+        return (
             self._eval_every > 0
             and self._current_step > 0
             and self._current_step % self._eval_every == 0
         )
-        return step_trigger or self._al.should_eval()
 
     def should_checkpoint(self) -> bool:
-        """True if step % checkpoint_every == 0 or server requested checkpoint."""
-        step_trigger = (
+        """True if step % checkpoint_every == 0."""
+        return (
             self._checkpoint_every > 0
             and self._current_step > 0
             and self._current_step % self._checkpoint_every == 0
         )
-        return step_trigger or self._al.should_checkpoint()
 
     def should_stop(self) -> bool:
-        """True if server/stub requested graceful stop."""
+        """True if SIGTERM was received."""
         return self._al.should_stop()
 
     # ------------------------------------------------------------------

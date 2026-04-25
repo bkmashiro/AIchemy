@@ -9,12 +9,8 @@ SDK → Stub messages:
   { "type": "checkpoint", "path": "..." }
   { "type": "config",   "config": {} }
   { "type": "done",     "metrics": {} }
+  { "type": "notify",   "message": "...", "level": "info" }
   { "type": "heartbeat" }
-
-Stub → SDK messages:
-  { "type": "signal", "signal": "should_stop" }
-  { "type": "signal", "signal": "should_checkpoint" }
-  { "type": "signal", "signal": "should_eval" }
 
 Zombie detection: 60s no heartbeat but PID alive → zombie callback.
 """
@@ -46,6 +42,7 @@ class TaskSocket:
         on_checkpoint(task_id, path)
         on_config(task_id, config)
         on_done(task_id, metrics)
+        on_notify(task_id, message, level)
         on_zombie(task_id)
     """
 
@@ -58,6 +55,7 @@ class TaskSocket:
         on_checkpoint: Callable[..., Awaitable[None]] | None = None,
         on_config: Callable[..., Awaitable[None]] | None = None,
         on_done: Callable[..., Awaitable[None]] | None = None,
+        on_notify: Callable[..., Awaitable[None]] | None = None,
         on_zombie: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         self.task_id = task_id
@@ -67,15 +65,11 @@ class TaskSocket:
         self._on_checkpoint = on_checkpoint
         self._on_config = on_config
         self._on_done = on_done
+        self._on_notify = on_notify
         self._on_zombie = on_zombie
 
         self._sock_path = task_socket_path(task_id)
         self._server: asyncio.AbstractServer | None = None
-        self._signals: dict[str, bool] = {
-            "should_stop": False,
-            "should_checkpoint": False,
-            "should_eval": False,
-        }
         self._last_heartbeat = time.monotonic()
         self._writers: list[asyncio.StreamWriter] = []
         self._zombie_task: asyncio.Task | None = None
@@ -126,26 +120,6 @@ class TaskSocket:
         log.debug("TaskSocket stopped: %s", self._sock_path)
 
     # ------------------------------------------------------------------ #
-    # Signal push (Stub → SDK)                                            #
-    # ------------------------------------------------------------------ #
-
-    def set_signal(self, signal_name: str) -> None:
-        """Set a signal flag; push to all connected SDK clients."""
-        if signal_name in self._signals:
-            self._signals[signal_name] = True
-            asyncio.create_task(self._broadcast_signal(signal_name))
-
-    async def _broadcast_signal(self, signal_name: str) -> None:
-        msg = json.dumps({"type": "signal", "signal": signal_name}) + "\n"
-        encoded = msg.encode()
-        for w in list(self._writers):
-            try:
-                w.write(encoded)
-                await w.drain()
-            except Exception as e:
-                log.debug("broadcast_signal write error: %s", e)
-
-    # ------------------------------------------------------------------ #
     # Client handling                                                      #
     # ------------------------------------------------------------------ #
 
@@ -153,16 +127,6 @@ class TaskSocket:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self._writers.append(writer)
-        # Send current signal state on connect
-        for sig, active in self._signals.items():
-            if active:
-                try:
-                    writer.write(
-                        (json.dumps({"type": "signal", "signal": sig}) + "\n").encode()
-                    )
-                    await writer.drain()
-                except Exception:
-                    pass
         try:
             while True:
                 line = await reader.readline()
@@ -217,6 +181,13 @@ class TaskSocket:
         elif mtype == "done":
             if self._on_done:
                 await self._on_done(self.task_id, msg.get("metrics") or {})
+        elif mtype == "notify":
+            if self._on_notify:
+                await self._on_notify(
+                    self.task_id,
+                    msg.get("message", ""),
+                    msg.get("level", "info"),
+                )
         else:
             log.debug("unknown SDK message type: %s", mtype)
 
@@ -275,11 +246,6 @@ class TaskSocketRegistry:
 
     def get(self, task_id: str) -> TaskSocket | None:
         return self._sockets.get(task_id)
-
-    def signal_task(self, task_id: str, signal_name: str) -> None:
-        ts = self._sockets.get(task_id)
-        if ts:
-            ts.set_signal(signal_name)
 
     async def stop_all(self) -> None:
         for ts in list(self._sockets.values()):

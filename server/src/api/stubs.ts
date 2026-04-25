@@ -12,7 +12,7 @@ import { Namespace } from "socket.io";
 import { maybeDispatch } from "../scheduler";
 import { reliableEmitToStub } from "../reliable";
 import { computeFingerprint, writeLockTable, idempotencyCache } from "../dedup";
-import { createTask, generateDisplayName, assembleCommand } from "./tasks";
+import { createTask } from "./tasks";
 
 export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
   const router = Router();
@@ -59,6 +59,46 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     store.setStub(stub);
     webNs.emit("stub.update", (() => { const { socket_id, ...rest } = stub; return rest; })());
     res.json({ ok: true, stub: (() => { const { socket_id, ...rest } = stub; return rest; })() });
+  });
+
+  // POST /stubs/:id/release — forcibly mark stub offline and lose its active tasks
+  router.post("/:id/release", (req: Request, res: Response) => {
+    const stub = store.getStub(req.params.id);
+    if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
+
+    const hasRunning = stub.tasks.some((t) => t.status === "running");
+    if (hasRunning) { res.status(409).json({ error: "Stub has running tasks — drain first" }); return; }
+
+    // Disconnect socket if online
+    if (stub.socket_id) {
+      const socket = stubNs.sockets.get(stub.socket_id);
+      if (socket) socket.disconnect(true);
+    }
+
+    stub.status = "offline";
+    stub.socket_id = undefined;
+    store.setStub(stub);
+    webNs.emit("stub.offline", { stub_id: stub.id });
+    res.json({ ok: true });
+  });
+
+  // POST /stubs/:id/restart — ask stub to exit cleanly (wrapper will restart it)
+  router.post("/:id/restart", (req: Request, res: Response) => {
+    const stub = store.getStub(req.params.id);
+    if (!stub || stub.status !== "online") { res.status(404).json({ error: "Stub not online" }); return; }
+    reliableEmitToStub(stub.id, "stub.restart", {});
+    res.json({ ok: true });
+  });
+
+  // POST /stubs/:id/sync — trigger immediate status sync and return result
+  router.post("/:id/sync", (req: Request, res: Response) => {
+    const stub = store.getStub(req.params.id);
+    if (!stub || stub.status !== "online" || !stub.socket_id) { res.status(404).json({ error: "Stub not online" }); return; }
+    const socket = stubNs.sockets.get(stub.socket_id);
+    if (!socket) { res.status(500).json({ error: "Socket not found" }); return; }
+    socket.emit("status.sync", {}, (response: any) => {
+      res.json(response ?? { error: "No response from stub" });
+    });
   });
 
   // POST /stubs/:id/exec — fire a shell command on the stub

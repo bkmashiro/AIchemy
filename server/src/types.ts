@@ -199,7 +199,7 @@ export interface ResumePayload {
   tags?: string[];
   running_tasks: Array<{ task_id: string; pid: number; step?: number; status: string }>;
   local_queue: string[];
-  lastSeq: number;
+  dead_tasks?: Array<{ task_id: string; exit_code: number }>;
   available_envs?: Array<{ name: string; type: string; path: string }>;
 }
 

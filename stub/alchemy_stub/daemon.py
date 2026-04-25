@@ -79,6 +79,9 @@ class StubDaemon:
         self.task_socket_registry = TaskSocketRegistry()
 
         identity = config.identity_hash
+        # Use /tmp for PID file and log dir to avoid home-dir permission issues
+        # (e.g. hw2025's home may not be writable from SLURM jobs)
+        os.environ.setdefault("ALCHEMY_LOG_DIR", f"/tmp/alchemy_stub_{identity}_logs")
         self.process_mgr = ProcessManager(
             max_concurrent=config.max_concurrent,
             env_setup=config.env_setup,
@@ -97,12 +100,10 @@ class StubDaemon:
         self.last_task_time: float = time.time()
         self._zombie_reported: set[str] = set()
         self._walltime_draining: bool = False
+        self._task_start_times: dict[str, float] = {}
 
         self.sio = socketio.AsyncClient(
-            reconnection=True,
-            reconnection_attempts=0,  # infinite
-            reconnection_delay=1,
-            reconnection_delay_max=60,
+            reconnection=False,  # outer while-loop handles reconnection; prevent double-socket
             logger=False,
             engineio_logger=False,
             ssl_verify=self._build_ssl_context(),
@@ -133,12 +134,14 @@ class StubDaemon:
         @sio.event(namespace="/stubs")
         async def connect():
             jlog("info", "sio.connect", server=self.config.server)
+            log.info("Connected to server %s", self.config.server)
             self._connected = True
             await self._send_resume()
 
         @sio.event(namespace="/stubs")
         async def disconnect():
             jlog("info", "sio.disconnect")
+            log.info("Disconnected from server")
             self._connected = False
 
         # ─── Server → Stub events (direct, with native ack) ─────────────
@@ -195,6 +198,29 @@ class StubDaemon:
             log.debug("request_sync received — re-sending resume")
             await self._send_resume()
 
+        @sio.on("status.sync", namespace="/stubs")
+        async def on_status_sync(*args):
+            ack = _find_ack(args)
+            running_tasks = [
+                {"task_id": tid, "pid": info.pid, "alive": info.poll() is None}
+                for tid, info in self.process_mgr._procs.items()
+            ]
+            status = {"running_tasks": running_tasks}
+            if ack:
+                ack(status)
+            else:
+                await self._emit("status.sync_response", status)
+
+        @sio.on("stub.restart", namespace="/stubs")
+        async def on_stub_restart(*args):
+            ack = _find_ack(args)
+            if ack:
+                ack({"ok": True})
+            jlog("info", "stub.restart_requested")
+            # Brief delay to allow ack to send before exiting
+            await asyncio.sleep(0.5)
+            os._exit(0)
+
     # ------------------------------------------------------------------ #
     # Resume                                                               #
     # ------------------------------------------------------------------ #
@@ -207,6 +233,12 @@ class StubDaemon:
         for task_id, pid in self.process_mgr.get_task_pids().items():
             running_tasks.append({"task_id": task_id, "pid": pid, "status": "running"})
 
+        # Tasks that died while stub was offline — report with exit code (-1 = unknown)
+        dead_tasks = [
+            {"task_id": tid, "exit_code": -1}
+            for tid, _pid in self.process_mgr._dead_on_reattach
+        ]
+
         payload: dict[str, Any] = {
             "hostname": self.config.hostname,
             "gpu": gpu_info,
@@ -214,6 +246,7 @@ class StubDaemon:
             "token": self.config.token,
             "running_tasks": running_tasks,
             "local_queue": [],
+            "dead_tasks": dead_tasks,
             "env_setup": self.config.env_setup or None,
             "default_cwd": self.config.default_cwd or None,
         }
@@ -253,6 +286,11 @@ class StubDaemon:
         config_update = data.get("config") or {}
 
         jlog("info", "resume_response", stub_id=self.stub_id, name=self.stub_name)
+        log.info("Registered as stub_id=%s name=%s", self.stub_id, self.stub_name)
+        if data.get("kill_tasks"):
+            log.info("Server requested kill of %d orphan task(s)", len(data["kill_tasks"]))
+        if data.get("adopt_tasks"):
+            log.info("Server assigned %d task(s) to adopt", len(data["adopt_tasks"]))
 
         # Apply server-authoritative config
         if "max_concurrent" in config_update:
@@ -264,13 +302,7 @@ class StubDaemon:
             log.info("resume_response: killing orphan task %s", task_id)
             await self._kill_task(task_id, grace_period_s=0)
 
-        # Report tasks that died while stub was restarting
-        for task_id, _pid in self.process_mgr._dead_on_reattach:
-            log.info("Reporting dead task %s (died while offline)", task_id)
-            await self._emit(
-                "task.failed",
-                {"task_id": task_id, "exit_code": -1, "error": "Died while stub was offline"},
-            )
+        # Dead-on-reattach tasks were already reported in the resume payload — clear the list
         self.process_mgr._dead_on_reattach.clear()
 
         # Adopt tasks server wants us to run
@@ -280,6 +312,8 @@ class StubDaemon:
     async def _handle_task_run(self, data: dict) -> None:
         task_id: str = data["task_id"]
         command: str = data["command"]
+
+        log.info("Task %s received: command=%s", task_id, command[:200])
 
         if not self.accepting_tasks:
             log.info("Not accepting new tasks (draining), ignoring task.run %s", task_id)
@@ -298,10 +332,24 @@ class StubDaemon:
             token=self.config.token,
         )
         if not result.ok:
+            error_detail = "; ".join(result.errors)
             jlog("error", "preflight.fail", task_id=task_id, errors=result.errors)
+            log.error("Preflight failed for task %s: %s", task_id, error_detail)
+            # Send error to task log buffer so web UI shows what went wrong
+            await self._emit(
+                "task.log",
+                {"task_id": task_id, "lines": [
+                    f"[alchemy-stub] PREFLIGHT FAILED: {err}" for err in result.errors
+                ]},
+            )
             await self._emit(
                 "preflight.fail",
                 {"task_id": task_id, "errors": result.errors},
+            )
+            # Also report as task.failed so server marks it done
+            await self._emit(
+                "task.failed",
+                {"task_id": task_id, "exit_code": -1, "error": f"Preflight failed: {error_detail}"},
             )
             return
 
@@ -313,7 +361,7 @@ class StubDaemon:
         params: dict[str, Any] | None = data.get("params")
         run_dir: str | None = data.get("run_dir")
 
-        jlog("info", "task.run", task_id=task_id, command=command[:120], run_dir=run_dir)
+        jlog("info", "task.run", task_id=task_id, command=command[:120], cwd=cwd, run_dir=run_dir)
         self.last_task_time = time.time()
 
         try:
@@ -327,10 +375,16 @@ class StubDaemon:
                 run_dir=run_dir,
             )
         except Exception as e:
+            error_msg = f"Failed to start process: {e}"
             log.error("Failed to start task %s: %s", task_id, e)
+            # Send error to task log buffer
+            await self._emit(
+                "task.log",
+                {"task_id": task_id, "lines": [f"[alchemy-stub] {error_msg}"]},
+            )
             await self._emit(
                 "task.failed",
-                {"task_id": task_id, "exit_code": -1, "error": str(e)},
+                {"task_id": task_id, "exit_code": -1, "error": error_msg},
             )
             return
 
@@ -344,6 +398,7 @@ class StubDaemon:
                 on_checkpoint=self._on_sdk_checkpoint,
                 on_config=self._on_sdk_config,
                 on_done=self._on_sdk_done,
+                on_notify=self._on_sdk_notify,
                 on_zombie=self._on_task_zombie,
             )
         except Exception as e:
@@ -362,15 +417,14 @@ class StubDaemon:
             self.process_mgr.kill_graceful(
                 task_id,
                 grace_period_s=grace_period_s,
-                task_socket_registry=self.task_socket_registry,
             )
         )
 
     async def _handle_task_signal(self, data: dict) -> None:
-        task_id: str = data["task_id"]
-        sig: str = data["signal"]
-        log.info("task.signal %s → %s", task_id, sig)
-        self.task_socket_registry.signal_task(task_id, sig)
+        # Legacy handler kept for backward compatibility — currently a no-op.
+        task_id: str = data.get("task_id", "")
+        sig: str = data.get("signal", "")
+        log.debug("task.signal (ignored, deprecated): task=%s signal=%s", task_id, sig)
 
     async def _handle_config_update(self, data: dict) -> None:
         if "max_concurrent" in data:
@@ -494,7 +548,9 @@ class StubDaemon:
     # ------------------------------------------------------------------ #
 
     async def _on_task_started(self, task_id: str, pid: int) -> None:
+        self._task_start_times[task_id] = time.time()
         jlog("info", "task.started", task_id=task_id, pid=pid)
+        log.info("Task %s started with pid=%d", task_id, pid)
         await self._emit("task.started", {"task_id": task_id, "pid": pid})
 
     async def _on_task_log(self, task_id: str, lines: list[str]) -> None:
@@ -503,14 +559,23 @@ class StubDaemon:
 
     async def _on_task_completed(self, task_id: str, exit_code: int) -> None:
         self.last_task_time = time.time()
-        jlog("info", "task.completed", task_id=task_id, exit_code=exit_code)
+        duration_s = round(time.time() - self._task_start_times.pop(task_id, time.time()))
+        jlog("info", "task.completed", task_id=task_id, exit_code=exit_code, duration_s=duration_s)
+        log.info("Task %s completed: exit_code=%d duration=%ds", task_id, exit_code, duration_s)
         await self.task_socket_registry.remove(task_id)
         await self._emit("task.completed", {"task_id": task_id, "exit_code": exit_code})
 
     async def _on_task_failed(self, task_id: str, exit_code: int, error: str) -> None:
         self.last_task_time = time.time()
-        jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error)
+        duration_s = round(time.time() - self._task_start_times.pop(task_id, time.time()))
+        jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error, duration_s=duration_s)
+        log.error("Task %s failed: exit_code=%d duration=%ds error=%s", task_id, exit_code, duration_s, error)
         await self.task_socket_registry.remove(task_id)
+        # Send error to task log buffer so web UI shows the failure reason
+        await self._emit(
+            "task.log",
+            {"task_id": task_id, "lines": [f"[alchemy-stub] Task failed: exit_code={exit_code} {error}"]},
+        )
         await self._emit(
             "task.failed",
             {"task_id": task_id, "exit_code": exit_code, "error": error},
@@ -580,6 +645,15 @@ class StubDaemon:
 
     async def _on_sdk_done(self, task_id: str, metrics: dict) -> None:
         log.info("SDK done for task %s", task_id)
+
+    async def _on_sdk_notify(self, task_id: str, message: str, level: str) -> None:
+        """Forward SDK notify message to server."""
+        jlog("info", "task.notify", task_id=task_id, level=level, message=message[:200])
+        await self._emit("task.notify", {
+            "task_id": task_id,
+            "message": message,
+            "level": level,
+        })
 
     # ------------------------------------------------------------------ #
     # Background loops                                                     #
@@ -678,18 +752,17 @@ class StubDaemon:
                 self._walltime_draining = True
                 self.accepting_tasks = False
 
-                # Step 2: checkpoint all running tasks
+                # Step 2: SIGTERM all running tasks (triggers SDK stop flag)
+                # Give tasks 60s to checkpoint and exit cleanly after SIGTERM
                 for task_id in list(self.process_mgr.get_task_pids()):
-                    self.task_socket_registry.signal_task(task_id, "should_checkpoint")
+                    asyncio.create_task(
+                        self.process_mgr.kill_graceful(task_id, grace_period_s=60)
+                    )
 
-                # Step 3: wait 60s for checkpoint
+                # Step 3: wait 60s for checkpoint + clean exit
                 await asyncio.sleep(60)
 
-                # Step 4: stop all running tasks
-                for task_id in list(self.process_mgr.get_task_pids()):
-                    self.task_socket_registry.signal_task(task_id, "should_stop")
-
-                # Step 5: wait up to (remaining - 120s)
+                # Step 4: wait up to (remaining - 120s) for remaining tasks
                 grace = max(0, remaining - 120)
                 jlog("info", "stub.walltime_drain",
                      detail="waiting_for_tasks",
@@ -736,10 +809,26 @@ class StubDaemon:
     # ------------------------------------------------------------------ #
 
     async def run(self) -> None:
+        jlog("info", "daemon.start",
+             server=self.config.server,
+             default_cwd=self.config.default_cwd,
+             max_concurrent=self.config.max_concurrent,
+             tags=self.config.tags,
+             env_setup=self.config.env_setup[:80] if self.config.env_setup else "")
+        log.info(
+            "Daemon starting: server=%s cwd=%s max_concurrent=%d tags=%s",
+            self.config.server, self.config.default_cwd,
+            self.config.max_concurrent, self.config.tags,
+        )
+
         # Re-attach surviving task processes from previous run
         reattached = self.process_mgr.load_and_reattach()
         if reattached:
-            log.info("Re-attached %d task(s) from previous run", len(reattached))
+            log.info("Re-attached %d task(s) from previous run: %s",
+                     len(reattached), list(reattached.keys()))
+        dead_count = len(self.process_mgr._dead_on_reattach)
+        if dead_count:
+            log.info("Found %d dead task(s) from previous run", dead_count)
 
         # Start process monitoring
         self.process_mgr.start_monitoring()
@@ -755,13 +844,18 @@ class StubDaemon:
         log.info("Connecting to %s", server)
         while True:
             try:
+                # Ensure clean state before connecting — prevent double-socket loops
+                if self.sio.connected:
+                    await self.sio.disconnect()
                 await self.sio.connect(server, namespaces=["/stubs"])
                 await self.sio.wait()
             except socketio.exceptions.ConnectionError as e:
                 jlog("warn", "sio.reconnect", error=str(e))
+                log.warning("Connection failed, retrying in 5s: %s", e)
                 await asyncio.sleep(5)
             except Exception as e:
                 jlog("error", "sio.reconnect", error=str(e))
+                log.error("Unexpected connection error, retrying in 5s: %s", e)
                 await asyncio.sleep(5)
 
     async def graceful_drain(self, timeout: float = 300.0) -> None:

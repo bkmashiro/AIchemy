@@ -1,116 +1,38 @@
-"""Tests for should_stop/should_checkpoint/should_eval signal handling."""
+"""Tests for should_stop (SIGTERM-based) and deprecated should_checkpoint/should_eval."""
 import os
-import threading
-import time
+import signal
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from alchemy_sdk.transport import UnixSocketTransport, NoopTransport, HttpTransport, make_transport
+from alchemy_sdk.transport import NoopTransport, HttpTransport, UnixSocketTransport, make_transport
 from alchemy_sdk.client import Alchemy
 
 
-class TestNoopTransportSignals:
-    def test_should_stop_false(self):
-        t = NoopTransport()
-        assert t.should_stop() is False
-
-    def test_should_checkpoint_false(self):
-        t = NoopTransport()
-        assert t.should_checkpoint() is False
-
-    def test_should_eval_false(self):
-        t = NoopTransport()
-        assert t.should_eval() is False
-
+class TestNoopTransport:
     def test_send_noop(self):
         t = NoopTransport()
         t.send({"type": "progress", "step": 1, "total": 100})  # must not raise
 
-
-class TestHttpTransportSignals:
-    def test_should_stop_always_false(self):
-        t = HttpTransport("http://localhost:3001", "task-123")
-        assert t.should_stop() is False
-
-    def test_should_checkpoint_always_false(self):
-        t = HttpTransport("http://localhost:3001", "task-123")
-        assert t.should_checkpoint() is False
-
-    def test_should_eval_always_false(self):
-        t = HttpTransport("http://localhost:3001", "task-123")
-        assert t.should_eval() is False
+    def test_close_noop(self):
+        t = NoopTransport()
+        t.close()  # must not raise
 
 
-class TestUnixSocketTransportSignals:
-    def test_signals_initially_false(self):
-        """Signal flags start False before any message received."""
+class TestHttpTransport:
+    def test_send_silently_fails(self):
+        t = HttpTransport("http://localhost:19999", "task-123")
+        t.send({"type": "progress", "step": 1, "total": 100})  # must not raise
+
+
+class TestUnixSocketTransport:
+    def test_connects_and_sends(self):
         with patch.object(UnixSocketTransport, "_connect", return_value=False), \
              patch.object(UnixSocketTransport, "_recv_loop"), \
              patch.object(UnixSocketTransport, "_heartbeat_loop"):
             t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            assert t.should_stop() is False
-            assert t.should_checkpoint() is False
-            assert t.should_eval() is False
-
-    def test_handle_should_stop_signal(self):
-        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
-             patch.object(UnixSocketTransport, "_recv_loop"), \
-             patch.object(UnixSocketTransport, "_heartbeat_loop"):
-            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            t._handle_message('{"type": "signal", "signal": "should_stop"}')
-            assert t.should_stop() is True
-            assert t.should_checkpoint() is False
-
-    def test_handle_should_checkpoint_signal(self):
-        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
-             patch.object(UnixSocketTransport, "_recv_loop"), \
-             patch.object(UnixSocketTransport, "_heartbeat_loop"):
-            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            t._handle_message('{"type": "signal", "signal": "should_checkpoint"}')
-            assert t.should_checkpoint() is True
-            assert t.should_stop() is False
-
-    def test_handle_should_eval_signal(self):
-        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
-             patch.object(UnixSocketTransport, "_recv_loop"), \
-             patch.object(UnixSocketTransport, "_heartbeat_loop"):
-            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            t._handle_message('{"type": "signal", "signal": "should_eval"}')
-            assert t.should_eval() is True
-
-    def test_handle_unknown_signal_ignored(self):
-        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
-             patch.object(UnixSocketTransport, "_recv_loop"), \
-             patch.object(UnixSocketTransport, "_heartbeat_loop"):
-            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            t._handle_message('{"type": "signal", "signal": "unknown_signal"}')
-            assert t.should_stop() is False
-
-    def test_handle_malformed_json_ignored(self):
-        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
-             patch.object(UnixSocketTransport, "_recv_loop"), \
-             patch.object(UnixSocketTransport, "_heartbeat_loop"):
-            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            t._handle_message("not valid json{{{")
-            # Must not crash, signals stay False
-            assert t.should_stop() is False
-
-    def test_signals_thread_safe(self):
-        """Signals can be set from recv thread and read from main thread."""
-        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
-             patch.object(UnixSocketTransport, "_recv_loop"), \
-             patch.object(UnixSocketTransport, "_heartbeat_loop"):
-            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-
-            def set_signal():
-                time.sleep(0.01)
-                t._handle_message('{"type": "signal", "signal": "should_stop"}')
-
-            thread = threading.Thread(target=set_signal)
-            thread.start()
-            thread.join()
-            assert t.should_stop() is True
+            t.send({"type": "heartbeat"})  # must not raise even when not connected
 
 
 class TestMakeTransport:
@@ -130,7 +52,6 @@ class TestMakeTransport:
         with patch("alchemy_sdk.transport._probe_unix_socket", return_value=True), \
              patch.object(UnixSocketTransport, "__init__", return_value=None):
             t = make_transport("task-123", "/tmp/test.sock", None)
-            # _probe returned True, so UnixSocketTransport was constructed
             assert isinstance(t, UnixSocketTransport)
 
     def test_http_fallback_when_socket_not_connectable(self):
@@ -144,45 +65,49 @@ class TestMakeTransport:
         assert isinstance(t, NoopTransport)
 
 
-class TestAlchemyClientSignals:
-    def test_should_stop_false_in_noop_mode(self):
-        with patch.dict(os.environ, {}, clear=True):
-            for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
-                os.environ.pop(k, None)
-            al = Alchemy()
+class TestAlchemyShouldStop:
+    def setup_method(self):
+        for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
+            os.environ.pop(k, None)
+
+    def test_should_stop_false_initially(self):
+        al = Alchemy()
         assert al.should_stop() is False
 
-    def test_should_checkpoint_false_in_noop_mode(self):
-        with patch.dict(os.environ, {}, clear=True):
-            for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
-                os.environ.pop(k, None)
-            al = Alchemy()
-        assert al.should_checkpoint() is False
-
-    def test_should_eval_false_in_noop_mode(self):
-        with patch.dict(os.environ, {}, clear=True):
-            for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
-                os.environ.pop(k, None)
-            al = Alchemy()
-        assert al.should_eval() is False
-
-    def test_delegates_should_stop_to_transport(self):
+    def test_should_stop_true_after_sigterm(self):
         al = Alchemy()
-        al._transport = MagicMock()
-        al._transport.should_stop.return_value = True
+        assert al.should_stop() is False
+        # Simulate SIGTERM
+        al._stop_flag = True
         assert al.should_stop() is True
 
-    def test_delegates_should_checkpoint_to_transport(self):
+    def test_should_stop_set_by_signal_handler(self):
         al = Alchemy()
-        al._transport = MagicMock()
-        al._transport.should_checkpoint.return_value = True
-        assert al.should_checkpoint() is True
+        # Trigger the installed SIGTERM handler
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert al.should_stop() is True
+        # Restore
+        al._stop_flag = False
 
-    def test_delegates_should_eval_to_transport(self):
+    def test_should_checkpoint_deprecated_returns_false(self):
         al = Alchemy()
-        al._transport = MagicMock()
-        al._transport.should_eval.return_value = True
-        assert al.should_eval() is True
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = al.should_checkpoint()
+            assert result is False
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "should_checkpoint" in str(w[0].message)
+
+    def test_should_eval_deprecated_returns_false(self):
+        al = Alchemy()
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = al.should_eval()
+            assert result is False
+            assert len(w) == 1
+            assert issubclass(w[0].category, DeprecationWarning)
+            assert "should_eval" in str(w[0].message)
 
     def test_context_manager_calls_done(self):
         al = Alchemy()
@@ -190,3 +115,51 @@ class TestAlchemyClientSignals:
             with al:
                 pass
             mock_done.assert_called_once()
+
+
+class TestAlchemyNotify:
+    def setup_method(self):
+        for k in ["ALCHEMY_TASK_ID", "ALCHEMY_STUB_SOCKET", "ALCHEMY_SERVER", "ALCHEMY_PARAMS"]:
+            os.environ.pop(k, None)
+
+    def test_notify_sends_via_transport(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        al.notify("training diverged", level="warning")
+        al._transport.send.assert_called_once_with({
+            "type": "notify",
+            "message": "training diverged",
+            "level": "warning",
+        })
+
+    def test_notify_default_level_is_info(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        al.notify("checkpoint saved")
+        al._transport.send.assert_called_once_with({
+            "type": "notify",
+            "message": "checkpoint saved",
+            "level": "info",
+        })
+
+    def test_notify_invalid_level_defaults_to_info(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        al.notify("something", level="bad_level")
+        al._transport.send.assert_called_once_with({
+            "type": "notify",
+            "message": "something",
+            "level": "info",
+        })
+
+    def test_notify_all_valid_levels(self):
+        al = Alchemy()
+        al._transport = MagicMock()
+        for level in ("debug", "info", "warning", "critical"):
+            al.notify("test", level=level)
+        assert al._transport.send.call_count == 4
+
+    def test_notify_noop_no_crash(self):
+        al = Alchemy()
+        assert isinstance(al._transport, NoopTransport)
+        al.notify("test message", level="critical")  # must not raise

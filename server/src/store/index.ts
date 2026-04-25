@@ -13,6 +13,7 @@ import { Stub, Task, Grid, Token, ServerState, TaskStatus } from "../types";
 import { writeLockTable } from "../dedup";
 import { backupState, pruneBackups } from "./backup";
 import { logger } from "../log";
+import { canTransition } from "../state-machine";
 
 const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), "state.json");
 const SNAPSHOT_INTERVAL = 60_000;
@@ -69,6 +70,23 @@ class Store {
 
   deleteStub(id: string): void {
     this.stubs.delete(id);
+  }
+
+  /** Remove stubs that have been offline for too long with no active tasks. */
+  pruneStaleStubs(maxOfflineHours: number = 24): number {
+    const cutoff = Date.now() - maxOfflineHours * 3600_000;
+    let pruned = 0;
+    for (const [id, stub] of this.stubs) {
+      if (stub.status === "offline" && stub.tasks.length === 0) {
+        const lastSeen = new Date(stub.last_heartbeat).getTime();
+        if (lastSeen < cutoff) {
+          this.stubs.delete(id);
+          pruned++;
+          logger.info("stub.pruned", { stub: stub.name, last_seen: stub.last_heartbeat });
+        }
+      }
+    }
+    return pruned;
   }
 
   // ─── Tokens ────────────────────────────────────────────────────────────────
@@ -147,6 +165,11 @@ class Store {
     const stub = this.stubs.get(stubId);
     if (!stub) return undefined;
     const [task] = this.archive.splice(idx, 1);
+    if (update.status && !canTransition(task.status, update.status)) {
+      logger.warn("unarchiveTask.illegal_transition", { taskId, from: task.status, to: update.status });
+      this.archive.push(task); // put it back
+      return undefined;
+    }
     const recovered = { ...task, ...update };
     stub.tasks.push(recovered);
     this._reindexTask(task, recovered);
@@ -180,6 +203,17 @@ class Store {
     const idx = this.globalQueue.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
     const prev = this.globalQueue[idx];
+    // Validate state transition
+    if (update.status && update.status !== prev.status) {
+      if (!canTransition(prev.status, update.status)) {
+        logger.error("state.illegal_transition", {
+          task_id: taskId,
+          from: prev.status,
+          to: update.status,
+        });
+        return undefined;
+      }
+    }
     this.globalQueue[idx] = { ...prev, ...update };
     const updated = this.globalQueue[idx];
     this._reindexTask(prev, updated);
@@ -216,11 +250,22 @@ class Store {
     const idx = stub.tasks.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
     const prev = stub.tasks[idx];
+    // Validate state transition
+    if (update.status && update.status !== prev.status) {
+      if (!canTransition(prev.status, update.status)) {
+        logger.error("state.illegal_transition", {
+          task_id: taskId,
+          from: prev.status,
+          to: update.status,
+        });
+        return undefined;
+      }
+    }
     stub.tasks[idx] = { ...prev, ...update };
     const updated = stub.tasks[idx];
     this._reindexTask(prev, updated);
-    // Auto-archive: move to archive when transitioning to terminal status
-    if (this._isActive(prev.status) && !this._isActive(updated.status)) {
+    // Auto-archive: archive any terminal task still in stub.tasks
+    if (!this._isActive(updated.status)) {
       this._archiveTask(stubId, taskId, updated);
     }
     return updated;
@@ -350,6 +395,7 @@ class Store {
   startPersistence(): void {
     setInterval(() => this.saveAsync(), SNAPSHOT_INTERVAL);
     setInterval(() => this._autoBackup(), BACKUP_INTERVAL);
+    setInterval(() => this.pruneStaleStubs(), 3600_000);  // hourly
   }
 
   private async _autoBackup(): Promise<void> {
