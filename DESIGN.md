@@ -13,6 +13,8 @@
 5. [设计哲学：为什么这样选择](#5-设计哲学为什么这样选择)
 6. [关注点分离](#6-关注点分离)
 7. [并发模型](#7-并发模型)
+8. [训练即纯函数：核心抽象](#8-训练即纯函数alchemy-的核心抽象)
+9. [SDK 设计：控制反转与语言特性](#9-sdk-设计控制反转与语言特性)
 
 ---
 
@@ -578,6 +580,208 @@ if (!this._isActive(updated.status) && updated.run_dir) {
 ```
 
 两种竞争处理策略的选择基于错误代价：VRAM OOM 可以自动重试（低代价），目录污染不可逆（高代价）。
+
+---
+
+## 8. 训练即纯函数：Alchemy 的核心抽象
+
+Alchemy 最深层的设计信念是：**一次成功的训练是一个纯函数调用。**
+
+```
+f(code_hash, config, seed) → (model_weights, metrics)
+```
+
+给定相同的代码、配置和随机种子，在相同硬件上，训练结果是确定性的（bit-identical，假设 `torch.use_deterministic_algorithms(True)`）。这意味着：
+
+- **可以随时杀掉、随时重启**——只要从最近的 checkpoint 恢复，结果不变
+- **可以在不同机器间迁移**——gpu20 的 checkpoint 拿到 gpu31 继续跑
+- **失败的运行可以无条件丢弃**——不存在"半成品"状态
+
+### 三态模型
+
+一个训练任务只有三种合法终态：
+
+| 状态 | 含义 | 处理 |
+|------|------|------|
+| **completed** | 纯函数执行完毕，结果已产出 | 收割结果 |
+| **resumable** | checkpoint 干净，中间状态一致 | 从 checkpoint 重启 |
+| **failed** | 标记为脏，结果不可信 | 丢弃或调试 |
+
+不存在第四种状态。不存在"跑了一半不知道行不行"。这消除了 ML 实验中最大的不确定性来源。
+
+### 副作用隔离的实现
+
+要让训练成为纯函数，必须隔离所有副作用：
+
+| 副作用 | 传统做法（用户管理） | Alchemy 模型（框架管理） |
+|--------|---------------------|------------------------|
+| Checkpoint 写入 | `torch.save(path)` | `ctx.save()` → 原子写入 + 注册 |
+| 指标记录 | `wandb.log()` | `al.log(step, loss)` → 自动收集 |
+| 随机种子 | 用户手动 set | 框架注入，统一 torch/numpy/random |
+| 配置读取 | `argparse` / yaml | `al.param("key")` → 服务器注入 |
+| 临时文件 | 随意写 | 沙箱目录，框架清理 |
+| 日志输出 | `print()` / `logging` | 框架截获 stdout/stderr |
+
+SDK 的 `checkpoint(path)` 是**声明式的**——它不调用 `torch.save()`，只是告诉服务器"这个 checkpoint 存在了"。训练代码负责保存，SDK 负责注册和管理。这个分层确保训练逻辑和基础设施逻辑完全解耦。
+
+### 确定性的边界
+
+GPU 浮点运算在不同硬件上不严格确定（cuDNN nondeterminism）。"纯"的定义是：**给定相同硬件 + 驱动 + seed，结果 bit-identical**。跨硬件只保证统计等价。`torch.use_deterministic_algorithms(True)` 作为可选 flag 提供——牺牲性能换取严格确定性。
+
+---
+
+## 9. SDK 设计：控制反转与语言特性
+
+### 设计哲学：从"调用 API"到"在生命周期里写代码"
+
+传统 ML 框架的 SDK 是**被动**的——用户调 `wandb.log()`，框架只看到用户愿意告诉它的。Alchemy SDK 的目标是**反转控制**：
+
+> 让用户在我们的生命周期里写代码，而不是在用户的代码里调我们的 API。
+
+这不是 API 设计问题，是**编程范式**问题。
+
+### 两层 API 设计
+
+**第一层：最小侵入（当前实现）**
+
+```python
+al = Alchemy()
+lr = al.param("lr")           # 服务器注入参数
+for step in range(total):
+    loss = train_step(batch)
+    al.log(step, total, loss=loss)
+    if al.should_stop():       # SIGTERM → 优雅退出
+        break
+al.done()
+```
+
+零重构成本。用户代码结构不变，只在关键点插入 SDK 调用。
+
+**第二层：AOP 装饰器（目标架构）**
+
+```python
+@al.managed(total_steps=500_000, checkpoint_every=50_000)
+def train(ctx: TrainingContext):
+    model = build_model(ctx.config)
+    if ctx.is_resume:
+        model.load(ctx.latest_checkpoint())
+    for batch in ctx.dataloader():
+        loss = model.step(batch)
+        ctx.step(loss)           # 自动收集 grad_norm/lr/throughput
+        if ctx.should_eval():    # 服务器控制 eval 频率
+            ctx.eval(run_eval(model))
+        if ctx.should_save():    # 框架管理 checkpoint 生命周期
+            ctx.save(model.state_dict())
+```
+
+`@al.managed` 注入 `TrainingContext` 作为第一个参数，包裹 preflight 检查和自动 `done()`。训练函数变成一个接收 context、返回 metrics 的纯函数。
+
+### 六个切面（Aspect Points）
+
+| 切面 | 功能 | 竞品对比 |
+|------|------|---------|
+| `ctx.step(loss)` | 自动采集 loss/grad_norm/lr/throughput，检测 NaN/spike | W&B 只采集用户显式 log 的 |
+| `ctx.should_eval()` | 服务器控制 eval 频率，跨实验自动对比 | Lightning 需要 Callback |
+| `ctx.should_save()` | checkpoint 生命周期：自动 prune 旧的，保留 best/latest | 手动管理 |
+| `ctx.should_stop()` | 统一入口：plateau/OOM/SIGTERM/服务器信号 | 各自为政 |
+| `ctx.optimizer()` | 包裹 torch.optim，注入超参数，支持动态 lr | 无 |
+| `ctx.dataloader()` | 检测数据瓶颈，自动 tune num_workers | 无 |
+
+与竞品的本质区别：W&B 只做观测，Lightning 需要重构代码结构，Ray 聚焦分布式。Alchemy 是**调度 + 观测 + 干预**三位一体，且数据留在自己的集群上。
+
+### Python 语言特性的运用
+
+**Sentinel 模式** (`client.py:12`)
+
+```python
+_MISSING = object()
+
+def param(self, key: str, default=_MISSING) -> Any:
+```
+
+`object()` 作为 sentinel 区分"没传 default"和"default=None"。这比 `default=None` 更安全——用户可以合法地把 `None` 作为默认值。
+
+**Managed 模式的严格性** (`client.py:114-118`)
+
+```python
+if self._managed:
+    raise KeyError(f"Parameter '{key}' not found. Available: {list(self._params.keys())}")
+```
+
+Managed 模式下 `param()` 禁止使用默认值。这是**刻意的严格性**：`param("seeed", default=42)` 这种 typo 在 unmanaged 模式下静默通过，在 managed 模式下直接崩。因为 managed 模式意味着参数由服务器注入，任何"找不到"都是 bug，不应该被默认值掩盖。
+
+**信号处理的生命周期** (`client.py:78-87`)
+
+```python
+def _install_sigterm_handler(self):
+    import signal
+    prev = signal.getsignal(signal.SIGTERM)
+    def handler(signum, frame):
+        self._stop_flag = True
+        if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
+            prev(signum, frame)
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except (OSError, ValueError):
+        pass
+```
+
+保存并链式调用前一个 SIGTERM handler，确保不覆盖用户自定义的信号处理。`try/except` 兜底处理无法安装信号处理器的环境（如某些 Windows 配置或子线程）。
+
+**传输层的三级降级** (`transport.py`)
+
+```python
+def make_transport(task_id, stub_socket, server):
+    if not task_id:
+        return NoopTransport()              # 本地调试
+    if stub_socket and _probe_unix_socket(stub_socket):
+        return UnixSocketTransport(...)     # 最优路径
+    if server:
+        return HttpTransport(...)           # 回退
+    return NoopTransport()                  # 最终兜底
+```
+
+这是**策略模式 + 优雅降级**。`Alchemy` 类不知道底层走的是 Unix socket 还是 HTTP 还是 noop——对上层 API 完全透明。`_probe_unix_socket()` 用 2 秒超时非阻塞探测，避免在不可达的 socket 上挂起。
+
+**Context Manager 与装饰器的双入口**
+
+```python
+# 入口一：Context Manager
+with Alchemy() as al:
+    al.log(step, total, loss=loss)
+# __exit__ 自动调 done()
+
+# 入口二：Decorator
+@al.managed(total_steps=500_000)
+def train(ctx):
+    ...
+# decorator 自动调 done()
+```
+
+两种风格服务不同场景：context manager 适合轻量使用，decorator 适合完整生命周期管理。都保证 `done()` 一定被调用——即使训练代码抛异常。
+
+### 12-Factor 初始化
+
+```python
+class Alchemy:
+    def __init__(self):
+        self._task_id = os.environ.get("ALCHEMY_TASK_ID")
+        self._managed = self._task_id is not None
+        self._params = json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
+```
+
+构造函数零参数。所有配置从环境变量读取。这是 12-factor app 的经典模式——进程不关心自己是怎么被启动的，只关心环境变量里有什么。这使得同一个训练脚本在本地 `python train.py` 和 Alchemy managed 模式下都能运行，行为由环境决定。
+
+### SDK 的"不做什么"
+
+SDK 刻意不做以下事情：
+
+1. **不调用 `torch.save()`** — `checkpoint(path)` 只注册，不保存
+2. **不修改模型权重** — 所有 report 方法返回 `None`
+3. **不缓存训练状态** — 没有隐藏的 SDK 内部状态需要恢复
+4. **不抛影响训练的异常** — `transport.send()` 吞掉所有异常
+
+这意味着：从 SDK 的角度看，训练代码是纯的。SDK 只是一个单向的观测通道（report out）加两个控制信号（`param()` in, `should_stop()` in）。训练的正确性不依赖 SDK 的正确性。
 
 ---
 
