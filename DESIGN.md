@@ -16,6 +16,7 @@
 8. [训练即纯函数：核心抽象](#8-训练即纯函数alchemy-的核心抽象)
 9. [SDK 设计：控制反转与语言特性](#9-sdk-设计控制反转与语言特性)
 10. [Managed Values：零侵入的状态托管](#10-managed-values零侵入的状态托管)
+11. [Experiment：假说驱动的实验管理](#11-experiment假说驱动的实验管理)
 
 ---
 
@@ -903,6 +904,113 @@ class eval:
 3. eval 的 `ctx.model` 拿到的是 train 产出的权重
 
 训练产出 → eval 输入，DAG 自动成型。
+
+---
+
+## 11. Experiment：假说驱动的实验管理
+
+### 问题
+
+Grid 解决了"批量提交"，但没解决"这组实验到底成功了没有"。用户提交 18 个 task（6 ctx × 3 seed），完成后要手动拉 JSON、对数字、判断哪些配置达标。这是最大的痛点——实验的成功标准在用户脑子里，不在系统里。
+
+### 核心抽象：Experiment = 假说 + 证据
+
+```python
+exp = al.experiment("ctx_scaling_atari",
+    description="context length 对 Atari z_rule 质量的影响",
+    criteria={
+        "silhouette_l2": "> 0.3",
+        "nmi":           "> 0.1",
+        "convergence":   "loss < 0.5",
+    },
+    matrix={
+        "ctx_len": [16, 32, 64, 128, 256, 512],
+        "seed":    [42, 123, 789],
+    }
+)
+
+@exp.task(total_steps=500_000, eval_every=10_000)
+def train(ctx):
+    ctx.model = JEMAModel(ctx_len=ctx.param("ctx_len"))
+    ctx.optimizer = Adam(ctx.model.parameters())
+    for step in ctx.steps():
+        ...
+        if ctx.should_eval():
+            metrics = evaluate(ctx.model)
+            ctx.log_eval(metrics)  # ← server 自动校验 criteria
+```
+
+### 三层结构
+
+```
+Experiment
+  ├── criteria{}          注册时声明，不可变
+  ├── matrix{} → Grid     复用现有笛卡尔积逻辑
+  └── tasks[]             每个 task 完成时自动校验
+```
+
+### 数据模型
+
+```typescript
+interface Experiment {
+  id: string;
+  name: string;
+  description?: string;
+  criteria: Record<string, string>;   // "metric": "op value"
+  grid_id: string;                    // 关联的 grid
+  status: "running" | "passed" | "partial" | "failed";
+  results: {
+    [taskId: string]: {
+      passed: boolean;
+      details: Record<string, {
+        value: number;
+        threshold: string;
+        ok: boolean;
+      }>;
+    };
+  };
+  created_at: string;
+}
+```
+
+### Criteria 表达式
+
+支持简单比较运算：
+
+| 表达式 | 含义 |
+|--------|------|
+| `"> 0.3"` | metric > 0.3 |
+| `"< 0.5"` | metric < 0.5 |
+| `">= 0.3 && < 0.8"` | 区间 |
+| `"top_k(3)"` | 该 metric 在所有 task 中排前 3（相对标准） |
+
+### 校验时机
+
+`log_eval()` 到达 server 时，自动触发 criteria 检查：
+
+1. 解析 criteria 表达式
+2. 用最新 eval metrics 逐条校验
+3. 更新 `experiment.results[taskId]`
+4. 重新派生 experiment.status（全部 passed → "passed"，部分 → "partial"）
+5. 状态变化时发 Discord 通知
+
+### 总览视图
+
+```
+ctx_scaling_atari          12/18 passed  ██████████░░░░ 67%
+├─ ctx16  s42 ✓  s123 ✓  s789 ✗ (sil=0.18)
+├─ ctx32  s42 ✓  s123 ✓  s789 ✓
+├─ ctx64  running...
+└─ ...
+```
+
+### 与现有系统的关系
+
+- Experiment **包含** Grid，不替代
+- Grid 的 CRUD、调度、重试逻辑完全不变
+- `log_eval()` 已存在，server 侧加 criteria hook
+- SDK 新增 `al.experiment()` 返回带 `.task()` 装饰器的对象
+- Web 新增 ExperimentsPage，复用 GridsPage 的 task 表格组件
 
 ---
 
