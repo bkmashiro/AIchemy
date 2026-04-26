@@ -249,6 +249,7 @@ class StubDaemon:
             "dead_tasks": dead_tasks,
             "env_setup": self.config.env_setup or None,
             "default_cwd": self.config.default_cwd or None,
+            "user": os.environ.get("USER", "unknown"),
         }
 
         if self.config.slurm_job_id:
@@ -309,7 +310,72 @@ class StubDaemon:
         for task in data.get("adopt_tasks", []):
             await self._handle_task_run(task)
 
+    def _resolve_command(self, command: str, cwd: str) -> str:
+        """Resolve relative paths in command to absolute using cwd.
+
+        Shell operators (&&, ||, ;, |) are preserved verbatim — shlex.split
+        treats them as regular tokens and shlex.join would quote them, breaking
+        the shell semantics.  We split around these operators first, resolve
+        each segment independently, and stitch back together.
+        """
+        import shlex
+        import re
+
+        # Shell operators that must stay unquoted
+        _SHELL_OPS = {'&&', '||', ';', '|', '>', '>>', '<', '2>', '2>>'}
+
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+
+        resolved: list[str] = []
+        for part in parts:
+            # Preserve shell operators literally
+            if part in _SHELL_OPS:
+                resolved.append(part)
+                continue
+            # Skip flags and absolute paths
+            if part.startswith('-') or part.startswith('/'):
+                # Handle --flag=relative/path
+                if '=' in part and not part.split('=', 1)[1].startswith('/'):
+                    flag, val = part.split('=', 1)
+                    if '/' in val:
+                        abs_val = os.path.join(cwd, val)
+                        if os.path.exists(abs_val):
+                            resolved.append(f"{flag}={abs_val}")
+                            continue
+                resolved.append(part)
+                continue
+            # Check if this looks like a relative file path
+            if '/' in part:
+                abs_path = os.path.join(cwd, part)
+                if os.path.exists(abs_path):
+                    resolved.append(abs_path)
+                    continue
+            resolved.append(part)
+
+        # Rebuild: quote each token EXCEPT shell operators
+        out_parts: list[str] = []
+        for tok in resolved:
+            if tok in _SHELL_OPS:
+                out_parts.append(tok)
+            else:
+                out_parts.append(shlex.quote(tok))
+        return ' '.join(out_parts)
+
     async def _handle_task_run(self, data: dict) -> None:
+        task_id: str = data.get("task_id", "unknown")
+        try:
+            await self._handle_task_run_inner(data)
+        except Exception as e:
+            log.error("[%s] Unhandled error in task.run: %s", task_id, e)
+            await self._emit(
+                "task.failed",
+                {"task_id": task_id, "exit_code": -2, "error": f"Unhandled dispatch error: {str(e)[:500]}"},
+            )
+
+    async def _handle_task_run_inner(self, data: dict) -> None:
         task_id: str = data["task_id"]
         command: str = data["command"]
 
@@ -360,6 +426,10 @@ class StubDaemon:
         task_env_setup: str = data.get("env_setup") or ""
         params: dict[str, Any] | None = data.get("params")
         run_dir: str | None = data.get("run_dir")
+
+        # Resolve relative paths in command using cwd
+        if cwd:
+            command = self._resolve_command(command, cwd)
 
         jlog("info", "task.run", task_id=task_id, command=command[:120], cwd=cwd, run_dir=run_dir)
         self.last_task_time = time.time()
@@ -692,9 +762,15 @@ class StubDaemon:
                         loop = asyncio.get_event_loop()
                         pids = self.process_mgr.get_task_pids()
                         sys_stats = await loop.run_in_executor(None, self.system_monitor.collect, pids)
+                        if sys_stats.get("mem_total_mb", 0) == 0:
+                            log.warning(
+                                "system_stats: mem_total_mb=0 — host RAM "
+                                "not reported this cycle (psutil may be "
+                                "unavailable or returned zero on this node)"
+                            )
                         await self._emit("system_stats", sys_stats)
                     except Exception as e:
-                        log.debug("system_stats error (skipping round): %s", e)
+                        log.warning("system_stats error (skipping round): %s", e)
 
                     # Per-task resource emit
                     try:
