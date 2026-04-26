@@ -1,0 +1,62 @@
+[
+  {
+    "name": "smoke_success_fast",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/success_fast.sh",
+    "tags": ["smoke", "fast"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_success_slow",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/success_slow.sh",
+    "tags": ["smoke", "slow"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_fail_exit1",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/fail_exit1.sh",
+    "tags": ["smoke", "fail"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_fail_oom",
+    "script": "python3 /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/fail_oom.py",
+    "tags": ["smoke", "fail", "oom"],
+    "priority": 3
+  },
+  {
+    "name": "smoke_writes_disk",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/writes_disk.sh",
+    "tags": ["smoke", "io"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_checkpoint_resume",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/checkpoint_resume.sh",
+    "tags": ["smoke", "resume"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_gpu_required",
+    "script": "python3 /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/gpu_required.py",
+    "tags": ["smoke", "gpu"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_long_running",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/long_running.sh",
+    "tags": ["smoke", "long"],
+    "priority": 2
+  },
+  {
+    "name": "smoke_signal_handler",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/signal_handler.sh",
+    "tags": ["smoke", "signal"],
+    "priority": 5
+  },
+  {
+    "name": "smoke_multi_tag",
+    "script": "bash /workspace/extra/projects/alchemy-v2/smoke-tests/scripts/multi_tag.sh",
+    "tags": ["smoke", "a40", "high-mem", "priority"],
+    "priority": 8
+  }
+]
