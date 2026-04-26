@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "alchemy": {
+      "command": "npx",
+      "args": ["tsx", "server/src/mcp/index.ts"],
+      "env": {
+        "ALCHEMY_SERVER_URL": "https://alchemy-v2.yuzhes.com",
+        "ALCHEMY_TOKEN": "your-token-here"
+      }
+    }
+  }
+}

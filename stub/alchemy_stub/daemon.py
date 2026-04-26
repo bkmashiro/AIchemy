@@ -272,6 +272,11 @@ class StubDaemon:
         if self.config.tags:
             payload["tags"] = self.config.tags
 
+        # B3: Report SLURM resource constraints
+        slurm_constraints = self._read_slurm_constraints()
+        if slurm_constraints:
+            payload["slurm_constraints"] = slurm_constraints
+
         # Discover available Python environments (conda/mamba/venv)
         try:
             payload["available_envs"] = discover_python_envs()
@@ -284,6 +289,55 @@ class StubDaemon:
             running_tasks=len(running_tasks),
             tags=self.config.tags,
         )
+
+    # ------------------------------------------------------------------ #
+    # SLURM resource discovery (B3)                                        #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _read_slurm_constraints() -> dict[str, Any] | None:
+        """Read SLURM allocation constraints from environment variables."""
+        mem_str = os.environ.get("SLURM_MEM_PER_NODE")
+        nodes_str = os.environ.get("SLURM_JOB_NUM_NODES")
+        cpus_str = os.environ.get("SLURM_CPUS_ON_NODE")
+        gpus_str = os.environ.get("SLURM_GPUS_ON_NODE")
+        time_str = os.environ.get("SLURM_JOB_TIME_LIMIT")  # minutes or HH:MM:SS
+
+        if not any([mem_str, nodes_str, cpus_str]):
+            return None
+
+        constraints: dict[str, Any] = {}
+        if mem_str:
+            # SLURM_MEM_PER_NODE is in MB
+            try:
+                constraints["mem_mb"] = int(mem_str)
+            except ValueError:
+                pass
+        if cpus_str:
+            try:
+                constraints["cpus"] = int(cpus_str)
+            except ValueError:
+                pass
+        if gpus_str:
+            try:
+                constraints["gpus"] = int(gpus_str)
+            except ValueError:
+                pass
+        if time_str:
+            # May be minutes (int) or HH:MM:SS
+            try:
+                constraints["time_min"] = int(time_str)
+            except ValueError:
+                # Try HH:MM:SS format
+                parts = time_str.split(":")
+                if len(parts) == 3:
+                    try:
+                        h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                        constraints["time_min"] = h * 60 + m + (1 if s > 0 else 0)
+                    except ValueError:
+                        pass
+
+        return constraints if constraints else None
 
     # ------------------------------------------------------------------ #
     # Event handlers: server → stub                                        #
@@ -638,28 +692,33 @@ class StubDaemon:
         if lines:
             await self._emit("task.log", {"task_id": task_id, "lines": lines})
 
-    async def _on_task_completed(self, task_id: str, exit_code: int) -> None:
+    async def _on_task_completed(self, task_id: str, exit_code: int, death_cause: str = "success", has_checkpoint: bool = False) -> None:
         self.last_task_time = time.time()
         duration_s = round(time.time() - self._task_start_times.pop(task_id, time.time()))
         jlog("info", "task.completed", task_id=task_id, exit_code=exit_code, duration_s=duration_s)
         log.info("Task %s completed: exit_code=%d duration=%ds", task_id, exit_code, duration_s)
         await self.task_socket_registry.remove(task_id)
-        await self._emit("task.completed", {"task_id": task_id, "exit_code": exit_code})
+        await self._emit("task.completed", {
+            "task_id": task_id,
+            "exit_code": exit_code,
+            "death_cause": death_cause,
+            "has_checkpoint": has_checkpoint,
+        })
 
-    async def _on_task_failed(self, task_id: str, exit_code: int, error: str) -> None:
+    async def _on_task_failed(self, task_id: str, exit_code: int, error: str, death_cause: str = "code_error", has_checkpoint: bool = False) -> None:
         self.last_task_time = time.time()
         duration_s = round(time.time() - self._task_start_times.pop(task_id, time.time()))
-        jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error, duration_s=duration_s)
-        log.error("Task %s failed: exit_code=%d duration=%ds error=%s", task_id, exit_code, duration_s, error)
+        jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error, death_cause=death_cause, duration_s=duration_s)
+        log.error("Task %s failed: exit_code=%d death_cause=%s duration=%ds error=%s", task_id, exit_code, death_cause, duration_s, error)
         await self.task_socket_registry.remove(task_id)
         # Send error to task log buffer so web UI shows the failure reason
         await self._emit(
             "task.log",
-            {"task_id": task_id, "lines": [f"[alchemy-stub] Task failed: exit_code={exit_code} {error}"]},
+            {"task_id": task_id, "lines": [f"[alchemy-stub] Task failed: exit_code={exit_code} death_cause={death_cause} {error}"]},
         )
         await self._emit(
             "task.failed",
-            {"task_id": task_id, "exit_code": exit_code, "error": error},
+            {"task_id": task_id, "exit_code": exit_code, "error": error, "death_cause": death_cause, "has_checkpoint": has_checkpoint},
         )
 
     async def _on_task_zombie(self, task_id: str) -> None:

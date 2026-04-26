@@ -110,6 +110,10 @@ export interface Task {
   max_retries: number;
   retry_of?: string;
 
+  // === Death classification (B1) ===
+  death_cause?: string;           // 'success' | 'code_error' | 'oom' | 'walltime' | 'preempt' | 'lost'
+  has_checkpoint?: boolean;
+
   // === Server Signals ===
   should_stop: boolean;
   should_checkpoint: boolean;
@@ -140,6 +144,12 @@ export interface Stub {
   default_output_dir?: string;     // Base dir for server-computed run_dir
   first_seen?: string;              // ISO timestamp: first time this stub connected
   last_seen?: string;               // ISO timestamp: last known activity
+  slurm_constraints?: {            // SLURM resource allocation (B3)
+    mem_mb?: number;
+    time_min?: number;
+    gpus?: number;
+    cpus?: number;
+  };
   // Internal — not serialized to API
   socket_id?: string;
 }
@@ -242,6 +252,7 @@ export interface ResumePayload {
   local_queue: string[];
   dead_tasks?: Array<{ task_id: string; exit_code: number }>;
   available_envs?: Array<{ name: string; type: string; path: string }>;
+  slurm_constraints?: { mem_mb?: number; time_min?: number; gpus?: number; cpus?: number };
 }
 
 export interface HeartbeatPayload {
@@ -269,12 +280,16 @@ export interface TaskLogPayload {
 export interface TaskCompletedPayload {
   task_id: string;
   exit_code: number;
+  death_cause?: string;
+  has_checkpoint?: boolean;
 }
 
 export interface TaskFailedPayload {
   task_id: string;
   exit_code: number;
   error?: string;
+  death_cause?: string;
+  has_checkpoint?: boolean;
 }
 
 export interface TaskConfigPayload {

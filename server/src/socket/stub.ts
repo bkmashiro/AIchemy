@@ -454,7 +454,7 @@ function handleResume(
   ns: Namespace,
 ): void {
   const { hostname, gpu, slurm_job_id, max_concurrent, token, env_setup, default_cwd,
-    tags, running_tasks, local_queue, available_envs, user } = payload;
+    tags, running_tasks, local_queue, available_envs, user, slurm_constraints } = payload;
 
   // Auth check
   const tokenRecord = store.getToken(token);
@@ -544,6 +544,7 @@ function handleResume(
       tags: tags ?? existingStub.tags,
       available_envs: available_envs ?? existingStub.available_envs,
       user: user ?? existingStub.user,
+      slurm_constraints: slurm_constraints ?? existingStub.slurm_constraints,
     };
     logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length });
   } else {
@@ -569,6 +570,7 @@ function handleResume(
       tags,
       available_envs,
       user,
+      slurm_constraints,
     };
     logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length, new: true });
   }
@@ -764,6 +766,14 @@ function handleTaskCompleted(stubId: string, payload: TaskCompletedPayload, webN
 
   cancelKillChain(payload.task_id);
 
+  // Store death metadata before completing
+  if (payload.death_cause || payload.has_checkpoint) {
+    store.updateTask(stubId, payload.task_id, {
+      death_cause: payload.death_cause,
+      has_checkpoint: payload.has_checkpoint,
+    });
+  }
+
   const updated = completeTask(stubId, payload.task_id, payload.exit_code);
   if (!updated) return;
 
@@ -792,39 +802,78 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
 
   cancelKillChain(payload.task_id);
 
-  // Classify failure
-  const isOom = payload.exit_code === 137;
+  const deathCause = payload.death_cause || (payload.exit_code === 137 ? "oom" : undefined);
+  const hasCheckpoint = payload.has_checkpoint ?? false;
   const isKilled = task.should_stop && payload.exit_code !== 0;
 
-  // Auto-retry for OOM
-  if (isOom && task.max_retries > 0 && task.retry_count < task.max_retries) {
-    const bumpedMem = task.requirements?.gpu_mem_mb
-      ? Math.ceil(task.requirements.gpu_mem_mb * 1.2)
-      : undefined;
+  // B2: Auto-resume for OOM, walltime, preempt
+  const resumableDeathCauses = ["oom", "walltime", "preempt"];
+  if (
+    !isKilled &&
+    deathCause &&
+    resumableDeathCauses.includes(deathCause) &&
+    task.max_retries > 0 &&
+    task.retry_count < task.max_retries &&
+    (hasCheckpoint || deathCause === "walltime" || deathCause === "preempt")
+  ) {
+    // Dedup: check if a retry already exists
+    const retryRoot = task.retry_of || task.id;
+    const allTasks = store.getAllTasks();
+    const existingRetry = allTasks.find(
+      (t) =>
+        (t.retry_of === retryRoot || t.retry_of === task.id) &&
+        t.id !== task.id &&
+        ["pending", "queued", "dispatched", "running"].includes(t.status),
+    );
+    if (existingRetry) {
+      logger.info("task.auto_resume_dedup", { task_seq: task.seq, existing_retry: existingRetry.seq, death_cause: deathCause });
+    } else {
+      // For OOM: bump memory by 25%
+      let retryOpts: import("../task-actions").RetryTaskOpts | undefined;
+      if (deathCause === "oom") {
+        const currentMem = task.requirements?.cpu_mem_mb || 60000;
+        const bumpedMem = Math.ceil(currentMem * 1.25);
+        retryOpts = {
+          requirements: { ...task.requirements, cpu_mem_mb: bumpedMem },
+        };
+      }
 
-    const retryOpts = bumpedMem
-      ? { requirements: { ...task.requirements, gpu_mem_mb: bumpedMem } }
-      : undefined;
-    const retryTask = createRetryTask(task, retryOpts);
+      const retryTask = createRetryTask(task, retryOpts);
 
-    // Mark original as failed
-    const failed = failTask(stubId, payload.task_id, payload.exit_code);
-    if (failed) {
-      webNs.emit("task.update", failed);
+      // Mark original as failed with death metadata
+      const failed = failTask(stubId, payload.task_id, payload.exit_code, {
+        death_cause: deathCause,
+        has_checkpoint: hasCheckpoint,
+        error_message: payload.error,
+      });
+      if (failed) {
+        webNs.emit("task.update", failed);
+      }
+
+      store.addToGlobalQueue(retryTask);
+      webNs.emit("task.update", retryTask);
+      logger.info("task.auto_resume", {
+        reason: deathCause,
+        task_seq: task.seq,
+        new_seq: retryTask.seq,
+        attempt: retryTask.retry_count,
+        max: task.max_retries,
+        has_checkpoint: hasCheckpoint,
+        mem_bumped: deathCause === "oom",
+      });
+      triggerSchedule();
+      return;
     }
-
-    store.addToGlobalQueue(retryTask);
-    webNs.emit("task.update", retryTask);
-    logger.info("task.retry", { reason: "oom", task_seq: task.seq, new_seq: retryTask.seq, attempt: retryTask.retry_count, max: task.max_retries });
-    triggerSchedule();
-    return;
   }
 
   let updated: Task | undefined;
   if (isKilled) {
     updated = killTask(stubId, payload.task_id, payload.exit_code);
   } else {
-    const extra: Partial<Task> = {};
+    const extra: Partial<Task> = {
+      death_cause: deathCause,
+      has_checkpoint: hasCheckpoint,
+    };
     if (payload.error) extra.error_message = payload.error;
     updated = failTask(stubId, payload.task_id, payload.exit_code, extra);
   }

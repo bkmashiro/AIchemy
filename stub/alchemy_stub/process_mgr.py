@@ -22,6 +22,7 @@ from collections import deque
 from typing import Any, Callable, Awaitable
 
 from .config import _parse_env_value
+from .error_classifier import classify_death, has_checkpoint
 from .task_socket import task_socket_path
 
 log = logging.getLogger(__name__)
@@ -74,10 +75,11 @@ def _log_path(task_id: str) -> str:
 class ProcessInfo:
     """Tracks a single running subprocess."""
 
-    def __init__(self, task_id: str, pid: int, proc: subprocess.Popen | None = None) -> None:
+    def __init__(self, task_id: str, pid: int, proc: subprocess.Popen | None = None, run_dir: str | None = None) -> None:
         self.task_id = task_id
         self.pid = pid
         self.proc = proc  # None for re-attached processes
+        self.run_dir = run_dir  # For checkpoint detection on death
         self.log_offset = 0
         self.log_buffer: deque[str] = deque(maxlen=500)
         self.log_pending: list[str] = []
@@ -123,6 +125,9 @@ class ProcessManager:
         self.on_completed = on_completed
         self.on_failed = on_failed
         self.on_zombie = on_zombie
+
+        # SLURM job ID for death classification (walltime detection)
+        self._slurm_job_id: str | None = os.environ.get("SLURM_JOB_ID")
 
         self._procs: dict[str, ProcessInfo] = {}
         self._pid_lock = threading.Lock()
@@ -193,7 +198,7 @@ class ProcessManager:
             raise
         log_file.close()  # stub only reads
 
-        info = ProcessInfo(task_id=task_id, pid=proc.pid, proc=proc)
+        info = ProcessInfo(task_id=task_id, pid=proc.pid, proc=proc, run_dir=run_dir)
         # Start log offset from beginning
         info.log_offset = 0
         self._procs[task_id] = info
@@ -340,16 +345,14 @@ class ProcessManager:
                     log.debug("on_log error: %s", e)
 
     async def _check_completions(self) -> None:
-        done: list[tuple[str, int]] = []
+        done: list[tuple[str, int, ProcessInfo]] = []
         for task_id, info in list(self._procs.items()):
             rc = info.poll()
             if rc is not None:
-                done.append((task_id, rc))
+                done.append((task_id, rc, info))
 
-        for task_id, exit_code in done:
-            info = self._procs.pop(task_id, None)
-            if info is None:
-                continue
+        for task_id, exit_code, info in done:
+            self._procs.pop(task_id, None)
 
             # Flush remaining logs
             if info.log_pending and self.on_log:
@@ -359,15 +362,25 @@ class ProcessManager:
                     pass
 
             self._remove_pid(task_id)
-            log.info("Task %s exited (exit_code=%d)", task_id, exit_code)
+
+            # Classify death cause and check for checkpoints
+            death_cause = classify_death(
+                exit_code=exit_code,
+                slurm_job_id=self._slurm_job_id,
+            )
+            ckpt = has_checkpoint(info.run_dir)
+            log.info(
+                "Task %s exited (exit_code=%d, death_cause=%s, has_checkpoint=%s)",
+                task_id, exit_code, death_cause, ckpt,
+            )
 
             if exit_code == 0:
                 if self.on_completed:
-                    await self.on_completed(task_id, exit_code)
+                    await self.on_completed(task_id, exit_code, death_cause, ckpt)
             else:
                 error_msg = f"Process exited with code {exit_code}"
                 if self.on_failed:
-                    await self.on_failed(task_id, exit_code, error_msg)
+                    await self.on_failed(task_id, exit_code, error_msg, death_cause, ckpt)
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                     #
