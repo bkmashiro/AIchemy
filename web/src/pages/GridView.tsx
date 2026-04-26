@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { Grid, Task, Stub, gridsApi, stubsApi } from "../lib/api";
 import { formatRelTime } from "../lib/format";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 type GridDetail = Grid & { tasks: Task[] };
 
@@ -41,6 +42,13 @@ export default function GridView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [acting, setActing] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<{
+    action: () => void;
+    title: string;
+    message: string;
+    variant: "danger" | "warning" | "default";
+    confirmLabel: string;
+  } | null>(null);
 
   // Build stub name lookup map
   const stubNames = new Map(stubs.map((s) => [s.id, s.name]));
@@ -63,30 +71,46 @@ export default function GridView() {
     return () => clearInterval(t);
   }, [id]);
 
-  const handleCancelAll = async () => {
-    if (!id || !confirm("Cancel all running tasks in this grid?")) return;
-    setActing(true);
-    try {
-      await gridsApi.cancelAll(id);
-      load();
-    } catch {
-      setError("Failed to cancel");
-    } finally {
-      setActing(false);
-    }
+  const handleCancelAll = () => {
+    if (!id) return;
+    setConfirmAction({
+      action: async () => {
+        setActing(true);
+        try {
+          await gridsApi.cancelAll(id);
+          load();
+        } catch {
+          setError("Failed to cancel");
+        } finally {
+          setActing(false);
+        }
+      },
+      title: "Cancel All Tasks",
+      message: "Cancel all running tasks in this grid?",
+      variant: "danger",
+      confirmLabel: "Cancel All",
+    });
   };
 
-  const handleRetryFailed = async () => {
-    if (!id || !confirm("Retry all failed tasks in this grid?")) return;
-    setActing(true);
-    try {
-      await gridsApi.retryFailed(id);
-      load();
-    } catch {
-      setError("Failed to retry");
-    } finally {
-      setActing(false);
-    }
+  const handleRetryFailed = () => {
+    if (!id) return;
+    setConfirmAction({
+      action: async () => {
+        setActing(true);
+        try {
+          await gridsApi.retryFailed(id);
+          load();
+        } catch {
+          setError("Failed to retry");
+        } finally {
+          setActing(false);
+        }
+      },
+      title: "Retry Failed Tasks",
+      message: "Retry all failed tasks in this grid?",
+      variant: "warning",
+      confirmLabel: "Retry All",
+    });
   };
 
   if (loading && !grid) {
@@ -330,6 +354,16 @@ export default function GridView() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmAction !== null}
+        title={confirmAction?.title ?? ""}
+        message={confirmAction?.message ?? ""}
+        variant={confirmAction?.variant ?? "default"}
+        confirmLabel={confirmAction?.confirmLabel ?? "Confirm"}
+        onConfirm={() => { confirmAction?.action(); setConfirmAction(null); }}
+        onCancel={() => setConfirmAction(null)}
+      />
     </div>
   );
 }

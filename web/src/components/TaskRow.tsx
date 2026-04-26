@@ -1,8 +1,10 @@
-import { memo, useState } from "react";
+import { memo, useState, useCallback } from "react";
 import { Task, tasksApi } from "../lib/api";
 import { taskDuration, taskEta, generateDisplayName } from "../lib/format";
 import { LossChart } from "./LossChart";
 import LogViewer from "./LogViewer";
+import ConfirmDialog from "./ConfirmDialog";
+import PhaseBadge from "./PhaseBadge";
 
 interface Props {
   task: Task;
@@ -51,6 +53,13 @@ function StatusBadge({ status }: { status: string }) {
 export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines, onUpdate, compact }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [acting, setActing] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<{
+    action: () => void;
+    title: string;
+    message: string;
+    variant: "danger" | "warning" | "default";
+    confirmLabel: string;
+  } | null>(null);
 
   const displayName = generateDisplayName(task);
   const progressPct = task.progress
@@ -76,8 +85,14 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   };
 
   const handleKill = (e: React.MouseEvent) => {
-    if (!confirm(`Kill task #${task.seq} ${displayName}?`)) return;
-    doAction(() => tasksApi.patch(task.id, { status: "killed" }), e);
+    const ev = e;
+    setConfirmAction({
+      action: () => doAction(() => tasksApi.patch(task.id, { status: "killed" }), ev),
+      title: "Kill Task",
+      message: `Kill task #${task.seq} "${displayName}"?${stubName ? ` (on ${stubName})` : ""} Status: ${task.status}`,
+      variant: "danger",
+      confirmLabel: "Kill",
+    });
   };
 
   const handleRetry = (e: React.MouseEvent) => {
@@ -85,13 +100,28 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   };
 
   const handlePause = (e: React.MouseEvent) => {
-    if (!confirm(`Pause task #${task.seq} ${displayName}?`)) return;
-    doAction(() => tasksApi.patch(task.id, { status: "paused" }), e);
+    const ev = e;
+    setConfirmAction({
+      action: () => doAction(() => tasksApi.patch(task.id, { status: "paused" }), ev),
+      title: "Pause Task",
+      message: `Pause task #${task.seq} "${displayName}"?${stubName ? ` (on ${stubName})` : ""} Status: ${task.status}`,
+      variant: "warning",
+      confirmLabel: "Pause",
+    });
   };
 
   const handleResume = (e: React.MouseEvent) => {
     doAction(() => tasksApi.patch(task.id, { status: "running" }), e);
   };
+
+  const handleConfirm = useCallback(() => {
+    confirmAction?.action();
+    setConfirmAction(null);
+  }, [confirmAction]);
+
+  const handleCancelDialog = useCallback(() => {
+    setConfirmAction(null);
+  }, []);
 
   const rowBg = ROW_BG[task.status] || "bg-gray-900/30 border-gray-800/30";
 
@@ -155,9 +185,10 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
               </div>
             </div>
 
-            {/* Sub line: status, duration, progress, loss, ETA */}
+            {/* Sub line: status, phase, duration, progress, loss, ETA */}
             <div className="flex items-center gap-2 mt-1 flex-wrap">
               <StatusBadge status={task.status} />
+              {task.phase && <PhaseBadge phase={task.phase} />}
               <span className="text-xs text-gray-500 font-mono">{duration}</span>
               {task.progress && (
                 <span className="text-xs text-gray-400 font-mono">
@@ -203,6 +234,16 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
 
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmAction !== null}
+        title={confirmAction?.title ?? ""}
+        message={confirmAction?.message ?? ""}
+        variant={confirmAction?.variant ?? "default"}
+        confirmLabel={confirmAction?.confirmLabel ?? "Confirm"}
+        onConfirm={handleConfirm}
+        onCancel={handleCancelDialog}
+      />
 
       {/* Expanded detail panel */}
       {expanded && (

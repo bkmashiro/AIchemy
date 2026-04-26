@@ -197,6 +197,17 @@ export function buildRunPayload(task: Task, stub: Stub): object {
   };
 }
 
+// ─── Checkpoint phase protection ─────────────────────────────────────────────
+
+/**
+ * Check if a task is currently in the checkpoint phase.
+ * Tasks in checkpoint phase should NOT be preempted or killed — interrupting
+ * a checkpoint write can corrupt the saved state and waste all training progress.
+ */
+export function isCheckpointProtected(task: Task): boolean {
+  return task.phase === "checkpoint";
+}
+
 // ─── Dispatch queued tasks for a stub ────────────────────────────────────────
 
 export function maybeDispatch(stub: Stub): void {

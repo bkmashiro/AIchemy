@@ -533,6 +533,7 @@ class StubDaemon:
                 on_config=self._on_sdk_config,
                 on_done=self._on_sdk_done,
                 on_notify=self._on_sdk_notify,
+                on_phase=self._on_sdk_phase,
                 on_zombie=self._on_task_zombie,
             )
         except Exception as e:
@@ -793,6 +794,13 @@ class StubDaemon:
             "task_id": task_id,
             "message": message,
             "level": level,
+        })
+
+    async def _on_sdk_phase(self, task_id: str, phase: str) -> None:
+        """Forward SDK phase report to server."""
+        await self._emit("task.phase", {
+            "task_id": task_id,
+            "phase": phase,
         })
 
     # ------------------------------------------------------------------ #

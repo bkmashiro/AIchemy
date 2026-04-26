@@ -4,6 +4,7 @@ import { Stub, stubsApi } from "../lib/api";
 import { formatRelTime, formatBytes, formatDuration } from "../lib/format";
 import { useSocket } from "../hooks/useSocket";
 import RemoteShell from "../components/RemoteShell";
+import ConfirmDialog from "../components/ConfirmDialog";
 
 const STATUS_COLORS: Record<string, string> = {
   running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
@@ -39,6 +40,13 @@ export default function StubDetailPage() {
   const [acting, setActing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { socket } = useSocket();
+  const [confirmAction, setConfirmAction] = useState<{
+    action: () => void;
+    title: string;
+    message: string;
+    variant: "danger" | "warning" | "default";
+    confirmLabel: string;
+  } | null>(null);
 
   // Settings edit state
   const [editMaxConcurrent, setEditMaxConcurrent] = useState<number | null>(null);
@@ -147,9 +155,13 @@ export default function StubDetailPage() {
           <button
             onClick={() => {
               if (hasRunningTasks) { alert("Cannot release: stub has running tasks."); return; }
-              if (confirm(`Mark stub "${stub.name}" offline?`)) {
-                doAction(() => stubsApi.release(stub.id));
-              }
+              setConfirmAction({
+                action: () => doAction(() => stubsApi.release(stub.id)),
+                title: "Release Stub",
+                message: `Mark stub "${stub.name}" offline? It will stop accepting tasks.`,
+                variant: "danger",
+                confirmLabel: "Release",
+              });
             }}
             disabled={acting || (isOnline && hasRunningTasks)}
             title="Mark stub offline (only if no running tasks)"
@@ -333,6 +345,16 @@ export default function StubDetailPage() {
       {isOnline && (
         <RemoteShell stubId={stub.id} socket={socket} isOnline={isOnline} />
       )}
+
+      <ConfirmDialog
+        open={confirmAction !== null}
+        title={confirmAction?.title ?? ""}
+        message={confirmAction?.message ?? ""}
+        variant={confirmAction?.variant ?? "default"}
+        confirmLabel={confirmAction?.confirmLabel ?? "Confirm"}
+        onConfirm={() => { confirmAction?.action(); setConfirmAction(null); }}
+        onCancel={() => setConfirmAction(null)}
+      />
     </div>
   );
 }

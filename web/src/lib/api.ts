@@ -129,6 +129,9 @@ export interface Task {
   max_retries: number;
   retry_of?: string;
 
+  // Lifecycle phase (Stream G — optional, not yet reported by stubs)
+  phase?: string;
+
   // Server signals
   should_stop: boolean;
   should_checkpoint: boolean;

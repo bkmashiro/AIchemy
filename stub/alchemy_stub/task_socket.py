@@ -10,6 +10,7 @@ SDK → Stub messages:
   { "type": "config",   "config": {} }
   { "type": "done",     "metrics": {} }
   { "type": "notify",   "message": "...", "level": "info" }
+  { "type": "phase",    "phase": "training" }
   { "type": "heartbeat" }
 
 Zombie detection: 60s no heartbeat but PID alive → zombie callback.
@@ -43,6 +44,7 @@ class TaskSocket:
         on_config(task_id, config)
         on_done(task_id, metrics)
         on_notify(task_id, message, level)
+        on_phase(task_id, phase)
         on_zombie(task_id)
     """
 
@@ -56,6 +58,7 @@ class TaskSocket:
         on_config: Callable[..., Awaitable[None]] | None = None,
         on_done: Callable[..., Awaitable[None]] | None = None,
         on_notify: Callable[..., Awaitable[None]] | None = None,
+        on_phase: Callable[..., Awaitable[None]] | None = None,
         on_zombie: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         self.task_id = task_id
@@ -66,6 +69,7 @@ class TaskSocket:
         self._on_config = on_config
         self._on_done = on_done
         self._on_notify = on_notify
+        self._on_phase = on_phase
         self._on_zombie = on_zombie
 
         self._sock_path = task_socket_path(task_id)
@@ -188,6 +192,9 @@ class TaskSocket:
                     msg.get("message", ""),
                     msg.get("level", "info"),
                 )
+        elif mtype == "phase":
+            if self._on_phase:
+                await self._on_phase(self.task_id, msg.get("phase", ""))
         else:
             log.debug("unknown SDK message type: %s", mtype)
 

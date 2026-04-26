@@ -17,9 +17,9 @@ import {
   TaskStartedPayload, TaskProgressPayload, TaskLogPayload,
   TaskCompletedPayload, TaskFailedPayload,
   TaskConfigPayload, TaskCheckpointPayload, PreflightFailPayload,
-  TaskResourcePayload, TaskMetricsPayload,
+  TaskResourcePayload, TaskMetricsPayload, TaskPhasePayload,
 } from "../types";
-import { maybeDispatch, triggerSchedule, buildRunPayload, computeRunDir } from "../scheduler";
+import { maybeDispatch, triggerSchedule, buildRunPayload, computeRunDir, isCheckpointProtected } from "../scheduler";
 import {
   registerStubSocket, unregisterStubSocket,
   reliableEmitToStub,
@@ -169,6 +169,16 @@ export function initiateKillChain(
   taskId: string,
   gracePeriodS: number = 30
 ): void {
+  // Checkpoint protection: if the task is currently writing a checkpoint,
+  // defer the kill to avoid corrupting saved state. The caller should retry later.
+  const task = store.getTask(stubId, taskId);
+  if (task && isCheckpointProtected(task)) {
+    logger.info("task.kill_deferred_checkpoint", { task_id: taskId, stub: stubId });
+    // Retry after 30s — checkpoint should be done by then
+    setTimeout(() => initiateKillChain(stubId, taskId, gracePeriodS), 30_000);
+    return;
+  }
+
   // Tell the stub to SIGTERM the task (stub's kill_graceful handles grace + SIGKILL).
   // grace_period_s passed to stub = full grace period before SIGKILL.
   store.updateTask(stubId, taskId, { should_stop: true });
@@ -272,6 +282,12 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
     socket.on("task.notify", (payload: { task_id: string; message: string; level: string }, ack?: Function) => {
       const stubId = socketToStub.get(socket.id);
       if (stubId) handleTaskNotify(stubId, payload, webNs);
+      if (ack) ack({ ok: true });
+    });
+
+    socket.on("task.phase", (payload: TaskPhasePayload, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (stubId) handleTaskPhase(stubId, payload, webNs);
       if (ack) ack({ ok: true });
     });
 
@@ -906,10 +922,72 @@ function handleTaskConfig(stubId: string, payload: TaskConfigPayload, webNs: Nam
 }
 
 function handleTaskCheckpoint(stubId: string, payload: TaskCheckpointPayload, webNs: Namespace): void {
+  const task = store.getTask(stubId, payload.task_id);
+  if (!task) return;
+
+  const newCount = (task.checkpoint_count || 0) + 1;
   const updated = store.updateTask(stubId, payload.task_id, {
     checkpoint_path: payload.path,
+    checkpoint_count: newCount,
   });
-  if (updated) webNs.emit("task.update", updated);
+  if (updated) {
+    webNs.emit("task.update", updated);
+
+    // G2: Auto-eval subtask creation
+    if (updated.auto_eval?.script) {
+      const { trigger, n } = updated.auto_eval;
+      let shouldEval = false;
+      if (trigger === "on_every") {
+        shouldEval = true;
+      } else if (trigger === "every_n_checkpoints" && n && n > 0) {
+        shouldEval = newCount % n === 0;
+      }
+      if (shouldEval) {
+        createAutoEvalTask(updated, stubId, webNs);
+      }
+    }
+  }
+}
+
+function createAutoEvalTask(parentTask: Task, stubId: string, webNs: Namespace): void {
+  const { v4: uuidv4 } = require("uuid");
+  const evalTask: Task = {
+    id: uuidv4(),
+    seq: store.nextSeq(),
+    fingerprint: `eval_${parentTask.fingerprint}_ckpt${parentTask.checkpoint_count}`,
+    display_name: `eval:${parentTask.display_name}:ckpt${parentTask.checkpoint_count}`,
+    script: parentTask.auto_eval!.script,
+    command: parentTask.auto_eval!.script,
+    status: "pending",
+    priority: parentTask.priority,
+    target_tags: parentTask.target_tags,
+    parent_task_id: parentTask.id,
+    created_at: new Date().toISOString(),
+    log_buffer: [],
+    retry_count: 0,
+    max_retries: 0,
+    should_stop: false,
+    should_checkpoint: false,
+  };
+  store.addToGlobalQueue(evalTask);
+  webNs.emit("task.update", evalTask);
+  logger.info("task.auto_eval_created", {
+    parent_seq: parentTask.seq,
+    eval_seq: evalTask.seq,
+    checkpoint_count: parentTask.checkpoint_count,
+  });
+  triggerSchedule();
+}
+
+function handleTaskPhase(stubId: string, payload: TaskPhasePayload, webNs: Namespace): void {
+  const validPhases = ["warmup", "training", "eval", "checkpoint", "cooldown"];
+  const phase = validPhases.includes(payload.phase) ? payload.phase : undefined;
+  if (!phase) return;
+
+  const updated = store.updateTask(stubId, payload.task_id, { phase });
+  if (updated) {
+    webNs.emit("task.update", updated);
+  }
 }
 
 function handlePreflightFail(stubId: string, payload: PreflightFailPayload, webNs: Namespace): void {

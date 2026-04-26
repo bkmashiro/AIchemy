@@ -78,6 +78,7 @@ vi.mock("../src/scheduler", () => ({
   triggerSchedule: vi.fn(),
   buildRunPayload: (task: any) => ({ task_id: task.id, command: task.command }),
   computeRunDir: vi.fn(() => "/runs/task"),
+  isCheckpointProtected: vi.fn(() => false),
 }));
 
 vi.mock("../src/reliable", () => ({

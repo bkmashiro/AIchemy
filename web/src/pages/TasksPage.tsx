@@ -2,6 +2,8 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task, TaskStatus, tasksApi } from "../lib/api";
 import { formatRelTime, taskDuration, generateDisplayName } from "../lib/format";
+import ConfirmDialog from "../components/ConfirmDialog";
+import PhaseBadge from "../components/PhaseBadge";
 
 const STATUS_ORDER: TaskStatus[] = ["running", "dispatched", "queued", "pending", "paused", "completed", "failed", "killed", "lost"];
 
@@ -28,6 +30,14 @@ export default function TasksPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<Filter>("all");
   const [acting, setActing] = useState<Set<string>>(new Set());
+  const [confirmAction, setConfirmAction] = useState<{
+    action: () => void;
+    title: string;
+    message: string;
+    items?: string[];
+    variant: "danger" | "warning" | "default";
+    confirmLabel: string;
+  } | null>(null);
   const navigate = useNavigate();
 
   const fetchTasks = useCallback(() => {
@@ -69,12 +79,20 @@ export default function TasksPage() {
     finally { setActing((s) => { const n = new Set(s); n.delete(id); return n; }); }
   };
 
-  const batchKillPending = async () => {
-    const ids = tasks.filter((t) => t.status === "pending").map((t) => t.id);
-    if (ids.length === 0) return;
-    if (!confirm(`Kill ${ids.length} pending tasks?`)) return;
-    await tasksApi.batch("kill", ids);
-    fetchTasks();
+  const batchKillPending = () => {
+    const pendingTasks = tasks.filter((t) => t.status === "pending");
+    if (pendingTasks.length === 0) return;
+    setConfirmAction({
+      action: async () => {
+        await tasksApi.batch("kill", pendingTasks.map((t) => t.id));
+        fetchTasks();
+      },
+      title: "Kill Pending Tasks",
+      message: `Kill ${pendingTasks.length} pending task${pendingTasks.length > 1 ? "s" : ""}?`,
+      items: pendingTasks.map((t) => `#${t.seq} ${generateDisplayName(t)}`),
+      variant: "danger",
+      confirmLabel: "Kill All",
+    });
   };
 
   if (loading) return <div className="text-gray-500 text-center py-20">Loading...</div>;
@@ -154,6 +172,7 @@ export default function TasksPage() {
                     <span className={`inline-flex px-1.5 py-0.5 rounded text-xs font-semibold border ${STATUS_COLORS[t.status] || ""}`}>
                       {t.status.toUpperCase()}
                     </span>
+                    {t.phase && <span className="ml-1.5"><PhaseBadge phase={t.phase} /></span>}
                   </td>
                   <td className="px-4 py-2 text-gray-500 text-xs font-mono hidden sm:table-cell">{taskDuration(t)}</td>
                   <td className="px-4 py-2 text-gray-500 text-xs font-mono hidden md:table-cell">
@@ -205,6 +224,17 @@ export default function TasksPage() {
           >Next</button>
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmAction !== null}
+        title={confirmAction?.title ?? ""}
+        message={confirmAction?.message ?? ""}
+        items={confirmAction?.items}
+        variant={confirmAction?.variant ?? "default"}
+        confirmLabel={confirmAction?.confirmLabel ?? "Confirm"}
+        onConfirm={() => { confirmAction?.action(); setConfirmAction(null); }}
+        onCancel={() => setConfirmAction(null)}
+      />
     </div>
   );
 }

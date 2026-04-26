@@ -91,6 +91,14 @@ export interface Task {
   log_buffer: string[];
   config_snapshot?: Record<string, any>;
 
+  // === Lifecycle Phase ===
+  phase?: string;
+
+  // === Auto-eval ===
+  auto_eval?: { script: string; trigger: string; n?: number };
+  parent_task_id?: string;
+  checkpoint_count?: number;
+
   // === Eval Metrics ===
   eval_metrics?: Record<string, number>;
 
@@ -318,4 +326,9 @@ export interface TaskMetricsPayload {
   task_id: string;
   metrics: Record<string, number>;
   step: number;
+}
+
+export interface TaskPhasePayload {
+  task_id: string;
+  phase: string;
 }

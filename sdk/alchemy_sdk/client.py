@@ -14,6 +14,9 @@ _MISSING = object()
 # Valid notification levels
 _NOTIFY_LEVELS = ("debug", "info", "warning", "critical")
 
+# Valid lifecycle phases
+_VALID_PHASES = ("warmup", "training", "eval", "checkpoint", "cooldown")
+
 
 class Alchemy:
     """
@@ -189,6 +192,29 @@ class Alchemy:
             level = "info"
         self._transport.send({"type": "notify", "message": msg, "level": level})
 
+    def set_phase(self, phase: str) -> None:
+        """
+        Report the current training lifecycle phase.
+
+        Valid phases: warmup, training, eval, checkpoint, cooldown.
+        Server uses this for scheduling decisions (e.g. won't preempt during checkpoint).
+        """
+        if phase not in _VALID_PHASES:
+            raise ValueError(
+                f"Invalid phase '{phase}'. Valid: {_VALID_PHASES}"
+            )
+        self._transport.send({"type": "phase", "phase": phase})
+
+    def phase(self, phase: str) -> "_PhaseContext":
+        """
+        Context manager for lifecycle phases.
+
+        Usage:
+            with alchemy.phase("eval"):
+                run_evaluation()
+        """
+        return _PhaseContext(self, phase)
+
     def done(self, metrics: Optional[dict[str, Any]] = None) -> None:
         """Signal that training is complete. Sends final metrics if provided."""
         msg: dict[str, Any] = {"type": "done"}
@@ -261,3 +287,19 @@ class Alchemy:
 
             return wrapper
         return decorator
+
+
+class _PhaseContext:
+    """Context manager for lifecycle phase reporting."""
+
+    def __init__(self, al: Alchemy, phase: str) -> None:
+        self._al = al
+        self._phase = phase
+
+    def __enter__(self) -> "_PhaseContext":
+        self._al.set_phase(self._phase)
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # Revert to training phase when exiting a phase block
+        self._al.set_phase("training")

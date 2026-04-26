@@ -4,6 +4,8 @@ import { Task, tasksApi, costApi, TaskCost } from "../lib/api";
 import { taskDuration, taskEta, formatRelTime, generateDisplayName } from "../lib/format";
 import LogViewer from "../components/LogViewer";
 import MetricsChart from "../components/MetricsChart";
+import ConfirmDialog from "../components/ConfirmDialog";
+import PhaseBadge from "../components/PhaseBadge";
 
 const STATUS_COLORS: Record<string, string> = {
   running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
@@ -34,6 +36,13 @@ export default function TaskDetailPage() {
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState(false);
   const [taskCost, setTaskCost] = useState<TaskCost | null>(null);
+  const [confirmAction, setConfirmAction] = useState<{
+    action: () => void;
+    title: string;
+    message: string;
+    variant: "danger" | "warning" | "default";
+    confirmLabel: string;
+  } | null>(null);
 
   const fetch = useCallback(() => {
     if (!id) return;
@@ -87,6 +96,7 @@ export default function TaskDetailPage() {
             <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold border ${STATUS_COLORS[task.status] || ""}`}>
               {task.status.toUpperCase()}
             </span>
+            {task.phase && <PhaseBadge phase={task.phase} />}
             <span className="text-sm text-gray-500 font-mono">#{task.seq}</span>
             <span className="text-sm text-gray-500">{taskDuration(task)}</span>
             {eta && <span className="text-sm text-cyan-400">{eta}</span>}
@@ -109,7 +119,13 @@ export default function TaskDetailPage() {
             </button>
           )}
           {isActive && (
-            <button onClick={() => { if (confirm(`Kill task #${task.seq}?`)) doAction(() => tasksApi.patch(task.id, { status: "killed" })); }} disabled={acting}
+            <button onClick={() => setConfirmAction({
+              action: () => doAction(() => tasksApi.patch(task.id, { status: "killed" })),
+              title: "Kill Task",
+              message: `Kill task #${task.seq} "${displayName}"?`,
+              variant: "danger",
+              confirmLabel: "Kill",
+            })} disabled={acting}
               className="px-3 py-1.5 text-sm bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-50 transition-colors">
               Kill
             </button>
@@ -199,6 +215,16 @@ export default function TaskDetailPage() {
         <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Logs</p>
         <LogViewer taskId={task.id} initialLines={task.log_buffer} maxHeight="500px" />
       </div>
+
+      <ConfirmDialog
+        open={confirmAction !== null}
+        title={confirmAction?.title ?? ""}
+        message={confirmAction?.message ?? ""}
+        variant={confirmAction?.variant ?? "default"}
+        confirmLabel={confirmAction?.confirmLabel ?? "Confirm"}
+        onConfirm={() => { confirmAction?.action(); setConfirmAction(null); }}
+        onCancel={() => setConfirmAction(null)}
+      />
     </div>
   );
 }
