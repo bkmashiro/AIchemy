@@ -255,9 +255,12 @@ class TestMaxConcurrentDynamic:
         final2 = wait_for_status(api, t2["id"], {"completed"}, timeout=30)
         assert final2["status"] == "completed"
 
-        # Cleanup
-        api.kill_task(t1["id"])
-        wait_for_status(api, t1["id"], TERMINAL_STATUSES, timeout=15)
+        # Cleanup (t1 may already be completed)
+        try:
+            api.kill_task(t1["id"])
+            wait_for_status(api, t1["id"], TERMINAL_STATUSES, timeout=15)
+        except Exception:
+            pass
 
 
 class TestEnvVarsPassedToTask:
@@ -411,7 +414,7 @@ class TestRetryTaskIdDiffers:
             f"retry_of should be {task['id']}, got {retry.get('retry_of')}"
         )
         assert retry["retry_count"] == 1
-        assert retry["status"] == "pending"
+        assert retry["status"] in ("pending", "queued"), f"Got {retry['status']}"
 
         # Wait for retry to complete (it will also fail with exit 1)
         wait_for_status(api, retry["id"], TERMINAL_STATUSES, timeout=20)

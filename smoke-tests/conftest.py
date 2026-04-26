@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import os
+
+# Strip proxy env vars — all test traffic is localhost
+for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+    os.environ.pop(_k, None)
+
 import pytest
 
 from harness.server import TestServer
@@ -42,6 +47,7 @@ def stub_default(test_server, api):
         name="test-stub-default",
         max_concurrent=5,
     )
+    s.snapshot_existing_stubs(api)
     s.start()
     s.wait_online(api)
     yield s
@@ -67,6 +73,7 @@ def stub_factory(test_server, api):
             max_concurrent=max_concurrent,
             default_cwd=default_cwd,
         )
+        s.snapshot_existing_stubs(api)
         s.start()
         s.wait_online(api)
         stubs.append(s)

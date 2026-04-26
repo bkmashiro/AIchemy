@@ -50,6 +50,7 @@ class TestStubDisconnectRunningTask:
             tags=[f"lossy_{uuid4().hex[:6]}"],
             max_concurrent=3,
         )
+        stub.snapshot_existing_stubs(api)
         stub.start()
         stub.wait_online(api)
         tag = stub.tags[0]
@@ -87,7 +88,7 @@ class TestStubReconnectRecovery:
         This simulates a stub restart where the task subprocess survives."""
         tag = f"recover_{uuid4().hex[:6]}"
         cwd = str(tmp_path / "recover_workdir")
-        os.makedirs(cwd, exist_ok=True)
+        os.makedirs(os.path.join(cwd, "runs"), exist_ok=True)
 
         stub = TestStub(
             test_server.url,
@@ -97,6 +98,7 @@ class TestStubReconnectRecovery:
             max_concurrent=3,
             default_cwd=cwd,
         )
+        stub.snapshot_existing_stubs(api)
         stub.start()
         stub.wait_online(api)
 
@@ -130,8 +132,10 @@ class TestStubReconnectRecovery:
             max_concurrent=3,
             default_cwd=cwd,
         )
+        # Same identity → same stub ID; use wait_online_by_id
+        old_stub_id = stub.stub_id
         stub2.start()
-        stub2.wait_online(api)
+        stub2.wait_online_by_id(api, old_stub_id)
 
         # Give it time to reconcile
         time.sleep(5)
@@ -145,9 +149,12 @@ class TestStubReconnectRecovery:
         )
 
         # Cleanup
-        if t2["status"] in ("running", "lost"):
-            api.kill_task(task["id"])
-            wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=30)
+        if t2["status"] == "running":
+            try:
+                api.kill_task(task["id"])
+                wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=30)
+            except Exception:
+                pass
         stub2.stop()
 
 
@@ -173,6 +180,7 @@ class TestStubOfflineSlotsFreed:
             tags=[tag],
             max_concurrent=1,
         )
+        stub_a.snapshot_existing_stubs(api)
         stub_a.start()
         stub_a.wait_online(api)
 
@@ -235,6 +243,7 @@ class TestAutoRetryOnLost:
             tags=[tag],
             max_concurrent=3,
         )
+        doomed_stub.snapshot_existing_stubs(api)
         doomed_stub.start()
         doomed_stub.wait_online(api)
 
@@ -296,7 +305,7 @@ class TestStubNameStability:
         same config, verify it gets the same stub_id."""
         tag = f"stable_{uuid4().hex[:6]}"
         cwd = str(tmp_path / "stable_cwd")
-        os.makedirs(cwd, exist_ok=True)
+        os.makedirs(os.path.join(cwd, "runs"), exist_ok=True)
 
         stub1 = TestStub(
             test_server.url,
@@ -306,6 +315,7 @@ class TestStubNameStability:
             max_concurrent=2,
             default_cwd=cwd,
         )
+        stub1.snapshot_existing_stubs(api)
         stub1.start()
         stub1.wait_online(api)
         first_id = stub1.stub_id
@@ -313,7 +323,7 @@ class TestStubNameStability:
         stub1.stop()
         time.sleep(3)
 
-        # Start again with same config
+        # Start again with same config — same identity → same stub ID
         stub2 = TestStub(
             test_server.url,
             test_server.token,
@@ -323,7 +333,7 @@ class TestStubNameStability:
             default_cwd=cwd,
         )
         stub2.start()
-        stub2.wait_online(api)
+        stub2.wait_online_by_id(api, first_id)
         second_id = stub2.stub_id
 
         # Same identity → same stub_id

@@ -19,14 +19,16 @@ class TestDedup:
 
     def test_fingerprint_dedup(self, api, stub_default):
         """Submitting identical task twice returns 409 with existing_task_id."""
-        # Use a unique script path to ensure unique fingerprint
-        script = f"bash {os.path.join(SCRIPTS, 'success_fast.sh')}"
-        # Use unique cwd to create a unique fingerprint
+        # Use long_running.sh so task stays active between submits
+        script = f"bash {os.path.join(SCRIPTS, 'long_running.sh')}"
         unique_cwd = f"/tmp/dedup_test_{uuid4().hex[:8]}"
-        os.makedirs(unique_cwd, exist_ok=True)
+        os.makedirs(os.path.join(unique_cwd, "runs"), exist_ok=True)
 
         name = _unique_name("smoke_dedup")
         task1 = api.submit_expect(script, name=name, cwd=unique_cwd)
+
+        # Wait for running to ensure it's active
+        wait_for_status(api, task1["id"], {"running"}, timeout=30)
 
         # Second submission with same fingerprint should be rejected
         name2 = _unique_name("smoke_dedup_dup")
@@ -43,10 +45,10 @@ class TestDedup:
         data = r.json()
         assert "existing_task_id" in data
 
-        # Cleanup: wait for first task
-        wait_for_status(api, task1["id"], {"completed"}, timeout=30)
+        # Kill the long-running task
+        api.kill_task(task1["id"])
+        wait_for_status(api, task1["id"], {"killed", "completed"}, timeout=30)
 
-        # After cleanup, clean up the temp dir
         import shutil
         shutil.rmtree(unique_cwd, ignore_errors=True)
 

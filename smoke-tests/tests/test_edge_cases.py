@@ -466,7 +466,7 @@ class TestRapidSubmitDedup:
     def test_concurrent_identical_submits(self, api, stub_default, tmp_path):
         """Two identical submits in quick succession: one succeeds, one gets 409."""
         unique_cwd = str(tmp_path / "dedup_race")
-        os.makedirs(unique_cwd, exist_ok=True)
+        os.makedirs(os.path.join(unique_cwd, "runs"), exist_ok=True)
         script = "sleep 10"
         params = {"dedup_race_key": uuid4().hex[:8]}
 
