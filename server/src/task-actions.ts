@@ -168,3 +168,23 @@ export function killGlobalTask(taskId: string): Task | undefined {
     finished_at: now(),
   });
 }
+
+/** Cancel a blocked task in the global queue (blocked → cancelled) */
+export function cancelBlockedTask(taskId: string, reason?: string): Task | undefined {
+  return store.updateGlobalQueueTask(taskId, {
+    status: "cancelled" as TaskStatus,
+    finished_at: now(),
+    error_message: reason,
+  });
+}
+
+/** Promote a blocked task to pending (blocked → pending), updating args and command */
+export function promoteBlockedTask(
+  taskId: string,
+  update: { args?: Record<string, string>; command?: string; display_name?: string },
+): Task | undefined {
+  return store.updateGlobalQueueTask(taskId, {
+    status: "pending" as TaskStatus,
+    ...update,
+  });
+}

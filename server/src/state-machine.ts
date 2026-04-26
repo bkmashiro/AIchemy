@@ -11,6 +11,8 @@ const LEGAL_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   failed:     ["pending"],
   killed:     ["pending"],
   lost:       ["pending", "failed", "running"],  // running = recover on reconnect
+  blocked:    ["pending", "cancelled", "killed"],
+  cancelled:  ["pending"],  // allow manual re-queue
 };
 
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {

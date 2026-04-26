@@ -164,9 +164,15 @@ class Alchemy:
             msg["metrics"] = metrics
         self._transport.send(msg)
 
+    def export(self, key: str, value: Any) -> None:
+        """Export a key-value pair for downstream DAG tasks to consume."""
+        self._transport.send({"type": "export", "key": key, "value": value})
+
     def log_eval(self, metrics: dict[str, Any]) -> None:
         """Report evaluation metrics immediately (not throttled)."""
         self._transport.send({"type": "eval", "metrics": metrics})
+        for k, v in metrics.items():
+            self.export(f"eval_{k}", v)
 
     def log_config(self, config: dict[str, Any]) -> None:
         """Report training config snapshot (e.g. hyperparams)."""
@@ -178,6 +184,7 @@ class Alchemy:
         Does NOT call torch.save — caller is responsible for saving.
         """
         self._transport.send({"type": "checkpoint", "path": path})
+        self.export("last_checkpoint_path", path)
 
     def notify(self, msg: str, level: str = "info") -> None:
         """

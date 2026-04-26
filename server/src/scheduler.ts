@@ -271,7 +271,8 @@ function _scheduleInner(): void {
     maybeDispatch(stub);
   }
 
-  const queue = store.getGlobalQueue(); // sorted: priority desc, created_at asc
+  // Only schedule pending tasks, not blocked ones (blocked wait for DAG deps)
+  const queue = store.getGlobalQueue().filter(t => t.status !== "blocked");
   if (queue.length === 0) return;
 
   for (const task of queue) {
@@ -296,6 +297,8 @@ function _scheduleInner(): void {
     logger.info("scheduler.assign", { task_seq: task.seq, stub: best.name, score: candidates[0].score });
     const moved = store.moveToStubQueue(task.id, best.id);
     if (moved) {
+      // Broadcast task assignment so frontend stays in sync
+      if (_webNsRef) _webNsRef.emit("task.update", moved);
       const updatedStub = store.getStub(best.id);
       if (updatedStub) {
         maybeDispatch(updatedStub);
@@ -316,7 +319,14 @@ export function triggerSchedule(): void {
 
 // ─── Periodic scheduling ─────────────────────────────────────────────────────
 
+let _webNsRef: Namespace | undefined;
+
+export function getWebNs(): Namespace | undefined {
+  return _webNsRef;
+}
+
 export function startScheduler(_webNs: Namespace, _stubNs: Namespace): void {
+  _webNsRef = _webNs;
   // Periodic schedule: every 30s
   setInterval(() => triggerSchedule(), 30_000);
   // Also drain immediately on startup (tasks may be pending)

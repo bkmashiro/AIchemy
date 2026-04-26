@@ -110,6 +110,10 @@ export interface TaskInput {
   target_tags?: string[];
   python_env?: string;
   submitted_by?: string;
+  depends_on?: string[];
+  ref?: string;
+  args_template?: Record<string, string>;
+  experiment_id?: string;
 }
 
 export function createTask(input: TaskInput): Task {
@@ -151,7 +155,7 @@ export function createTask(input: TaskInput): Task {
     env_overrides: input.env_overrides,
     command,
     requirements: input.requirements,
-    status: "pending",
+    status: input.depends_on && input.depends_on.length > 0 ? "blocked" : "pending",
     priority: input.priority ?? 5,
     stub_id: input.stub_id,
     target_tags: input.target_tags,
@@ -166,6 +170,10 @@ export function createTask(input: TaskInput): Task {
     run_dir: input.run_dir,
     python_env: input.python_env,
     submitted_by: input.submitted_by,
+    depends_on: input.depends_on,
+    ref: input.ref,
+    args_template: input.args_template,
+    experiment_id: input.experiment_id,
   };
 
   return task;
@@ -230,7 +238,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
       switch (action) {
         case "kill": {
-          if (!["running", "paused", "queued", "dispatched", "pending"].includes(task.status)) {
+          if (!["running", "paused", "queued", "dispatched", "pending", "blocked"].includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot kill in status '${task.status}'` }); break;
           }
           if (stubId && (task.status === "running" || task.status === "dispatched")) {
@@ -317,7 +325,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, target_tags, python_env,
-      submitted_by,
+      submitted_by, depends_on, ref, args_template, experiment_id,
     } = req.body;
 
     if (!script) {
@@ -372,7 +380,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const task = createTask({
       script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
-      submitted_by,
+      submitted_by, depends_on, ref, args_template, experiment_id,
     });
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected
@@ -437,7 +445,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
     if (status !== undefined) {
       // Status override — limited transitions
-      if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused"].includes(task.status)) {
+      if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused", "blocked"].includes(task.status)) {
         if (stubId && (task.status === "running" || task.status === "dispatched")) {
           initiateKillChain(stubId, task.id);
           return res.json(task);

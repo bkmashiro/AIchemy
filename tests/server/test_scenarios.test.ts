@@ -1691,3 +1691,284 @@ describe("Double-action protection", () => {
     socket.disconnect();
   }, 10_000);
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DAG PIPELINE EXPERIMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("DAG pipeline experiments", () => {
+
+  it("creates experiment with task_specs and wires depends_on", async () => {
+    const r = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-linear",
+      task_specs: [
+        { ref: "train", script: "python train.py" },
+        { ref: "eval", script: "python eval.py", depends_on: ["train"] },
+        { ref: "report", script: "python report.py", depends_on: ["eval"] },
+      ],
+    });
+    expect(r.status).toBe(201);
+    const exp = await r.json();
+    expect(exp.task_refs).toBeDefined();
+    expect(Object.keys(exp.task_refs)).toEqual(expect.arrayContaining(["train", "eval", "report"]));
+
+    // Check task statuses
+    const trainR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.train}`, TOKEN);
+    const train = await trainR.json();
+    expect(train.status).toBe("pending"); // no deps → pending
+
+    const evalR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.eval}`, TOKEN);
+    const evalTask = await evalR.json();
+    expect(evalTask.status).toBe("blocked");
+    expect(evalTask.depends_on).toContain(exp.task_refs.train);
+
+    const reportR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.report}`, TOKEN);
+    const report = await reportR.json();
+    expect(report.status).toBe("blocked");
+    expect(report.depends_on).toContain(exp.task_refs.eval);
+  }, 10_000);
+
+  it("rejects DAG with cycle", async () => {
+    const r = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-cycle",
+      task_specs: [
+        { ref: "a", script: "a.py", depends_on: ["b"] },
+        { ref: "b", script: "b.py", depends_on: ["a"] },
+      ],
+    });
+    expect(r.status).toBe(400);
+    const body = await r.json();
+    expect(body.error).toMatch(/cycle/i);
+  });
+
+  it("rejects DAG with unknown dependency ref", async () => {
+    const r = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-bad-ref",
+      task_specs: [
+        { ref: "a", script: "a.py", depends_on: ["ghost"] },
+      ],
+    });
+    expect(r.status).toBe(400);
+    expect((await r.json()).error).toMatch(/unknown ref/);
+  });
+
+  it("linear pipeline: train→eval promotion on completion", async () => {
+    const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-promote-test",
+      task_specs: [
+        { ref: "train", script: "echo train" },
+        { ref: "eval", script: "echo eval", depends_on: ["train"] },
+      ],
+    });
+    const exp = await expR.json();
+    const trainId = exp.task_refs.train;
+    const evalId = exp.task_refs.eval;
+
+    // Connect stub
+    const { socket, stubId } = await connectAndResume(BASE, TOKEN, {
+      hostname: `dag-stub-${Date.now()}`,
+      maxConcurrent: 2,
+    });
+
+    // Stub should get train task (eval is blocked)
+    const buf = new TaskRunBuffer(socket);
+    await sleep(500); // let scheduler run
+    const trainPayload = await buf.waitForTask(trainId);
+    expect(trainPayload.task_id).toBe(trainId);
+
+    // Complete train
+    socket.emit("task.started", { task_id: trainId, pid: 1 });
+    await sleep(100);
+    socket.emit("task.completed", { task_id: trainId, exit_code: 0 });
+    await sleep(800); // let promotion + scheduler run
+
+    // eval should now be promoted to pending and dispatched
+    const evalCheck = await apiGet(`${BASE}/api/tasks/${evalId}`, TOKEN);
+    const evalTask = await evalCheck.json();
+    expect(["pending", "queued", "dispatched", "running"]).toContain(evalTask.status);
+
+    buf.destroy();
+    socket.disconnect();
+  }, 15_000);
+
+  it("cascading cancellation: fail train → cancel eval + report", async () => {
+    const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-cascade-test",
+      task_specs: [
+        { ref: "train", script: "echo fail" },
+        { ref: "eval", script: "echo eval", depends_on: ["train"] },
+        { ref: "report", script: "echo report", depends_on: ["eval"] },
+      ],
+    });
+    const exp = await expR.json();
+    const trainId = exp.task_refs.train;
+    const evalId = exp.task_refs.eval;
+    const reportId = exp.task_refs.report;
+
+    // Connect stub and run train
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `dag-cascade-${Date.now()}`,
+      maxConcurrent: 2,
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    await sleep(500);
+    await buf.waitForTask(trainId);
+
+    // Fail train
+    socket.emit("task.started", { task_id: trainId, pid: 2 });
+    await sleep(100);
+    socket.emit("task.failed", { task_id: trainId, exit_code: 1, error: "crash" });
+    await sleep(800);
+
+    // eval and report should be cancelled
+    const evalCheck = await apiGet(`${BASE}/api/tasks/${evalId}`, TOKEN);
+    expect((await evalCheck.json()).status).toBe("cancelled");
+
+    const reportCheck = await apiGet(`${BASE}/api/tasks/${reportId}`, TOKEN);
+    expect((await reportCheck.json()).status).toBe("cancelled");
+
+    buf.destroy();
+    socket.disconnect();
+  }, 15_000);
+
+  it("fan-out: one root, two downstream — both blocked then promoted", async () => {
+    const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-fanout",
+      task_specs: [
+        { ref: "data", script: "echo data" },
+        { ref: "branch_a", script: "echo a", depends_on: ["data"] },
+        { ref: "branch_b", script: "echo b", depends_on: ["data"] },
+      ],
+    });
+    const exp = await expR.json();
+
+    // Initially branch_a and branch_b should be blocked
+    const aR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.branch_a}`, TOKEN);
+    expect((await aR.json()).status).toBe("blocked");
+
+    const bR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.branch_b}`, TOKEN);
+    expect((await bR.json()).status).toBe("blocked");
+
+    // Connect stub, complete data
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `dag-fanout-${Date.now()}`,
+      maxConcurrent: 4,
+    });
+    const buf = new TaskRunBuffer(socket);
+    await sleep(500);
+    const dataPayload = await buf.waitForTask(exp.task_refs.data);
+    socket.emit("task.started", { task_id: dataPayload.task_id, pid: 3 });
+    await sleep(100);
+    socket.emit("task.completed", { task_id: dataPayload.task_id, exit_code: 0 });
+    await sleep(800);
+
+    // Both should be promoted
+    const aCheck = await apiGet(`${BASE}/api/tasks/${exp.task_refs.branch_a}`, TOKEN);
+    expect(["pending", "queued", "dispatched", "running"]).toContain((await aCheck.json()).status);
+
+    const bCheck = await apiGet(`${BASE}/api/tasks/${exp.task_refs.branch_b}`, TOKEN);
+    expect(["pending", "queued", "dispatched", "running"]).toContain((await bCheck.json()).status);
+
+    buf.destroy();
+    socket.disconnect();
+  }, 15_000);
+
+  it("kill blocked task transitions to killed", async () => {
+    const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-kill-blocked",
+      task_specs: [
+        { ref: "slow", script: "echo slow" },
+        { ref: "wait", script: "echo wait", depends_on: ["slow"] },
+      ],
+    });
+    const exp = await expR.json();
+    const waitId = exp.task_refs.wait;
+
+    // Kill the blocked task
+    const killR = await apiPatch(`${BASE}/api/tasks/${waitId}`, TOKEN, { status: "killed" });
+    expect(killR.status).toBe(200);
+    const killed = await killR.json();
+    expect(killed.status).toBe("killed");
+  }, 10_000);
+
+  it("export via SDK endpoint persists on task", async () => {
+    // Create a simple task
+    const taskR = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: "echo export-test" });
+    const task = await taskR.json();
+
+    // Connect stub, start the task
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `dag-export-${Date.now()}`,
+      maxConcurrent: 2,
+    });
+    const buf = new TaskRunBuffer(socket);
+    await sleep(500);
+    await buf.waitForTask(task.id);
+    socket.emit("task.started", { task_id: task.id, pid: 4 });
+    await sleep(200);
+
+    // SDK export endpoint (no auth — task_id is the credential)
+    const sdkR = await fetch(`${BASE}/api/sdk/report`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: task.id, type: "export", key: "best_model", value: "/runs/model.pt" }),
+    });
+    expect(sdkR.status).toBe(200);
+
+    // Check export is stored
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.exports?.best_model).toBe("/runs/model.pt");
+
+    buf.destroy();
+    socket.disconnect();
+  }, 10_000);
+
+  it("template resolution with exports in args_template", async () => {
+    const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
+      name: "dag-template",
+      task_specs: [
+        { ref: "train", script: "echo train" },
+        { ref: "eval", script: "echo eval",
+          depends_on: ["train"],
+          args_template: { "--ckpt": "{{deps.train.exports.last_checkpoint_path}}" },
+        },
+      ],
+    });
+    const exp = await expR.json();
+    const trainId = exp.task_refs.train;
+    const evalId = exp.task_refs.eval;
+
+    // Connect stub
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `dag-tmpl-${Date.now()}`,
+      maxConcurrent: 2,
+    });
+    const buf = new TaskRunBuffer(socket);
+    await sleep(500);
+    await buf.waitForTask(trainId);
+    socket.emit("task.started", { task_id: trainId, pid: 5 });
+    await sleep(100);
+
+    // Export checkpoint via SDK
+    await fetch(`${BASE}/api/sdk/report`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: trainId, type: "export", key: "last_checkpoint_path", value: "/runs/train/ckpt_100.pt" }),
+    });
+    await sleep(100);
+
+    // Complete train → should promote eval with resolved template
+    socket.emit("task.completed", { task_id: trainId, exit_code: 0 });
+    await sleep(800);
+
+    const evalCheck = await apiGet(`${BASE}/api/tasks/${evalId}`, TOKEN);
+    const evalTask = await evalCheck.json();
+    expect(["pending", "queued", "dispatched", "running"]).toContain(evalTask.status);
+    expect(evalTask.args?.["--ckpt"]).toBe("/runs/train/ckpt_100.pt");
+
+    buf.destroy();
+    socket.disconnect();
+  }, 15_000);
+});

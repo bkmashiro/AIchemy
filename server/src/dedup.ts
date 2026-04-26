@@ -40,7 +40,7 @@ export function computeFingerprint(input: FingerprintInput): string {
 
 // ─── Active statuses for dedup check ─────────────────────────────────────────
 
-const ACTIVE_STATUSES: TaskStatus[] = ["pending", "queued", "dispatched", "running", "paused"];
+const ACTIVE_STATUSES: TaskStatus[] = ["pending", "queued", "dispatched", "running", "paused", "blocked"];
 
 export function isActiveStatus(status: TaskStatus): boolean {
   return ACTIVE_STATUSES.includes(status);

@@ -20,6 +20,7 @@ import {
   TaskResourcePayload, TaskMetricsPayload, TaskPhasePayload,
 } from "../types";
 import { maybeDispatch, triggerSchedule, buildRunPayload, computeRunDir, isCheckpointProtected } from "../scheduler";
+import { promoteBlockedTasks, cascadeCancellation } from "../dag";
 import {
   registerStubSocket, unregisterStubSocket,
   reliableEmitToStub,
@@ -108,13 +109,14 @@ function markTasksLost(stub: Stub, webNs: Namespace): void {
 function handleAutoRetry(task: Task, webNs: Namespace): void {
   if (task.max_retries > 0 && task.retry_count < task.max_retries) {
     // Dedup: check if a retry already exists for this task (or its retry chain root)
+    // Include "lost" to prevent duplicate retries when disconnect→lost→retry→disconnect repeats
     const retryRoot = task.retry_of || task.id;
     const allTasks = store.getAllTasks();
     const existingRetry = allTasks.find(
       (t) =>
         (t.retry_of === retryRoot || t.retry_of === task.id) &&
         t.id !== task.id &&
-        ["pending", "queued", "dispatched", "running"].includes(t.status),
+        ["pending", "queued", "dispatched", "running", "lost"].includes(t.status),
     );
     if (existingRetry) {
       logger.info("task.retry_dedup", { task_seq: task.seq, existing_retry: existingRetry.seq });
@@ -292,6 +294,17 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       if (ack) ack({ ok: true });
     });
 
+    socket.on("task.export", (payload: { task_id: string; key: string; value: any }, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) { if (ack) ack({ ok: false }); return; }
+      const task = store.getTask(stubId, payload.task_id);
+      if (!task) { if (ack) ack({ ok: false }); return; }
+      const exports = { ...(task.exports || {}), [payload.key]: payload.value };
+      const updated = store.updateTask(stubId, payload.task_id, { exports });
+      if (updated) webNs.emit("task.update", updated);
+      if (ack) ack({ ok: true });
+    });
+
     // ─── Non-reliable events ────────────────────────────────────────────────
 
     socket.on("heartbeat", (payload: HeartbeatPayload) => {
@@ -384,9 +397,14 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       const task = store.getTask(stubId, payload.task_id);
       if (!task) { if (ack) ack({ ok: false }); return; }
 
-      // Store eval metrics on the task
+      // Store eval metrics on the task + auto-export
+      const evalExports = { ...(task.exports || {}) };
+      for (const [k, v] of Object.entries(payload.metrics)) {
+        evalExports[`eval_${k}`] = v;
+      }
       store.updateTask(stubId, payload.task_id, {
         eval_metrics: payload.metrics,
+        exports: evalExports,
       });
 
       // Check experiment criteria
@@ -808,6 +826,9 @@ function handleTaskCompleted(stubId: string, payload: TaskCompletedPayload, webN
     maybeDispatch(stub);
   }
   triggerSchedule();
+
+  // DAG: promote downstream blocked tasks
+  promoteBlockedTasks(payload.task_id, webNs);
 }
 
 function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Namespace): void {
@@ -830,14 +851,14 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
     task.retry_count < task.max_retries &&
     (hasCheckpoint || deathCause === "walltime" || deathCause === "preempt")
   ) {
-    // Dedup: check if a retry already exists
+    // Dedup: check if a retry already exists (include "lost" to prevent duplicates)
     const retryRoot = task.retry_of || task.id;
     const allTasks = store.getAllTasks();
     const existingRetry = allTasks.find(
       (t) =>
         (t.retry_of === retryRoot || t.retry_of === task.id) &&
         t.id !== task.id &&
-        ["pending", "queued", "dispatched", "running"].includes(t.status),
+        ["pending", "queued", "dispatched", "running", "lost"].includes(t.status),
     );
     if (existingRetry) {
       logger.info("task.auto_resume_dedup", { task_seq: task.seq, existing_retry: existingRetry.seq, death_cause: deathCause });
@@ -905,6 +926,9 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
     checkGridCompletion(updated.grid_id, webNs);
   }
 
+  // DAG: cascade cancellation to downstream blocked tasks
+  cascadeCancellation(payload.task_id, webNs);
+
   const stub = store.getStub(stubId);
   if (stub) {
     maybeDispatch(stub);
@@ -924,9 +948,11 @@ function handleTaskCheckpoint(stubId: string, payload: TaskCheckpointPayload, we
   if (!task) return;
 
   const newCount = (task.checkpoint_count || 0) + 1;
+  const exports = { ...(task.exports || {}), last_checkpoint_path: payload.path };
   const updated = store.updateTask(stubId, payload.task_id, {
     checkpoint_path: payload.path,
     checkpoint_count: newCount,
+    exports,
   });
   if (updated) {
     webNs.emit("task.update", updated);

@@ -80,14 +80,22 @@ class Store {
     const cutoff = Date.now() - maxOfflineHours * 3600_000;
     let pruned = 0;
     for (const [id, stub] of this.stubs) {
-      if (stub.status === "offline" && stub.tasks.length === 0) {
-        const lastSeen = new Date(stub.last_heartbeat).getTime();
-        if (lastSeen < cutoff) {
-          this.stubs.delete(id);
-          pruned++;
-          logger.info("stub.pruned", { stub: stub.name, last_seen: stub.last_heartbeat });
-        }
+      if (stub.status !== "offline") continue;
+      const lastSeen = new Date(stub.last_heartbeat).getTime();
+      if (lastSeen >= cutoff) continue;
+
+      // Archive any remaining tasks, then delete stub
+      const hasActiveTasks = stub.tasks.some((t) => this._isActive(t.status));
+      if (hasActiveTasks) continue; // skip stubs with active tasks
+
+      // Move terminal tasks to archive before deleting stub
+      for (const task of stub.tasks) {
+        this.archive.push(task);
+        this._taskIndex.set(task.id, { location: "archive" });
       }
+      this.stubs.delete(id);
+      pruned++;
+      logger.info("stub.pruned", { stub: stub.name, last_seen: stub.last_heartbeat, tasks_archived: stub.tasks.length });
     }
     return pruned;
   }
@@ -333,7 +341,7 @@ class Store {
   // ─── Fingerprint Index ─────────────────────────────────────────────────────
 
   private _activeStatuses: Set<TaskStatus> = new Set([
-    "pending", "queued", "dispatched", "running", "paused",
+    "pending", "queued", "dispatched", "running", "paused", "blocked",
   ]);
 
   private _isActive(status: TaskStatus): boolean {
@@ -436,7 +444,7 @@ class Store {
     const statuses = tasks.map((t) => t.status);
     const allCompleted = statuses.every((s) => s === "completed");
     const anyRunning = statuses.some((s) => ["running", "dispatched", "queued"].includes(s));
-    const anyFailed = statuses.some((s) => ["failed", "killed", "lost"].includes(s));
+    const anyFailed = statuses.some((s) => ["failed", "killed", "lost", "cancelled"].includes(s));
     const anyCompleted = statuses.some((s) => s === "completed");
 
     if (allCompleted) {
@@ -470,6 +478,13 @@ class Store {
 
   deleteExperiment(id: string): void {
     this.experiments.delete(id);
+  }
+
+  /** Find all blocked tasks in global queue whose depends_on includes the given taskId. */
+  getBlockedTasksDependingOn(taskId: string): Task[] {
+    return this.globalQueue.filter(
+      (t) => t.status === "blocked" && t.depends_on?.includes(taskId)
+    );
   }
 
   getExperimentByGridId(gridId: string): Experiment | undefined {

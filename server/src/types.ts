@@ -37,7 +37,9 @@ export type TaskStatus =
   | "completed"    // Exit 0
   | "failed"       // Non-zero exit
   | "killed"       // User cancelled
-  | "lost";        // Stub disconnected, fate unknown
+  | "lost"         // Stub disconnected, fate unknown
+  | "blocked"      // Waiting for dependency tasks to complete
+  | "cancelled";   // Cancelled because a dependency failed
 
 export interface Task {
   // === Identity ===
@@ -74,6 +76,13 @@ export interface Task {
   priority: number;
   stub_id?: string;
   target_tags?: string[];        // Tag-based routing (scheduler filters stubs by tag)
+
+  // === DAG / Experiment ===
+  depends_on?: string[];               // Prerequisite task IDs
+  ref?: string;                        // Reference name within an experiment (for DAG wiring)
+  exports?: Record<string, any>;       // Runtime key-value outputs
+  args_template?: Record<string, string>; // Template strings resolved at promotion time
+  experiment_id?: string;              // Owning experiment ID
 
   // === Grid ===
   grid_id?: string;
@@ -194,6 +203,26 @@ export interface Grid {
   target_tags?: string[];          // Propagated to all tasks in this grid
 }
 
+// ─── Task Spec (DAG pipeline definition) ────────────────────────────────────
+
+export interface TaskSpec {
+  ref: string;
+  script: string;
+  raw_args?: string;
+  args?: Record<string, string>;
+  args_template?: Record<string, string>;
+  depends_on?: string[];  // ref names within experiment
+  cwd?: string;
+  python_env?: string;
+  env_setup?: string;
+  env?: Record<string, string>;
+  env_overrides?: Record<string, string>;
+  requirements?: Task["requirements"];
+  target_tags?: string[];
+  max_retries?: number;
+  priority?: number;
+}
+
 // ─── Experiment ─────────────────────────────────────────────────────────────
 
 export interface CriterionResult {
@@ -217,6 +246,8 @@ export interface Experiment {
   status: "running" | "passed" | "partial" | "failed";
   results: Record<string, TaskValidation>;  // taskId → validation
   created_at: string;
+  task_specs?: TaskSpec[];                  // Original DAG spec
+  task_refs?: Record<string, string>;      // ref name → task_id mapping
 }
 
 export interface Token {

@@ -103,6 +103,24 @@ export function createSdkRouter(webNs: Namespace): Router {
         }
         break;
       }
+      case "eval": {
+        if (metrics) {
+          const update: Partial<typeof task> = { eval_metrics: { ...(task.eval_metrics || {}), ...metrics } };
+          if (stubId) store.updateTask(stubId, task_id, update);
+          else store.updateGlobalQueueTask(task_id, update);
+        }
+        break;
+      }
+      case "export": {
+        const { key, value } = req.body;
+        if (key !== undefined) {
+          const exports = { ...(task.exports || {}), [key]: value };
+          if (stubId) store.updateTask(stubId, task_id, { exports });
+          else store.updateGlobalQueueTask(task_id, { exports });
+          logger.info("task.export", { task_id, key });
+        }
+        break;
+      }
       case "heartbeat":
         // No-op — just acknowledge
         break;
