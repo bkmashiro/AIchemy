@@ -2,16 +2,72 @@
 
 End-to-end task simulation suite. Exercises the full scheduler pipeline without real training jobs.
 
-## Quick start
+## Prerequisites
+
+- **Node.js 20+** (for the test server)
+- **Python 3.12+** (for stubs and test runner)
+- **Docker + Docker Compose** (only for heterogeneous tests)
+
+## Setup
 
 ```bash
-# Submit all smoke tasks
-cd /workspace/extra/projects/alchemy-v2/smoke-tests
-./run_smoke.sh
+cd /workspace/extra/projects/alchemy-v2
 
-# Submit a subset by name filter
-./run_smoke.sh fast
-./run_smoke.sh fail
+# Install server dependencies
+cd server && npm ci && cd ..
+
+# Install Python test dependencies
+pip install -r smoke-tests/requirements.txt
+pip install ./sdk ./stub
+```
+
+## Running Tests
+
+### Local (no Docker)
+
+```bash
+cd smoke-tests
+
+# Run all non-Docker tests
+pytest tests/ -v -m "not docker" --timeout=120
+
+# Run a single test file
+pytest tests/test_lifecycle.py -v
+
+# Run a single test
+pytest tests/test_lifecycle.py::test_success_fast -v
+```
+
+### Docker heterogeneous tests
+
+```bash
+cd smoke-tests
+
+# Build Docker images first
+docker compose -f docker/docker-compose.test.yml build
+
+# Run only Docker tests
+pytest tests/test_heterogeneous.py -v -m docker --timeout=180
+
+# Run all tests (local + Docker)
+pytest tests/ -v --timeout=180
+```
+
+### CI
+
+The GitHub Actions workflow (`.github/workflows/smoke-tests.yml`) runs automatically on push/PR when `server/`, `stub/`, `sdk/`, or `smoke-tests/` change. Two jobs:
+
+1. **smoke-basic** — Runs all non-Docker tests on ubuntu-latest with Node 20 + Python 3.12.
+2. **smoke-docker** — Builds Docker images and runs heterogeneous stub tests. Depends on smoke-basic passing first.
+
+Test artifacts are uploaded on failure for debugging.
+
+## Quick smoke (legacy)
+
+```bash
+cd smoke-tests
+./run_smoke.sh          # submit all smoke tasks
+./run_smoke.sh fast     # filter by name
 ```
 
 Environment overrides:
@@ -20,33 +76,43 @@ Environment overrides:
 ALCHEMY_SERVER=http://my-server:3002 ALCHEMY_TOKEN=my-token ./run_smoke.sh
 ```
 
-## Task inventory
+## Test Markers
 
-| Name | Script | Tags | Expected outcome |
-|---|---|---|---|
-| `smoke_success_fast` | `success_fast.sh` | smoke, fast | exits 0 in ~3s |
-| `smoke_success_slow` | `success_slow.sh` | smoke, slow | exits 0 in ~30s |
-| `smoke_fail_exit1` | `fail_exit1.sh` | smoke, fail | exits 1 after 2s |
-| `smoke_fail_oom` | `fail_oom.py` | smoke, fail, oom | killed by OOM |
-| `smoke_writes_disk` | `writes_disk.sh` | smoke, io | writes 50MB, cleans up |
-| `smoke_checkpoint_resume` | `checkpoint_resume.sh` | smoke, resume | writes checkpoint; re-run resumes |
-| `smoke_gpu_required` | `gpu_required.py` | smoke, gpu | checks nvidia-smi, runs matmul |
-| `smoke_long_running` | `long_running.sh` | smoke, long | runs 5min, periodic stdout |
-| `smoke_signal_handler` | `signal_handler.sh` | smoke, signal | SIGTERM → graceful exit |
-| `smoke_multi_tag` | `multi_tag.sh` | smoke, a40, high-mem, priority | tag routing test |
+| Marker | Description |
+|--------|-------------|
+| `docker` | Requires Docker. Skipped by default with `-m "not docker"` |
 
-## checkpoint_resume notes
+## Docker Test Scenarios
 
-The checkpoint file is stored in `$SMOKE_CKPT_DIR` (default `/tmp/smoke_checkpoint`).
-Submit the task twice to test the resume path, or clear the dir to reset.
+| Scenario | Container | Expected behavior |
+|----------|-----------|-------------------|
+| Python too old | `stub-oldpy` (Python 3.8) | Exits immediately, does not register |
+| No nvidia-smi | `stub-nogpu` | Registers with empty GPU info, CPU tasks run |
+| Read-only /tmp | `stub-noperm` | Fails self-check, does not register |
+| Slow network | `stub-slow` (tc netem 500ms) | Registers slower but works, tasks complete |
+| Competing stubs | 3x `stub-compete-*` | Tasks distributed across all stubs |
 
-## gpu_required notes
+## Configuration
 
-Gracefully skips the pytorch matmul if `nvidia-smi` is absent or torch is not installed.
-Always exits 0 in non-GPU environments — it's a capability probe, not a hard requirement.
+All configurable via environment variables:
 
-## Dependencies
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ALCHEMY_TEST_PORT` | `13002` | Test server port |
+| `ALCHEMY_TEST_SERVER_DIR` | `../server` | Path to server source |
+| `ALCHEMY_TEST_STUB_DIR` | `../stub` | Path to stub source |
+| `ALCHEMY_TEST_SCRIPTS_DIR` | `./scripts` | Path to task scripts |
+| `ALCHEMY_TEST_REPORT_DIR` | `/tmp/alchemy_test_results` | Output dir for logs/reports |
+| `ALCHEMY_TEST_TIMEOUT` | `120` | Default per-test timeout (seconds) |
 
-- `curl`, `jq` — required for `run_smoke.sh`
-- `python3` stdlib — `fail_oom.py`, `gpu_required.py` (torch optional)
-- `dd`, `mktemp` — standard coreutils, present on all Linux nodes
+## Task Scripts
+
+| Name | Script | Expected outcome |
+|---|---|---|
+| `smoke_success_fast` | `success_fast.sh` | exits 0 in ~3s |
+| `smoke_success_slow` | `success_slow.sh` | exits 0 in ~30s |
+| `smoke_fail_exit1` | `fail_exit1.sh` | exits 1 after 2s |
+| `smoke_fail_oom` | `fail_oom.py` | killed by OOM |
+| `smoke_writes_disk` | `writes_disk.sh` | writes 50MB, cleans up |
+| `smoke_checkpoint_resume` | `checkpoint_resume.sh` | writes checkpoint; re-run resumes |
+| `smoke_signal_handler` | `signal_handler.sh` | SIGTERM cleanup |

@@ -1,0 +1,96 @@
+services:
+  test-server:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.server
+    ports:
+      - "13002:13002"
+    environment:
+      PORT: "13002"
+      STATE_FILE: /tmp/test-state.json
+      ALCHEMY_TOKEN: test-docker-token
+      NODE_ENV: test
+      DISCORD_WEBHOOK_URL: ""
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:13002/api/health').then(r=>{if(!r.ok)throw 1})"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  stub-normal:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-base
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token", "--tags", "normal", "--idle-timeout", "0"]
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  stub-nogpu:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-nogpu
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token", "--tags", "nogpu", "--idle-timeout", "0"]
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  stub-oldpy:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-oldpy
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token"]
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  stub-noperm:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-noperm
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token"]
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  stub-slow:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-base
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token", "--tags", "slow-net", "--idle-timeout", "0"]
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  # Additional stub-base instances for competing stubs test
+  stub-compete-1:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-base
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token", "--tags", "compete", "--idle-timeout", "0"]
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  stub-compete-2:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-base
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token", "--tags", "compete", "--idle-timeout", "0"]
+    depends_on:
+      test-server:
+        condition: service_healthy
+
+  stub-compete-3:
+    build:
+      context: ../..
+      dockerfile: smoke-tests/docker/Dockerfile.stub-base
+    command: ["--server", "http://test-server:13002", "--token", "test-docker-token", "--tags", "compete", "--idle-timeout", "0"]
+    depends_on:
+      test-server:
+        condition: service_healthy

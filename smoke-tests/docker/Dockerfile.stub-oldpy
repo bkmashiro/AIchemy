@@ -1,0 +1,16 @@
+FROM python:3.8-slim
+
+WORKDIR /app
+
+COPY stub/ ./stub/
+COPY sdk/ ./sdk/
+
+# The stub requires Python >= 3.10. pip install may partially succeed
+# (setuptools will reject requires-python), but even if it does,
+# the stub's _check_python_version() will sys.exit().
+# We use || true so the image still builds — the point is to test runtime failure.
+RUN pip install --no-cache-dir ./sdk ./stub 2>/dev/null || \
+    pip install --no-cache-dir aiohttp "python-socketio[asyncio_client]" psutil 2>/dev/null || \
+    true
+
+ENTRYPOINT ["python", "-m", "alchemy_stub"]

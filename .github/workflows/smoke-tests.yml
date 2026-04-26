@@ -1,0 +1,105 @@
+name: Smoke Tests
+
+on:
+  push:
+    paths:
+      - "server/**"
+      - "stub/**"
+      - "sdk/**"
+      - "smoke-tests/**"
+  pull_request:
+    paths:
+      - "server/**"
+      - "stub/**"
+      - "sdk/**"
+      - "smoke-tests/**"
+  workflow_dispatch:
+
+jobs:
+  smoke-basic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install server deps
+        run: cd server && npm ci
+
+      - name: Install test deps
+        run: |
+          pip install -r smoke-tests/requirements.txt
+          pip install ./sdk
+          pip install ./stub
+
+      - name: Run smoke tests (no Docker)
+        run: |
+          cd smoke-tests
+          pytest tests/ -v --timeout=120 -m "not docker" --tb=short \
+            --junitxml=results/junit.xml
+        env:
+          ALCHEMY_TEST_PORT: "13002"
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-test-results
+          path: |
+            smoke-tests/results/
+            /tmp/alchemy_test_*/
+
+  smoke-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: smoke-basic
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: |
+          pip install -r smoke-tests/requirements.txt
+          pip install ./sdk
+          pip install ./stub
+
+      - name: Build test images
+        run: |
+          cd smoke-tests
+          docker compose -f docker/docker-compose.test.yml build
+
+      - name: Run heterogeneous tests
+        run: |
+          cd smoke-tests
+          pytest tests/test_heterogeneous.py -v --timeout=180 -m docker --tb=short \
+            --junitxml=results/junit-docker.xml
+
+      - name: Collect Docker logs on failure
+        if: failure()
+        run: |
+          mkdir -p smoke-tests/results/docker-logs
+          cd smoke-tests
+          docker compose -f docker/docker-compose.test.yml -p alchemy-smoke-test \
+            logs --no-color > results/docker-logs/all.log 2>&1 || true
+          docker compose -f docker/docker-compose.test.yml -p alchemy-smoke-test \
+            down --volumes --remove-orphans -t 5 || true
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-docker-results
+          path: |
+            smoke-tests/results/
