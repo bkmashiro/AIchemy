@@ -21,9 +21,40 @@ import time
 from collections import deque
 from typing import Any, Callable, Awaitable
 
+from .config import _parse_env_value
 from .task_socket import task_socket_path
 
 log = logging.getLogger(__name__)
+
+
+def merge_env(
+    base: dict[str, str],
+    default_env: dict[str, str],
+    task_overrides: dict[str, str],
+    alchemy_vars: dict[str, str],
+) -> dict[str, str]:
+    """Merge environment layers for task execution.
+
+    Order (later wins): base → default_env → task_overrides → alchemy_vars.
+
+    PATH-like expansion: if a value in default_env or task_overrides starts with
+    ``$KEY:`` or ends with ``:$KEY`` (where KEY matches the variable being set),
+    the reference is expanded from the *current merged state* so far, allowing
+    append/prepend semantics (e.g. PATH=/my/bin:$PATH).
+
+    Other $VAR references are expanded against the merged state at that layer.
+    """
+    result = dict(base)
+
+    for layer in (default_env, task_overrides):
+        for key, value in layer.items():
+            # Expand $VAR references against current merged result
+            expanded = _parse_env_value(value, result)
+            result[key] = expanded
+
+    # ALCHEMY_* vars always win — no expansion needed
+    result.update(alchemy_vars)
+    return result
 
 _LOG_DIR_ENV = "ALCHEMY_LOG_DIR"
 _PID_FILE_DEFAULT = os.path.join(os.path.expanduser("~"), ".alchemy", "stub_tasks.json")
@@ -73,6 +104,7 @@ class ProcessManager:
         max_concurrent: int = 3,
         env_setup: str = "",
         default_cwd: str = "",
+        default_env: dict[str, str] | None = None,
         pid_file: str = _PID_FILE_DEFAULT,
         on_started: Callable[[str, int], Awaitable[None]] | None = None,
         on_log: Callable[[str, list[str]], Awaitable[None]] | None = None,
@@ -83,6 +115,7 @@ class ProcessManager:
         self.max_concurrent = max_concurrent
         self.env_setup = env_setup
         self.default_cwd = default_cwd
+        self.default_env = default_env or {}
         self.pid_file = pid_file
 
         self.on_started = on_started
@@ -114,6 +147,7 @@ class ProcessManager:
         task_env_setup: str = "",
         params: dict[str, Any] | None = None,
         run_dir: str | None = None,
+        env_overrides: dict[str, str] | None = None,
     ) -> int:
         """Spawn subprocess. Returns PID."""
         if task_id in self._procs:
@@ -124,30 +158,40 @@ class ProcessManager:
         # Build wrapper shell script
         script = self._build_script(task_id, task_env_setup, env or {}, command)
 
-        # Environment for subprocess
-        proc_env = os.environ.copy()
-        proc_env["ALCHEMY_TASK_ID"] = task_id
-        proc_env["ALCHEMY_STUB_SOCKET"] = task_socket_path(task_id)
+        # Build ALCHEMY_* vars
+        alchemy_vars: dict[str, str] = {"ALCHEMY_TASK_ID": task_id}
+        alchemy_vars["ALCHEMY_STUB_SOCKET"] = task_socket_path(task_id)
         if params:
-            proc_env["ALCHEMY_PARAMS"] = json.dumps(params)
-        # Inject ALCHEMY_RUN_DIR — server is authoritative source of truth (spec §8)
+            alchemy_vars["ALCHEMY_PARAMS"] = json.dumps(params)
         if run_dir:
-            proc_env["ALCHEMY_RUN_DIR"] = run_dir
+            alchemy_vars["ALCHEMY_RUN_DIR"] = run_dir
+
+        # Merge env layers: process env → default_env → task env_overrides → ALCHEMY_*
+        proc_env = merge_env(
+            base=dict(os.environ),
+            default_env=self.default_env,
+            task_overrides=env_overrides or {},
+            alchemy_vars=alchemy_vars,
+        )
+        # Legacy: also apply task-level env dict (from server's task.env field)
         if env:
             proc_env.update(env)
 
-        # Open log file
+        # Open log file — use context manager to avoid fd leak if Popen raises
         log_path = _log_path(task_id)
         log_file = open(log_path, "w")
-
-        proc = subprocess.Popen(
-            ["bash", "-c", script],
-            cwd=effective_cwd,
-            env=proc_env,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # detach from stub's process group
-        )
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", script],
+                cwd=effective_cwd,
+                env=proc_env,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,  # detach from stub's process group
+            )
+        except Exception:
+            log_file.close()
+            raise
         log_file.close()  # stub only reads
 
         info = ProcessInfo(task_id=task_id, pid=proc.pid, proc=proc)

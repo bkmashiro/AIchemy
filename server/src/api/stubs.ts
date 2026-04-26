@@ -37,10 +37,12 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
 
     if (req.body.name !== undefined) {
-      stub.name = req.body.name;
+      stub.name = String(req.body.name);
     }
     if (req.body.max_concurrent !== undefined) {
-      stub.max_concurrent = req.body.max_concurrent;
+      const mc = Number(req.body.max_concurrent);
+      if (!Number.isFinite(mc) || mc < 1 || mc > 64) { res.status(400).json({ error: "max_concurrent must be 1-64" }); return; }
+      stub.max_concurrent = mc;
       // Notify stub of config change (reliable)
       reliableEmitToStub(stub.id, "config.update", { max_concurrent: stub.max_concurrent });
       // Trigger dispatch in case new slots opened
@@ -124,15 +126,34 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     res.json({ request_id: requestId });
   });
 
+  // DELETE /stubs/prune — MUST be before /:id to avoid route shadowing
+  router.delete("/prune", (_req: Request, res: Response) => {
+    const pruned = store.pruneStaleStubs();
+    res.json({ ok: true, pruned });
+  });
+
+  // DELETE /stubs/:id — remove a specific offline stub with no active tasks
+  router.delete("/:id", (req: Request, res: Response) => {
+    const stub = store.getStub(req.params.id);
+    if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
+    if (stub.status === "online") { res.status(409).json({ error: "Stub is online — release first" }); return; }
+    const activeTasks = stub.tasks.filter((t) => ["running", "dispatched", "queued", "paused"].includes(t.status));
+    if (activeTasks.length > 0) { res.status(409).json({ error: "Stub has active tasks" }); return; }
+    store.deleteStub(req.params.id);
+    webNs.emit("stub.deleted", { stub_id: req.params.id });
+    res.json({ ok: true });
+  });
+
   // POST /stubs/:id/tasks — direct submission to stub queue
   router.post("/:id/tasks", (req: Request, res: Response) => {
     const stub = store.getStub(req.params.id);
     if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
 
     const {
-      script, args, raw_args, name, cwd, env_setup, env,
+      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, target_tags, python_env,
+      submitted_by,
     } = req.body;
 
     if (!script) { res.status(400).json({ error: "script required" }); return; }
@@ -174,9 +195,9 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     }
 
     const task = createTask({
-      script, args, raw_args, name, cwd, env_setup, env,
+      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides,
-      stub_id: stub.id, target_tags, python_env,
+      stub_id: stub.id, target_tags, python_env, submitted_by,
     });
 
     // Direct to stub queue — status is queued, not pending

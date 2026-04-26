@@ -13,7 +13,7 @@ import { store } from "./store";
 import { Stub, Task } from "./types";
 import { reliableEmitToStub } from "./reliable";
 import { logger } from "./log";
-import { dispatchTask } from "./task-actions";
+import { dispatchTask, failTask } from "./task-actions";
 import { notifyDispatched } from "./discord";
 
 // ─── GPU name normalization ───────────────────────────────────────────────────
@@ -123,9 +123,18 @@ export function scoreStub(stub: Stub, task: Task): number {
     }
   }
 
-  // VRAM waste penalty: avoid over-provisioning
+  // VRAM waste penalty: avoid over-provisioning (use available, not total)
   if (task.requirements?.gpu_mem_mb) {
-    s -= (stub.gpu.vram_total_mb - task.requirements.gpu_mem_mb) / 1000;
+    s -= (availableVram(stub) - task.requirements.gpu_mem_mb) / 1000;
+  }
+
+  // User affinity: prefer stubs owned by the same user who submitted the task
+  if (task.submitted_by && stub.user) {
+    if (task.submitted_by === stub.user) {
+      s += 30;
+    } else {
+      s -= 50;
+    }
   }
 
   return s;
@@ -153,7 +162,8 @@ export function computeRunDir(task: Task, stub: Stub): string {
     baseOutputDir = path.join(base, "runs");
   }
 
-  return path.join(baseOutputDir, task.fingerprint.slice(0, 12));
+  const fp = task.fingerprint || task.id;
+  return path.join(baseOutputDir, fp.slice(0, 12));
 }
 
 // ─── Build run payload ────────────────────────────────────────────────────────
@@ -180,6 +190,7 @@ export function buildRunPayload(task: Task, stub: Stub): object {
     command: task.command,
     cwd: task.cwd,
     env: task.env,
+    env_overrides: task.env_overrides,
     env_setup: resolveEnvSetup(task, stub),
     run_dir,
     params: task.param_overrides,
@@ -210,12 +221,37 @@ export function maybeDispatch(stub: Stub): void {
     reliableEmitToStub(stub.id, "task.run", buildRunPayload(task, stub));
     logger.info("task.dispatch", { task_seq: task.seq, stub: stub.name, display_name: task.display_name, run_dir });
     if (updated) notifyDispatched(updated).catch(() => {});
+
+    // Dispatch timeout: if no task.started within 30s, mark as failed
+    // Only fail if task is still in "dispatched" status on the SAME stub (not recovered/moved)
+    const dispatchTaskId = task.id;
+    const dispatchStubId = stub.id;
+    setTimeout(() => {
+      const t = store.findTask(dispatchTaskId);
+      if (t && t.task.status === "dispatched" && !t.archived && t.stubId === dispatchStubId) {
+        failTask(dispatchStubId, dispatchTaskId, -3, { error_message: "Dispatch timeout: no task.started within 30s" });
+        logger.warn("task.dispatch_timeout", { task_id: dispatchTaskId, stub: dispatchStubId });
+      }
+    }, 30_000);
   }
 }
 
 // ─── Main schedule loop ───────────────────────────────────────────────────────
 
+let _scheduling = false;
+
 export function schedule(): void {
+  // Re-entrancy guard — prevent over-dispatch from concurrent triggers
+  if (_scheduling) return;
+  _scheduling = true;
+  try {
+    _scheduleInner();
+  } finally {
+    _scheduling = false;
+  }
+}
+
+function _scheduleInner(): void {
   const stubs = store.getOnlineStubs();
   if (stubs.length === 0) return;
 
@@ -274,4 +310,10 @@ export function startScheduler(_webNs: Namespace, _stubNs: Namespace): void {
   setInterval(() => triggerSchedule(), 30_000);
   // Also drain immediately on startup (tasks may be pending)
   setTimeout(() => triggerSchedule(), 1_000);
+
+  // Hourly zombie stub cleanup
+  setInterval(() => {
+    const pruned = store.pruneStaleStubs();
+    if (pruned > 0) logger.info("scheduler.prune_stubs", { pruned });
+  }, 3600_000);
 }

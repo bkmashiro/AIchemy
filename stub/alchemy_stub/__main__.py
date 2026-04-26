@@ -133,11 +133,20 @@ class _GracefulDrain(Exception):
 
 
 _daemon_instance: StubDaemon | None = None
+_drain_requested = False
 
 
 def _sigusr1_handler(signum, frame):
+    global _drain_requested
     jlog("info", "stub.stop", reason="SIGUSR1")
-    raise _GracefulDrain()
+    _drain_requested = True
+    # If there's an active event loop, schedule a stop on it safely
+    try:
+        loop = asyncio.get_running_loop()
+        loop.call_soon_threadsafe(loop.stop)
+    except RuntimeError:
+        # No running loop — raise directly (will be caught between asyncio.run calls)
+        raise _GracefulDrain()
 
 
 # ------------------------------------------------------------------ #
@@ -177,7 +186,8 @@ def main() -> None:
     signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
     while True:
-        global _daemon_instance
+        global _daemon_instance, _drain_requested
+        _drain_requested = False
         _daemon_instance = StubDaemon(config)
         try:
             asyncio.run(_daemon_instance.run())
@@ -185,17 +195,24 @@ def main() -> None:
             jlog("info", "stub.stop", reason="keyboard_interrupt")
             sys.exit(0)
         except _GracefulDrain:
+            _drain_requested = True
+        except SystemExit:
+            raise
+        except Exception as e:
+            if _drain_requested:
+                pass  # loop.stop() caused run() to return — handle below
+            else:
+                jlog("error", "stub.crash", error=str(e), restart_in_s=5)
+                time.sleep(5)
+                continue
+
+        if _drain_requested:
             jlog("info", "stub.stop", reason="SIGUSR1_drain")
             try:
                 asyncio.run(_daemon_instance.graceful_drain(timeout=300))
             except Exception as e:
                 log.warning("Drain error: %s", e)
             sys.exit(0)
-        except SystemExit:
-            raise
-        except Exception as e:
-            jlog("error", "stub.crash", error=str(e), restart_in_s=5)
-            time.sleep(5)
 
 
 if __name__ == "__main__":

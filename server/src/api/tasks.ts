@@ -66,12 +66,12 @@ export function assembleCommand(task: Partial<Task>): string {
     parts.push(`${envSetup} &&`);
   }
   if (cwd) {
-    parts.push(`cd ${cwd} &&`);
+    parts.push(`cd '${cwd.replace(/'/g, "'\\''")}' &&`);
   }
   if (env && Object.keys(env).length > 0) {
     const envStr = Object.entries(env)
       .filter(([k]) => !k.startsWith("ALCHEMY_"))
-      .map(([k, v]) => `export ${k}='${v}'`)
+      .map(([k, v]) => `export ${k}='${String(v).replace(/'/g, "'\\''")}'`)
       .join(" && ");
     if (envStr) parts.push(`${envStr} &&`);
   }
@@ -98,6 +98,7 @@ export interface TaskInput {
   cwd?: string;
   env_setup?: string;
   env?: Record<string, string>;
+  env_overrides?: Record<string, string>;
   requirements?: Task["requirements"];
   priority?: number;
   max_retries?: number;
@@ -108,6 +109,7 @@ export interface TaskInput {
   stub_id?: string;
   target_tags?: string[];
   python_env?: string;
+  submitted_by?: string;
 }
 
 export function createTask(input: TaskInput): Task {
@@ -146,6 +148,7 @@ export function createTask(input: TaskInput): Task {
     cwd: input.cwd,
     env_setup: input.env_setup,
     env: input.env,
+    env_overrides: input.env_overrides,
     command,
     requirements: input.requirements,
     status: "pending",
@@ -162,6 +165,7 @@ export function createTask(input: TaskInput): Task {
     should_checkpoint: false,
     run_dir: input.run_dir,
     python_env: input.python_env,
+    submitted_by: input.submitted_by,
   };
 
   return task;
@@ -242,6 +246,9 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           results.push({ id: taskId, ok: true }); break;
         }
         case "retry": {
+          if (!TERMINAL_STATUSES.includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot retry in status '${task.status}'` }); break;
+          }
           const retryTask = _createRetryTask(task);
           store.addToGlobalQueue(retryTask);
           webNs.emit("task.update", retryTask);
@@ -307,9 +314,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
   // POST /tasks
   router.post("/", (req: Request, res: Response) => {
     const {
-      script, args, raw_args, name, cwd, env_setup, env,
+      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, target_tags, python_env,
+      submitted_by,
     } = req.body;
 
     if (!script) {
@@ -354,8 +362,9 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     const task = createTask({
-      script, args, raw_args, name, cwd, env_setup, env,
+      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
+      submitted_by,
     });
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected
@@ -463,6 +472,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const found = store.findTask(req.params.id);
     if (!found) { res.status(404).json({ error: "Task not found" }); return; }
     const { task } = found;
+
+    if (!TERMINAL_STATUSES.includes(task.status)) {
+      res.status(400).json({ error: `Cannot retry in status '${task.status}'` }); return;
+    }
 
     const retryTask = _createRetryTask(task);
     store.addToGlobalQueue(retryTask);
