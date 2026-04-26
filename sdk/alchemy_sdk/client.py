@@ -73,6 +73,7 @@ class Alchemy:
 
         # Throttle state for log()
         self._last_log_time: float = 0.0
+        self._current_phase: str = "training"
 
         # SIGTERM-based stop flag — set by signal handler, read by should_stop()
         self._stop_flag: bool = False
@@ -203,6 +204,7 @@ class Alchemy:
             raise ValueError(
                 f"Invalid phase '{phase}'. Valid: {_VALID_PHASES}"
             )
+        self._current_phase = phase
         self._transport.send({"type": "phase", "phase": phase})
 
     def phase(self, phase: str) -> "_PhaseContext":
@@ -234,6 +236,7 @@ class Alchemy:
             self.done()
         else:
             self.notify(f"Training crashed: {exc_type.__name__}: {exc_val}", level="critical")
+        self._transport.close()
 
     # ------------------------------------------------------------------
     # AOP decorator
@@ -295,11 +298,12 @@ class _PhaseContext:
     def __init__(self, al: Alchemy, phase: str) -> None:
         self._al = al
         self._phase = phase
+        self._prev_phase: str = "training"
 
     def __enter__(self) -> "_PhaseContext":
+        self._prev_phase = self._al._current_phase
         self._al.set_phase(self._phase)
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        # Revert to training phase when exiting a phase block
-        self._al.set_phase("training")
+        self._al.set_phase(self._prev_phase)

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { Stub, stubsApi } from "../lib/api";
 import { formatRelTime, formatBytes, formatDuration } from "../lib/format";
-import { useSocket } from "../hooks/useSocket";
+import { Socket } from "socket.io-client";
 import RemoteShell from "../components/RemoteShell";
 import ConfirmDialog from "../components/ConfirmDialog";
 
@@ -32,14 +32,13 @@ function formatWalltime(seconds: number): string {
   return formatDuration(seconds * 1000);
 }
 
-export default function StubDetailPage() {
+export default function StubDetailPage({ socket }: { socket: Socket | null }) {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [stub, setStub] = useState<Stub | null>(null);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { socket } = useSocket();
   const [confirmAction, setConfirmAction] = useState<{
     action: () => void;
     title: string;

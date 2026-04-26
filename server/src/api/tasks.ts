@@ -71,7 +71,7 @@ export function assembleCommand(task: Partial<Task>): string {
   if (env && Object.keys(env).length > 0) {
     const envStr = Object.entries(env)
       .filter(([k]) => !k.startsWith("ALCHEMY_"))
-      .map(([k, v]) => `export ${k}='${String(v).replace(/'/g, "'\\''")}'`)
+      .map(([k, v]) => `export ${k}='${String(v).replace(/'/g, "'\\''")}'`) // keys validated at submission
       .join(" && ");
     if (envStr) parts.push(`${envStr} &&`);
   }
@@ -324,6 +324,14 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       res.status(400).json({ error: "script required" }); return;
     }
 
+    // Validate env variable keys to prevent shell injection
+    if (env && typeof env === "object") {
+      const invalidKey = Object.keys(env).find((k) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k));
+      if (invalidKey) {
+        res.status(400).json({ error: `Invalid env key: "${invalidKey}"` }); return;
+      }
+    }
+
     // Idempotency check
     if (idempotency_key) {
       const existing = idempotencyCache.get(idempotency_key);
@@ -372,7 +380,12 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       writeLockTable.acquire(run_dir, task.id);
     }
 
-    store.addToGlobalQueue(task);
+    try {
+      store.addToGlobalQueue(task);
+    } catch (e) {
+      if (run_dir) writeLockTable.release(run_dir);
+      throw e;
+    }
     if (webNs) webNs.emit("task.update", task);
     logger.info("task.submit", { task_seq: task.seq, fingerprint: task.fingerprint, display_name: task.display_name });
     notifySubmitted(task).catch(() => {});
@@ -427,6 +440,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused"].includes(task.status)) {
         if (stubId && (task.status === "running" || task.status === "dispatched")) {
           initiateKillChain(stubId, task.id);
+          return res.json(task);
         } else if (stubId) {
           const killed = killTask(stubId, task.id);
           if (killed) webNs.emit("task.update", killed);

@@ -132,7 +132,8 @@ export function registerTools(server: McpServer): void {
         if (params.status) qs.set("status", params.status);
         const limit = params.limit ?? 20;
         qs.set("limit", String(limit));
-        if (params.offset) qs.set("page", String(Math.floor(params.offset / limit) + 1));
+        // Always compute page from offset; offset=0 maps to page 1. Sub-page granularity is lost (rounded to boundary).
+        qs.set("page", String(Math.floor((params.offset ?? 0) / limit) + 1));
         const data = await api(`/tasks?${qs.toString()}`);
         const tasks: any[] = data.tasks || [];
         if (tasks.length === 0) return text("No tasks found.");

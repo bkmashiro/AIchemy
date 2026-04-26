@@ -102,6 +102,7 @@ class StubDaemon:
         self._zombie_reported: set[str] = set()
         self._walltime_draining: bool = False
         self._task_start_times: dict[str, float] = {}
+        self._killing: set[str] = set()
 
         self.sio = socketio.AsyncClient(
             reconnection=False,  # outer while-loop handles reconnection; prevent double-socket
@@ -548,12 +549,16 @@ class StubDaemon:
     async def _kill_task(self, task_id: str, grace_period_s: float = 5.0) -> None:
         if not self.process_mgr.is_running(task_id):
             return
-        asyncio.create_task(
-            self.process_mgr.kill_graceful(
+        if task_id in self._killing:
+            return
+        self._killing.add(task_id)
+        try:
+            await self.process_mgr.kill_graceful(
                 task_id,
                 grace_period_s=grace_period_s,
             )
-        )
+        finally:
+            self._killing.discard(task_id)
 
     async def _handle_task_signal(self, data: dict) -> None:
         # Legacy handler kept for backward compatibility — currently a no-op.

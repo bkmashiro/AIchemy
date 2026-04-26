@@ -45,7 +45,9 @@ export function createMetricsRouter(): Router {
     let usedVram = 0;
     for (const s of stubs) {
       if (s.status !== "online") continue;
-      totalVram += s.gpu.vram_total_mb * s.gpu.count;
+      if (s.gpu) {
+        totalVram += s.gpu.vram_total_mb * s.gpu.count;
+      }
       if (s.gpu_stats?.gpus) {
         for (const g of s.gpu_stats.gpus) {
           usedVram += g.memory_used_mb;
@@ -118,6 +120,12 @@ export function createMetricsRouter(): Router {
   router.get("/metrics/cost", (_req: Request, res: Response) => {
     const from = _req.query.from ? new Date(_req.query.from as string) : undefined;
     const to = _req.query.to ? new Date(_req.query.to as string) : undefined;
+    if (from && isNaN(from.getTime())) {
+      res.status(400).json({ error: "Invalid 'from' date" }); return;
+    }
+    if (to && isNaN(to.getTime())) {
+      res.status(400).json({ error: "Invalid 'to' date" }); return;
+    }
 
     const tasks = store.getAllTasks();
     const stubs = store.getAllStubs();
@@ -165,6 +173,12 @@ export function createMetricsRouter(): Router {
   router.get("/metrics/cost/breakdown", (_req: Request, res: Response) => {
     const from = _req.query.from ? new Date(_req.query.from as string) : undefined;
     const to = _req.query.to ? new Date(_req.query.to as string) : undefined;
+    if (from && isNaN(from.getTime())) {
+      res.status(400).json({ error: "Invalid 'from' date" }); return;
+    }
+    if (to && isNaN(to.getTime())) {
+      res.status(400).json({ error: "Invalid 'to' date" }); return;
+    }
 
     const tasks = store.getAllTasks();
     const stubs = store.getAllStubs();

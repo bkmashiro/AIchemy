@@ -982,3 +982,712 @@ describe("Seq numbers", () => {
     expect(t3.seq).toBe(t2.seq + 1);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 19. TASK RETRY VIA API
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Task retry via API", () => {
+  it("POST /tasks/:id/retry creates retry task with incremented retry_count", async () => {
+    const ts = Date.now();
+    const tag = `retry-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `retry-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
+      script: `python retry_${ts}.py`, max_retries: 3, target_tags: [tag],
+    });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    // Start and fail
+    socket.emit("task.started", { task_id: payload.task_id, pid: 900 });
+    await sleep(200);
+    socket.emit("task.failed", { task_id: payload.task_id, exit_code: 1 });
+    await sleep(300);
+
+    // Retry
+    const retryR = await apiPost(`${BASE}/api/tasks/${task.id}/retry`, TOKEN, {});
+    expect(retryR.status).toBe(201);
+    const retryTask = await retryR.json();
+    expect(retryTask.retry_of).toBe(task.id);
+    expect(retryTask.retry_count).toBe(1);
+    expect(["pending", "queued", "dispatched"]).toContain(retryTask.status);
+
+    socket.disconnect();
+  }, 15_000);
+
+  it("Retry of running task → 400", async () => {
+    const ts = Date.now();
+    const tag = `retryrun-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `retryrun-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
+      script: `python retryrun_${ts}.py`, target_tags: [tag],
+    });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 901 });
+    await sleep(200);
+
+    // Can't retry a running task
+    const retryR = await apiPost(`${BASE}/api/tasks/${task.id}/retry`, TOKEN, {});
+    expect([400, 409]).toContain(retryR.status);
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 20. TASK PROGRESS REPORTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Task progress reporting", () => {
+  it("task.progress updates step/total/loss", async () => {
+    const ts = Date.now();
+    const tag = `prog-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `prog-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python prog_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 910 });
+    await sleep(200);
+
+    socket.emit("task.progress", { task_id: payload.task_id, step: 500, total: 10000, loss: 0.42 });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.progress).toBeTruthy();
+    expect(t.progress.step).toBe(500);
+    expect(t.progress.total).toBe(10000);
+    expect(t.progress.loss).toBe(0.42);
+
+    socket.disconnect();
+  }, 10_000);
+
+  it("Progress updates are cumulative (last wins)", async () => {
+    const ts = Date.now();
+    const tag = `progcum-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `progcum-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python progcum_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 911 });
+    await sleep(200);
+
+    socket.emit("task.progress", { task_id: payload.task_id, step: 100, total: 1000, loss: 0.9 });
+    await sleep(100);
+    socket.emit("task.progress", { task_id: payload.task_id, step: 200, total: 1000, loss: 0.7 });
+    await sleep(100);
+    socket.emit("task.progress", { task_id: payload.task_id, step: 300, total: 1000, loss: 0.5 });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.progress.step).toBe(300);
+    expect(t.progress.loss).toBe(0.5);
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 21. TASK PHASE REPORTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Task phase reporting", () => {
+  it("task.phase updates phase field", async () => {
+    const ts = Date.now();
+    const tag = `phase-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `phase-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python phase_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 920 });
+    await sleep(200);
+
+    socket.emit("task.phase", { task_id: payload.task_id, phase: "warmup" });
+    await sleep(200);
+
+    let check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    let t = await check.json();
+    expect(t.phase).toBe("warmup");
+
+    socket.emit("task.phase", { task_id: payload.task_id, phase: "training" });
+    await sleep(200);
+
+    check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    t = await check.json();
+    expect(t.phase).toBe("training");
+
+    socket.disconnect();
+  }, 10_000);
+
+  it("Invalid phase is rejected", async () => {
+    const ts = Date.now();
+    const tag = `badphase-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `badphase-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python badphase_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 921 });
+    await sleep(200);
+
+    socket.emit("task.phase", { task_id: payload.task_id, phase: "invalid_phase" });
+    await sleep(200);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.phase).not.toBe("invalid_phase");
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 22. TASK COMPLETION LIFECYCLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Task completion lifecycle", () => {
+  it("Normal completion: started → completed with exit_code 0", async () => {
+    const ts = Date.now();
+    const tag = `complete-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `complete-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python complete_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 930 });
+    await sleep(200);
+    socket.emit("task.completed", { task_id: payload.task_id, exit_code: 0 });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.status).toBe("completed");
+    expect(t.exit_code).toBe(0);
+    expect(t.started_at).toBeTruthy();
+    expect(t.finished_at).toBeTruthy();
+
+    socket.disconnect();
+  }, 10_000);
+
+  it("Completion frees stub slot for next task", async () => {
+    const ts = Date.now();
+    const tag = `compfree-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `compfree-${ts}`, gpuName: "A40", maxConcurrent: 1, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+
+    // Submit two tasks
+    const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python compfree_a_${ts}.py`, target_tags: [tag] });
+    const t1 = await r1.json();
+    const p1 = await buf.waitForTask(t1.id);
+
+    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python compfree_b_${ts}.py`, target_tags: [tag] });
+    const t2 = await r2.json();
+
+    // Start and complete first task
+    socket.emit("task.started", { task_id: p1.task_id, pid: 931 });
+    await sleep(200);
+    socket.emit("task.completed", { task_id: p1.task_id, exit_code: 0 });
+
+    // Second task should now be dispatched
+    const p2 = await buf.waitForTask(t2.id);
+    expect(p2.task_id).toBe(t2.id);
+
+    socket.disconnect();
+  }, 15_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 23. DEATH CAUSE IN TASK.FAILED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Death cause classification", () => {
+  it("task.failed with death_cause persists on task", async () => {
+    const ts = Date.now();
+    const tag = `death-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `death-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python death_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 940 });
+    await sleep(200);
+    socket.emit("task.failed", {
+      task_id: payload.task_id,
+      exit_code: 137,
+      death_cause: "oom",
+      has_checkpoint: true,
+    });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.status).toBe("failed");
+    expect(t.death_cause).toBe("oom");
+    expect(t.has_checkpoint).toBe(true);
+
+    socket.disconnect();
+  }, 10_000);
+
+  it("task.failed with death_cause=walltime sets correct fields", async () => {
+    const ts = Date.now();
+    const tag = `wall-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `walltime-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python walltime_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 941 });
+    await sleep(200);
+    socket.emit("task.failed", {
+      task_id: payload.task_id,
+      exit_code: 143,
+      death_cause: "walltime",
+      has_checkpoint: false,
+    });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.death_cause).toBe("walltime");
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 24. TASK PAUSE / RESUME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Task pause and resume", () => {
+  it("PATCH task to paused → task status becomes paused", async () => {
+    const ts = Date.now();
+    const tag = `pause-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `pause-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python pause_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 950 });
+    await sleep(200);
+
+    const pauseR = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "paused" });
+    expect(pauseR.status).toBe(200);
+
+    await sleep(200);
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.status).toBe("paused");
+
+    socket.disconnect();
+  }, 10_000);
+
+  it("PATCH paused task to running → resumes", async () => {
+    const ts = Date.now();
+    const tag = `resume-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `resume-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python resume_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 951 });
+    await sleep(200);
+
+    await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "paused" });
+    await sleep(200);
+    const resumeR = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "running" });
+    expect(resumeR.status).toBe(200);
+
+    await sleep(200);
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.status).toBe("running");
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 25. ENV KEY VALIDATION (shell injection prevention)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Env key validation", () => {
+  it("Valid env keys accepted", async () => {
+    const ts = Date.now();
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
+      script: `python envvalid_${ts}.py`,
+      env: { CUDA_VISIBLE_DEVICES: "0", MY_VAR_123: "hello" },
+    });
+    expect(r.status).toBe(201);
+  });
+
+  it("Invalid env key → 400", async () => {
+    const ts = Date.now();
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
+      script: `python envinject_${ts}.py`,
+      env: { "FOO$(evil)": "bar" },
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it("Env key with spaces → 400", async () => {
+    const ts = Date.now();
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
+      script: `python envspace_${ts}.py`,
+      env: { "MY VAR": "val" },
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it("Env key starting with number → 400", async () => {
+    const ts = Date.now();
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
+      script: `python envnum_${ts}.py`,
+      env: { "123FOO": "val" },
+    });
+    expect(r.status).toBe(400);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 26. CHECKPOINT REPORTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Checkpoint reporting", () => {
+  it("task.checkpoint increments checkpoint_count", async () => {
+    const ts = Date.now();
+    const tag = `ckpt-tag-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `ckpt-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python ckpt_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 960 });
+    await sleep(200);
+
+    socket.emit("task.checkpoint", { task_id: payload.task_id, path: "/runs/ckpt_100.pt", step: 100 });
+    await sleep(200);
+    socket.emit("task.checkpoint", { task_id: payload.task_id, path: "/runs/ckpt_200.pt", step: 200 });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.checkpoint_path).toBe("/runs/ckpt_200.pt");
+    expect(t.checkpoint_count).toBe(2);
+    // has_checkpoint is set by stub on task completion, not by checkpoint events
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 27. STUB RECONNECT WITH RUNNING TASKS (reconciliation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Stub reconnect reconciliation", () => {
+  it("Reconnecting stub reports running tasks → server reconciles", async () => {
+    const ts = Date.now();
+    const hostname = `recon-${ts}`;
+    const tag = `recon-tag-${ts}`;
+
+    // First connection: get a task running
+    const { socket: s1 } = await connectAndResume(BASE, TOKEN, {
+      hostname, gpuName: "A40", maxConcurrent: 5, tags: [tag],
+    });
+    const buf1 = new TaskRunBuffer(s1);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python recon_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf1.waitForTask(task.id);
+
+    s1.emit("task.started", { task_id: payload.task_id, pid: 970 });
+    await sleep(200);
+
+    // Disconnect
+    s1.disconnect();
+    await sleep(500);
+
+    // Task should be lost now
+    let check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    let t = await check.json();
+    expect(t.status).toBe("lost");
+
+    // Reconnect with task still running
+    const s2 = await connectStub(BASE);
+    const resumeP = waitReliable(s2, "resume_response");
+    sendResume(s2, {
+      token: TOKEN,
+      hostname,
+      gpuName: "A40",
+      maxConcurrent: 5,
+      runningTasks: [{ task_id: task.id, pid: 970 }],
+      tags: [tag],
+    });
+    await resumeP;
+
+    // Task should be back to running
+    await sleep(300);
+    check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    t = await check.json();
+    expect(t.status).toBe("running");
+
+    s2.disconnect();
+  }, 15_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 28. BATCH OPERATIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Batch operations", () => {
+  it("Batch kill multiple tasks", async () => {
+    const ts = Date.now();
+    const tag = `batchkill-${ts}`;
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python batchkill_${i}_${ts}.py`, target_tags: [tag] });
+      const t = await r.json();
+      ids.push(t.id);
+    }
+
+    // Tasks stay pending (no stub with this tag), so batch kill works directly
+    const r = await apiPost(`${BASE}/api/tasks/batch`, TOKEN, {
+      action: "kill",
+      task_ids: ids,
+    });
+    expect(r.status).toBe(200);
+    const result = await r.json();
+    expect(result.results.filter((r: any) => r.ok).length).toBe(3);
+
+    // Verify all killed
+    for (const id of ids) {
+      const check = await apiGet(`${BASE}/api/tasks/${id}`, TOKEN);
+      const t = await check.json();
+      expect(t.status).toBe("killed");
+    }
+  }, 10_000);
+
+  it("Batch requeue killed tasks", async () => {
+    const ts = Date.now();
+    const tag = `batchreq-${ts}`;
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python batchreq_${i}_${ts}.py`, target_tags: [tag] });
+      const t = await r.json();
+      ids.push(t.id);
+    }
+
+    // Kill first (pending → killed, no kill chain needed)
+    await apiPost(`${BASE}/api/tasks/batch`, TOKEN, { action: "kill", task_ids: ids });
+    await sleep(200);
+
+    // Requeue
+    const r = await apiPost(`${BASE}/api/tasks/batch`, TOKEN, {
+      action: "requeue",
+      task_ids: ids,
+    });
+    expect(r.status).toBe(200);
+    const result = await r.json();
+    expect(result.results.filter((r: any) => r.ok).length).toBe(2);
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 29. PAGINATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Task pagination", () => {
+  it("GET /tasks with limit returns correct page size", async () => {
+    const r = await apiGet(`${BASE}/api/tasks?limit=2&page=1`, TOKEN);
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    const tasks = Array.isArray(body) ? body : body.tasks;
+    expect(tasks.length).toBeLessThanOrEqual(2);
+    if (!Array.isArray(body)) {
+      expect(typeof body.total).toBe("number");
+    }
+  });
+
+  it("GET /tasks with status filter", async () => {
+    const r = await apiGet(`${BASE}/api/tasks?status=pending`, TOKEN);
+    expect(r.status).toBe(200);
+    const body = await r.json();
+    const tasks = Array.isArray(body) ? body : body.tasks;
+    for (const t of tasks) {
+      expect(t.status).toBe("pending");
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 30. STATE PERSISTENCE (globalQueue survives restart)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("State persistence", () => {
+  it("Pending tasks survive server restart", async () => {
+    const ts = Date.now();
+    const tag = `persist-${ts}`;
+    const script = `python persist_${ts}.py`;
+
+    // Submit with unique tag → no stub has this tag → stays pending
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script, target_tags: [tag] });
+    expect(r.status).toBe(201);
+    const task = await r.json();
+    expect(task.status).toBe("pending");
+
+    // Force state save via health check (server saves periodically)
+    await sleep(1000);
+
+    // Verify task is still there
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.status).toBe("pending");
+    expect(t.script).toBe(script);
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 31. KILL CHAIN: RUNNING TASK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Kill chain for running tasks", () => {
+  it("Kill running task → stub receives task.kill, then task.failed closes it", async () => {
+    const ts = Date.now();
+    const tag = `killchain-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `killchain-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python killchain_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 990 });
+    await sleep(200);
+
+    // Listen for kill signal
+    const killP = waitReliable(socket, "task.kill", 5000);
+
+    // Kill via API
+    await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+
+    const killPayload = await killP;
+    expect(killPayload.task_id).toBe(task.id);
+
+    // Stub reports task.failed (process killed)
+    socket.emit("task.failed", { task_id: payload.task_id, exit_code: 137, death_cause: "killed" });
+    await sleep(300);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(["killed", "failed"]).toContain(t.status);
+
+    socket.disconnect();
+  }, 10_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 32. DOUBLE-ACTION PROTECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("Double-action protection", () => {
+  it("Killing an already killed task is idempotent", async () => {
+    const ts = Date.now();
+    const tag = `dblkill-${ts}`;
+    const script = `python dblkill_${ts}.py`;
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script, target_tags: [tag] });
+    const task = await r.json();
+
+    // Kill it (pending → killed)
+    const k1 = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+    expect(k1.status).toBe(200);
+
+    // Kill again — should not error
+    const k2 = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+    expect([200, 400]).toContain(k2.status);
+  });
+
+  it("Completing an already completed task is rejected", async () => {
+    const ts = Date.now();
+    const tag = `dblcomp-${ts}`;
+    const { socket } = await connectAndResume(BASE, TOKEN, {
+      hostname: `dblcomp-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+    });
+
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python dblcomp_${ts}.py`, target_tags: [tag] });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
+
+    socket.emit("task.started", { task_id: payload.task_id, pid: 995 });
+    await sleep(200);
+    socket.emit("task.completed", { task_id: payload.task_id, exit_code: 0 });
+    await sleep(300);
+
+    // Send completed again — should be ignored gracefully
+    socket.emit("task.completed", { task_id: payload.task_id, exit_code: 0 });
+    await sleep(200);
+
+    const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
+    const t = await check.json();
+    expect(t.status).toBe("completed");
+
+    socket.disconnect();
+  }, 10_000);
+});

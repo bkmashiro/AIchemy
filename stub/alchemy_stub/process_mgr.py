@@ -134,6 +134,7 @@ class ProcessManager:
         self._monitor_task: asyncio.Task | None = None
         # Tasks that died while stub was offline — report on reconnect
         self._dead_on_reattach: list[tuple[str, int]] = []
+        self._stub_killed: set[str] = set()
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -198,11 +199,17 @@ class ProcessManager:
             raise
         log_file.close()  # stub only reads
 
-        info = ProcessInfo(task_id=task_id, pid=proc.pid, proc=proc, run_dir=run_dir)
-        # Start log offset from beginning
-        info.log_offset = 0
-        self._procs[task_id] = info
-        self._save_pid(task_id, proc.pid)
+        try:
+            info = ProcessInfo(task_id=task_id, pid=proc.pid, proc=proc, run_dir=run_dir)
+            info.log_offset = 0
+            self._procs[task_id] = info
+            self._save_pid(task_id, proc.pid)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise
 
         log.info("Task %s started (pid=%d)", task_id, proc.pid)
 
@@ -225,6 +232,7 @@ class ProcessManager:
         if not info:
             return
 
+        self._stub_killed.add(task_id)
         # Step 1: SIGTERM — SDK's SIGTERM handler sets should_stop() = True
         self._send_signal_to_group(info.pid, signal.SIGTERM)
 
@@ -255,7 +263,12 @@ class ProcessManager:
             self._send_signal_to_group(info.pid, signal.SIGCONT)
 
     def is_running(self, task_id: str) -> bool:
-        return task_id in self._procs
+        info = self._procs.get(task_id)
+        if info is None:
+            return False
+        if info.proc is not None and info.proc.poll() is not None:
+            return False
+        return True
 
     def running_count(self) -> int:
         return len(self._procs)
@@ -354,6 +367,20 @@ class ProcessManager:
         for task_id, exit_code, info in done:
             self._procs.pop(task_id, None)
 
+            # Final read of log file to capture lines written after last _tail_logs
+            lp = _log_path(task_id)
+            try:
+                with open(lp, "r", errors="replace") as f:
+                    f.seek(info.log_offset)
+                    new = f.read()
+                    if new:
+                        info.log_offset = f.tell()
+                        for line in new.splitlines():
+                            info.log_buffer.append(line)
+                            info.log_pending.append(line)
+            except FileNotFoundError:
+                pass
+
             # Flush remaining logs
             if info.log_pending and self.on_log:
                 try:
@@ -364,9 +391,12 @@ class ProcessManager:
             self._remove_pid(task_id)
 
             # Classify death cause and check for checkpoints
+            killed_by_stub = task_id in self._stub_killed
+            self._stub_killed.discard(task_id)
             death_cause = classify_death(
                 exit_code=exit_code,
                 slurm_job_id=self._slurm_job_id,
+                killed_by_stub=killed_by_stub,
             )
             ckpt = has_checkpoint(info.run_dir)
             log.info(

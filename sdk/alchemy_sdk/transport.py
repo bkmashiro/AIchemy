@@ -153,6 +153,7 @@ class UnixSocketTransport:
                     with self._sock_lock:
                         self._sock = None
                     buf = ""
+                    time.sleep(self.RECONNECT_DELAY)
                     continue
                 buf += chunk.decode(errors="replace")
                 # Drain any complete lines (currently no messages to handle)

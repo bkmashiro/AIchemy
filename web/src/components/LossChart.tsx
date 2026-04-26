@@ -65,7 +65,10 @@ export function LossChart({ data, height = 160, startedAt, totalSteps }: SingleS
             axisLine={false}
           />
           <YAxis
-            domain={[minLoss * 0.98, maxLoss * 1.02]}
+            domain={[
+              minLoss === maxLoss ? minLoss - Math.max(Math.abs(minLoss) * 0.1, 1e-6) : minLoss * 0.98,
+              minLoss === maxLoss ? maxLoss + Math.max(Math.abs(maxLoss) * 0.1, 1e-6) : maxLoss * 1.02,
+            ]}
             tick={{ fill: "#6b7280", fontSize: 10 }}
             tickLine={false}
             axisLine={false}

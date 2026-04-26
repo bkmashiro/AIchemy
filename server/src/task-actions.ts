@@ -100,10 +100,11 @@ export function resolveDeadTask(stubId: string, taskId: string, exitCode: number
 
 /** preflight fail → failed with error log */
 export function preflightFail(stubId: string, taskId: string, errors: string[]): Task | undefined {
+  const task = store.getTask(stubId, taskId);
   return store.updateTask(stubId, taskId, {
     status: "failed" as TaskStatus,
     finished_at: now(),
-    log_buffer: errors,
+    log_buffer: [...(task?.log_buffer ?? []), ...errors],
   });
 }
 

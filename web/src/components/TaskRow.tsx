@@ -68,11 +68,10 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   const eta = task.status === "running" ? taskEta(task) : null;
   const duration = taskDuration(task);
 
-  const isActive = ["running", "paused", "queued", "dispatched"].includes(task.status);
+  const isActive = ["running", "paused", "queued", "dispatched", "pending"].includes(task.status);
   const canRetry = ["failed", "killed", "lost"].includes(task.status);
 
-  const doAction = async (action: () => Promise<any>, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const doAction = async (action: () => Promise<any>) => {
     setActing(true);
     try {
       await action();
@@ -85,9 +84,9 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   };
 
   const handleKill = (e: React.MouseEvent) => {
-    const ev = e;
+    e.stopPropagation();
     setConfirmAction({
-      action: () => doAction(() => tasksApi.patch(task.id, { status: "killed" }), ev),
+      action: () => doAction(() => tasksApi.patch(task.id, { status: "killed" })),
       title: "Kill Task",
       message: `Kill task #${task.seq} "${displayName}"?${stubName ? ` (on ${stubName})` : ""} Status: ${task.status}`,
       variant: "danger",
@@ -96,13 +95,14 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   };
 
   const handleRetry = (e: React.MouseEvent) => {
-    doAction(() => tasksApi.retry(task.id), e);
+    e.stopPropagation();
+    doAction(() => tasksApi.retry(task.id));
   };
 
   const handlePause = (e: React.MouseEvent) => {
-    const ev = e;
+    e.stopPropagation();
     setConfirmAction({
-      action: () => doAction(() => tasksApi.patch(task.id, { status: "paused" }), ev),
+      action: () => doAction(() => tasksApi.patch(task.id, { status: "paused" })),
       title: "Pause Task",
       message: `Pause task #${task.seq} "${displayName}"?${stubName ? ` (on ${stubName})` : ""} Status: ${task.status}`,
       variant: "warning",
@@ -111,7 +111,8 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   };
 
   const handleResume = (e: React.MouseEvent) => {
-    doAction(() => tasksApi.patch(task.id, { status: "running" }), e);
+    e.stopPropagation();
+    doAction(() => tasksApi.patch(task.id, { status: "running" }));
   };
 
   const handleConfirm = useCallback(() => {

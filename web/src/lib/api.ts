@@ -270,10 +270,7 @@ export const gridsApi = {
 };
 
 export const overviewApi = {
-  get: () =>
-    fetch("/api/overview", { headers: { Authorization: `Bearer ${getStoredToken()}` } }).then(
-      (r) => r.json()
-    ) as Promise<OverviewData>,
+  get: () => api.get<OverviewData>("/overview").then((r) => r.data),
 };
 
 export const metricsApi = {

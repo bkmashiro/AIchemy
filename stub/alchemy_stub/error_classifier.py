@@ -86,7 +86,7 @@ def classify_failure(exit_code: int, last_lines: list[str]) -> dict:
 
 # ─── DeathCause (coarse, for auto-resume) ────────────────────────────────────
 
-DeathCause = Literal["success", "code_error", "oom", "walltime", "preempt", "lost"]
+DeathCause = Literal["success", "code_error", "oom", "walltime", "preempt", "lost", "killed"]
 
 
 def _check_dmesg_oom() -> bool:
@@ -114,6 +114,7 @@ def classify_death(
     exit_code: int,
     signal_num: int | None = None,
     slurm_job_id: str | None = None,
+    killed_by_stub: bool = False,
 ) -> DeathCause:
     """Classify task death cause for auto-resume decision.
 
@@ -139,12 +140,15 @@ def classify_death(
     if effective_signal == 9:
         if _check_dmesg_oom():
             return "oom"
-        # SIGKILL without dmesg confirmation — still most likely OOM in ML context
-        return "oom"
+        return "lost"
 
-    # SIGTERM (15) under SLURM → walltime
-    if effective_signal == 15 and slurm_job_id:
+    # SIGTERM (15) under SLURM → walltime (unless stub itself initiated the kill)
+    if effective_signal == 15 and slurm_job_id and not killed_by_stub:
         return "walltime"
+
+    # SIGTERM from stub-initiated kill → killed
+    if effective_signal == 15 and killed_by_stub:
+        return "killed"
 
     # SIGTERM without SLURM → generic code_error
     if effective_signal == 15:

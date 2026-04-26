@@ -24,10 +24,10 @@ export default function LogViewer({ taskId, initialLines = [], liveLines = [], m
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  const endRef = useRef<HTMLDivElement>(null);
 
   // Fetch history from REST on mount
   useEffect(() => {
+    setFetchedLines([]);
     tasksApi
       .logs(taskId, 500)
       .then((data) => setFetchedLines(data.lines))
@@ -112,7 +112,6 @@ export default function LogViewer({ taskId, initialLines = [], liveLines = [], m
             </div>
           ))
         )}
-        <div ref={endRef} />
       </div>
     </div>
   );

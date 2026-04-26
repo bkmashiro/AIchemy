@@ -36,7 +36,7 @@ function NavItem({ to, label, badge, end }: { to: string; label: string; badge?:
 }
 
 function AppInner(_props: { onLogout: () => void }) {
-  const { stubs, globalQueue, connected, lossHistory, logBuffers } = useSocket();
+  const { stubs, globalQueue, connected, lossHistory, logBuffers, socket } = useSocket();
 
   const runningCount = stubs.reduce(
     (n, s) => n + s.tasks.filter((t) => t.status === "running").length,
@@ -108,7 +108,7 @@ function AppInner(_props: { onLogout: () => void }) {
             />
             <Route path="/tasks" element={<TasksPage />} />
             <Route path="/tasks/:id" element={<TaskDetailPage />} />
-            <Route path="/stubs/:id" element={<StubDetailPage />} />
+            <Route path="/stubs/:id" element={<StubDetailPage socket={socket} />} />
             <Route path="/grids" element={<GridsPage />} />
             <Route path="/grids/:id" element={<GridView />} />
             <Route path="/experiments" element={<ExperimentsPage />} />

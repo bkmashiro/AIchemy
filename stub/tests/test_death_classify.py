@@ -15,14 +15,14 @@ class TestClassifyDeath:
     def test_exit_zero_with_slurm(self):
         assert classify_death(0, slurm_job_id="12345") == "success"
 
-    def test_sigkill_exit_137_is_oom(self):
-        assert classify_death(137) == "oom"
+    def test_sigkill_exit_137_without_dmesg_is_lost(self):
+        assert classify_death(137) == "lost"
 
-    def test_sigkill_exit_minus9_is_oom(self):
-        assert classify_death(-9) == "oom"
+    def test_sigkill_exit_minus9_without_dmesg_is_lost(self):
+        assert classify_death(-9) == "lost"
 
-    def test_sigkill_signal_9_is_oom(self):
-        assert classify_death(137, signal_num=9) == "oom"
+    def test_sigkill_signal_9_without_dmesg_is_lost(self):
+        assert classify_death(137, signal_num=9) == "lost"
 
     def test_sigterm_exit_143_without_slurm_is_code_error(self):
         assert classify_death(143) == "code_error"
@@ -57,9 +57,14 @@ class TestClassifyDeath:
         mock_dmesg.assert_called_once()
 
     @patch("alchemy_stub.error_classifier._check_dmesg_oom", return_value=False)
-    def test_sigkill_without_dmesg_still_oom(self, mock_dmesg):
-        # SIGKILL without dmesg confirmation still defaults to OOM
-        assert classify_death(137) == "oom"
+    def test_sigkill_without_dmesg_is_lost(self, mock_dmesg):
+        assert classify_death(137) == "lost"
+
+    def test_sigterm_killed_by_stub_is_killed(self):
+        assert classify_death(143, killed_by_stub=True) == "killed"
+
+    def test_sigterm_killed_by_stub_with_slurm_is_killed(self):
+        assert classify_death(143, slurm_job_id="12345", killed_by_stub=True) == "killed"
 
 
 class TestHasCheckpoint:

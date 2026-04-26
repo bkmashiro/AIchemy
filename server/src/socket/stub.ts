@@ -79,7 +79,8 @@ function generateStubName(hostname: string, gpuName: string, slurmJobId?: string
 // ─── Fail stub tasks → lost ───────────────────────────────────────────────────
 
 function markTasksLost(stub: Stub, webNs: Namespace): void {
-  for (const task of stub.tasks) {
+  const tasksSnapshot = [...stub.tasks];
+  for (const task of tasksSnapshot) {
     if (task.status === "lost") continue; // already lost — don't create duplicate
     if (["running", "dispatched", "paused"].includes(task.status)) {
       if (task.should_stop) {
@@ -174,8 +175,8 @@ export function initiateKillChain(
   const task = store.getTask(stubId, taskId);
   if (task && isCheckpointProtected(task)) {
     logger.info("task.kill_deferred_checkpoint", { task_id: taskId, stub: stubId });
-    // Retry after 30s — checkpoint should be done by then
-    setTimeout(() => initiateKillChain(stubId, taskId, gracePeriodS), 30_000);
+    const deferTimer = setTimeout(() => initiateKillChain(stubId, taskId, gracePeriodS), 30_000);
+    killTimers.set(taskId, deferTimer);
     return;
   }
 
@@ -349,7 +350,9 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       if (!task) return;
       // Auto-promote dispatched → running
       promoteIfDispatched(stubId, payload.task_id);
-      const buf = task.log_buffer;
+      const freshTask = store.getTask(stubId, payload.task_id);
+      if (!freshTask) return;
+      const buf = freshTask.log_buffer;
       buf.push(...payload.lines);
       if (buf.length > 500) buf.splice(0, buf.length - 500);
       store.updateTask(stubId, payload.task_id, { log_buffer: buf });
@@ -603,7 +606,8 @@ function handleResume(
   const adoptTasks: string[] = [];
   const killTasks: string[] = [];
 
-  for (const task of stub.tasks) {
+  const stubTasksSnapshot = [...stub.tasks];
+  for (const task of stubTasksSnapshot) {
     if (["running", "dispatched", "paused"].includes(task.status)) {
       if (!reportedRunning.has(task.id)) {
         // Case A: server thinks it's running, stub doesn't know about it
@@ -652,8 +656,9 @@ function handleResume(
     for (const dead of payload.dead_tasks) {
       // Bug 3 fix: Use store.findTask to get the authoritative stubId for this
       // task, not the reconnecting stub's ID — tasks may have been moved.
-      const taskEntry = store.getTask(stubId, dead.task_id)
-        ? { task: store.getTask(stubId, dead.task_id)!, stubId, archived: false }
+      const directTask = store.getTask(stubId, dead.task_id);
+      const taskEntry = directTask
+        ? { task: directTask, stubId, archived: false }
         : store.findTask(dead.task_id);
       if (!taskEntry) continue;
       const task = taskEntry.task;
@@ -756,11 +761,6 @@ function handleResume(
     });
   }, REQUEST_SYNC_INTERVAL_MS);
   stubSyncIntervals.set(stubId, syncInterval);
-
-  socket.on("disconnect", () => {
-    clearInterval(syncInterval);
-    stubSyncIntervals.delete(stubId);
-  });
 }
 
 function handleTaskStarted(stubId: string, payload: TaskStartedPayload, webNs: Namespace): void {
@@ -782,15 +782,13 @@ function handleTaskCompleted(stubId: string, payload: TaskCompletedPayload, webN
 
   cancelKillChain(payload.task_id);
 
-  // Store death metadata before completing
-  if (payload.death_cause || payload.has_checkpoint) {
-    store.updateTask(stubId, payload.task_id, {
-      death_cause: payload.death_cause,
-      has_checkpoint: payload.has_checkpoint,
-    });
-  }
-
-  const updated = completeTask(stubId, payload.task_id, payload.exit_code);
+  const updated = store.updateTask(stubId, payload.task_id, {
+    status: "completed" as import("../types").TaskStatus,
+    exit_code: payload.exit_code,
+    finished_at: new Date().toISOString(),
+    ...(payload.death_cause !== undefined ? { death_cause: payload.death_cause } : {}),
+    ...(payload.has_checkpoint !== undefined ? { has_checkpoint: payload.has_checkpoint } : {}),
+  });
   if (!updated) return;
 
   logger.info("task.completed", { task_seq: updated.seq, stub: stubId, exit_code: payload.exit_code });

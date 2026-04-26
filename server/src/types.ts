@@ -232,6 +232,7 @@ export interface ServerState {
   experiments: Experiment[];
   seq_counter: number;
   archive?: Task[];
+  global_queue?: Task[];
 }
 
 // ─── Reliable Messaging ──────────────────────────────────────────────────────

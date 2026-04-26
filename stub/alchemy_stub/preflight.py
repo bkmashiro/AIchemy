@@ -150,7 +150,11 @@ async def run_preflight(
 
     def _check_script_exists(raw: str) -> str | None:
         """Return error string if script file not found, else None."""
-        parts = raw.strip().split()
+        import shlex
+        try:
+            parts = shlex.split(raw.strip())
+        except ValueError:
+            parts = raw.strip().split()
         if len(parts) < 2 or parts[0] not in _PYTHON_BINS:
             return None
         candidate = parts[1]

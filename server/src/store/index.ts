@@ -227,7 +227,7 @@ class Store {
     // Auto-archive: splice before reindex so task is fully moved before lock release
     if (this._isActive(prev.status) && !this._isActive(updated.status)) {
       this.globalQueue.splice(idx, 1);
-      this.archive.push(updated);
+      this.archive.push({ ...updated });
       this._taskIndex.set(taskId, { location: "archive" });
     }
     this._reindexTask(prev, updated);
@@ -510,6 +510,7 @@ class Store {
       experiments: Array.from(this.experiments.values()),
       seq_counter: this.seqCounter,
       archive: this.archive,
+      global_queue: this.globalQueue,
     };
     return JSON.stringify(state, null, 2);
   }
@@ -572,6 +573,10 @@ class Store {
 
     if (state.archive) {
       this.archive = state.archive;
+    }
+
+    if (state.global_queue) {
+      this.globalQueue = state.global_queue;
     }
 
     if (typeof state.seq_counter === "number") {
