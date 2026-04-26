@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { Task, tasksApi } from "../lib/api";
+import { Task, tasksApi, costApi, TaskCost } from "../lib/api";
 import { taskDuration, taskEta, formatRelTime, generateDisplayName } from "../lib/format";
 import LogViewer from "../components/LogViewer";
 import MetricsChart from "../components/MetricsChart";
@@ -34,6 +34,7 @@ export default function TaskDetailPage() {
   const [task, setTask] = useState<Task | null>(null);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState(false);
+  const [taskCost, setTaskCost] = useState<TaskCost | null>(null);
   const { socket } = useSocket();
 
   const fetch = useCallback(() => {
@@ -47,6 +48,15 @@ export default function TaskDetailPage() {
     const t = setInterval(fetch, 3000);
     return () => clearInterval(t);
   }, [fetch]);
+
+  useEffect(() => {
+    if (!id) return;
+    costApi.taskCost(id).then((r) => setTaskCost(r.cost)).catch(() => {});
+    const t = setInterval(() => {
+      costApi.taskCost(id).then((r) => setTaskCost(r.cost)).catch(() => {});
+    }, 10000);
+    return () => clearInterval(t);
+  }, [id]);
 
   const doAction = async (action: () => Promise<any>) => {
     setActing(true);
@@ -169,6 +179,8 @@ export default function TaskDetailPage() {
         {task.finished_at && <MetaRow label="Finished" value={`${task.finished_at} (${formatRelTime(task.finished_at)})`} />}
         {task.exit_code !== undefined && <MetaRow label="Exit Code" value={String(task.exit_code)} />}
         {task.pid && <MetaRow label="PID" value={String(task.pid)} />}
+        {taskCost && <MetaRow label="GPU-Hours" value={`${taskCost.gpu_hours.toFixed(3)} h (${taskCost.gpu_type} @ $${taskCost.rate_per_hour}/hr)`} />}
+        {taskCost && <MetaRow label="Est. Cost" value={`$${taskCost.cost_usd.toFixed(2)}`} />}
       </div>
 
       {/* Param overrides */}

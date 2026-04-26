@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Stub, Task, overviewApi, OverviewData } from "../lib/api";
+import { Stub, Task, overviewApi, OverviewData, costApi, CostSummary } from "../lib/api";
 import { formatRelTime, generateDisplayName } from "../lib/format";
 import StubCard from "../components/StubCard";
 import TaskForm from "../components/TaskForm";
@@ -65,6 +65,71 @@ function RecentTaskRow({ task, onClick }: { task: Task; onClick: () => void }) {
       )}
       {task.finished_at && (
         <span className="text-xs text-gray-600 shrink-0">{formatRelTime(task.finished_at)}</span>
+      )}
+    </div>
+  );
+}
+
+type CostRange = "7d" | "30d" | "all";
+
+function CostWidget() {
+  const [range, setRange] = useState<CostRange>("7d");
+  const [cost, setCost] = useState<CostSummary | null>(null);
+
+  useEffect(() => {
+    const params: { from?: string } = {};
+    if (range === "7d") params.from = new Date(Date.now() - 7 * 86400_000).toISOString();
+    else if (range === "30d") params.from = new Date(Date.now() - 30 * 86400_000).toISOString();
+    costApi.summary(params).then(setCost).catch(() => {});
+  }, [range]);
+
+  const TUITION_USD = 15000;
+  const roi = cost && cost.total_cost_usd > 0
+    ? Math.round((cost.total_cost_usd / TUITION_USD) * 100)
+    : 0;
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-gray-300">GPU Cost</h3>
+        <div className="flex gap-1">
+          {(["7d", "30d", "all"] as CostRange[]).map((r) => (
+            <button
+              key={r}
+              onClick={() => setRange(r)}
+              className={`px-2 py-0.5 text-xs rounded transition-colors ${
+                range === r
+                  ? "bg-gray-700 text-white"
+                  : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              {r === "all" ? "All" : r}
+            </button>
+          ))}
+        </div>
+      </div>
+      {cost ? (
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <div className="text-xs text-gray-500">GPU-Hours</div>
+            <div className="text-lg font-bold text-blue-400 tabular-nums">{cost.total_gpu_hours.toFixed(1)}</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Est. Cost</div>
+            <div className="text-lg font-bold text-green-400 tabular-nums">${cost.total_cost_usd.toFixed(2)}</div>
+          </div>
+          <div>
+            <div className="text-xs text-gray-500">Utilization</div>
+            <div className="text-lg font-bold text-yellow-400 tabular-nums">{cost.utilization_pct.toFixed(1)}%</div>
+          </div>
+        </div>
+      ) : (
+        <div className="text-gray-600 text-sm">Loading...</div>
+      )}
+      {cost && roi > 0 && (
+        <div className="text-xs text-gray-600 mt-2 text-right">
+          Tuition ROI: {roi}%
+        </div>
       )}
     </div>
   );
@@ -149,6 +214,9 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
           color="text-purple-400"
         />
       </div>
+
+      {/* Cost widget */}
+      <CostWidget />
 
       {/* Top actions */}
       <div className="flex items-center justify-between">

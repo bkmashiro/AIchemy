@@ -278,3 +278,47 @@ export const metricsApi = {
     api.get(`/stubs/${stubId}/metrics`, { params: { hours } }).then((r) => r.data),
   getTaskMetrics: (taskId: string) => api.get(`/tasks/${taskId}/metrics`).then((r) => r.data),
 };
+
+// ─── Cost API ─────────────────────────────────────────────────────────────────
+
+export interface CostSummary {
+  total_gpu_hours: number;
+  total_cost_usd: number;
+  utilization_pct: number;
+  task_count: number;
+}
+
+export interface CostBreakdownEntry {
+  gpu_type: string;
+  gpu_hours: number;
+  cost_usd: number;
+  task_count: number;
+}
+
+export interface ExperimentCostEntry {
+  experiment: string;
+  gpu_hours: number;
+  cost_usd: number;
+  task_count: number;
+}
+
+export interface CostBreakdown {
+  by_gpu_type: CostBreakdownEntry[];
+  by_experiment: ExperimentCostEntry[];
+}
+
+export interface TaskCost {
+  gpu_hours: number;
+  cost_usd: number;
+  gpu_type: string;
+  rate_per_hour: number;
+}
+
+export const costApi = {
+  summary: (params?: { from?: string; to?: string }) =>
+    api.get<CostSummary>("/metrics/cost", { params }).then((r) => r.data),
+  breakdown: (params?: { from?: string; to?: string }) =>
+    api.get<CostBreakdown>("/metrics/cost/breakdown", { params }).then((r) => r.data),
+  taskCost: (taskId: string) =>
+    api.get<{ task_id: string; cost: TaskCost | null }>(`/tasks/${taskId}/cost`).then((r) => r.data),
+};

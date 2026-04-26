@@ -10,6 +10,7 @@
 import { Router, Request, Response } from "express";
 import { store } from "../store";
 import { metricsStore } from "../metrics";
+import { aggregateCosts, computeTaskCost, matchGpuType, getGpuRate } from "../cost";
 
 let overviewCache: { data: any; ts: number } | null = null;
 const OVERVIEW_CACHE_TTL = 10_000;
@@ -97,6 +98,84 @@ export function createMetricsRouter(): Router {
     const tail = req.query.tail ? parseInt(req.query.tail as string, 10) : undefined;
     const lines = tail ? task.log_buffer.slice(-tail) : task.log_buffer;
     res.json({ task_id: task.id, lines });
+  });
+
+  // GET /tasks/:id/cost — cost for a single task
+  router.get("/tasks/:id/cost", (req: Request, res: Response) => {
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const { task } = found;
+    const stub = task.stub_id ? store.getStub(task.stub_id) : undefined;
+    const gpuName = stub?.gpu.name || "default";
+    const gpuCount = stub?.gpu.count || 1;
+    const cost = computeTaskCost(task, gpuName, gpuCount);
+    res.json({ task_id: task.id, cost });
+  });
+
+  // ─── Cost Statistics ───────────────────────────────────────────────────────
+
+  // GET /metrics/cost — aggregate cost summary
+  router.get("/metrics/cost", (_req: Request, res: Response) => {
+    const from = _req.query.from ? new Date(_req.query.from as string) : undefined;
+    const to = _req.query.to ? new Date(_req.query.to as string) : undefined;
+
+    const tasks = store.getAllTasks();
+    const stubs = store.getAllStubs();
+
+    // Build stub GPU info map
+    const stubMap = new Map<string, { gpu_name: string; gpu_count: number; first_seen: string; last_seen: string }>();
+    for (const stub of stubs) {
+      stubMap.set(stub.id, {
+        gpu_name: stub.gpu.name,
+        gpu_count: stub.gpu.count,
+        first_seen: stub.first_seen || stub.connected_at,
+        last_seen: stub.last_seen || stub.last_heartbeat,
+      });
+    }
+
+    const costStubMap = new Map<string, { gpu_name: string; gpu_count: number }>();
+    for (const [id, info] of stubMap) {
+      costStubMap.set(id, { gpu_name: info.gpu_name, gpu_count: info.gpu_count });
+    }
+
+    const { summary, breakdown } = aggregateCosts(tasks, costStubMap, from, to);
+
+    // Compute utilization: sum(task_gpu_hours) / sum(stub_wall_gpu_hours)
+    let totalStubGpuHours = 0;
+    for (const [, info] of stubMap) {
+      const stubFrom = new Date(info.first_seen).getTime();
+      const stubTo = new Date(info.last_seen).getTime();
+      if (isNaN(stubFrom) || isNaN(stubTo) || stubTo <= stubFrom) continue;
+      // Apply time range filter
+      const effectiveFrom = from ? Math.max(stubFrom, from.getTime()) : stubFrom;
+      const effectiveTo = to ? Math.min(stubTo, to.getTime()) : stubTo;
+      if (effectiveTo <= effectiveFrom) continue;
+      const hours = (effectiveTo - effectiveFrom) / 3_600_000;
+      totalStubGpuHours += hours * info.gpu_count;
+    }
+
+    summary.utilization_pct = totalStubGpuHours > 0
+      ? Math.round((summary.total_gpu_hours / totalStubGpuHours) * 10000) / 100
+      : 0;
+
+    res.json(summary);
+  });
+
+  // GET /metrics/cost/breakdown — cost breakdown by GPU type and experiment
+  router.get("/metrics/cost/breakdown", (_req: Request, res: Response) => {
+    const from = _req.query.from ? new Date(_req.query.from as string) : undefined;
+    const to = _req.query.to ? new Date(_req.query.to as string) : undefined;
+
+    const tasks = store.getAllTasks();
+    const stubs = store.getAllStubs();
+
+    const costStubMap = new Map<string, { gpu_name: string; gpu_count: number }>();
+    for (const stub of stubs) {
+      costStubMap.set(stub.id, { gpu_name: stub.gpu.name, gpu_count: stub.gpu.count });
+    }
+
+    const { breakdown } = aggregateCosts(tasks, costStubMap, from, to);
+    res.json(breakdown);
   });
 
   return router;
