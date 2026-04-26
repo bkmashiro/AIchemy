@@ -8,12 +8,16 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
+_EMA_ALPHA = 0.3  # weight on the newest sample; ~3-sample effective window
+
 
 class GpuMonitor:
     """Polls GPU stats. Falls back to mock data if nvidia-smi unavailable."""
 
     def __init__(self) -> None:
         self._available = self._check_available()
+        # EMA state: {gpu_index: smoothed_utilization_pct}
+        self._ema: dict[int, float] = {}
 
     # ------------------------------------------------------------------ #
     # Availability                                                         #
@@ -86,11 +90,18 @@ class GpuMonitor:
                 if len(parts) < 6:
                     continue
                 try:
+                    idx = int(parts[0])
+                    raw_util = int(parts[2])
+                    # EMA smoothing: initialise with raw value on first sample
+                    prev = self._ema.get(idx, raw_util)
+                    smoothed = _EMA_ALPHA * raw_util + (1 - _EMA_ALPHA) * prev
+                    self._ema[idx] = smoothed
                     gpus.append(
                         {
-                            "index": int(parts[0]),
+                            "index": idx,
                             "name": parts[1],
-                            "utilization_pct": int(parts[2]),
+                            "utilization_pct": round(smoothed, 1),
+                            "utilization_pct_raw": raw_util,
                             "memory_used_mb": int(parts[3]),
                             "memory_total_mb": int(parts[4]),
                             "temperature_c": int(parts[5]),
