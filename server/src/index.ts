@@ -18,6 +18,7 @@ import { setupControllerNamespace } from "./socket/controller";
 import { createGlobalTasksRouter } from "./api/tasks";
 import { createStubsRouter } from "./api/stubs";
 import { createGridsRouter } from "./api/grids";
+import { createExperimentsRouter } from "./api/experiments";
 import { createMetricsRouter } from "./api/metrics";
 import { createSdkRouter } from "./api/sdk";
 import { createClusterRouter } from "./api/cluster";
@@ -144,7 +145,8 @@ api.post("/admin/restore", async (req, res) => {
 
 // Cleanup endpoint — prunes old archived tasks
 api.post("/cleanup", (req, res) => {
-  const { older_than_hours = 24 } = req.body;
+  const older_than_hours = Number(req.body.older_than_hours ?? 24);
+  if (!Number.isFinite(older_than_hours) || older_than_hours < 1) { res.status(400).json({ error: "older_than_hours must be >= 1" }); return; }
   const cutoff = Date.now() - older_than_hours * 3600_000;
   const archive = store.getArchive();
   const before = archive.length;
@@ -163,6 +165,7 @@ api.post("/cleanup", (req, res) => {
 api.use("/tasks", createGlobalTasksRouter(stubNs, webNs));
 api.use("/stubs", createStubsRouter(stubNs, webNs));
 api.use("/grids", createGridsRouter(stubNs, webNs));
+api.use("/experiments", createExperimentsRouter(stubNs, webNs));
 api.use("/cluster", createClusterRouter());
 
 // Health check — no auth required
@@ -200,7 +203,12 @@ const dashboardDir = path.join(__dirname, "dashboard");
 app.use(express.static(dashboardDir));
 
 // SPA fallback — serve index.html for non-API, non-file routes
-app.get("*", (_req, res) => {
+// L5: Don't swallow /api/* 404s — only serve SPA for non-API paths
+app.get("*", (req, res) => {
+  if (req.path.startsWith("/api/")) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
   res.sendFile(path.join(dashboardDir, "index.html"));
 });
 

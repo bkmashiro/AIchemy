@@ -46,10 +46,21 @@ def _load_env_file(path: str) -> dict[str, str]:
     if not isinstance(data, dict):
         raise ValueError(f"default-env-file must be a YAML mapping, got {type(data).__name__}")
 
-    # Accept top-level dict or nested under 'default_env' key
-    env_dict = data.get("default_env", data)
-    if not isinstance(env_dict, dict):
-        raise ValueError("default_env key must be a mapping")
+    # Accept nested under 'default_env' key, or top-level if all keys look like env vars
+    if "default_env" in data:
+        env_dict = data["default_env"]
+        if not isinstance(env_dict, dict):
+            raise ValueError("default_env key must be a mapping")
+    else:
+        # Validate that all keys look like env var names (uppercase, digits, underscores)
+        _ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+        bad_keys = [k for k in data if not _ENV_KEY_RE.match(str(k))]
+        if bad_keys:
+            raise ValueError(
+                f"No 'default_env' key found and file contains non-env-var keys: {bad_keys}. "
+                f"Wrap env vars under a 'default_env' key, or ensure all keys are UPPER_CASE."
+            )
+        env_dict = data
 
     return {str(k): str(v) for k, v in env_dict.items()}
 

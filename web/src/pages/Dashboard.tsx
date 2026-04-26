@@ -77,10 +77,14 @@ function CostWidget() {
   const [cost, setCost] = useState<CostSummary | null>(null);
 
   useEffect(() => {
+    setCost(null);
     const params: { from?: string } = {};
     if (range === "7d") params.from = new Date(Date.now() - 7 * 86400_000).toISOString();
     else if (range === "30d") params.from = new Date(Date.now() - 30 * 86400_000).toISOString();
-    costApi.summary(params).then(setCost).catch(() => {});
+    costApi.summary(params).then(setCost).catch((err) => {
+      console.error("Failed to fetch cost summary:", err);
+      setCost(null);
+    });
   }, [range]);
 
   const TUITION_USD = 15000;

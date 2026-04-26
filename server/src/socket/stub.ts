@@ -9,7 +9,6 @@
 
 import { Namespace, Socket } from "socket.io";
 import { createHash } from "crypto";
-import { v4 as uuidv4 } from "uuid";
 import { store } from "../store";
 import { metricsStore } from "../metrics";
 import {
@@ -35,7 +34,7 @@ import { evaluateCriteria } from "../criteria";
 import { deriveExperimentStatus } from "../api/experiments";
 import { writeLockTable } from "../dedup";
 import { logger } from "../log";
-import { loseTask, startTask, completeTask, failTask, killTask, recoverTask, resolveDeadTask, preflightFail, promoteIfDispatched } from "../task-actions";
+import { loseTask, startTask, completeTask, failTask, killTask, recoverTask, resolveDeadTask, preflightFail, promoteIfDispatched, createRetryTask } from "../task-actions";
 
 const HEARTBEAT_TIMEOUT_MS = 180_000; // 6 missed × 30s — generous for CF tunnel latency
 const REQUEST_SYNC_INTERVAL_MS = 5 * 60_000;
@@ -121,23 +120,7 @@ function handleAutoRetry(task: Task, webNs: Namespace): void {
       return;
     }
 
-    const retryTask: Task = {
-      ...task,
-      id: uuidv4(),
-      seq: store.nextSeq(),
-      status: "pending",
-      stub_id: undefined,
-      run_dir: undefined, // Clear so computeRunDir assigns fresh path
-      retry_count: task.retry_count + 1,
-      retry_of: retryRoot,
-      created_at: new Date().toISOString(),
-      started_at: undefined,
-      finished_at: undefined,
-      exit_code: undefined,
-      pid: undefined,
-      log_buffer: [],
-      progress: undefined,
-    };
+    const retryTask = createRetryTask(task);
     store.addToGlobalQueue(retryTask);
     webNs.emit("task.update", retryTask);
     logger.info("task.retry", { task_seq: task.seq, new_seq: retryTask.seq, attempt: retryTask.retry_count, max: task.max_retries });
@@ -448,6 +431,12 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       for (const task of stub.tasks) {
         cancelKillChain(task.id);
       }
+      // Bug 4 fix: Clear sync interval on disconnect to prevent leak
+      const syncIv = stubSyncIntervals.get(stubId);
+      if (syncIv) {
+        clearInterval(syncIv);
+        stubSyncIntervals.delete(stubId);
+      }
       markTasksLost(stub, webNs);
       store.setStub(stub);
       webNs.emit("stub.offline", { stub_id: stubId });
@@ -516,7 +505,14 @@ function handleResume(
     const oldSocket = ns.sockets.get(existingStub.socket_id);
     if (oldSocket) {
       logger.info("stub.ghost_kicked", { stub_id: stubId, old_socket: existingStub.socket_id });
+      // Bug 1 fix: Remove old socket mapping BEFORE disconnecting so the
+      // disconnect handler sees socket_id mismatch and skips markTasksLost.
       socketToStub.delete(existingStub.socket_id);
+      unregisterStubSocket(stubId, existingStub.socket_id);
+      // Update stored socket_id so disconnect handler's
+      // `stub.socket_id !== socket.id` check correctly skips the old socket.
+      existingStub.socket_id = socket.id;
+      store.setStub(existingStub);
       oldSocket.disconnect(true);
     }
   }
@@ -636,11 +632,17 @@ function handleResume(
   // Process dead_tasks from stub (died while offline)
   if (payload.dead_tasks && payload.dead_tasks.length > 0) {
     for (const dead of payload.dead_tasks) {
-      const taskEntry = store.getTask(stubId, dead.task_id) ? { task: store.getTask(stubId, dead.task_id)!, archived: false } : store.findTask(dead.task_id);
-      const task = taskEntry?.task ?? store.getTask(stubId, dead.task_id);
+      // Bug 3 fix: Use store.findTask to get the authoritative stubId for this
+      // task, not the reconnecting stub's ID — tasks may have been moved.
+      const taskEntry = store.getTask(stubId, dead.task_id)
+        ? { task: store.getTask(stubId, dead.task_id)!, stubId, archived: false }
+        : store.findTask(dead.task_id);
+      if (!taskEntry) continue;
+      const task = taskEntry.task;
+      const taskStubId = taskEntry.stubId ?? stubId;
       if (task && ["running", "dispatched", "paused", "lost"].includes(task.status)) {
         const newStatus = dead.exit_code === 0 ? "completed" : "failed";
-        const updated = resolveDeadTask(stubId, dead.task_id, dead.exit_code);
+        const updated = resolveDeadTask(taskStubId, dead.task_id, dead.exit_code);
         if (updated) {
           webNs.emit("task.update", updated);
           logger.info("task.dead_on_reattach", { task_seq: updated.seq, status: newStatus, exit_code: dead.exit_code });
@@ -800,26 +802,10 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
       ? Math.ceil(task.requirements.gpu_mem_mb * 1.2)
       : undefined;
 
-    const retryTask: Task = {
-      ...task,
-      id: uuidv4(),
-      seq: store.nextSeq(),
-      status: "pending",
-      stub_id: undefined,
-      run_dir: undefined, // Clear so computeRunDir assigns fresh path
-      retry_count: task.retry_count + 1,
-      retry_of: task.retry_of || task.id,
-      created_at: new Date().toISOString(),
-      started_at: undefined,
-      finished_at: undefined,
-      exit_code: undefined,
-      pid: undefined,
-      log_buffer: [],
-      progress: undefined,
-      requirements: bumpedMem
-        ? { ...task.requirements, gpu_mem_mb: bumpedMem }
-        : task.requirements,
-    };
+    const retryOpts = bumpedMem
+      ? { requirements: { ...task.requirements, gpu_mem_mb: bumpedMem } }
+      : undefined;
+    const retryTask = createRetryTask(task, retryOpts);
 
     // Mark original as failed
     const failed = failTask(stubId, payload.task_id, payload.exit_code);

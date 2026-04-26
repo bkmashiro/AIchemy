@@ -36,6 +36,8 @@ class Store {
   private fingerprintIndex: FingerprintIndex = new Map();
   // Archive: terminal tasks moved here so they don't clutter stub.tasks
   private archive: Task[] = [];
+  // Task ID index: O(1) lookup by task ID
+  private _taskIndex = new Map<string, { stubId?: string; location: "global" | "stub" | "archive" }>();
 
   constructor() {
     this.load();
@@ -147,6 +149,7 @@ class Store {
     const idx = this.archive.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
     const [task] = this.archive.splice(idx, 1);
+    this._taskIndex.delete(taskId);
     return task;
   }
 
@@ -157,6 +160,7 @@ class Store {
       stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
     }
     this.archive.push(task);
+    this._taskIndex.set(taskId, { location: "archive" });
   }
 
   /** Move a task from archive back to a stub's task list (for lost→running recovery). */
@@ -173,6 +177,7 @@ class Store {
     }
     const recovered = { ...task, ...update };
     stub.tasks.push(recovered);
+    this._taskIndex.set(taskId, { stubId, location: "stub" });
     this._reindexTask(task, recovered);
     return recovered;
   }
@@ -188,6 +193,7 @@ class Store {
   addToGlobalQueue(task: Task): void {
     task.stub_id = undefined;
     this.globalQueue.push(task);
+    this._taskIndex.set(task.id, { location: "global" });
     if (task.fingerprint) {
       this._indexFingerprint(task);
     }
@@ -197,6 +203,7 @@ class Store {
     const idx = this.globalQueue.findIndex((t) => t.id === taskId);
     if (idx === -1) return undefined;
     const [task] = this.globalQueue.splice(idx, 1);
+    this._taskIndex.delete(taskId);
     return task;
   }
 
@@ -217,12 +224,13 @@ class Store {
     }
     this.globalQueue[idx] = { ...prev, ...update };
     const updated = this.globalQueue[idx];
-    this._reindexTask(prev, updated);
-    // Auto-archive: move to archive when transitioning to terminal status
+    // Auto-archive: splice before reindex so task is fully moved before lock release
     if (this._isActive(prev.status) && !this._isActive(updated.status)) {
       this.globalQueue.splice(idx, 1);
       this.archive.push(updated);
+      this._taskIndex.set(taskId, { location: "archive" });
     }
+    this._reindexTask(prev, updated);
     return updated;
   }
 
@@ -234,14 +242,39 @@ class Store {
 
   /** Find a task by id across global queue, all stubs, and archive. */
   findTask(taskId: string): { task: Task; stubId: string | null; archived?: boolean } | undefined {
+    // Fast path: use index
+    const entry = this._taskIndex.get(taskId);
+    if (entry) {
+      if (entry.location === "stub" && entry.stubId) {
+        const stub = this.stubs.get(entry.stubId);
+        const task = stub?.tasks.find((t) => t.id === taskId);
+        if (task) return { task, stubId: entry.stubId };
+      } else if (entry.location === "global") {
+        const task = this.globalQueue.find((t) => t.id === taskId);
+        if (task) return { task, stubId: null };
+      } else if (entry.location === "archive") {
+        const task = this.archive.find((t) => t.id === taskId);
+        if (task) return { task, stubId: task.stub_id || null, archived: true };
+      }
+    }
+    // Slow fallback: linear scan (index miss or stale)
     for (const stub of this.stubs.values()) {
       const task = stub.tasks.find((t) => t.id === taskId);
-      if (task) return { task, stubId: stub.id };
+      if (task) {
+        this._taskIndex.set(taskId, { stubId: stub.id, location: "stub" });
+        return { task, stubId: stub.id };
+      }
     }
     const gq = this.globalQueue.find((t) => t.id === taskId);
-    if (gq) return { task: gq, stubId: null };
+    if (gq) {
+      this._taskIndex.set(taskId, { location: "global" });
+      return { task: gq, stubId: null };
+    }
     const arch = this.archive.find((t) => t.id === taskId);
-    if (arch) return { task: arch, stubId: arch.stub_id || null, archived: true };
+    if (arch) {
+      this._taskIndex.set(taskId, { location: "archive" });
+      return { task: arch, stubId: arch.stub_id || null, archived: true };
+    }
     return undefined;
   }
 
@@ -279,12 +312,21 @@ class Store {
     const stub = this.stubs.get(stubId);
     if (!stub) {
       // Put back
-      this.globalQueue.push(task);
+      this.addToGlobalQueue(task);
       return undefined;
     }
+    if (!canTransition(task.status, "queued")) {
+      logger.warn("moveToStubQueue.illegal_transition", { taskId, from: task.status, to: "queued" });
+      // Put back
+      this.addToGlobalQueue(task);
+      return undefined;
+    }
+    const prev = { ...task };
     task.stub_id = stubId;
     task.status = "queued";
     stub.tasks.push(task);
+    this._taskIndex.set(taskId, { stubId, location: "stub" });
+    this._reindexTask(prev, task);
     return task;
   }
 
@@ -335,6 +377,21 @@ class Store {
       if (task.fingerprint && this._isActive(task.status)) {
         this.fingerprintIndex.set(task.fingerprint, task.id);
       }
+    }
+  }
+
+  private _rebuildTaskIndex(): void {
+    this._taskIndex.clear();
+    for (const task of this.globalQueue) {
+      this._taskIndex.set(task.id, { location: "global" });
+    }
+    for (const stub of this.stubs.values()) {
+      for (const task of stub.tasks) {
+        this._taskIndex.set(task.id, { stubId: stub.id, location: "stub" });
+      }
+    }
+    for (const task of this.archive) {
+      this._taskIndex.set(task.id, { location: "archive" });
     }
   }
 
@@ -517,7 +574,7 @@ class Store {
       this.archive = state.archive;
     }
 
-    if (state.seq_counter) {
+    if (typeof state.seq_counter === "number") {
       this.seqCounter = state.seq_counter;
     }
 
@@ -532,6 +589,7 @@ class Store {
 
     // Rebuild indices after loading
     this.rebuildFingerprintIndex();
+    this._rebuildTaskIndex();
   }
 
   loadFromState(state: ServerState): void {
@@ -541,6 +599,7 @@ class Store {
     this.grids.clear();
     this.experiments.clear();
     this.fingerprintIndex.clear();
+    this._taskIndex.clear();
     this.archive = [];
     this.seqCounter = 0;
     this._applyState(state);
@@ -563,6 +622,7 @@ class Store {
     this.grids.clear();
     this.experiments.clear();
     this.fingerprintIndex.clear();
+    this._taskIndex.clear();
     this.archive = [];
     this.seqCounter = 0;
     writeLockTable.clear();

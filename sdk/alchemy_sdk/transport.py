@@ -206,11 +206,14 @@ def make_transport(
     if not task_id:
         return NoopTransport()
 
-    # Try Unix socket first — probe before constructing to allow fallback
+    # Try Unix socket first — check path exists before constructing
     if stub_socket:
-        if _probe_unix_socket(stub_socket):
-            return UnixSocketTransport(stub_socket, task_id)
-        # Socket path set but not reachable — fall through to HTTP
+        if os.path.exists(stub_socket):
+            transport = UnixSocketTransport(stub_socket, task_id)
+            if transport._sock is not None:
+                return transport
+            transport.close()
+        # Socket not reachable — fall through to HTTP
 
     # Try HTTP fallback
     if server:

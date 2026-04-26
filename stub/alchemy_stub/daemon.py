@@ -605,6 +605,7 @@ class StubDaemon:
             log.warning("shell.exec: timeout request_id=%s", request_id)
             try:
                 proc.kill()
+                await proc.wait()  # reap zombie process
             except Exception:
                 pass
             await self.sio.emit(
@@ -761,7 +762,7 @@ class StubDaemon:
                 async def _collect_and_emit_stats() -> None:
                     # GPU stats (non-reliable)
                     try:
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         gpu_stats = await loop.run_in_executor(None, self.gpu_monitor.query)
                         await self._emit("gpu_stats", gpu_stats)
                     except Exception as e:
@@ -769,7 +770,7 @@ class StubDaemon:
 
                     # System stats (non-reliable)
                     try:
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         pids = self.process_mgr.get_task_pids()
                         sys_stats = await loop.run_in_executor(None, self.system_monitor.collect, pids)
                         if sys_stats.get("mem_total_mb", 0) == 0:

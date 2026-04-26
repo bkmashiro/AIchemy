@@ -76,10 +76,15 @@ class Alchemy:
         self._install_sigterm_handler()
 
     def _install_sigterm_handler(self) -> None:
-        """Install SIGTERM handler that sets the stop flag."""
+        """Install SIGTERM handler that sets the stop flag. Chains with existing handler."""
         try:
+            prev = signal.getsignal(signal.SIGTERM)
+
             def _handler(signum: int, frame: Any) -> None:
                 self._stop_flag = True
+                # Chain previous handler if callable
+                if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
+                    prev(signum, frame)
 
             signal.signal(signal.SIGTERM, _handler)
         except (OSError, ValueError):
@@ -199,7 +204,10 @@ class Alchemy:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.done()
+        if exc_type is None:
+            self.done()
+        else:
+            self.notify(f"Training crashed: {exc_type.__name__}: {exc_val}", level="critical")
 
     # ------------------------------------------------------------------
     # AOP decorator
@@ -237,10 +245,19 @@ class Alchemy:
                     eval_every=eval_every,
                     checkpoint_every=checkpoint_every,
                 )
-                run_preflight(ctx, reads=reads or [])
-                result = fn(ctx, *args, **kwargs)
-                self.done(metrics=result if isinstance(result, dict) else None)
-                return result
+                run_preflight(ctx, reads=reads or [], writes=writes or [])
+                try:
+                    result = fn(ctx, *args, **kwargs)
+                except KeyboardInterrupt:
+                    self.notify("Training interrupted (KeyboardInterrupt)", level="warning")
+                    raise
+                except Exception as e:
+                    # Emergency checkpoint if possible
+                    self.notify(f"Training crashed: {type(e).__name__}: {e}", level="critical")
+                    raise
+                else:
+                    self.done(metrics=result if isinstance(result, dict) else None)
+                    return result
 
             return wrapper
         return decorator

@@ -4,7 +4,6 @@ import { Task, tasksApi, costApi, TaskCost } from "../lib/api";
 import { taskDuration, taskEta, formatRelTime, generateDisplayName } from "../lib/format";
 import LogViewer from "../components/LogViewer";
 import MetricsChart from "../components/MetricsChart";
-import { useSocket } from "../hooks/useSocket";
 
 const STATUS_COLORS: Record<string, string> = {
   running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
@@ -35,12 +34,10 @@ export default function TaskDetailPage() {
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState(false);
   const [taskCost, setTaskCost] = useState<TaskCost | null>(null);
-  const { socket } = useSocket();
 
   const fetch = useCallback(() => {
     if (!id) return;
-    tasksApi.get(id).then(setTask).catch(() => setLoading(false));
-    setLoading(false);
+    tasksApi.get(id).then(setTask).finally(() => setLoading(false));
   }, [id]);
 
   useEffect(() => {
@@ -145,7 +142,7 @@ export default function TaskDetailPage() {
 
       {/* Metrics chart */}
       {(task.status === "running" || task.status === "completed" || task.status === "failed") && (
-        <MetricsChart taskId={task.id} socket={socket} />
+        <MetricsChart taskId={task.id} socket={null} />
       )}
 
       {/* Command */}

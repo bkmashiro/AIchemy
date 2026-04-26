@@ -34,9 +34,13 @@ export default function LogViewer({ taskId, initialLines = [], liveLines = [], m
       .catch(() => {});
   }, [taskId]);
 
-  // Merge fetched + live, dedup by content (simple approach: use set on lines)
-  // Prefer fetched as ground truth, append new live lines
-  const allLines = liveLines.length > fetchedLines.length ? liveLines : fetchedLines;
+  // Merge fetched (REST snapshot) + live lines
+  // Use fetched as ground truth, then append any live lines beyond the snapshot length
+  const allLines = (() => {
+    if (liveLines.length <= fetchedLines.length) return fetchedLines;
+    // Live buffer has lines beyond the snapshot — append the newer ones
+    return [...fetchedLines, ...liveLines.slice(fetchedLines.length)];
+  })();
 
   useEffect(() => {
     if (autoScroll && containerRef.current) {

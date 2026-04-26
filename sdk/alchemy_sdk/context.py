@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
 if TYPE_CHECKING:
     from .client import Alchemy
+
+# Hook callback type: (ctx, step) -> None
+HookFn = Callable[["TrainingContext", int], None]
 
 
 class TrainingContext:
@@ -48,6 +52,14 @@ class TrainingContext:
 
         # is_resume is set by preflight after scanning checkpoint_dir
         self.is_resume: bool = False
+
+        # Lifecycle hooks
+        self._hooks: dict[str, list[HookFn]] = {
+            "on_step_start": [],
+            "on_step_end": [],
+            "on_eval": [],
+            "on_checkpoint": [],
+        }
 
     # ------------------------------------------------------------------
     # Pure reads
@@ -140,11 +152,16 @@ class TrainingContext:
         """
         if not self._checkpoint_dir.exists():
             return None
-        pts = sorted(
-            self._checkpoint_dir.glob("*.pt"),
-            key=lambda p: p.stat().st_mtime,
-        )
-        return pts[-1] if pts else None
+        pts = []
+        for p in self._checkpoint_dir.glob("*.pt"):
+            try:
+                pts.append((p.stat().st_mtime, p))
+            except OSError:
+                continue  # file deleted between glob and stat
+        if not pts:
+            return None
+        pts.sort(key=lambda x: x[0])
+        return pts[-1][1]
 
     def save_checkpoint(self, state_dict: Any, name: str = "latest") -> Path:
         """
@@ -166,12 +183,43 @@ class TrainingContext:
 
         # Write atomically via tmp file + rename
         tmp = path.with_suffix(".tmp")
-        torch.save(state_dict, tmp)
-        tmp.replace(path)
+        try:
+            torch.save(state_dict, tmp)
+            tmp.replace(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
         # Notify stub
         self._al.checkpoint(str(path))
         return path
+
+    # ------------------------------------------------------------------
+    # Lifecycle hooks
+    # ------------------------------------------------------------------
+
+    def on(self, event: str, fn: HookFn) -> "TrainingContext":
+        """
+        Register a lifecycle hook.
+
+        Events: on_step_start, on_step_end, on_eval, on_checkpoint.
+        Callback signature: (ctx, step) -> None.
+
+        Returns self for chaining:
+            ctx.on("on_eval", my_eval_fn).on("on_checkpoint", my_save_fn)
+        """
+        if event not in self._hooks:
+            raise ValueError(f"Unknown hook event: {event}. Valid: {list(self._hooks)}")
+        self._hooks[event].append(fn)
+        return self
+
+    def _fire(self, event: str) -> None:
+        """Fire all hooks registered for an event."""
+        for fn in self._hooks.get(event, []):
+            fn(self, self._current_step)
 
     # ------------------------------------------------------------------
     # Training loop iterator
@@ -181,6 +229,8 @@ class TrainingContext:
         """
         Yield step indices [start, total_steps).
         Automatically calls al.log() at each step (throttled internally).
+        Fires on_step_start before yield, on_step_end after.
+        Auto-fires on_eval and on_checkpoint when conditions met.
         Breaks on should_stop().
         """
         self._current_step = start
@@ -193,11 +243,19 @@ class TrainingContext:
             if self._al.should_stop():
                 break
 
+            self._fire("on_step_start")
             yield step
 
             # Auto-report progress after each step
             self._al.log(step=self._current_step, total=total)
 
+            # Fire conditional hooks
+            if self.should_eval():
+                self._fire("on_eval")
+            if self.should_checkpoint():
+                self._fire("on_checkpoint")
+
+            self._fire("on_step_end")
             self._current_step += 1
 
     # ------------------------------------------------------------------
@@ -250,10 +308,14 @@ class TrainingContext:
 # Helpers
 # ---------------------------------------------------------------------------
 
+_umask_lock = threading.Lock()
+
+
 def _makedirs_002(path: Path) -> None:
-    """Create directories with umask 002 (group-writable)."""
-    old_umask = os.umask(0o002)
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    finally:
-        os.umask(old_umask)
+    """Create directories with umask 002 (group-writable). Thread-safe."""
+    with _umask_lock:
+        old_umask = os.umask(0o002)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        finally:
+            os.umask(old_umask)

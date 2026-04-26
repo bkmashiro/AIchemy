@@ -174,13 +174,33 @@ vi.mock("../src/task-actions", () => ({
   preflightFail: vi.fn(),
   promoteIfDispatched: vi.fn(),
   dispatchTask: vi.fn(),
+  createRetryTask: vi.fn((task: any, opts?: any) => ({
+    ...task,
+    id: `retry-${task.id}-${Date.now()}`,
+    seq: 9999,
+    status: "pending",
+    stub_id: undefined,
+    run_dir: opts?.clearRunDir === false ? task.run_dir : undefined,
+    retry_count: (task.retry_count || 0) + 1,
+    retry_of: task.retry_of || task.id,
+    created_at: new Date().toISOString(),
+    started_at: undefined,
+    finished_at: undefined,
+    exit_code: undefined,
+    pid: undefined,
+    log_buffer: [],
+    progress: undefined,
+    should_stop: false,
+    should_checkpoint: false,
+    requirements: opts?.requirements ?? task.requirements,
+  })),
 }));
 
 // ─── Import after mocks ───────────────────────────────────────────────────────
 
 import { initiateKillChain, cancelKillChain, setupStubNamespace } from "../src/socket/stub";
 import { notifyLost, notifyKilled } from "../src/discord";
-import { loseTask, killTask, recoverTask, resolveDeadTask } from "../src/task-actions";
+import { loseTask, killTask, recoverTask, resolveDeadTask, createRetryTask } from "../src/task-actions";
 import { reliableEmitToStub } from "../src/reliable";
 import { triggerSchedule } from "../src/scheduler";
 import { logger } from "../src/log";

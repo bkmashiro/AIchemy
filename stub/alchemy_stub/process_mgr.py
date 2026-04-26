@@ -135,8 +135,7 @@ class ProcessManager:
     # ------------------------------------------------------------------ #
 
     def start_monitoring(self) -> None:
-        loop = asyncio.get_event_loop()
-        self._monitor_task = loop.create_task(self._monitor_loop())
+        self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())
 
     async def start(
         self,
@@ -166,16 +165,16 @@ class ProcessManager:
         if run_dir:
             alchemy_vars["ALCHEMY_RUN_DIR"] = run_dir
 
-        # Merge env layers: process env → default_env → task env_overrides → ALCHEMY_*
+        # Merge env layers: process env → default_env → task env + env_overrides → ALCHEMY_*
+        # Combine task env and env_overrides into one layer (overrides win)
+        combined_task_env = dict(env or {})
+        combined_task_env.update(env_overrides or {})
         proc_env = merge_env(
             base=dict(os.environ),
             default_env=self.default_env,
-            task_overrides=env_overrides or {},
+            task_overrides=combined_task_env,
             alchemy_vars=alchemy_vars,
         )
-        # Legacy: also apply task-level env dict (from server's task.env field)
-        if env:
-            proc_env.update(env)
 
         # Open log file — use context manager to avoid fd leak if Popen raises
         log_path = _log_path(task_id)
@@ -381,16 +380,17 @@ class ProcessManager:
         env: dict[str, str],
         command: str,
     ) -> str:
-        """Assemble the shell script that wraps the task command."""
+        """Assemble the shell script that wraps the task command.
+
+        NOTE: env vars are NOT exported here — they are set via proc_env
+        (through merge_env). This method only handles env_setup commands
+        and the actual command.
+        """
         parts: list[str] = ["set -e"]
         if self.env_setup:
             parts.append(self.env_setup)
         if task_env_setup:
             parts.append(task_env_setup)
-        # Extra env vars (non-ALCHEMY_, those go in proc_env)
-        for k, v in env.items():
-            if not k.startswith("ALCHEMY_"):
-                parts.append(f"export {shlex.quote(k)}={shlex.quote(v)}")
         parts.append(command)
         return "\n".join(parts)
 

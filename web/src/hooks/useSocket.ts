@@ -63,8 +63,9 @@ export function useSocket() {
         .catch(() => {});
 
       authFetch("/api/tasks")
-        .then((data: Task[]) => {
-          if (Array.isArray(data)) setGlobalQueue(data.filter((t) => !t.stub_id || t.stub_id === ""));
+        .then((data: any) => {
+          const tasks: Task[] = Array.isArray(data) ? data : (data?.tasks ?? []);
+          setGlobalQueue(tasks.filter((t) => !t.stub_id || t.stub_id === ""));
         })
         .catch(() => {});
     });

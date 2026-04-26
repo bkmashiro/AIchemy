@@ -8,7 +8,7 @@
  * Fire and forget — callers should .catch(() => {}).
  */
 
-import { Task } from "./types";
+import { Task, Experiment } from "./types";
 import { store } from "./store";
 import { logger } from "./log";
 
@@ -180,6 +180,62 @@ export interface GridNotifyPayload {
   failed: number;
   best_loss?: number;
   best_params?: Record<string, any>;
+}
+
+// ─── Experiment notifications ────────────────────────────────────────────────
+
+export async function notifyExperimentPassed(exp: Experiment): Promise<void> {
+  const grid = store.getGrid(exp.grid_id);
+  const total = grid?.task_ids.length ?? 0;
+  const passed = Object.values(exp.results).filter((v) => v.passed).length;
+
+  const msg = `✅ Experiment "${exp.name}" PASSED (${passed}/${total})`;
+
+  await sendEmbed(WEBHOOK_HUMAN, {
+    title: `✅ Experiment "${exp.name}" PASSED`,
+    color: COLOR.completed,
+    fields: [
+      { name: "Result", value: `${passed}/${total} passed`, inline: true },
+      { name: "Criteria", value: Object.entries(exp.criteria).map(([k, v]) => `${k}: ${v}`).join(", "), inline: false },
+    ],
+    timestamp: new Date().toISOString(),
+  });
+
+  await sendPlainText(WEBHOOK_AI, msg);
+}
+
+export async function notifyExperimentPartial(exp: Experiment): Promise<void> {
+  const grid = store.getGrid(exp.grid_id);
+  const total = grid?.task_ids.length ?? 0;
+  const passed = Object.values(exp.results).filter((v) => v.passed).length;
+  const failed = Object.values(exp.results).filter((v) => !v.passed).length;
+
+  // Build failure details
+  const failDetails = Object.entries(exp.results)
+    .filter(([_, v]) => !v.passed)
+    .slice(0, 5)
+    .map(([taskId, v]) => {
+      const failedCriteria = Object.entries(v.details)
+        .filter(([_, cr]) => !cr.ok)
+        .map(([metric, cr]) => `${metric}=${cr.value} ${cr.threshold}`)
+        .join(", ");
+      return `${taskId.slice(0, 8)}: ${failedCriteria}`;
+    })
+    .join("\n");
+
+  const msg = `⚠️ Experiment "${exp.name}" PARTIAL (${passed}/${total} passed)`;
+
+  await sendEmbed(WEBHOOK_HUMAN, {
+    title: `⚠️ Experiment "${exp.name}" PARTIAL`,
+    color: COLOR.killed,
+    fields: [
+      { name: "Result", value: `${passed}/${total} passed, ${failed} failed`, inline: true },
+      ...(failDetails ? [{ name: "Failed", value: failDetails.slice(0, 1024), inline: false }] : []),
+    ],
+    timestamp: new Date().toISOString(),
+  });
+
+  await sendPlainText(WEBHOOK_AI, msg);
 }
 
 export async function notifyGridDone(payload: GridNotifyPayload): Promise<void> {

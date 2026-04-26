@@ -86,6 +86,11 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
     const display_name = gridDisplayName(name, script, param_space);
     const combinations = cartesianProduct(param_space);
 
+    // M10: Guard against combinatorial explosion
+    if (combinations.length > 1000) {
+      res.status(400).json({ error: `param_space produces ${combinations.length} combinations (max 1000)` }); return;
+    }
+
     const grid: Grid = {
       id: gridId,
       name,

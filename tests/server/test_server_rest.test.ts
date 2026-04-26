@@ -126,7 +126,9 @@ describe("Task CRUD", () => {
   it("GET /tasks returns empty array initially (no tasks for this script)", async () => {
     const r = await apiGet(`${BASE_URL}/api/tasks`, TOKEN);
     expect(r.status).toBe(200);
-    const tasks = await r.json();
+    const body = await r.json();
+    // API returns paginated object { tasks: [...], total: N } or array for backwards compat
+    const tasks = Array.isArray(body) ? body : body.tasks;
     expect(Array.isArray(tasks)).toBe(true);
   });
 
@@ -285,7 +287,7 @@ describe("Command assembly", () => {
     const task = await r.json();
     // command should contain all pieces
     expect(task.command).toContain("source activate ml");
-    expect(task.command).toContain("cd /workspace/project");
+    expect(task.command).toContain("cd '/workspace/project'");
     expect(task.command).toContain("MY_VAR");
     expect(task.command).toContain("--seed 42");
     expect(task.command).toContain("--verbose");

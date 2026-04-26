@@ -20,7 +20,7 @@ import {
 import { triggerSchedule, maybeDispatch } from "../scheduler";
 import { notifySubmitted } from "../discord";
 import { initiateKillChain } from "../socket/stub";
-import { killTask, killGlobalTask, pauseTask, resumeTask } from "../task-actions";
+import { killTask, killGlobalTask, pauseTask, resumeTask, createRetryTask } from "../task-actions";
 import { reliableEmitToStub } from "../reliable";
 import { logger } from "../log";
 
@@ -249,7 +249,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           if (!TERMINAL_STATUSES.includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot retry in status '${task.status}'` }); break;
           }
-          const retryTask = _createRetryTask(task);
+          const retryTask = createRetryTask(task);
           store.addToGlobalQueue(retryTask);
           webNs.emit("task.update", retryTask);
           triggerSchedule();
@@ -477,7 +477,13 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       res.status(400).json({ error: `Cannot retry in status '${task.status}'` }); return;
     }
 
-    const retryTask = _createRetryTask(task);
+    let retryTask: Task;
+    try {
+      retryTask = createRetryTask(task);
+    } catch (e: any) {
+      logger.error("retry.create_failed", { error: e.message, stack: e.stack });
+      res.status(500).json({ error: e.message }); return;
+    }
     store.addToGlobalQueue(retryTask);
     webNs.emit("task.update", retryTask);
     triggerSchedule();
@@ -487,24 +493,3 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
   return router;
 }
 
-function _createRetryTask(task: Task): Task {
-  const seq = store.nextSeq();
-  return {
-    ...task,
-    id: uuidv4(),
-    seq,
-    status: "pending",
-    stub_id: undefined,
-    retry_count: task.retry_count + 1,
-    retry_of: task.retry_of || task.id,
-    created_at: new Date().toISOString(),
-    started_at: undefined,
-    finished_at: undefined,
-    exit_code: undefined,
-    pid: undefined,
-    log_buffer: [],
-    progress: undefined,
-    should_stop: false,
-    should_checkpoint: false,
-  };
-}

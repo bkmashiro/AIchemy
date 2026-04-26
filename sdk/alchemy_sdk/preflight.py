@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,11 +12,16 @@ if TYPE_CHECKING:
     from .context import TrainingContext
 
 
-def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
+def run_preflight(
+    ctx: "TrainingContext",
+    reads: list[str],
+    writes: list[str] | None = None,
+) -> None:
     """
     Perform pre-training sanity checks:
 
     1. Verify every path in `reads` exists and is readable. → raise on fail.
+    1b. Verify every path in `writes` has a writable parent. → raise on fail.
     2. Ensure run_dir parent is writable (ALCHEMY_RUN_DIR writable). → raise on fail.
     3. Auto-create run_dir + checkpoint_dir with umask 002.
     4. Disk space warning if < 1 GiB free.
@@ -34,6 +40,30 @@ def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
             raise PermissionError(
                 f"Preflight: reads path is not readable: {rpath}"
             )
+
+    # 1b. Write paths check — verify parent dir exists and is writable
+    for wpath in (writes or []):
+        p = Path(wpath)
+        # If target exists, check it's writable directly
+        if p.exists():
+            if not os.access(wpath, os.W_OK):
+                raise PermissionError(
+                    f"Preflight: writes path exists but is not writable: {wpath}"
+                )
+        else:
+            # Target doesn't exist — check parent is writable (so we can create it)
+            parent = p.parent
+            if parent.exists():
+                if not os.access(parent, os.W_OK):
+                    raise PermissionError(
+                        f"Preflight: writes path parent is not writable: {parent} "
+                        f"(needed for {wpath})"
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"Preflight: writes path parent does not exist: {parent} "
+                    f"(needed for {wpath})"
+                )
 
     # 2. run_dir writable — check parent directory
     run_dir_parent = ctx.run_dir.parent
@@ -89,10 +119,14 @@ def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
 # Helper
 # ---------------------------------------------------------------------------
 
+_umask_lock = threading.Lock()
+
+
 def _makedirs_002(path: Path) -> None:
-    """Create directories with umask 002 (group-writable)."""
-    old_umask = os.umask(0o002)
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    finally:
-        os.umask(old_umask)
+    """Create directories with umask 002 (group-writable). Thread-safe."""
+    with _umask_lock:
+        old_umask = os.umask(0o002)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        finally:
+            os.umask(old_umask)

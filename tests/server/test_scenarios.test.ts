@@ -863,7 +863,7 @@ describe("Command assembly", () => {
     const cmd = task.command;
 
     expect(cmd).toContain("source activate myenv");
-    expect(cmd).toContain("cd /tmp/workdir");
+    expect(cmd).toContain("cd '/tmp/workdir'");
     expect(cmd).toContain(`python train_${ts}.py`);
     expect(cmd).toContain("--lr 0.001");
     expect(cmd).toContain("--seed 42");

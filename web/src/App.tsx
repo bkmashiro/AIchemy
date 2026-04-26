@@ -9,6 +9,7 @@ import GridsPage from "./pages/GridsPage";
 import TasksPage from "./pages/TasksPage";
 import TaskDetailPage from "./pages/TaskDetailPage";
 import StubDetailPage from "./pages/StubDetail";
+import ExperimentsPage from "./pages/ExperimentsPage";
 import LoginPage from "./pages/LoginPage";
 
 function NavItem({ to, label, badge, end }: { to: string; label: string; badge?: number; end?: boolean }) {
@@ -59,6 +60,7 @@ function AppInner(_props: { onLogout: () => void }) {
           <NavItem to="/" label="Dashboard" end />
           <NavItem to="/tasks" label="Tasks" />
           <NavItem to="/grids" label="Grids" />
+          <NavItem to="/experiments" label="Experiments" />
           <NavItem to="/resources" label="Resources" />
         </nav>
 
@@ -109,6 +111,8 @@ function AppInner(_props: { onLogout: () => void }) {
             <Route path="/stubs/:id" element={<StubDetailPage />} />
             <Route path="/grids" element={<GridsPage />} />
             <Route path="/grids/:id" element={<GridView />} />
+            <Route path="/experiments" element={<ExperimentsPage />} />
+            <Route path="/experiments/:id" element={<ExperimentsPage />} />
             <Route
               path="/resources"
               element={

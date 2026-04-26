@@ -19,13 +19,25 @@ const RETRY_DELAY_MS = 3_000;
 // ─── Per-stub socket registry ────────────────────────────────────────────────
 
 const stubSockets: Map<string, Socket> = new Map();
+// Generation counter per stub — incremented on each new socket registration.
+// Reliable emit aborts retries when the generation changes (reconnect happened).
+const stubGeneration: Map<string, number> = new Map();
 
 export function registerStubSocket(stubId: string, socket: Socket): void {
   stubSockets.set(stubId, socket);
+  stubGeneration.set(stubId, (stubGeneration.get(stubId) ?? 0) + 1);
 }
 
-export function unregisterStubSocket(stubId: string): void {
-  stubSockets.delete(stubId);
+export function unregisterStubSocket(stubId: string, socketId?: string): void {
+  if (socketId) {
+    // Only delete if the current entry matches — prevents delayed disconnect from killing new socket
+    const current = stubSockets.get(stubId);
+    if (current && current.id === socketId) {
+      stubSockets.delete(stubId);
+    }
+  } else {
+    stubSockets.delete(stubId);
+  }
 }
 
 export function getStubSocket(stubId: string): Socket | undefined {
@@ -58,20 +70,37 @@ export async function reliableEmitToStub(stubId: string, event: string, payload:
     return;
   }
 
+  // Bug 2 fix: Capture the generation at send time. If the stub reconnects
+  // (generation increments), abort retries — the reconnected stub will
+  // re-report its state, so replaying stale messages would cause a storm.
+  const startGen = stubGeneration.get(stubId) ?? 0;
+
+  let currentSocket = socket;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await emitWithAck(socket, event, payload);
+      await emitWithAck(currentSocket, event, payload);
       return; // ack received
     } catch (err) {
+      // Abort if stub reconnected since we started
+      if ((stubGeneration.get(stubId) ?? 0) !== startGen) {
+        logger.info("reliable.abort_stale", { stubId, event, attempt, reason: "stub_reconnected" });
+        return;
+      }
       if (attempt < MAX_RETRIES) {
         logger.info("reliable.retry", { stubId, event, attempt: attempt + 1 });
         await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-        // Re-check socket is still valid
-        const current = stubSockets.get(stubId);
-        if (!current || !current.connected) {
+        // Re-fetch socket — stub may have reconnected with a new socket
+        const freshSocket = stubSockets.get(stubId);
+        if (!freshSocket || !freshSocket.connected) {
           logger.warn("reliable.socket_gone", { stubId, event, attempt: attempt + 1 });
           return;
         }
+        // Check generation again after delay
+        if ((stubGeneration.get(stubId) ?? 0) !== startGen) {
+          logger.info("reliable.abort_stale", { stubId, event, attempt: attempt + 1, reason: "stub_reconnected" });
+          return;
+        }
+        currentSocket = freshSocket;
       } else {
         logger.error("reliable.gave_up", { stubId, event, attempts: MAX_RETRIES });
       }

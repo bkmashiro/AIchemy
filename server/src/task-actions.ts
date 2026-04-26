@@ -9,6 +9,7 @@
  * handled by store.updateTask() internally.
  */
 
+import { v4 as uuidv4 } from "uuid";
 import { store } from "./store";
 import { Task, TaskStatus } from "./types";
 import { logger } from "./log";
@@ -118,6 +119,43 @@ export function resumeTask(stubId: string, taskId: string): Task | undefined {
   return store.updateTask(stubId, taskId, {
     status: "running" as TaskStatus,
   });
+}
+
+// ─── Retry task creation ───────────────────────────────────────────────────
+
+export interface RetryTaskOpts {
+  /** Override requirements (e.g., bumped gpu_mem_mb for OOM retries) */
+  requirements?: Task["requirements"];
+  /** Clear run_dir so scheduler assigns a fresh path (default: true) */
+  clearRunDir?: boolean;
+}
+
+/**
+ * Create a retry copy of a terminal task.
+ * Unified helper — used by auto-retry (lost), OOM retry, and manual retry.
+ */
+export function createRetryTask(task: Task, opts?: RetryTaskOpts): Task {
+  const clearRunDir = opts?.clearRunDir ?? true;
+  return {
+    ...task,
+    id: uuidv4(),
+    seq: store.nextSeq(),
+    status: "pending" as TaskStatus,
+    stub_id: undefined,
+    run_dir: clearRunDir ? undefined : task.run_dir,
+    retry_count: task.retry_count + 1,
+    retry_of: task.retry_of || task.id,
+    created_at: now(),
+    started_at: undefined,
+    finished_at: undefined,
+    exit_code: undefined,
+    pid: undefined,
+    log_buffer: [],
+    progress: undefined,
+    should_stop: false,
+    should_checkpoint: false,
+    requirements: opts?.requirements ?? task.requirements,
+  };
 }
 
 // ─── Global queue actions ───────────────────────────────────────────────────
