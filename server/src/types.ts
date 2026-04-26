@@ -56,6 +56,7 @@ export interface Task {
   cwd?: string;
   env_setup?: string;
   env?: Record<string, string>;
+  env_overrides?: Record<string, string>;  // Per-task env overrides, merged by stub after default_env
   python_env?: string;           // e.g. "jema", "base", "~/venv" — resolved to activate command
 
   // === Assembled (read-only, server builds) ===
@@ -90,8 +91,17 @@ export interface Task {
   log_buffer: string[];
   config_snapshot?: Record<string, any>;
 
+  // === Eval Metrics ===
+  eval_metrics?: Record<string, number>;
+
   // === Metrics buffer (ephemeral, not persisted) ===
   metrics_buffer?: Record<string, Array<{ step: number; value: number; ts: string }>>;
+
+  // === Submission ===
+  submitted_by?: string;
+
+  // === Error ===
+  error_message?: string;
 
   // === Resume & Retry ===
   run_dir?: string;
@@ -124,9 +134,12 @@ export interface Stub {
   idle_timeout_s?: number;
   tags?: string[];                 // Stub tags for task routing
   available_envs?: Array<{ name: string; type: string; path: string; activate?: string }>;  // Python envs on this stub
+  user?: string;                    // OS user ($USER) reported by stub
   auto_renew?: boolean;            // SLURM: auto-submit new sbatch when walltime < 15min
   deploy_config?: DeployConfig;    // Persisted deploy config for auto-renew
   default_output_dir?: string;     // Base dir for server-computed run_dir
+  first_seen?: string;              // ISO timestamp: first time this stub connected
+  last_seen?: string;               // ISO timestamp: last known activity
   // Internal — not serialized to API
   socket_id?: string;
 }
@@ -163,6 +176,31 @@ export interface Grid {
   target_tags?: string[];          // Propagated to all tasks in this grid
 }
 
+// ─── Experiment ─────────────────────────────────────────────────────────────
+
+export interface CriterionResult {
+  value: number;
+  threshold: string;    // e.g. "> 0.3"
+  ok: boolean;
+}
+
+export interface TaskValidation {
+  passed: boolean;
+  checked_at: string;
+  details: Record<string, CriterionResult>;
+}
+
+export interface Experiment {
+  id: string;
+  name: string;
+  description?: string;
+  criteria: Record<string, string>;    // "metric_name": "op value"
+  grid_id: string;
+  status: "running" | "passed" | "partial" | "failed";
+  results: Record<string, TaskValidation>;  // taskId → validation
+  created_at: string;
+}
+
 export interface Token {
   token: string;
   name: string;                  // Semantic name (required)
@@ -173,6 +211,7 @@ export interface ServerState {
   stubs: Stub[];
   tokens: Token[];
   grids: Grid[];
+  experiments: Experiment[];
   seq_counter: number;
   archive?: Task[];
 }
@@ -189,6 +228,7 @@ export interface ReliableMessage {
 // ─── Socket Payloads ─────────────────────────────────────────────────────────
 
 export interface ResumePayload {
+  stub_id?: string;  // Client-computed stub ID (aligned with server formula). If provided, server validates and uses it.
   hostname: string;
   gpu: GpuInfo;
   slurm_job_id?: string;
@@ -197,6 +237,7 @@ export interface ResumePayload {
   env_setup?: string;
   default_cwd?: string;
   tags?: string[];
+  user?: string;
   running_tasks: Array<{ task_id: string; pid: number; step?: number; status: string }>;
   local_queue: string[];
   dead_tasks?: Array<{ task_id: string; exit_code: number }>;

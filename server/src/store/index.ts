@@ -9,7 +9,7 @@
 import fs from "fs";
 import fsp from "fs/promises";
 import path from "path";
-import { Stub, Task, Grid, Token, ServerState, TaskStatus } from "../types";
+import { Stub, Task, Grid, Token, Experiment, ServerState, TaskStatus } from "../types";
 import { writeLockTable } from "../dedup";
 import { backupState, pruneBackups } from "./backup";
 import { logger } from "../log";
@@ -30,6 +30,7 @@ class Store {
   // Global queue: tasks with no stub assigned (status="pending")
   private globalQueue: Task[] = [];
   private grids: Map<string, Grid> = new Map();
+  private experiments: Map<string, Experiment> = new Map();
   private seqCounter: number = 0;
   // Fingerprint index: fingerprint → task_id for active tasks
   private fingerprintIndex: FingerprintIndex = new Map();
@@ -360,7 +361,13 @@ class Store {
   }
 
   getGridTasks(gridId: string): Task[] {
-    return this.getAllTasks().filter((t) => t.grid_id === gridId);
+    // M6: Use getActiveTasks to exclude archive — grid status should reflect live tasks only
+    // Include archive terminal tasks for grid completion detection
+    const active = this.getActiveTasks().filter((t) => t.grid_id === gridId);
+    const archived = this.archive.filter((t) => t.grid_id === gridId);
+    // Deduplicate by id (a task might appear in both during transition)
+    const seen = new Set(active.map((t) => t.id));
+    return [...active, ...archived.filter((t) => !seen.has(t.id))];
   }
 
   updateGridStatus(gridId: string): void {
@@ -390,12 +397,37 @@ class Store {
     this.grids.set(gridId, grid);
   }
 
+  // ─── Experiments ────────────────────────────────────────────────────────────
+
+  getExperiment(id: string): Experiment | undefined {
+    return this.experiments.get(id);
+  }
+
+  getAllExperiments(): Experiment[] {
+    return Array.from(this.experiments.values());
+  }
+
+  setExperiment(exp: Experiment): void {
+    this.experiments.set(exp.id, exp);
+  }
+
+  deleteExperiment(id: string): void {
+    this.experiments.delete(id);
+  }
+
+  getExperimentByGridId(gridId: string): Experiment | undefined {
+    for (const exp of this.experiments.values()) {
+      if (exp.grid_id === gridId) return exp;
+    }
+    return undefined;
+  }
+
   // ─── Persistence ───────────────────────────────────────────────────────────
 
   startPersistence(): void {
     setInterval(() => this.saveAsync(), SNAPSHOT_INTERVAL);
     setInterval(() => this._autoBackup(), BACKUP_INTERVAL);
-    setInterval(() => this.pruneStaleStubs(), 3600_000);  // hourly
+    // Note: pruneStaleStubs is called from scheduler.ts on its own interval — don't duplicate here
   }
 
   private async _autoBackup(): Promise<void> {
@@ -418,6 +450,7 @@ class Store {
       })),
       tokens: Array.from(this.tokens.values()),
       grids: Array.from(this.grids.values()),
+      experiments: Array.from(this.experiments.values()),
       seq_counter: this.seqCounter,
       archive: this.archive,
     };
@@ -454,7 +487,7 @@ class Store {
       const raw = fs.readFileSync(STATE_FILE, "utf-8");
       const state: ServerState = JSON.parse(raw);
       this._applyState(state);
-      logger.info("state.load", { stubs: this.stubs.size, tokens: this.tokens.size, grids: this.grids.size, seq: this.seqCounter });
+      logger.info("state.load", { stubs: this.stubs.size, tokens: this.tokens.size, grids: this.grids.size, experiments: this.experiments.size, seq: this.seqCounter });
     } catch (err) {
       logger.error("state.load_failed", { error: String(err) });
     }
@@ -474,6 +507,10 @@ class Store {
 
     for (const grid of state.grids || []) {
       this.grids.set(grid.id, grid);
+    }
+
+    for (const exp of state.experiments || []) {
+      this.experiments.set(exp.id, exp);
     }
 
     if (state.archive) {
@@ -502,6 +539,7 @@ class Store {
     this.tokens.clear();
     this.globalQueue = [];
     this.grids.clear();
+    this.experiments.clear();
     this.fingerprintIndex.clear();
     this.archive = [];
     this.seqCounter = 0;
@@ -523,6 +561,7 @@ class Store {
     this.tokens.clear();
     this.globalQueue = [];
     this.grids.clear();
+    this.experiments.clear();
     this.fingerprintIndex.clear();
     this.archive = [];
     this.seqCounter = 0;

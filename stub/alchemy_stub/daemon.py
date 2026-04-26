@@ -86,6 +86,7 @@ class StubDaemon:
             max_concurrent=config.max_concurrent,
             env_setup=config.env_setup,
             default_cwd=config.default_cwd,
+            default_env=config.default_env,
             pid_file=f"/tmp/alchemy_stub_{identity}_tasks.json",
             on_started=self._on_task_started,
             on_log=self._on_task_log,
@@ -229,6 +230,12 @@ class StubDaemon:
         """Send unified resume event (spec §4)."""
         gpu_info = self.gpu_monitor.get_gpu_info()
 
+        # Compute server-compatible stub_id using actual GPU info
+        computed_stub_id = self.config.compute_stub_id(
+            gpu_name=gpu_info.get("name", "CPU-only"),
+            gpu_count=gpu_info.get("count", 0),
+        )
+
         running_tasks = []
         for task_id, pid in self.process_mgr.get_task_pids().items():
             running_tasks.append({"task_id": task_id, "pid": pid, "status": "running"})
@@ -240,6 +247,7 @@ class StubDaemon:
         ]
 
         payload: dict[str, Any] = {
+            "stub_id": computed_stub_id,
             "hostname": self.config.hostname,
             "gpu": gpu_info,
             "max_concurrent": self.config.max_concurrent,
@@ -426,6 +434,7 @@ class StubDaemon:
         task_env_setup: str = data.get("env_setup") or ""
         params: dict[str, Any] | None = data.get("params")
         run_dir: str | None = data.get("run_dir")
+        env_overrides: dict[str, str] | None = data.get("env_overrides")
 
         # Resolve relative paths in command using cwd
         if cwd:
@@ -443,6 +452,7 @@ class StubDaemon:
                 task_env_setup=task_env_setup,
                 params=params,
                 run_dir=run_dir,
+                env_overrides=env_overrides,
             )
         except Exception as e:
             error_msg = f"Failed to start process: {e}"
