@@ -39,8 +39,8 @@ export default function LogViewer({ taskId, initialLines = [], liveLines = [], m
   const allLines = liveLines.length > fetchedLines.length ? liveLines : fetchedLines;
 
   useEffect(() => {
-    if (autoScroll) {
-      endRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (autoScroll && containerRef.current) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
   }, [allLines, autoScroll]);
 

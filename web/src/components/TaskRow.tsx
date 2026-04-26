@@ -85,6 +85,7 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   };
 
   const handlePause = (e: React.MouseEvent) => {
+    if (!confirm(`Pause task #${task.seq} ${displayName}?`)) return;
     doAction(() => tasksApi.patch(task.id, { status: "paused" }), e);
   };
 
@@ -108,12 +109,50 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
           </span>
 
           <div className="flex-1 min-w-0">
-            {/* Main line: #seq display_name */}
+            {/* Main line: #seq display_name + action buttons */}
             <div className="flex items-baseline gap-1.5 flex-wrap">
               <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq}</span>
-              <span className="text-sm text-white font-medium truncate" title={displayName}>
+              <span className="text-sm text-white font-medium break-words" title={displayName}>
                 {displayName}
               </span>
+              <div className="flex items-center gap-2 ml-auto shrink-0" onClick={(e) => e.stopPropagation()}>
+                {task.status === "running" && (
+                  <button
+                    onClick={handlePause}
+                    disabled={acting}
+                    className="px-2 py-1 text-xs bg-orange-900/50 hover:bg-orange-800 border border-orange-800/50 rounded text-orange-300 disabled:opacity-50 transition-colors"
+                  >
+                    Pause
+                  </button>
+                )}
+                {task.status === "paused" && (
+                  <button
+                    onClick={handleResume}
+                    disabled={acting}
+                    className="px-2 py-1 text-xs bg-green-900/50 hover:bg-green-800 border border-green-800/50 rounded text-green-300 disabled:opacity-50 transition-colors"
+                  >
+                    Resume
+                  </button>
+                )}
+                {isActive && (
+                  <button
+                    onClick={handleKill}
+                    disabled={acting}
+                    className="px-2 py-1 text-xs bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-50 transition-colors"
+                  >
+                    Kill
+                  </button>
+                )}
+                {canRetry && (
+                  <button
+                    onClick={handleRetry}
+                    disabled={acting}
+                    className="px-2 py-1 text-xs bg-blue-900/50 hover:bg-blue-800 border border-blue-800/50 rounded text-blue-300 disabled:opacity-50 transition-colors"
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
             </div>
 
             {/* Sub line: status, duration, progress, loss, ETA */}
@@ -162,48 +201,6 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
             )}
           </div>
 
-          {/* Right side: stub name + action buttons */}
-          <div className="flex items-center gap-2 shrink-0" onClick={(e) => e.stopPropagation()}>
-            {stubName && (
-              <span className="text-xs text-gray-600 hidden sm:block">{stubName}</span>
-            )}
-            {task.status === "running" && (
-              <button
-                onClick={handlePause}
-                disabled={acting}
-                className="px-2 py-1 text-xs bg-orange-900/50 hover:bg-orange-800 border border-orange-800/50 rounded text-orange-300 disabled:opacity-50 transition-colors"
-              >
-                Pause
-              </button>
-            )}
-            {task.status === "paused" && (
-              <button
-                onClick={handleResume}
-                disabled={acting}
-                className="px-2 py-1 text-xs bg-green-900/50 hover:bg-green-800 border border-green-800/50 rounded text-green-300 disabled:opacity-50 transition-colors"
-              >
-                Resume
-              </button>
-            )}
-            {isActive && (
-              <button
-                onClick={handleKill}
-                disabled={acting}
-                className="px-2 py-1 text-xs bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-50 transition-colors"
-              >
-                Kill
-              </button>
-            )}
-            {canRetry && (
-              <button
-                onClick={handleRetry}
-                disabled={acting}
-                className="px-2 py-1 text-xs bg-blue-900/50 hover:bg-blue-800 border border-blue-800/50 rounded text-blue-300 disabled:opacity-50 transition-colors"
-              >
-                Retry
-              </button>
-            )}
-          </div>
         </div>
       </div>
 
