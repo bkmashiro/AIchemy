@@ -96,6 +96,30 @@ class Alchemy:
             pass
 
     # ------------------------------------------------------------------
+    # Config (injected by stub via ALCHEMY_CONFIG env var)
+    # ------------------------------------------------------------------
+
+    @property
+    def config(self) -> dict[str, Any]:
+        """
+        Read experiment config injected by the stub.
+
+        The stub writes the resolved config (experiment config + task overrides)
+        to a temp JSON file and sets ALCHEMY_CONFIG to its path.
+        Returns empty dict if no config is available.
+        """
+        config_path = os.environ.get("ALCHEMY_CONFIG")
+        if not config_path:
+            return {}
+        try:
+            with open(config_path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            if self._managed:
+                raise RuntimeError(f"Failed to read ALCHEMY_CONFIG from {config_path}: {e}") from e
+            return {}
+
+    # ------------------------------------------------------------------
     # Pure reads (no IO)
     # ------------------------------------------------------------------
 

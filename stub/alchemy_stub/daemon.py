@@ -24,6 +24,7 @@ import socketio
 
 from .config import Config
 from .env_discover import discover_python_envs
+from .exec import handle_exec_request
 from .gpu_monitor import GpuMonitor
 from .log_setup import jlog
 from .preflight import run_preflight
@@ -87,6 +88,7 @@ class StubDaemon:
             env_setup=config.env_setup,
             default_cwd=config.default_cwd,
             default_env=config.default_env,
+            umask=config.umask,
             pid_file=f"/tmp/alchemy_stub_{identity}_tasks.json",
             on_started=self._on_task_started,
             on_log=self._on_task_log,
@@ -194,6 +196,30 @@ class StubDaemon:
             if data:
                 if ack: ack({"ok": True})
                 await self._handle_shell_exec(data)
+
+        # ── Spec 3: synchronous exec.request ──────────────────────────────
+        @sio.on("exec.request", namespace="/stubs")
+        async def on_exec_request(*args):
+            data = _extract_dict(args)
+            ack = _find_ack(args)
+            if not data:
+                if ack:
+                    ack({"request_id": "", "stdout": "", "stderr": "Bad payload\n",
+                         "exit_code": -1, "truncated": False})
+                return
+            try:
+                result = await handle_exec_request(data, self.config, self._emit)
+            except Exception as e:
+                log.error("exec.request unhandled error: %s", e)
+                result = {
+                    "request_id": data.get("request_id", ""),
+                    "stdout": "",
+                    "stderr": f"Internal stub error: {e}\n",
+                    "exit_code": -1,
+                    "truncated": False,
+                }
+            if ack:
+                ack(result)
 
         @sio.on("request_sync", namespace="/stubs")
         async def on_request_sync(*args):
@@ -490,6 +516,20 @@ class StubDaemon:
         params: dict[str, Any] | None = data.get("params")
         run_dir: str | None = data.get("run_dir")
         env_overrides: dict[str, str] | None = data.get("env_overrides")
+        outputs: list[str] | None = data.get("outputs") or None
+        resolved_config: dict[str, Any] | None = data.get("resolved_config")
+
+        # Write resolved_config to temp file for ALCHEMY_CONFIG injection
+        config_path: str | None = None
+        if resolved_config:
+            config_path = f"/tmp/alchemy_config_{task_id}.json"
+            try:
+                import json as _json
+                with open(config_path, "w") as f:
+                    _json.dump(resolved_config, f)
+            except Exception as e:
+                log.warning("Failed to write config file for task %s: %s", task_id, e)
+                config_path = None
 
         # Resolve relative paths in command using cwd
         if cwd:
@@ -508,6 +548,8 @@ class StubDaemon:
                 params=params,
                 run_dir=run_dir,
                 env_overrides=env_overrides,
+                outputs=outputs,
+                config_path=config_path,
             )
         except Exception as e:
             error_msg = f"Failed to start process: {e}"
@@ -600,6 +642,21 @@ class StubDaemon:
         request_id: str = data.get("request_id", "")
         command: str = data.get("command", "")
         timeout: int = min(int(data.get("timeout", 30)), 120)
+
+        # Security gate: require --allow-exec (same as exec.request path)
+        if not self.config.allow_exec:
+            log.warning("shell.exec rejected: --allow-exec not set, request_id=%s", request_id)
+            await self.sio.emit(
+                "shell.output",
+                {"request_id": request_id, "chunk": "Error: exec disabled (start stub with --allow-exec)\n", "stream": "stdout"},
+                namespace="/stubs",
+            )
+            await self.sio.emit(
+                "shell.done",
+                {"request_id": request_id, "exit_code": 1},
+                namespace="/stubs",
+            )
+            return
 
         if self._is_blocked_command(command):
             log.warning("shell.exec: blocked command request_id=%s", request_id)
@@ -794,7 +851,7 @@ class StubDaemon:
 
     async def _on_sdk_notify(self, task_id: str, message: str, level: str) -> None:
         """Forward SDK notify message to server."""
-        jlog("info", "task.notify", task_id=task_id, level=level, message=message[:200])
+        jlog("info", "task.notify", task_id=task_id, notify_level=level, message=message[:200])
         await self._emit("task.notify", {
             "task_id": task_id,
             "message": message,
@@ -855,21 +912,22 @@ class StubDaemon:
                     except Exception as e:
                         log.warning("system_stats error (skipping round): %s", e)
 
-                    # Per-task resource emit
+                    # Per-task resource emit (no per-pid nvidia-smi; GPU is exclusive via SLURM)
                     try:
-                        for task_id, pid in self.process_mgr.get_task_pids().items():
-                            gpu_mem = self.gpu_monitor.get_gpu_mem_for_pid(pid)
-                            per = self.system_monitor.collect({task_id: pid})
-                            task_per = per.get("per_task", {}).get(task_id, {})
-                            await self._emit(
-                                "task.resource",
-                                {
-                                    "task_id": task_id,
-                                    "gpu_mem_mb": gpu_mem,
-                                    "cpu_mem_mb": task_per.get("mem_mb", 0),
-                                    "gpu_util_pct": 0,
-                                },
-                            )
+                        pids = self.process_mgr.get_task_pids()
+                        if pids:
+                            per = await loop.run_in_executor(None, self.system_monitor.collect, pids)
+                            for task_id in pids:
+                                task_per = per.get("per_task", {}).get(task_id, {})
+                                await self._emit(
+                                    "task.resource",
+                                    {
+                                        "task_id": task_id,
+                                        "gpu_mem_mb": 0,
+                                        "cpu_mem_mb": task_per.get("mem_mb", 0),
+                                        "gpu_util_pct": 0,
+                                    },
+                                )
                     except Exception as e:
                         log.debug("task.resource error: %s", e)
 
@@ -932,6 +990,16 @@ class StubDaemon:
                     if time.monotonic() >= deadline:
                         break
                     await asyncio.sleep(2)
+
+                # Step 5: SIGKILL any tasks still alive after grace period
+                # (zombie tasks may have ignored SIGTERM — escalate to SIGKILL)
+                still_running = list(self.process_mgr.get_task_pids())
+                if still_running:
+                    jlog("warn", "stub.walltime_drain",
+                         detail="sigkill_remaining",
+                         task_ids=still_running)
+                    for task_id in still_running:
+                        self.process_mgr.kill_immediate(task_id)
 
                 # Step 6: notify server
                 jlog("info", "stub.walltime_drain",

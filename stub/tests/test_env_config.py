@@ -5,8 +5,8 @@ Tests merge_env(), _parse_env_value(), and CLI config loading.
 import os
 import pytest
 
-from alchemy_stub.config import _parse_env_value, _parse_key_value, _load_env_file
-from alchemy_stub.process_mgr import merge_env
+from alchemy_stub.config import _parse_env_value, _parse_key_value, _load_env_file, _load_env_file_full
+from alchemy_stub.process_mgr import merge_env, ProcessManager
 
 try:
     import yaml  # noqa: F401
@@ -209,3 +209,132 @@ class TestMergeEnv:
             alchemy_vars={},
         )
         assert result["X"] == "/home/u/x"
+
+
+# ─── _load_env_file_full ─────────────────────────────────────────────────────
+
+
+@pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
+class TestLoadEnvFileFull:
+    def test_full_config_yaml(self, tmp_path):
+        f = tmp_path / "env.yaml"
+        f.write_text(
+            "default_cwd: /vol/bitbucket/ys25/jema\n"
+            "default_env:\n"
+            "  NUMBA_CACHE_DIR: /tmp/numba_cache\n"
+            "  FOO: bar\n"
+            "umask: '022'\n"
+        )
+        cfg = _load_env_file_full(str(f))
+        assert cfg.default_env == {"NUMBA_CACHE_DIR": "/tmp/numba_cache", "FOO": "bar"}
+        assert cfg.default_cwd == "/vol/bitbucket/ys25/jema"
+        assert cfg.umask == 0o022
+
+    def test_umask_string_formats(self, tmp_path):
+        """Accept '022', '0022', '0o022' as octal strings."""
+        for raw in ("022", "0022", "0o022"):
+            f = tmp_path / f"env_{raw}.yaml"
+            f.write_text(f"default_env: {{}}\numask: '{raw}'\n")
+            cfg = _load_env_file_full(str(f))
+            assert cfg.umask == 0o022, f"failed for raw={raw!r}"
+
+    def test_umask_integer(self, tmp_path):
+        """Bare integer in YAML (e.g. umask: 18 → octal 022)."""
+        f = tmp_path / "env.yaml"
+        # 18 decimal == 0o022 octal
+        f.write_text("default_env: {}\numask: 18\n")
+        cfg = _load_env_file_full(str(f))
+        assert cfg.umask == 18  # stored as-is when already int
+
+    def test_no_umask_returns_none(self, tmp_path):
+        f = tmp_path / "env.yaml"
+        f.write_text("default_env:\n  X: y\n")
+        cfg = _load_env_file_full(str(f))
+        assert cfg.umask is None
+
+    def test_no_default_cwd_returns_none(self, tmp_path):
+        f = tmp_path / "env.yaml"
+        f.write_text("default_env:\n  X: y\n")
+        cfg = _load_env_file_full(str(f))
+        assert cfg.default_cwd is None
+
+    def test_invalid_umask_raises(self, tmp_path):
+        f = tmp_path / "env.yaml"
+        f.write_text("default_env: {}\numask: 'not-a-number'\n")
+        with pytest.raises(ValueError, match="Invalid umask"):
+            _load_env_file_full(str(f))
+
+    def test_backward_compat_load_env_file(self, tmp_path):
+        """_load_env_file() still works as flat-dict extractor."""
+        f = tmp_path / "env.yaml"
+        f.write_text(
+            "default_cwd: /some/dir\n"
+            "default_env:\n"
+            "  KEY: val\n"
+            "umask: '027'\n"
+        )
+        result = _load_env_file(str(f))
+        assert result == {"KEY": "val"}
+
+
+# ─── umask applied in subprocess ─────────────────────────────────────────────
+
+
+class TestUmaskSubprocess:
+    """Verify ProcessManager passes umask to child processes via preexec_fn."""
+
+    def test_default_umask_022(self, tmp_path):
+        """With umask=0o022, files created by subprocess should be 0o644."""
+        mgr = ProcessManager(umask=0o022, pid_file=str(tmp_path / "pids.json"))
+        out_file = tmp_path / "output.txt"
+
+        import subprocess as _sp
+
+        script = f"touch {out_file}"
+
+        _task_umask = mgr.umask
+
+        def preexec():
+            import os as _os
+            _os.umask(_task_umask)
+
+        proc = _sp.Popen(
+            ["bash", "-c", script],
+            preexec_fn=preexec,
+        )
+        proc.wait(timeout=5)
+        mode = oct(out_file.stat().st_mode & 0o777)
+        assert mode == oct(0o644), f"expected 0o644, got {mode}"
+
+    def test_umask_027_restricts_other(self, tmp_path):
+        """With umask=0o027, 'other' bits should be cleared (rw-r-----,  0o640)."""
+        mgr = ProcessManager(umask=0o027, pid_file=str(tmp_path / "pids.json"))
+        out_file = tmp_path / "output.txt"
+
+        import subprocess as _sp
+
+        script = f"touch {out_file}"
+
+        _task_umask = mgr.umask
+
+        def preexec():
+            import os as _os
+            _os.umask(_task_umask)
+
+        proc = _sp.Popen(
+            ["bash", "-c", script],
+            preexec_fn=preexec,
+        )
+        proc.wait(timeout=5)
+        mode = oct(out_file.stat().st_mode & 0o777)
+        assert mode == oct(0o640), f"expected 0o640, got {mode}"
+
+    def test_umask_stored_on_manager(self):
+        """ProcessManager stores the configured umask."""
+        mgr = ProcessManager(umask=0o027)
+        assert mgr.umask == 0o027
+
+    def test_default_umask_value(self):
+        """Default umask is 0o022."""
+        mgr = ProcessManager()
+        assert mgr.umask == 0o022

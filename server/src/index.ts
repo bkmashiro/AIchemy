@@ -161,6 +161,19 @@ api.post("/cleanup", (req, res) => {
   res.json({ ok: true, purged, older_than_hours });
 });
 
+// GET /stats — task counts by status + stub online/offline counts
+api.get("/stats", (_req, res) => {
+  const allTasks = store.getAllTasks();
+  const taskCounts: Record<string, number> = {};
+  for (const t of allTasks) {
+    taskCounts[t.status] = (taskCounts[t.status] ?? 0) + 1;
+  }
+  const allStubs = store.getAllStubs();
+  const online = allStubs.filter((s) => s.status === "online").length;
+  const offline = allStubs.length - online;
+  res.json({ tasks: taskCounts, stubs: { online, offline } });
+});
+
 // Mount routers
 api.use("/tasks", createGlobalTasksRouter(stubNs, webNs));
 api.use("/stubs", createStubsRouter(stubNs, webNs));

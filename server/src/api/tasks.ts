@@ -114,6 +114,9 @@ export interface TaskInput {
   ref?: string;
   args_template?: Record<string, string>;
   experiment_id?: string;
+  outputs?: string[];
+  resolved_config?: Record<string, any>;
+  auto_retry_on?: number[];
 }
 
 export function createTask(input: TaskInput): Task {
@@ -165,6 +168,7 @@ export function createTask(input: TaskInput): Task {
     log_buffer: [],
     retry_count: 0,
     max_retries: input.max_retries ?? 0,
+    auto_retry_on: input.auto_retry_on,
     should_stop: false,
     should_checkpoint: false,
     run_dir: input.run_dir,
@@ -174,6 +178,8 @@ export function createTask(input: TaskInput): Task {
     ref: input.ref,
     args_template: input.args_template,
     experiment_id: input.experiment_id,
+    outputs: input.outputs,
+    resolved_config: input.resolved_config,
   };
 
   return task;
@@ -181,7 +187,7 @@ export function createTask(input: TaskInput): Task {
 
 // ─── Terminal statuses ────────────────────────────────────────────────────────
 
-const TERMINAL_STATUSES = ["completed", "failed", "killed", "lost"];
+const TERMINAL_STATUSES = ["completed", "failed", "killed", "lost", "cancelled"];
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
@@ -293,6 +299,20 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           triggerSchedule();
           results.push({ id: taskId, ok: true }); break;
         }
+        case "cancel": {
+          if (!["pending", "blocked", "queued"].includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot cancel in status '${task.status}'` }); break;
+          }
+          const now = new Date().toISOString();
+          let cancelled: Task | undefined;
+          if (stubId) {
+            cancelled = store.updateTask(stubId, taskId, { status: "cancelled" as any, finished_at: now });
+          } else {
+            cancelled = store.updateGlobalQueueTask(taskId, { status: "cancelled" as any, finished_at: now });
+          }
+          if (cancelled) webNs.emit("task.update", cancelled);
+          results.push({ id: taskId, ok: true }); break;
+        }
         case "delete": {
           if (!TERMINAL_STATUSES.includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot delete in status '${task.status}'` }); break;
@@ -325,7 +345,8 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, target_tags, python_env,
-      submitted_by, depends_on, ref, args_template, experiment_id,
+      submitted_by, depends_on, ref, args_template, experiment_id, outputs,
+      auto_retry_on,
     } = req.body;
 
     if (!script) {
@@ -380,7 +401,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const task = createTask({
       script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
-      submitted_by, depends_on, ref, args_template, experiment_id,
+      submitted_by, depends_on, ref, args_template, experiment_id, outputs, auto_retry_on,
     });
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected
@@ -445,10 +466,24 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
     if (status !== undefined) {
       // Status override — limited transitions
-      if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused", "blocked"].includes(task.status)) {
+      if (status === "cancelled" && ["pending", "blocked", "queued"].includes(task.status)) {
+        // pending/blocked/queued → cancelled (no stub interaction needed)
+        const now = new Date().toISOString();
+        let cancelled: Task | undefined;
+        if (stubId) {
+          cancelled = store.updateTask(stubId, task.id, { status: "cancelled" as any, finished_at: now });
+        } else {
+          cancelled = store.updateGlobalQueueTask(task.id, { status: "cancelled" as any, finished_at: now });
+        }
+        if (cancelled) webNs.emit("task.update", cancelled);
+        res.json(cancelled || task);
+        return;
+      } else if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused", "blocked"].includes(task.status)) {
         if (stubId && (task.status === "running" || task.status === "dispatched")) {
           initiateKillChain(stubId, task.id);
-          return res.json(task);
+          // Return the updated task with should_stop=true (set by initiateKillChain)
+          const updated = store.getTask(stubId, task.id);
+          return res.json(updated || task);
         } else if (stubId) {
           const killed = killTask(stubId, task.id);
           if (killed) webNs.emit("task.update", killed);
@@ -488,6 +523,63 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     res.json(updated || task);
   });
 
+  // POST /tasks/:id/reschedule — kill + requeue with optional new target_tags
+  router.post("/:id/reschedule", (req: Request, res: Response) => {
+    if (!webNs || !stubNs) { res.status(503).json({ error: "Not ready" }); return; }
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const { task, stubId } = found;
+
+    // Only active tasks can be rescheduled
+    if (["completed", "failed", "killed", "lost", "cancelled"].includes(task.status)) {
+      res.status(400).json({ error: `Cannot reschedule in terminal status '${task.status}'` }); return;
+    }
+
+    const { target_tags, priority } = req.body;
+
+    // Kill the current execution if running/dispatched
+    if (stubId && (task.status === "running" || task.status === "dispatched")) {
+      initiateKillChain(stubId, task.id);
+    } else if (stubId) {
+      const killed = killTask(stubId, task.id);
+      if (killed) webNs.emit("task.update", killed);
+    } else {
+      killGlobalTask(task.id);
+      const killed = store.findTask(task.id)?.task;
+      if (killed) webNs.emit("task.update", killed);
+    }
+
+    // Create a new task preserving original config, with optional overrides
+    const newTask = createTask({
+      script: task.script,
+      args: task.args,
+      raw_args: task.raw_args,
+      name: task.name,
+      cwd: task.cwd,
+      env_setup: task.env_setup,
+      env: task.env,
+      env_overrides: task.env_overrides,
+      requirements: task.requirements,
+      priority: priority ?? task.priority,
+      max_retries: task.max_retries,
+      target_tags: target_tags ?? task.target_tags,
+      python_env: task.python_env,
+      submitted_by: task.submitted_by,
+      grid_id: task.grid_id,
+      param_overrides: task.param_overrides,
+      ref: task.ref,
+      args_template: task.args_template,
+      experiment_id: task.experiment_id,
+      outputs: task.outputs,
+    });
+
+    store.addToGlobalQueue(newTask);
+    webNs.emit("task.update", newTask);
+    logger.info("task.reschedule", { old_seq: task.seq, new_seq: newTask.seq, target_tags: newTask.target_tags });
+    triggerSchedule();
+    res.status(201).json(newTask);
+  });
+
   // POST /tasks/:id/retry
   router.post("/:id/retry", (req: Request, res: Response) => {
     if (!webNs) { res.status(503).json({ error: "Not ready" }); return; }
@@ -497,6 +589,26 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     if (!TERMINAL_STATUSES.includes(task.status)) {
       res.status(400).json({ error: `Cannot retry in status '${task.status}'` }); return;
+    }
+
+    const force = req.query.force === "true";
+    if (!force) {
+      // Dedup: reject if a pending/running copy already exists for the same fingerprint root
+      const retryRoot = task.retry_of || task.id;
+      const existingActive = store.getAllTasks().find(
+        (t) =>
+          t.id !== task.id &&
+          (t.retry_of === retryRoot || t.retry_of === task.id || t.id === retryRoot) &&
+          ["pending", "queued", "dispatched", "running"].includes(t.status),
+      );
+      if (existingActive) {
+        res.status(409).json({
+          error: "Active retry already exists for this task",
+          existing_task_id: existingActive.id,
+          task: existingActive,
+        });
+        return;
+      }
     }
 
     let retryTask: Task;

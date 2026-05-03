@@ -3,7 +3,7 @@
 Startup sequence:
   1. Parse args → Config
   2. Setup structured JSON logging to stderr
-  3. os.umask(0o002)
+  3. os.umask(config.umask)  # default 0o022, overridable via --umask or env file
   4. Acquire singleton flock
   5. Self-check (Python version, /tmp writable, GPU access, server reachable)
   6. Run daemon with top-level restart loop
@@ -162,8 +162,8 @@ def main() -> None:
     # Structured JSON logging to stderr
     setup_logging()
 
-    # Group-writable output files
-    os.umask(0o002)
+    # Apply configured umask so stub-created files (log dirs, lock files) match
+    os.umask(config.umask)
 
     # Singleton lock
     _acquire_singleton_lock(config.identity_hash)

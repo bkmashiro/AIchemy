@@ -36,9 +36,13 @@ import { deriveExperimentStatus } from "../api/experiments";
 import { writeLockTable } from "../dedup";
 import { logger } from "../log";
 import { loseTask, startTask, completeTask, failTask, killTask, recoverTask, resolveDeadTask, preflightFail, promoteIfDispatched, createRetryTask } from "../task-actions";
+import { updateExperimentManifest } from "../git-tracking";
 
 const HEARTBEAT_TIMEOUT_MS = 180_000; // 6 missed × 30s — generous for CF tunnel latency
 const REQUEST_SYNC_INTERVAL_MS = 5 * 60_000;
+
+// Module-level stub namespace reference for internal helpers (set in setupStubNamespace)
+let _stubNs: Namespace;
 
 // H3: Track per-stub sync intervals to prevent leak on re-resume
 const stubSyncIntervals: Map<string, ReturnType<typeof setInterval>> = new Map();
@@ -209,6 +213,7 @@ export function cancelKillChain(taskId: string): void {
 // ─── Setup stub namespace ─────────────────────────────────────────────────────
 
 export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
+  _stubNs = ns;
   // Heartbeat timeout checker
   setInterval(() => {
     const now = Date.now();
@@ -448,6 +453,12 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       webNs.emit("shell.done", data);
     });
 
+    // ─── Exec (Spec 3) ──────────────────────────────────────────────────────
+    // exec.request is emitted directly to the stub socket with a native ack
+    // callback from api/exec.ts. The stub's ack carries the exec.response payload
+    // back to the waiting HTTP handler. No relay needed on the server side —
+    // the socket.emit(..., callback) in exec.ts handles the full round-trip.
+
     socket.on("disconnect", () => {
       const stubId = socketToStub.get(socket.id);
       socketToStub.delete(socket.id);
@@ -577,8 +588,8 @@ function handleResume(
       default_cwd: default_cwd ?? existingStub.default_cwd,
       // Server is authoritative: preserve stored max_concurrent; only fall back to stub's value if none is stored
       max_concurrent: existingStub.max_concurrent ?? max_concurrent,
-      // Update tags from stub if provided, otherwise keep existing
-      tags: tags ?? existingStub.tags,
+      // Update tags from stub only if non-empty; empty array would overwrite API-set tags
+      tags: (tags && tags.length > 0) ? tags : existingStub.tags,
       available_envs: available_envs ?? existingStub.available_envs,
       user: user ?? existingStub.user,
       slurm_constraints: slurm_constraints ?? existingStub.slurm_constraints,
@@ -829,6 +840,14 @@ function handleTaskCompleted(stubId: string, payload: TaskCompletedPayload, webN
 
   // DAG: promote downstream blocked tasks
   promoteBlockedTasks(payload.task_id, webNs);
+
+  // Git tracking: update manifest fire-and-forget
+  if (updated.experiment_id) {
+    const exp = store.getExperiment(updated.experiment_id);
+    if (exp?.git_tracking) {
+      updateExperimentManifest(exp, updated, stubId, _stubNs).catch(() => {});
+    }
+  }
 }
 
 function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Namespace): void {
@@ -840,6 +859,46 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
   const deathCause = payload.death_cause || (payload.exit_code === 137 ? "oom" : undefined);
   const hasCheckpoint = payload.has_checkpoint ?? false;
   const isKilled = task.should_stop && payload.exit_code !== 0;
+
+  // auto_retry_on: exit code based retry (user-configured, no checkpoint required)
+  if (
+    !isKilled &&
+    task.auto_retry_on &&
+    task.auto_retry_on.length > 0 &&
+    payload.exit_code !== undefined &&
+    task.auto_retry_on.includes(payload.exit_code) &&
+    task.max_retries > 0 &&
+    task.retry_count < task.max_retries
+  ) {
+    const retryRoot = task.retry_of || task.id;
+    const allTasks = store.getAllTasks();
+    const existingRetry = allTasks.find(
+      (t) =>
+        (t.retry_of === retryRoot || t.retry_of === task.id) &&
+        t.id !== task.id &&
+        ["pending", "queued", "dispatched", "running", "lost"].includes(t.status),
+    );
+    if (!existingRetry) {
+      const retryTask = createRetryTask(task);
+      const failed = failTask(stubId, payload.task_id, payload.exit_code, {
+        death_cause: deathCause,
+        has_checkpoint: hasCheckpoint,
+        error_message: payload.error,
+      });
+      if (failed) webNs.emit("task.update", failed);
+      store.addToGlobalQueue(retryTask);
+      webNs.emit("task.update", retryTask);
+      logger.info("task.auto_retry_on", {
+        exit_code: payload.exit_code,
+        task_seq: task.seq,
+        new_seq: retryTask.seq,
+        attempt: retryTask.retry_count,
+        max: task.max_retries,
+      });
+      triggerSchedule();
+      return;
+    }
+  }
 
   // B2: Auto-resume for OOM, walltime, preempt
   const resumableDeathCauses = ["oom", "walltime", "preempt"];

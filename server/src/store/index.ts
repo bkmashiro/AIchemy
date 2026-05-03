@@ -19,6 +19,8 @@ const STATE_FILE = process.env.STATE_FILE || path.join(process.cwd(), "state.jso
 const SNAPSHOT_INTERVAL = 60_000;
 const BACKUP_INTERVAL = 30 * 60_000;
 const BACKUP_KEEP_COUNT = 48;
+const ARCHIVE_LOG_TAIL = 50;   // Keep only last N log lines per archived task
+const ARCHIVE_MAX = 500;       // Max archived tasks; oldest pruned first (lost before completed/failed)
 export const BACKUPS_DIR = path.join(path.dirname(STATE_FILE), "backups");
 
 // Fingerprint index: fingerprint → task_id (for active tasks only)
@@ -90,6 +92,7 @@ class Store {
 
       // Move terminal tasks to archive before deleting stub
       for (const task of stub.tasks) {
+        this._truncateLogBuffer(task);
         this.archive.push(task);
         this._taskIndex.set(task.id, { location: "archive" });
       }
@@ -97,6 +100,7 @@ class Store {
       pruned++;
       logger.info("stub.pruned", { stub: stub.name, last_seen: stub.last_heartbeat, tasks_archived: stub.tasks.length });
     }
+    if (pruned > 0) this._pruneArchive();
     return pruned;
   }
 
@@ -161,14 +165,88 @@ class Store {
     return task;
   }
 
-  /** Move a terminal task to archive. Removes from stub.tasks. */
+  /** Move a terminal task to archive. Removes from stub.tasks. Truncates log_buffer. */
   private _archiveTask(stubId: string, taskId: string, task: Task): void {
     const stub = this.stubs.get(stubId);
     if (stub) {
       stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
     }
+    this._truncateLogBuffer(task);
     this.archive.push(task);
     this._taskIndex.set(taskId, { location: "archive" });
+    this._pruneArchive();
+  }
+
+  /** Truncate log_buffer to last ARCHIVE_LOG_TAIL lines to save space. */
+  private _truncateLogBuffer(task: Task): void {
+    if (task.log_buffer && task.log_buffer.length > ARCHIVE_LOG_TAIL) {
+      task.log_buffer = task.log_buffer.slice(-ARCHIVE_LOG_TAIL);
+    }
+  }
+
+  /**
+   * Deduplicate lost tasks in archive: for lost tasks sharing the same
+   * name + script, keep only the most recent one (by finished_at or created_at).
+   */
+  deduplicateLost(): number {
+    const lostByKey = new Map<string, Task[]>();
+    const nonLost: Task[] = [];
+
+    for (const task of this.archive) {
+      if (task.status === "lost") {
+        const key = `${task.name ?? ""}\0${task.script}`;
+        let group = lostByKey.get(key);
+        if (!group) { group = []; lostByKey.set(key, group); }
+        group.push(task);
+      } else {
+        nonLost.push(task);
+      }
+    }
+
+    let removed = 0;
+    const keptLost: Task[] = [];
+    for (const group of lostByKey.values()) {
+      // Sort newest first
+      group.sort((a, b) => (b.finished_at ?? b.created_at).localeCompare(a.finished_at ?? a.created_at));
+      keptLost.push(group[0]);
+      for (let i = 1; i < group.length; i++) {
+        this._taskIndex.delete(group[i].id);
+        removed++;
+      }
+    }
+
+    this.archive = [...nonLost, ...keptLost];
+    if (removed > 0) {
+      logger.info("archive.dedup_lost", { removed, remaining: this.archive.length });
+    }
+    return removed;
+  }
+
+  /**
+   * Prune archive to ARCHIVE_MAX entries.
+   * Priority: keep completed/failed over lost. Within same priority, drop oldest first.
+   */
+  private _pruneArchive(): void {
+    if (this.archive.length <= ARCHIVE_MAX) return;
+
+    // Sort: lost first (expendable), then by date ascending (oldest first)
+    const sorted = [...this.archive].sort((a, b) => {
+      const aLost = a.status === "lost" ? 0 : 1;
+      const bLost = b.status === "lost" ? 0 : 1;
+      if (aLost !== bLost) return aLost - bLost;
+      return (a.finished_at ?? a.created_at).localeCompare(b.finished_at ?? b.created_at);
+    });
+
+    const toRemove = sorted.length - ARCHIVE_MAX;
+    const removedTasks = sorted.slice(0, toRemove);
+    const kept = new Set(sorted.slice(toRemove).map((t) => t.id));
+
+    for (const task of removedTasks) {
+      this._taskIndex.delete(task.id);
+    }
+
+    this.archive = this.archive.filter((t) => kept.has(t.id));
+    logger.info("archive.prune", { removed: toRemove, remaining: this.archive.length });
   }
 
   /** Move a task from archive back to a stub's task list (for lost→running recovery). */
@@ -235,8 +313,11 @@ class Store {
     // Auto-archive: splice before reindex so task is fully moved before lock release
     if (this._isActive(prev.status) && !this._isActive(updated.status)) {
       this.globalQueue.splice(idx, 1);
-      this.archive.push({ ...updated });
+      const archived = { ...updated };
+      this._truncateLogBuffer(archived);
+      this.archive.push(archived);
       this._taskIndex.set(taskId, { location: "archive" });
+      this._pruneArchive();
     }
     this._reindexTask(prev, updated);
     return updated;
@@ -374,9 +455,23 @@ class Store {
   /**
    * Check if a task with the given fingerprint is currently active.
    * Returns the task_id if found, undefined otherwise.
+   * Excludes tasks with should_stop=true (kill pending) so resubmit after kill works.
    */
   findActiveByFingerprint(fingerprint: string): string | undefined {
-    return this.fingerprintIndex.get(fingerprint);
+    const taskId = this.fingerprintIndex.get(fingerprint);
+    if (!taskId) return undefined;
+    // Verify the task is truly active and not being killed
+    const found = this.findTask(taskId);
+    if (!found) {
+      // Stale index entry — clean up
+      this.fingerprintIndex.delete(fingerprint);
+      return undefined;
+    }
+    if (found.task.should_stop) {
+      // Task is being killed — don't block resubmit
+      return undefined;
+    }
+    return taskId;
   }
 
   rebuildFingerprintIndex(): void {
@@ -494,6 +589,23 @@ class Store {
     return undefined;
   }
 
+  /** Find most recent experiment with given name. Prefers completed/passed, falls back to any. */
+  findExperimentByName(name: string): Experiment | undefined {
+    let best: Experiment | undefined;
+    for (const exp of this.experiments.values()) {
+      if (exp.name !== name) continue;
+      if (!best) { best = exp; continue; }
+      // Prefer terminal experiments
+      const bestTerminal = ["passed", "completed", "partial", "failed"].includes(best.status);
+      const expTerminal = ["passed", "completed", "partial", "failed"].includes(exp.status);
+      if (expTerminal && !bestTerminal) { best = exp; continue; }
+      if (bestTerminal && !expTerminal) continue;
+      // Among same category, prefer newer
+      if (exp.created_at > best.created_at) best = exp;
+    }
+    return best;
+  }
+
   // ─── Persistence ───────────────────────────────────────────────────────────
 
   startPersistence(): void {
@@ -603,9 +715,15 @@ class Store {
       const terminal = stub.tasks.filter((t) => !this._isActive(t.status));
       if (terminal.length > 0) {
         stub.tasks = stub.tasks.filter((t) => this._isActive(t.status));
+        for (const t of terminal) this._truncateLogBuffer(t);
         this.archive.push(...terminal);
       }
     }
+
+    // Truncate log_buffer on existing archived tasks, dedup lost, prune
+    for (const t of this.archive) this._truncateLogBuffer(t);
+    this.deduplicateLost();
+    this._pruneArchive();
 
     // Rebuild indices after loading
     this.rebuildFingerprintIndex();

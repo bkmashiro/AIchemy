@@ -185,7 +185,7 @@ function resolveEnvSetup(task: Task, stub: Stub): string | undefined {
 
 export function buildRunPayload(task: Task, stub: Stub): object {
   const run_dir = computeRunDir(task, stub);
-  return {
+  const payload: Record<string, any> = {
     task_id: task.id,
     command: task.command,
     cwd: task.cwd,
@@ -194,7 +194,15 @@ export function buildRunPayload(task: Task, stub: Stub): object {
     env_setup: resolveEnvSetup(task, stub),
     run_dir,
     params: task.param_overrides,
+    outputs: task.outputs,
   };
+
+  // Include resolved_config so stub can inject ALCHEMY_CONFIG
+  if (task.resolved_config) {
+    payload.resolved_config = task.resolved_config;
+  }
+
+  return payload;
 }
 
 // ─── Checkpoint phase protection ─────────────────────────────────────────────

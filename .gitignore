@@ -9,3 +9,4 @@ state-v2.json
 backups/
 *.log
 .DS_Store
+state-v2.json.bak

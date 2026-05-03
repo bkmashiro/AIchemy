@@ -2,8 +2,8 @@ import { TaskStatus } from "./types";
 import { logger } from "./log";
 
 const LEGAL_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  pending:    ["queued", "killed"],
-  queued:     ["dispatched", "pending", "killed"],
+  pending:    ["queued", "killed", "cancelled"],
+  queued:     ["dispatched", "pending", "killed", "cancelled"],
   dispatched: ["running", "failed", "lost", "killed"],
   running:    ["completed", "failed", "paused", "killed", "lost"],
   paused:     ["running", "killed", "lost"],

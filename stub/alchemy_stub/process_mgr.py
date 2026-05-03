@@ -75,11 +75,21 @@ def _log_path(task_id: str) -> str:
 class ProcessInfo:
     """Tracks a single running subprocess."""
 
-    def __init__(self, task_id: str, pid: int, proc: subprocess.Popen | None = None, run_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        task_id: str,
+        pid: int,
+        proc: subprocess.Popen | None = None,
+        run_dir: str | None = None,
+        outputs: list[str] | None = None,
+        start_time: float | None = None,
+    ) -> None:
         self.task_id = task_id
         self.pid = pid
         self.proc = proc  # None for re-attached processes
         self.run_dir = run_dir  # For checkpoint detection on death
+        self.outputs: list[str] = outputs or []  # Declared output file paths
+        self.start_time: float = start_time if start_time is not None else time.time()
         self.log_offset = 0
         self.log_buffer: deque[str] = deque(maxlen=500)
         self.log_pending: list[str] = []
@@ -98,6 +108,64 @@ class ProcessInfo:
             return None  # alive but different user
 
 
+def _is_safe_output_path(path: str) -> bool:
+    """Reject output paths that could cause damage if deleted.
+
+    Only allow absolute paths under common data directories.
+    Reject paths containing '..' traversal or pointing to system dirs.
+    """
+    real = os.path.realpath(path)
+    # Block relative paths and traversal
+    if not os.path.isabs(path) or ".." in path.split(os.sep):
+        return False
+    # Block system directories
+    _BLOCKED_PREFIXES = ("/etc", "/usr", "/bin", "/sbin", "/lib", "/boot", "/dev", "/proc", "/sys")
+    for prefix in _BLOCKED_PREFIXES:
+        if real.startswith(prefix + "/") or real == prefix:
+            return False
+    return True
+
+
+def _rollback_outputs(task_id: str, outputs: list[str], start_time: float) -> None:
+    """Delete declared output files that were created/modified after task start.
+
+    Called on task failure to clean up partial/empty artifacts so retry tasks
+    can write them without hitting EPERM errors from a different user's stale files.
+    """
+    if not outputs:
+        return
+    for path in outputs:
+        try:
+            if not _is_safe_output_path(path):
+                log.warning("[%s] rollback: rejecting unsafe output path %s", task_id, path)
+                continue
+            if not os.path.exists(path):
+                continue
+            # Use lstat to avoid TOCTOU with symlinks — check the link itself, not target
+            stat = os.lstat(path)
+            mtime = stat.st_mtime
+            if mtime >= start_time:
+                os.remove(path)
+                log.info("[%s] rollback: deleted output file %s (mtime=%.3f >= task_start=%.3f)",
+                         task_id, path, mtime, start_time)
+            else:
+                log.debug("[%s] rollback: skipping %s (mtime=%.3f < task_start=%.3f, pre-existing)",
+                          task_id, path, mtime, start_time)
+        except Exception as e:
+            log.warning("[%s] rollback: failed to delete %s: %s", task_id, path, e)
+
+
+def _verify_outputs(task_id: str, outputs: list[str]) -> None:
+    """Warn if declared output files are missing after successful task completion."""
+    if not outputs:
+        return
+    for path in outputs:
+        if not os.path.exists(path):
+            log.warning("[%s] output missing after success: %s", task_id, path)
+        else:
+            log.debug("[%s] output verified: %s", task_id, path)
+
+
 class ProcessManager:
     """Manages concurrent task subprocesses."""
 
@@ -107,17 +175,19 @@ class ProcessManager:
         env_setup: str = "",
         default_cwd: str = "",
         default_env: dict[str, str] | None = None,
+        umask: int = 0o022,
         pid_file: str = _PID_FILE_DEFAULT,
         on_started: Callable[[str, int], Awaitable[None]] | None = None,
         on_log: Callable[[str, list[str]], Awaitable[None]] | None = None,
-        on_completed: Callable[[str, int], Awaitable[None]] | None = None,
-        on_failed: Callable[[str, int, str], Awaitable[None]] | None = None,
+        on_completed: Callable[[str, int, str, bool], Awaitable[None]] | None = None,
+        on_failed: Callable[[str, int, str, str, bool], Awaitable[None]] | None = None,
         on_zombie: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.max_concurrent = max_concurrent
         self.env_setup = env_setup
         self.default_cwd = default_cwd
         self.default_env = default_env or {}
+        self.umask = umask
         self.pid_file = pid_file
 
         self.on_started = on_started
@@ -153,6 +223,8 @@ class ProcessManager:
         params: dict[str, Any] | None = None,
         run_dir: str | None = None,
         env_overrides: dict[str, str] | None = None,
+        outputs: list[str] | None = None,
+        config_path: str | None = None,
     ) -> int:
         """Spawn subprocess. Returns PID."""
         if task_id in self._procs:
@@ -170,6 +242,8 @@ class ProcessManager:
             alchemy_vars["ALCHEMY_PARAMS"] = json.dumps(params)
         if run_dir:
             alchemy_vars["ALCHEMY_RUN_DIR"] = run_dir
+        if config_path:
+            alchemy_vars["ALCHEMY_CONFIG"] = config_path
 
         # Merge env layers: process env → default_env → task env + env_overrides → ALCHEMY_*
         # Combine task env and env_overrides into one layer (overrides win)
@@ -182,6 +256,17 @@ class ProcessManager:
             alchemy_vars=alchemy_vars,
         )
 
+        # preexec_fn: set umask in child before exec so output files are
+        # world-readable (rw-r--r-- with umask=022), preventing EPERM when a
+        # different user's stub runs eval on training outputs.
+        _task_umask = self.umask
+
+        def _preexec():
+            os.umask(_task_umask)
+
+        # Record start_time BEFORE spawning so rollback catches all outputs
+        task_start_time = time.time()
+
         # Open log file — use context manager to avoid fd leak if Popen raises
         log_path = _log_path(task_id)
         log_file = open(log_path, "w")
@@ -193,6 +278,7 @@ class ProcessManager:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,  # detach from stub's process group
+                preexec_fn=_preexec,
             )
         except Exception:
             log_file.close()
@@ -200,7 +286,14 @@ class ProcessManager:
         log_file.close()  # stub only reads
 
         try:
-            info = ProcessInfo(task_id=task_id, pid=proc.pid, proc=proc, run_dir=run_dir)
+            info = ProcessInfo(
+                task_id=task_id,
+                pid=proc.pid,
+                proc=proc,
+                run_dir=run_dir,
+                outputs=outputs,
+                start_time=task_start_time,
+            )
             info.log_offset = 0
             self._procs[task_id] = info
             self._save_pid(task_id, proc.pid)
@@ -390,6 +483,14 @@ class ProcessManager:
 
             self._remove_pid(task_id)
 
+            # Clean up config temp file
+            config_file = f"/tmp/alchemy_config_{task_id}.json"
+            try:
+                if os.path.exists(config_file):
+                    os.remove(config_file)
+            except OSError:
+                pass
+
             # Classify death cause and check for checkpoints
             killed_by_stub = task_id in self._stub_killed
             self._stub_killed.discard(task_id)
@@ -405,9 +506,13 @@ class ProcessManager:
             )
 
             if exit_code == 0:
+                # Verify declared outputs exist on success
+                _verify_outputs(task_id, info.outputs)
                 if self.on_completed:
                     await self.on_completed(task_id, exit_code, death_cause, ckpt)
             else:
+                # Roll back output files created/modified after task start
+                _rollback_outputs(task_id, info.outputs, info.start_time)
                 error_msg = f"Process exited with code {exit_code}"
                 if self.on_failed:
                     await self.on_failed(task_id, exit_code, error_msg, death_cause, ckpt)
@@ -452,8 +557,12 @@ class ProcessManager:
             try:
                 data: dict = {}
                 if os.path.exists(self.pid_file):
-                    with open(self.pid_file) as f:
-                        data = json.load(f)
+                    try:
+                        with open(self.pid_file) as f:
+                            data = json.load(f)
+                    except (json.JSONDecodeError, ValueError):
+                        log.warning("_save_pid: corrupt PID file, resetting to empty")
+                        data = {}
                 data[task_id] = pid
                 tmp = self.pid_file + ".tmp"
                 with open(tmp, "w") as f:

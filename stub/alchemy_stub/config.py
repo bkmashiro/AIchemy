@@ -36,8 +36,24 @@ def _parse_env_value(value: str, env: dict[str, str] | None = None) -> str:
     return re.sub(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)", _replace, value)
 
 
-def _load_env_file(path: str) -> dict[str, str]:
-    """Load default_env from a YAML file. Returns flat dict."""
+@dataclass
+class EnvFileConfig:
+    """Structured result from loading a --default-env-file YAML."""
+    default_env: dict[str, str]
+    default_cwd: str | None = None
+    umask: int | None = None  # parsed octal, e.g. 0o022
+
+
+def _load_env_file_full(path: str) -> EnvFileConfig:
+    """Load a full env-config YAML file.
+
+    Supported top-level keys:
+      default_env:   mapping of env var name → value
+      default_cwd:   string path (used as fallback cwd for tasks)
+      umask:         octal string like "022" or integer
+
+    The file may also be a flat mapping of env var names (legacy format).
+    """
     import yaml  # lazy import — only needed if --default-env-file is used
 
     with open(path) as f:
@@ -46,9 +62,11 @@ def _load_env_file(path: str) -> dict[str, str]:
     if not isinstance(data, dict):
         raise ValueError(f"default-env-file must be a YAML mapping, got {type(data).__name__}")
 
+    _RESERVED_KEYS = {"default_env", "default_cwd", "umask"}
+
     # Accept nested under 'default_env' key, or top-level if all keys look like env vars
-    if "default_env" in data:
-        env_dict = data["default_env"]
+    if "default_env" in data or any(k in data for k in _RESERVED_KEYS):
+        env_dict = data.get("default_env", {})
         if not isinstance(env_dict, dict):
             raise ValueError("default_env key must be a mapping")
     else:
@@ -62,7 +80,36 @@ def _load_env_file(path: str) -> dict[str, str]:
             )
         env_dict = data
 
-    return {str(k): str(v) for k, v in env_dict.items()}
+    # Parse optional umask field
+    umask_val: int | None = None
+    if "umask" in data:
+        raw_umask = data["umask"]
+        try:
+            if isinstance(raw_umask, int):
+                umask_val = raw_umask
+            else:
+                # Accept "022", "0o022", "0022" etc.
+                umask_val = int(str(raw_umask), 8)
+        except ValueError:
+            raise ValueError(f"Invalid umask value in env file: {raw_umask!r}. Use octal string like '022'.")
+
+    default_cwd = data.get("default_cwd") or None
+    if default_cwd is not None:
+        default_cwd = str(default_cwd)
+
+    return EnvFileConfig(
+        default_env={str(k): str(v) for k, v in env_dict.items()},
+        default_cwd=default_cwd,
+        umask=umask_val,
+    )
+
+
+def _load_env_file(path: str) -> dict[str, str]:
+    """Load default_env from a YAML file. Returns flat dict.
+
+    Backward-compatible wrapper around _load_env_file_full().
+    """
+    return _load_env_file_full(path).default_env
 
 
 def _parse_key_value(s: str) -> tuple[str, str]:
@@ -83,6 +130,8 @@ class Config:
     idle_timeout: int  # seconds; 0 = infinite
     tags: list[str] = field(default_factory=list)
     default_env: dict[str, str] = field(default_factory=dict)
+    umask: int = 0o022  # applied before spawning task subprocesses
+    allow_exec: bool = False  # --allow-exec: enables exec.request handler (Spec 3)
 
     hostname: str = field(default_factory=socket.gethostname)
     gpu_indices: str = ""  # e.g. "0,1" — used for identity hash
@@ -173,7 +222,26 @@ def parse_args() -> Config:
         "--default-env-file",
         default=None,
         metavar="PATH",
-        help="YAML file with default_env mapping for tasks.",
+        help="YAML file with default_env, default_cwd, and umask config for tasks.",
+    )
+    parser.add_argument(
+        "--umask",
+        default=None,
+        metavar="OCTAL",
+        help=(
+            "Umask applied before spawning task subprocesses (e.g. '022'). "
+            "Default: 022 (world-readable output files). "
+            "Can also be set via 'umask' key in --default-env-file."
+        ),
+    )
+    parser.add_argument(
+        "--allow-exec",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable exec.request handler: allow the server to run arbitrary commands "
+            "on this stub via POST /api/stubs/:id/exec2. Disabled by default for security."
+        ),
     )
 
     args = parser.parse_args()
@@ -194,25 +262,46 @@ def parse_args() -> Config:
 
     tags: list[str] = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
 
+    # Load env file first (provides default_env, default_cwd, umask baselines)
+    file_cfg: EnvFileConfig | None = None
+    if args.default_env_file:
+        file_cfg = _load_env_file_full(args.default_env_file)
+
     # Build default_env: file first, then CLI overrides, expand $VAR references
     default_env: dict[str, str] = {}
-    if args.default_env_file:
-        default_env.update(_load_env_file(args.default_env_file))
+    if file_cfg:
+        default_env.update(file_cfg.default_env)
     for entry in args.default_env:
         k, v = _parse_key_value(entry)
         default_env[k] = v
     # Expand variable references against current process env
     default_env = {k: _parse_env_value(v) for k, v in default_env.items()}
 
+    # Resolve default_cwd: CLI flag > env file > ALCHEMY_DEFAULT_CWD env > cwd
+    file_cwd = file_cfg.default_cwd if file_cfg else None
+    default_cwd = args.default_cwd or file_cwd or os.getcwd()
+
+    # Resolve umask: CLI flag > env file > default 022
+    resolved_umask: int = 0o022
+    if file_cfg and file_cfg.umask is not None:
+        resolved_umask = file_cfg.umask
+    if args.umask is not None:
+        try:
+            resolved_umask = int(args.umask, 8)
+        except ValueError:
+            raise ValueError(f"Invalid --umask value: {args.umask!r}. Use octal string like '022'.")
+
     return Config(
         server=args.server.rstrip("/"),
         token=args.token,
         max_concurrent=args.max_concurrent,
         env_setup=args.env_setup,
-        default_cwd=args.default_cwd or os.getcwd(),
+        default_cwd=default_cwd,
         idle_timeout=idle_timeout,
         tags=tags,
         default_env=default_env,
+        umask=resolved_umask,
+        allow_exec=args.allow_exec,
         hostname=socket.gethostname(),
         gpu_indices=args.gpu_indices,
         slurm_job_id=slurm_job_id,

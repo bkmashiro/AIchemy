@@ -20,6 +20,7 @@ import { computeFingerprint } from "../dedup";
 import { evaluateCriteria } from "../criteria";
 import { validateDag } from "../dag";
 import { logger } from "../log";
+import { initExperimentManifest, readExperimentManifest } from "../git-tracking";
 
 // ─── Cartesian product (same as grids.ts) ────────────────────────────────────
 
@@ -63,7 +64,7 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): Router {
+export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Router {
   const router = Router();
 
   // POST /experiments
@@ -73,6 +74,8 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
       matrix, base_args, max_retries,
       requirements, target_tags, task_specs,
       python_env, cwd,
+      config, config_diff, parent_name,
+      git_tracking, git_repo_path,
     } = req.body;
 
     if (!name) { res.status(400).json({ error: "name required" }); return; }
@@ -88,6 +91,13 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
       const gridId = uuidv4();
       const refToTaskId: Record<string, string> = {};
       const taskIds: string[] = [];
+
+      // Resolve parent_id from parent_name (best-effort)
+      let parentId: string | undefined;
+      if (parent_name) {
+        const parentExp = store.findExperimentByName(parent_name);
+        if (parentExp) parentId = parentExp.id;
+      }
 
       // Create tasks in topological order (specs are assumed ordered, but we process roots first)
       for (const spec of task_specs as TaskSpec[]) {
@@ -122,6 +132,11 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
           priority: spec.priority,
         });
 
+        // Attach resolved_config from SDK (experiment config + task overrides)
+        if (spec.resolved_config) {
+          (task as any).resolved_config = spec.resolved_config;
+        }
+
         store.addToGlobalQueue(task);
         webNs.emit("task.update", task);
         refToTaskId[spec.ref] = task.id;
@@ -154,6 +169,12 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
         created_at: new Date().toISOString(),
         task_specs: task_specs as TaskSpec[],
         task_refs: refToTaskId,
+        config: config || undefined,
+        config_diff: config_diff || undefined,
+        parent_name: parent_name || undefined,
+        parent_id: parentId,
+        git_tracking: git_tracking === true ? true : undefined,
+        git_repo_path: git_repo_path || undefined,
       };
 
       store.setExperiment(experiment);
@@ -162,7 +183,17 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
       webNs.emit("grid.update", grid);
       webNs.emit("experiment.update", experiment);
 
-      logger.info("experiment.created", { id: experimentId, name, tasks: taskIds.length, dag: true });
+      // Git tracking: init manifest fire-and-forget
+      if (experiment.git_tracking && taskIds.length > 0) {
+        const firstTaskStubId = store.getTask("", taskIds[0])?.stub_id;
+        // Use first available online stub that matches target_tags, or any online stub
+        const candidateStub = store.getAllStubs().find((s) => s.status === "online");
+        if (candidateStub) {
+          initExperimentManifest(experiment, candidateStub.id, stubNs).catch(() => {});
+        }
+      }
+
+      logger.info("experiment.created", { id: experimentId, name, tasks: taskIds.length, dag: true, has_config: !!config, parent: parent_name || null });
       res.status(201).json(experiment);
       return;
     }
@@ -240,6 +271,8 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
       status: "running",
       results: {},
       created_at: new Date().toISOString(),
+      git_tracking: git_tracking === true ? true : undefined,
+      git_repo_path: git_repo_path || undefined,
     };
 
     store.setExperiment(experiment);
@@ -247,6 +280,14 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
 
     webNs.emit("grid.update", grid);
     webNs.emit("experiment.update", experiment);
+
+    // Git tracking: init manifest fire-and-forget
+    if (experiment.git_tracking) {
+      const candidateStub = store.getAllStubs().find((s) => s.status === "online");
+      if (candidateStub) {
+        initExperimentManifest(experiment, candidateStub.id, stubNs).catch(() => {});
+      }
+    }
 
     logger.info("experiment.created", { id: experiment.id, name, tasks: taskIds.length, criteria: Object.keys(criteria) });
     res.status(201).json(experiment);
@@ -271,6 +312,51 @@ export function createExperimentsRouter(_stubNs: Namespace, webNs: Namespace): R
     const status = deriveExperimentStatus(exp);
 
     res.json({ ...exp, status, grid, tasks });
+  });
+
+  // GET /experiments/:id/diff — config diff for lineage tracking
+  router.get("/:id/diff", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+
+    const result: Record<string, any> = {
+      experiment_id: exp.id,
+      name: exp.name,
+      config: exp.config || null,
+      config_diff: exp.config_diff || null,
+      parent_name: exp.parent_name || null,
+      parent_id: exp.parent_id || null,
+    };
+
+    // If parent exists, include parent config for context
+    if (exp.parent_id) {
+      const parent = store.getExperiment(exp.parent_id);
+      if (parent) {
+        result.parent_config = parent.config || null;
+      }
+    }
+
+    res.json(result);
+  });
+
+  // GET /experiments/:id/manifest
+  router.get("/:id/manifest", async (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    if (!exp.git_tracking) { res.status(400).json({ error: "git_tracking not enabled for this experiment" }); return; }
+    if (!exp.git_repo_path) { res.status(400).json({ error: "git_repo_path not set on experiment" }); return; }
+
+    // Find an online stub to exec on
+    const stub = store.getAllStubs().find((s) => s.status === "online");
+    if (!stub) { res.status(503).json({ error: "No online stub available" }); return; }
+
+    try {
+      const content = await readExperimentManifest(exp, stub.id, stubNs);
+      res.set("Content-Type", "text/yaml").send(content);
+    } catch (err: any) {
+      logger.warn("experiment.manifest-read-failed", { id: exp.id, name: exp.name, error: String(err) });
+      res.status(500).json({ error: `Failed to read manifest: ${err.message}` });
+    }
   });
 
   // DELETE /experiments/:id

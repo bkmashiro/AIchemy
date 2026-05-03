@@ -60,7 +60,11 @@ def _build_fake_psutil(
 
 
 def _load_sm(fake_psutil: types.ModuleType | None = None):
-    """Load (or reload) system_monitor with the given fake psutil injected."""
+    """Load (or reload) system_monitor with the given fake psutil injected.
+
+    Pass fake_psutil=None to simulate psutil being unavailable (ImportError).
+    Pass a fake module to simulate a specific psutil behaviour.
+    """
     # Remove cached module so we get a fresh import
     for key in list(sys.modules):
         if "system_monitor" in key and "alchemy_stub" in key:
@@ -68,11 +72,24 @@ def _load_sm(fake_psutil: types.ModuleType | None = None):
 
     if fake_psutil is not None:
         sys.modules["psutil"] = fake_psutil
-    elif "psutil" in sys.modules:
-        del sys.modules["psutil"]
+        import alchemy_stub.system_monitor as sm
+        return sm
+    else:
+        # Simulate psutil being unavailable by temporarily blocking the import
+        import builtins
+        real_import = builtins.__import__
 
-    import alchemy_stub.system_monitor as sm
-    return sm
+        def _blocked_import(name, *args, **kwargs):
+            if name == "psutil":
+                raise ImportError("psutil not available (test-injected)")
+            return real_import(name, *args, **kwargs)
+
+        builtins.__import__ = _blocked_import
+        try:
+            import alchemy_stub.system_monitor as sm
+            return sm
+        finally:
+            builtins.__import__ = real_import
 
 
 # ---------------------------------------------------------------------------

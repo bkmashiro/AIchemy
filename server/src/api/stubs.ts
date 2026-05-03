@@ -13,6 +13,7 @@ import { maybeDispatch } from "../scheduler";
 import { reliableEmitToStub } from "../reliable";
 import { computeFingerprint, writeLockTable, idempotencyCache } from "../dedup";
 import { createTask } from "./tasks";
+import { createExecRouter } from "./exec";
 
 export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
   const router = Router();
@@ -125,6 +126,10 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
 
     res.json({ request_id: requestId });
   });
+
+  // POST /stubs/:id/exec2 — synchronous exec via WS exec.request/exec.response (Spec 3)
+  // Distinct from the fire-and-forget /exec shell relay above.
+  router.use("/:id/exec2", createExecRouter(stubNs));
 
   // DELETE /stubs/prune — MUST be before /:id to avoid route shadowing
   router.delete("/prune", (_req: Request, res: Response) => {

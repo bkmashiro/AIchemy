@@ -83,6 +83,7 @@ export interface Task {
   exports?: Record<string, any>;       // Runtime key-value outputs
   args_template?: Record<string, string>; // Template strings resolved at promotion time
   experiment_id?: string;              // Owning experiment ID
+  outputs?: string[];                  // Declared output file paths for artifact rollback
 
   // === Grid ===
   grid_id?: string;
@@ -99,6 +100,7 @@ export interface Task {
   progress?: { step: number; total: number; loss?: number; metrics?: Record<string, number> };
   log_buffer: string[];
   config_snapshot?: Record<string, any>;
+  resolved_config?: Record<string, any>;    // Experiment config merged with task overrides
 
   // === Lifecycle Phase ===
   phase?: string;
@@ -126,6 +128,7 @@ export interface Task {
   retry_count: number;
   max_retries: number;
   retry_of?: string;
+  auto_retry_on?: number[];       // Exit codes that trigger automatic retry (e.g. [-9, -15])
 
   // === Death classification (B1) ===
   death_cause?: string;           // 'success' | 'code_error' | 'oom' | 'walltime' | 'preempt' | 'lost'
@@ -221,6 +224,9 @@ export interface TaskSpec {
   target_tags?: string[];
   max_retries?: number;
   priority?: number;
+  outputs?: string[];     // Declared output file paths for artifact rollback
+  config_overrides?: Record<string, any>;   // Per-task config overrides (dot-path → value)
+  resolved_config?: Record<string, any>;    // Merged experiment config + task overrides (computed by SDK)
 }
 
 // ─── Experiment ─────────────────────────────────────────────────────────────
@@ -248,6 +254,14 @@ export interface Experiment {
   created_at: string;
   task_specs?: TaskSpec[];                  // Original DAG spec
   task_refs?: Record<string, string>;      // ref name → task_id mapping
+  // Config + Lineage
+  config?: Record<string, any>;                           // Full config snapshot
+  config_diff?: Record<string, { old: any; new: any }>;   // Diff against parent
+  parent_name?: string;                                    // Fork source experiment name
+  parent_id?: string;                                      // Fork source experiment ID (best-effort)
+  // Git tracking
+  git_tracking?: boolean;                                  // Enable git manifest tracking
+  git_repo_path?: string;                                  // Absolute path to git repo on stub
 }
 
 export interface Token {
@@ -363,4 +377,39 @@ export interface TaskMetricsPayload {
 export interface TaskPhasePayload {
   task_id: string;
   phase: string;
+}
+
+// ─── Exec (Spec 3) ───────────────────────────────────────────────────────────
+
+export interface ExecRequest {
+  /** Shell command to run on the stub. */
+  command: string;
+  /** Timeout in milliseconds. Server default: 30000. */
+  timeout?: number;
+}
+
+export interface ExecResponse {
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+  /** True if stdout or stderr were truncated to 4KB. */
+  truncated: boolean;
+}
+
+export interface ExecRequestPayload {
+  /** Unique request ID for correlation. */
+  request_id: string;
+  command: string;
+  /** Timeout in seconds passed to stub subprocess. */
+  timeout_s: number;
+}
+
+export interface ExecResponsePayload {
+  request_id: string;
+  stdout: string;
+  stderr: string;
+  exit_code: number;
+  truncated: boolean;
+  /** Set if exec was rejected (e.g. --allow-exec not set). */
+  error?: string;
 }
