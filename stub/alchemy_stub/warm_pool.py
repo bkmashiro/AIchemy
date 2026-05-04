@@ -188,24 +188,24 @@ class WarmPool:
     # ---------------------------------------------------------------------- #
 
     async def start(self) -> None:
-        """Spawn all workers and wait until they're ready."""
+        """Spawn all workers in background — returns immediately, workers become ready async.
+
+        This avoids blocking the event loop during NFS-backed imports (torch ~30s).
+        submit() will wait for a worker to become ready via _acquire_worker().
+        """
         if self._started:
             return
         self._started = True
         self._sem = asyncio.Semaphore(self.size)
 
-        spawn_tasks = []
         for i in range(self.size):
             worker_id = f"w{i}"
             state = _WorkerState(worker_id)
             self._workers[worker_id] = state
-            spawn_tasks.append(asyncio.create_task(self._spawn_worker(state)))
+            # Fire-and-forget — workers become ready in background
+            asyncio.create_task(self._spawn_worker(state))
 
-        # Wait for all workers to be ready (or fail — they'll be respawned on demand)
-        results = await asyncio.gather(*spawn_tasks, return_exceptions=True)
-        alive = sum(1 for r in results if r is not True and not isinstance(r, Exception))
-        ready = sum(1 for w in self._workers.values() if w.is_alive())
-        log.info("WarmPool: started %d/%d workers", ready, self.size)
+        log.info("WarmPool: spawning %d workers in background", self.size)
 
     async def submit(
         self,
@@ -219,7 +219,9 @@ class WarmPool:
         stub_socket: str,
     ) -> int:
         """Submit a task. Blocks until a worker is free. Returns worker PID."""
-        assert self._sem is not None, "call start() first"
+        if not self._started:
+            await self.start()
+        assert self._sem is not None
 
         payload = {
             "type": "task",

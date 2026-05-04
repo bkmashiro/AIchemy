@@ -71,7 +71,8 @@ async function syncCode(
     await execAsync(mkdirCmd, { timeout: 30_000 });
 
     const tarLocal = `tar czf - -C "${stubLocalPath}" .`;
-    const extractCmd = `ssh ${flags} ${userAtHost(target)} "tar xzf - -C ${target.remote_dir}"`;
+    // Clear __pycache__ before extract to avoid stale .pyc masking new code
+    const extractCmd = `ssh ${flags} ${userAtHost(target)} "find ${target.remote_dir} -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; tar xzf - -C ${target.remote_dir}"`;
     await execAsync(`${tarLocal} | ${extractCmd}`, { timeout: 120_000, shell: "/bin/bash" });
   } else {
     // Direct rsync
@@ -81,33 +82,50 @@ async function syncCode(
   }
 }
 
-/** Steps 2+3: kill old stub, start new one via PYTHONPATH. Returns PID. */
+/** Steps 2+3: kill old stub, start new one via PYTHONPATH. Returns PID.
+ *
+ * Isolation: each stub gets its own PID file (`/tmp/alchemy_stub_{name}.pid`)
+ * and log file (`stub_{name}.log`). Kill uses PID file — never `pkill -f` —
+ * so NFS-shared nodes don't interfere with each other.
+ */
 async function startStub(
   target: StubTarget,
   serverUrl: string,
   token: string,
   sshKeyPath?: string,
 ): Promise<number | undefined> {
-  const { host, user, jump_host, python_path, remote_dir, max_concurrent, tags, default_cwd } = target;
+  const { host, user, jump_host, python_path, remote_dir, max_concurrent, tags, default_cwd, name } = target;
   const opts = { keyPath: sshKeyPath, jumpHost: jump_host, timeout: 30_000 };
+  const pidFile = `/tmp/alchemy_stub_${name}.pid`;
+  const logFile = `${remote_dir}/stub_${name}.log`;
 
-  // Step 2: kill old stub (best-effort)
+  // Step 2: kill old stub via PID file (precise, no cross-node interference)
   try {
-    await sshExec(host, user, `pkill -f "alchemy_stub.*--server" || true`, opts);
+    const killCmd =
+      `if [ -f ${pidFile} ]; then` +
+      ` pid=$(cat ${pidFile});` +
+      ` kill $pid 2>/dev/null || true;` +
+      ` sleep 1;` +
+      ` kill -9 $pid 2>/dev/null || true;` +
+      ` rm -f ${pidFile};` +
+      ` fi`;
+    await sshExec(host, user, killCmd, opts);
   } catch {
     // intentionally ignored
   }
 
   // Step 3: launch with PYTHONPATH set so no pip install needed
+  // remote_dir contains alchemy_stub/ directly (tar extracted from stub/)
   let launchCmd =
-    `PYTHONPATH=${remote_dir}/stub` +
+    `PYTHONPATH=${remote_dir}` +
     ` nohup ${python_path} -m alchemy_stub` +
     ` --server ${JSON.stringify(serverUrl)}` +
     ` --token ${JSON.stringify(token)}` +
     ` --max-concurrent ${max_concurrent}`;
   if (tags) launchCmd += ` --tags ${JSON.stringify(tags)}`;
   if (default_cwd) launchCmd += ` --default-cwd ${JSON.stringify(default_cwd)}`;
-  launchCmd += ` >> ${remote_dir}/stub.log 2>&1 & echo $!`;
+  // Write PID file for clean shutdown; log to per-stub file
+  launchCmd += ` >> ${logFile} 2>&1 & echo $! | tee ${pidFile}`;
 
   const pidStr = await sshExec(host, user, launchCmd, opts);
   const pid = parseInt(pidStr.trim(), 10);
@@ -152,14 +170,16 @@ export async function getStubStatus(
   target: StubTarget,
   sshKeyPath?: string,
 ): Promise<{ running: boolean; pid?: number }> {
+  const pidFile = `/tmp/alchemy_stub_${target.name}.pid`;
   try {
+    // Check PID file first (precise), fall back to pgrep
     const out = await sshExec(
       target.host,
       target.user,
-      `pgrep -f "alchemy_stub.*--server" || true`,
+      `if [ -f ${pidFile} ]; then pid=$(cat ${pidFile}); kill -0 $pid 2>/dev/null && echo $pid || echo 0; else echo 0; fi`,
       { keyPath: sshKeyPath, jumpHost: target.jump_host, timeout: 15_000 },
     );
-    const pid = parseInt(out.trim().split("\n")[0], 10);
+    const pid = parseInt(out.trim(), 10);
     if (Number.isFinite(pid) && pid > 0) {
       return { running: true, pid };
     }

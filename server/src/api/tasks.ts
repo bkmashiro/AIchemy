@@ -75,7 +75,12 @@ export function assembleCommand(task: Partial<Task>): string {
       .join(" && ");
     if (envStr) parts.push(`${envStr} &&`);
   }
-  parts.push(script);
+  // If script looks like a Python file and has no shebang prefix, prepend python
+  if (script.endsWith(".py") && !script.startsWith("python")) {
+    parts.push(`python ${script}`);
+  } else {
+    parts.push(script);
+  }
   if (args && Object.keys(args).length > 0) {
     const argsStr = Object.entries(args)
       .map(([k, v]) => `${k} ${v}`)

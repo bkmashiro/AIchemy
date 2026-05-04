@@ -525,6 +525,11 @@ class StubDaemon:
 
         jlog("info", "preflight.pass", task_id=task_id)
 
+        # Lazy-start warm pool on first task (avoids blocking connection with NFS imports)
+        if self.warm_pool and not self.warm_pool._started:
+            log.info("First task received — starting warm pool in background")
+            await self.warm_pool.start()
+
         cwd = data.get("cwd") or self.config.default_cwd or None
         env: dict[str, str] = data.get("env") or {}
         task_env_setup: str = data.get("env_setup") or ""
@@ -1063,10 +1068,11 @@ class StubDaemon:
             self.config.max_concurrent, self.config.tags,
         )
 
-        # Start warm worker pool (non-blocking — workers spawn in background)
+        # Start warm worker pool LAZILY — don't spawn workers until first task arrives.
+        # NFS-backed torch import takes 30s+ and blocks the event loop/connection.
         if self.warm_pool:
-            log.info("Starting warm worker pool (size=%d)", self.config.max_concurrent)
-            asyncio.create_task(self.warm_pool.start())
+            log.info("Warm worker pool configured (size=%d, lazy start)", self.config.max_concurrent)
+            # Pool will be started on first task submission in _on_task_run()
 
         # Re-attach surviving task processes from previous run
         reattached = self.process_mgr.load_and_reattach()
