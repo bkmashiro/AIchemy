@@ -54,9 +54,9 @@ function TargetCard({ target }: { target: DeployTarget }) {
         {target.env_setup && <Row label="Env Setup" value={target.env_setup} />}
       </div>
 
-      {target.tags && target.tags.length > 0 && (
+      {target.tags && (Array.isArray(target.tags) ? target.tags : String(target.tags).split(",").filter(Boolean)).length > 0 && (
         <div className="flex flex-wrap gap-1 pt-1">
-          {target.tags.map((tag) => (
+          {(Array.isArray(target.tags) ? target.tags : String(target.tags).split(",").map(s => s.trim()).filter(Boolean)).map((tag) => (
             <span key={tag} className="bg-gray-800 text-gray-400 rounded px-1.5 py-0.5 text-xs font-mono">
               {tag}
             </span>
