@@ -78,7 +78,7 @@ class Store {
   }
 
   /** Remove stubs that have been offline for too long with no active tasks. */
-  pruneStaleStubs(maxOfflineHours: number = 24): number {
+  pruneStaleStubs(maxOfflineHours: number = 1): number {
     const cutoff = Date.now() - maxOfflineHours * 3600_000;
     let pruned = 0;
     for (const [id, stub] of this.stubs) {
@@ -172,6 +172,15 @@ class Store {
       stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
     }
     this._truncateLogBuffer(task);
+    // Dedup: if a "lost" record for the same task_id already exists in archive, update in place
+    if (task.status === "lost") {
+      const existingIdx = this.archive.findIndex((t) => t.id === taskId && t.status === "lost");
+      if (existingIdx !== -1) {
+        this.archive[existingIdx] = task;
+        this._taskIndex.set(taskId, { location: "archive" });
+        return;
+      }
+    }
     this.archive.push(task);
     this._taskIndex.set(taskId, { location: "archive" });
     this._pruneArchive();
@@ -225,9 +234,17 @@ class Store {
   /**
    * Prune archive to ARCHIVE_MAX entries.
    * Priority: keep completed/failed over lost. Within same priority, drop oldest first.
+   *
+   * Saves state to disk BEFORE pruning to ensure no task is permanently lost
+   * due to the 60s snapshot interval race condition.
    */
   private _pruneArchive(): void {
     if (this.archive.length <= ARCHIVE_MAX) return;
+
+    // Persist current state before pruning so no task is lost without being saved first.
+    this.saveAsync().catch((err) => {
+      logger.error("archive.prune_save_failed", { error: String(err) });
+    });
 
     // Sort: lost first (expendable), then by date ascending (oldest first)
     const sorted = [...this.archive].sort((a, b) => {
@@ -417,6 +434,34 @@ class Store {
     this._taskIndex.set(taskId, { stubId, location: "stub" });
     this._reindexTask(prev, task);
     return task;
+  }
+
+  /**
+   * Move all queued/dispatched tasks from a stub back to the global pending queue.
+   * Called on disconnect so tasks can be rescheduled to another stub.
+   * Returns the list of re-queued tasks.
+   */
+  requeueStubTasks(stubId: string): Task[] {
+    const stub = this.stubs.get(stubId);
+    if (!stub) return [];
+    const requeued: Task[] = [];
+    const remaining: Task[] = [];
+    for (const task of stub.tasks) {
+      if (task.status === "queued" || task.status === "dispatched") {
+        const prev = { ...task };
+        task.status = "pending";
+        task.stub_id = undefined;
+        this.globalQueue.push(task);
+        this._taskIndex.set(task.id, { location: "global" });
+        this._reindexTask(prev, task);
+        requeued.push(task);
+        logger.info("task.requeued_on_disconnect", { task_id: task.id, from: prev.status, stub: stub.name });
+      } else {
+        remaining.push(task);
+      }
+    }
+    stub.tasks = remaining;
+    return requeued;
   }
 
   // ─── Fingerprint Index ─────────────────────────────────────────────────────

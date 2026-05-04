@@ -47,6 +47,7 @@ export interface PaginatedTasks {
   total: number;
   page: number;
   limit: number;
+  counts?: Record<string, number>;
 }
 
 // ─── Data Models (spec §1) ────────────────────────────────────────────────────
@@ -135,6 +136,10 @@ export interface Task {
   // Server signals
   should_stop: boolean;
   should_checkpoint: boolean;
+
+  // Dispatch tracking
+  dispatch_attempts?: number;
+  target_stub_id?: string;
 }
 
 export interface GpuStatEntry {
@@ -182,6 +187,12 @@ export interface Stub {
   idle_timeout_s?: number;
   tags?: string[];               // Routing tags (--tags a40-cluster,ys25)
   walltime_remaining_s?: number; // SLURM: seconds remaining
+
+  // Inherited from deploy target config
+  deploy_python_path?: string;
+  deploy_default_cwd?: string;
+  deploy_env_setup?: string;
+  deploy_default_env?: Record<string, string>;
 }
 
 export interface Grid {
@@ -227,7 +238,7 @@ export interface TaskSubmitPayload {
 // ─── API client functions ──────────────────────────────────────────────────────
 
 export const tasksApi = {
-  list: (params?: { page?: number; limit?: number; status?: string }) =>
+  list: (params?: { page?: number; limit?: number; status?: string; status_group?: string }) =>
     api.get<PaginatedTasks>("/tasks", { params }).then((r) => r.data),
   get: (id: string) => api.get<Task>(`/tasks/${id}`).then((r) => r.data),
   submit: (data: TaskSubmitPayload) => api.post<Task>("/tasks", data).then((r) => r.data),
@@ -321,4 +332,29 @@ export const costApi = {
     api.get<CostBreakdown>("/metrics/cost/breakdown", { params }).then((r) => r.data),
   taskCost: (taskId: string) =>
     api.get<{ task_id: string; cost: TaskCost | null }>(`/tasks/${taskId}/cost`).then((r) => r.data),
+};
+
+// ─── Deploy API ───────────────────────────────────────────────────────────────
+
+export interface DeployTarget {
+  name: string;
+  host: string;
+  user?: string;
+  jump_host?: string;
+  python_path?: string;
+  default_cwd?: string;
+  env_setup?: string;
+  tags?: string[];
+  max_concurrent?: number;
+}
+
+export interface TunnelStatus {
+  running: boolean;
+  url?: string;
+  uptime_s?: number;
+}
+
+export const deployApi = {
+  targets: () => api.get<DeployTarget[]>("/deploy/targets").then((r) => r.data),
+  tunnelStatus: () => api.get<TunnelStatus>("/deploy/tunnel").then((r) => r.data),
 };

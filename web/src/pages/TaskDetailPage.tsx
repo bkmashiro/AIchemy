@@ -185,6 +185,17 @@ export default function TaskDetailPage() {
         {task.env_setup && <MetaRow label="Env Setup" value={task.env_setup} />}
         {task.target_tags && task.target_tags.length > 0 && <MetaRow label="Tags" value={task.target_tags.join(", ")} />}
         {task.requirements && <MetaRow label="Requirements" value={JSON.stringify(task.requirements)} />}
+        {task.target_stub_id && (
+          <MetaRow label="Pinned To" value={<Link to={`/stubs/${task.target_stub_id}`} className="text-blue-400 hover:underline">{task.target_stub_id}</Link>} />
+        )}
+        {task.dispatch_attempts !== undefined && task.dispatch_attempts > 0 && (
+          <MetaRow label="Dispatch" value={
+            <span className="flex items-center gap-1.5 text-yellow-400">
+              <span>⚠</span>
+              <span>{task.dispatch_attempts} attempt{task.dispatch_attempts !== 1 ? "s" : ""}</span>
+            </span>
+          } />
+        )}
         {task.grid_id && <MetaRow label="Grid" value={<Link to={`/grids/${task.grid_id}`} className="text-blue-400 hover:underline">{task.grid_id.slice(0, 8)}</Link>} />}
         {task.retry_of && <MetaRow label="Retry Of" value={<Link to={`/tasks/${task.retry_of}`} className="text-blue-400 hover:underline">{task.retry_of.slice(0, 8)}</Link>} />}
         <MetaRow label="Created" value={task.created_at} />

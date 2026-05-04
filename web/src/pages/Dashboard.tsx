@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { Stub, Task, overviewApi, OverviewData, costApi, CostSummary } from "../lib/api";
+import { Stub, Task, overviewApi, OverviewData, costApi, CostSummary, deployApi, TunnelStatus } from "../lib/api";
 import { formatRelTime, generateDisplayName } from "../lib/format";
 import StubCard from "../components/StubCard";
 import TaskForm from "../components/TaskForm";
@@ -143,11 +143,18 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
   const [showForm, setShowForm] = useState(false);
   const [offlineOpen, setOfflineOpen] = useState(false);
   const [overview, setOverview] = useState<OverviewData | null>(null);
+  const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const navigate = useNavigate();
 
   useEffect(() => {
     overviewApi.get().then(setOverview).catch(() => {});
     const t = setInterval(() => overviewApi.get().then(setOverview).catch(() => {}), 10000);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    deployApi.tunnelStatus().then(setTunnel).catch(() => {});
+    const t = setInterval(() => deployApi.tunnelStatus().then(setTunnel).catch(() => {}), 30000);
     return () => clearInterval(t);
   }, []);
 
@@ -217,6 +224,22 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
           sub={overview ? `${overview.grids.total} total` : undefined}
           color="text-purple-400"
         />
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex flex-col gap-1">
+          <span className="text-xs text-gray-500 uppercase tracking-wider">Tunnel</span>
+          {tunnel === null ? (
+            <span className="text-gray-700 text-sm">—</span>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <div className={`w-2 h-2 rounded-full shrink-0 ${tunnel.running ? "bg-green-400 shadow-[0_0_4px_rgba(74,222,128,0.6)]" : "bg-red-500"}`} />
+              <span className={`text-sm font-semibold ${tunnel.running ? "text-green-400" : "text-red-400"}`}>
+                {tunnel.running ? "✓ running" : "✗ down"}
+              </span>
+            </div>
+          )}
+          {tunnel?.running && tunnel.url && (
+            <span className="text-xs text-gray-600 truncate" title={tunnel.url}>{tunnel.url}</span>
+          )}
+        </div>
       </div>
 
       {/* Cost widget */}

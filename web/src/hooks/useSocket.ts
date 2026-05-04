@@ -126,9 +126,13 @@ export function useSocket() {
       }
       // Remove from global queue when assigned to stub
       setGlobalQueue((prev) => prev.filter((t) => t.id !== task.id));
+      const TERMINAL = ["completed", "failed", "killed", "lost"];
       setStubs((prev) =>
         prev.map((s) => {
           if (s.id !== task.stub_id) return s;
+          if (TERMINAL.includes(task.status)) {
+            return { ...s, tasks: s.tasks.filter((t) => t.id !== task.id) };
+          }
           const exists = s.tasks.find((t) => t.id === task.id);
           const tasks = exists
             ? s.tasks.map((t) => (t.id === task.id ? task : t))

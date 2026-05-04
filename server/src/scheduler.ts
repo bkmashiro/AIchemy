@@ -73,6 +73,9 @@ export function scoreStub(stub: Stub, task: Task): number {
   // Hard constraints
   if (stub.status !== "online") return -Infinity;
 
+  // Stub pinning: if target_stub_id is set, only that stub is eligible
+  if (task.target_stub_id && stub.id !== task.target_stub_id) return -Infinity;
+
   // Tag filter: stub must have ALL target_tags
   if (task.target_tags && task.target_tags.length > 0) {
     const stubTags = new Set(stub.tags || []);
@@ -158,7 +161,7 @@ export function computeRunDir(task: Task, stub: Stub): string {
   if (stub.default_output_dir) {
     baseOutputDir = stub.default_output_dir;
   } else {
-    const base = task.cwd || stub.default_cwd || process.cwd();
+    const base = task.cwd ?? stub.deploy_default_cwd ?? stub.default_cwd ?? process.cwd();
     baseOutputDir = path.join(base, "runs");
   }
 
@@ -185,13 +188,29 @@ function resolveEnvSetup(task: Task, stub: Stub): string | undefined {
 
 export function buildRunPayload(task: Task, stub: Stub): object {
   const run_dir = computeRunDir(task, stub);
+
+  // ─── Stub-level environment inheritance ──────────────────────────────────
+  // Task-level settings always win; stub deploy defaults fill in the gaps.
+
+  // cwd: task > stub.deploy_default_cwd > stub.default_cwd
+  const cwd = task.cwd ?? stub.deploy_default_cwd ?? stub.default_cwd;
+
+  // env_setup: task (via resolveEnvSetup) > stub.deploy_env_setup
+  const resolvedEnvSetup = resolveEnvSetup(task, stub) ?? stub.deploy_env_setup;
+
+  // env: start with stub.deploy_default_env, overlay task.env on top (task wins)
+  let env: Record<string, string> | undefined;
+  if (stub.deploy_default_env || task.env) {
+    env = { ...(stub.deploy_default_env ?? {}), ...(task.env ?? {}) };
+  }
+
   const payload: Record<string, any> = {
     task_id: task.id,
     command: task.command,
-    cwd: task.cwd,
-    env: task.env,
+    cwd,
+    env,
     env_overrides: task.env_overrides,
-    env_setup: resolveEnvSetup(task, stub),
+    env_setup: resolvedEnvSetup,
     run_dir,
     params: task.param_overrides,
     outputs: task.outputs,
@@ -241,15 +260,38 @@ export function maybeDispatch(stub: Stub): void {
     logger.info("task.dispatch", { task_seq: task.seq, stub: stub.name, display_name: task.display_name, run_dir });
     if (updated) notifyDispatched(updated).catch(() => {});
 
-    // Dispatch timeout: if no task.started within 30s, mark as failed
-    // Only fail if task is still in "dispatched" status on the SAME stub (not recovered/moved)
+    // Dispatch timeout: if no task.started within 30s, recover to pending (up to 3 attempts)
+    // Only act if task is still in "dispatched" status on the SAME stub (not recovered/moved)
     const dispatchTaskId = task.id;
     const dispatchStubId = stub.id;
     setTimeout(() => {
       const t = store.findTask(dispatchTaskId);
       if (t && t.task.status === "dispatched" && !t.archived && t.stubId === dispatchStubId) {
-        failTask(dispatchStubId, dispatchTaskId, -3, { error_message: "Dispatch timeout: no task.started within 30s" });
-        logger.warn("task.dispatch_timeout", { task_id: dispatchTaskId, stub: dispatchStubId });
+        const attempts = (t.task.dispatch_attempts ?? 0) + 1;
+        logger.warn("task.dispatch_timeout", { task_id: dispatchTaskId, stub: dispatchStubId, attempt: attempts });
+        if (attempts >= 3) {
+          failTask(dispatchStubId, dispatchTaskId, -3, {
+            error_message: `Dispatch timeout: no task.started after ${attempts} attempts`,
+          });
+          logger.warn("task.dispatch_failed_permanent", { task_id: dispatchTaskId, attempts });
+        } else {
+          // Move back to global queue as pending for retry
+          const stub2 = store.getStub(dispatchStubId);
+          if (stub2) {
+            stub2.tasks = stub2.tasks.filter((t2) => t2.id !== dispatchTaskId);
+            store.setStub(stub2);
+          }
+          const recovered: Task = {
+            ...t.task,
+            status: "pending",
+            stub_id: undefined,
+            dispatch_attempts: attempts,
+          };
+          store.addToGlobalQueue(recovered);
+          if (_webNsRef) _webNsRef.emit("task.update", recovered);
+          logger.info("task.dispatch_recovered", { task_id: dispatchTaskId, attempt: attempts });
+          triggerSchedule();
+        }
       }
     }, 30_000);
   }

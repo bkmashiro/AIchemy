@@ -227,10 +227,9 @@ const BASE_RESUME_PAYLOAD = {
 function computeExpectedStubId(
   hostname = BASE_HOSTNAME,
   gpu = BASE_GPU,
-  defaultCwd?: string,
-  slurmJobId?: string,
+  cudaVisibleDevices: string = "",
 ): string {
-  const input = `${hostname}|${gpu.name}|${gpu.count}|${defaultCwd || ""}|${slurmJobId || ""}`;
+  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}`;
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 

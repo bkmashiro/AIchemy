@@ -200,6 +200,29 @@ export default function StubDetailPage({ socket }: { socket: Socket | null }) {
         {stub.default_cwd && <MetaRow label="Default CWD" value={stub.default_cwd} />}
       </div>
 
+      {/* Deploy Config */}
+      {(stub.deploy_python_path || stub.deploy_default_cwd || stub.deploy_env_setup || stub.deploy_default_env) && (
+        <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <p className="text-xs text-gray-500 uppercase tracking-wider mb-2">Deploy Config</p>
+          {stub.deploy_python_path && <MetaRow label="Python Path" value={stub.deploy_python_path} />}
+          {stub.deploy_default_cwd && <MetaRow label="Default CWD" value={stub.deploy_default_cwd} />}
+          {stub.deploy_env_setup && <MetaRow label="Env Setup" value={stub.deploy_env_setup} />}
+          {stub.deploy_default_env && Object.keys(stub.deploy_default_env).length > 0 && (
+            <MetaRow label="Default Env" value={
+              <div className="space-y-0.5">
+                {Object.entries(stub.deploy_default_env).map(([k, v]) => (
+                  <div key={k} className="text-xs font-mono">
+                    <span className="text-blue-400">{k}</span>
+                    <span className="text-gray-600">=</span>
+                    <span className="text-gray-300">{v}</span>
+                  </div>
+                ))}
+              </div>
+            } />
+          )}
+        </div>
+      )}
+
       {/* GPU Stats */}
       {gpus.length > 0 && (
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">

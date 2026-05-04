@@ -75,7 +75,9 @@ export interface Task {
   status: TaskStatus;
   priority: number;
   stub_id?: string;
+  target_stub_id?: string;       // Hard-pin task to a specific stub by ID
   target_tags?: string[];        // Tag-based routing (scheduler filters stubs by tag)
+  dispatch_attempts?: number;    // Number of failed dispatch attempts (for retry logic)
 
   // === DAG / Experiment ===
   depends_on?: string[];               // Prerequisite task IDs
@@ -170,6 +172,12 @@ export interface Stub {
     gpus?: number;
     cpus?: number;
   };
+  // Deploy config inherited defaults (set at connect time from deploy-config.yaml)
+  deploy_python_path?: string;
+  deploy_default_cwd?: string;
+  deploy_env_setup?: string;
+  deploy_default_env?: Record<string, string>;
+
   // Internal — not serialized to API
   socket_id?: string;
 }
@@ -296,6 +304,7 @@ export interface ResumePayload {
   hostname: string;
   gpu: GpuInfo;
   slurm_job_id?: string;
+  cuda_visible_devices?: string;  // CUDA_VISIBLE_DEVICES value — part of stable identity hash
   max_concurrent: number;
   token: string;
   env_setup?: string;
@@ -412,4 +421,43 @@ export interface ExecResponsePayload {
   truncated: boolean;
   /** Set if exec was rejected (e.g. --allow-exec not set). */
   error?: string;
+}
+
+// ─── Deployment Types ────────────────────────────────────────────────────────
+
+export interface StubTarget {
+  name: string;
+  host: string;
+  user?: string;
+  jump_host?: string;
+  remote_dir: string;
+  python_path: string;
+  max_concurrent: number;
+  tags?: string;
+  default_cwd?: string;
+  env_setup?: string;
+  default_env?: Record<string, string>;
+  allow_exec?: boolean;
+}
+
+export interface TunnelConfig {
+  enabled: boolean;
+  token: string;
+  cloudflared: string;
+  restart_on_failure: boolean;
+}
+
+export interface DeployFileConfig {
+  tunnel?: TunnelConfig;
+  ssh?: { key_path: string };
+  stub_package?: { local_path: string; sdk_path?: string };
+  stubs: StubTarget[];
+}
+
+export interface DeployResult {
+  ok: boolean;
+  target: string;
+  step?: string;
+  error?: string;
+  pid?: number;
 }

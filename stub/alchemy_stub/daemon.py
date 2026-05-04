@@ -32,6 +32,7 @@ from .process_mgr import ProcessManager
 from .system_monitor import SystemMonitor
 from .task_socket import TaskSocketRegistry
 from .walltime import CHECK_INTERVAL_S, DRAIN_THRESHOLD_S, get_remaining_walltime
+from .warm_pool import WarmPool
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,16 @@ class StubDaemon:
         # Use /tmp for PID file and log dir to avoid home-dir permission issues
         # (e.g. hw2025's home may not be writable from SLURM jobs)
         os.environ.setdefault("ALCHEMY_LOG_DIR", f"/tmp/alchemy_stub_{identity}_logs")
+
+        # Warm worker pool (disabled if config.warm_workers is False)
+        self.warm_pool: WarmPool | None = None
+        if getattr(config, "warm_workers", True):
+            self.warm_pool = WarmPool(
+                size=config.max_concurrent,
+                env_setup=config.env_setup or "",
+                preload=["torch", "numpy"],
+            )
+
         self.process_mgr = ProcessManager(
             max_concurrent=config.max_concurrent,
             env_setup=config.env_setup,
@@ -95,6 +106,7 @@ class StubDaemon:
             on_completed=self._on_task_completed,
             on_failed=self._on_task_failed,
             on_zombie=self._on_task_zombie,
+            warm_pool=self.warm_pool,
         )
 
         self.stub_id: str | None = None
@@ -273,10 +285,13 @@ class StubDaemon:
             for tid, _pid in self.process_mgr._dead_on_reattach
         ]
 
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", self.config.gpu_indices)
+
         payload: dict[str, Any] = {
             "stub_id": computed_stub_id,
             "hostname": self.config.hostname,
             "gpu": gpu_info,
+            "cuda_visible_devices": cuda_visible_devices,  # part of stable identity hash
             "max_concurrent": self.config.max_concurrent,
             "token": self.config.token,
             "running_tasks": running_tasks,
@@ -1048,6 +1063,11 @@ class StubDaemon:
             self.config.max_concurrent, self.config.tags,
         )
 
+        # Start warm worker pool (non-blocking — workers spawn in background)
+        if self.warm_pool:
+            log.info("Starting warm worker pool (size=%d)", self.config.max_concurrent)
+            asyncio.create_task(self.warm_pool.start())
+
         # Re-attach surviving task processes from previous run
         reattached = self.process_mgr.load_and_reattach()
         if reattached:
@@ -1096,4 +1116,6 @@ class StubDaemon:
                 break
             await asyncio.sleep(1)
         await self.task_socket_registry.stop_all()
+        if self.warm_pool:
+            await self.warm_pool.shutdown()
         log.info("Drain complete")

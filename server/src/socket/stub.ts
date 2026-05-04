@@ -18,6 +18,7 @@ import {
   TaskCompletedPayload, TaskFailedPayload,
   TaskConfigPayload, TaskCheckpointPayload, PreflightFailPayload,
   TaskResourcePayload, TaskMetricsPayload, TaskPhasePayload,
+  DeployFileConfig,
 } from "../types";
 import { maybeDispatch, triggerSchedule, buildRunPayload, computeRunDir, isCheckpointProtected } from "../scheduler";
 import { promoteBlockedTasks, cascadeCancellation } from "../dag";
@@ -55,13 +56,16 @@ const socketToStub: Map<string, string> = new Map();
 /**
  * Compute a stable stub identity hash.
  *
- * Formula: sha256(hostname|gpu.name|gpu.count|defaultCwd|slurmJobId)[:12]
+ * Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count)[:12]
+ *
+ * Intentionally excludes defaultCwd and slurmJobId so identity survives
+ * SLURM job restarts on the same physical GPU.
  *
  * IMPORTANT: This must match the Python stub's _compute_identity_hash in
  * stub/alchemy_stub/config.py. If you change this, update both sides.
  */
-export function computeStubId(hostname: string, gpu: { name: string; count: number }, defaultCwd?: string, slurmJobId?: string): string {
-  const input = `${hostname}|${gpu.name}|${gpu.count}|${defaultCwd || ""}|${slurmJobId || ""}`;
+export function computeStubId(hostname: string, gpu: { name: string; count: number }, cudaVisibleDevices: string = ""): string {
+  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}`;
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
@@ -87,7 +91,8 @@ function markTasksLost(stub: Stub, webNs: Namespace): void {
   const tasksSnapshot = [...stub.tasks];
   for (const task of tasksSnapshot) {
     if (task.status === "lost") continue; // already lost — don't create duplicate
-    if (["running", "dispatched", "paused"].includes(task.status)) {
+    // Note: dispatched/queued tasks are re-queued by requeueStubTasks() before this runs
+    if (["running", "paused"].includes(task.status)) {
       if (task.should_stop) {
         // Task was being killed — mark as killed instead of lost
         const updated = killTask(stub.id, task.id, undefined);
@@ -212,7 +217,7 @@ export function cancelKillChain(taskId: string): void {
 
 // ─── Setup stub namespace ─────────────────────────────────────────────────────
 
-export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
+export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig?: DeployFileConfig | null): void {
   _stubNs = ns;
   // Heartbeat timeout checker
   setInterval(() => {
@@ -223,6 +228,11 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
       if (now - lastHb > HEARTBEAT_TIMEOUT_MS) {
         logger.warn("stub.offline", { stub: stub.name, reason: "heartbeat_timeout", elapsed_s: Math.floor((now - lastHb) / 1000) });
         stub.status = "offline";
+        // Re-queue dispatched/queued tasks back to global pending so they can be rescheduled
+        const requeued = store.requeueStubTasks(stub.id);
+        for (const task of requeued) {
+          webNs.emit("task.update", task);
+        }
         markTasksLost(stub, webNs);
         store.setStub(stub);
         webNs.emit("stub.offline", { stub_id: stub.id });
@@ -236,7 +246,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
     // ─── Resume ─────────────────────────────────────────────────────────────
     socket.on("resume", (payload: ResumePayload, ack?: Function) => {
       try {
-        handleResume(socket, payload, webNs, ns);
+        handleResume(socket, payload, webNs, ns, deployConfig);
         if (ack) ack({ ok: true });
       } catch (err) {
         logger.error("resume.handler_error", { error: String(err) });
@@ -485,6 +495,11 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace): void {
         clearInterval(syncIv);
         stubSyncIntervals.delete(stubId);
       }
+      // Re-queue dispatched/queued tasks back to global pending so they can be rescheduled
+      const requeued = store.requeueStubTasks(stubId);
+      for (const task of requeued) {
+        webNs.emit("task.update", task);
+      }
       markTasksLost(stub, webNs);
       store.setStub(stub);
       webNs.emit("stub.offline", { stub_id: stubId });
@@ -500,9 +515,11 @@ function handleResume(
   payload: ResumePayload,
   webNs: Namespace,
   ns: Namespace,
+  deployConfig?: DeployFileConfig | null,
 ): void {
   const { hostname, gpu, slurm_job_id, max_concurrent, token, env_setup, default_cwd,
-    tags, running_tasks, local_queue, available_envs, user, slurm_constraints } = payload;
+    tags, running_tasks, local_queue, available_envs, user, slurm_constraints,
+    cuda_visible_devices } = payload;
 
   // Auth check
   const tokenRecord = store.getToken(token);
@@ -515,7 +532,7 @@ function handleResume(
   // Compute stable stub ID.
   // If the stub sends a pre-computed stub_id (aligned formula), use it.
   // Otherwise fall back to server-side computation for backward compat.
-  const serverComputedId = computeStubId(hostname, gpu, default_cwd, slurm_job_id);
+  const serverComputedId = computeStubId(hostname, gpu, cuda_visible_devices ?? "");
   let stubId: string;
   if (payload.stub_id) {
     if (payload.stub_id !== serverComputedId) {
@@ -525,8 +542,7 @@ function handleResume(
         hostname,
         gpu_name: gpu.name,
         gpu_count: gpu.count,
-        default_cwd,
-        slurm_job_id,
+        cuda_visible_devices,
       });
     }
     // Trust the client-provided ID — it was computed with the same formula
@@ -568,6 +584,11 @@ function handleResume(
   // Determine stub type
   const stubType: "slurm" | "workstation" = slurm_job_id ? "slurm" : "workstation";
 
+  // Look up deploy config target for this stub by hostname
+  const deployTarget = deployConfig?.stubs?.find(
+    (t) => t.host === hostname || t.name === hostname,
+  );
+
   let stub: Stub;
   const now = new Date().toISOString();
 
@@ -593,6 +614,11 @@ function handleResume(
       available_envs: available_envs ?? existingStub.available_envs,
       user: user ?? existingStub.user,
       slurm_constraints: slurm_constraints ?? existingStub.slurm_constraints,
+      // Always refresh deploy config defaults from current deploy-config.yaml
+      deploy_python_path: deployTarget?.python_path,
+      deploy_default_cwd: deployTarget?.default_cwd,
+      deploy_env_setup: deployTarget?.env_setup,
+      deploy_default_env: deployTarget?.default_env,
     };
     logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length });
   } else {
@@ -619,6 +645,10 @@ function handleResume(
       available_envs,
       user,
       slurm_constraints,
+      deploy_python_path: deployTarget?.python_path,
+      deploy_default_cwd: deployTarget?.default_cwd,
+      deploy_env_setup: deployTarget?.env_setup,
+      deploy_default_env: deployTarget?.default_env,
     };
     logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length, new: true });
   }
@@ -973,6 +1003,18 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
   }
   if (!updated) return;
 
+  if (isKilled) {
+    logger.warn("task.killed", { task_seq: updated.seq, stub: stubId, exit_code: payload.exit_code });
+  } else {
+    logger.warn("task.failed", {
+      task_seq: updated.seq,
+      stub: stubId,
+      exit_code: payload.exit_code,
+      death_cause: deathCause,
+      error: payload.error ? String(payload.error).slice(0, 500) : undefined,
+    });
+  }
+
   webNs.emit("task.update", updated);
 
   if (isKilled) {
@@ -1076,6 +1118,12 @@ function handleTaskPhase(stubId: string, payload: TaskPhasePayload, webNs: Names
 function handlePreflightFail(stubId: string, payload: PreflightFailPayload, webNs: Namespace): void {
   const updated = preflightFail(stubId, payload.task_id, payload.errors);
   if (updated) {
+    logger.warn("task.preflight_fail", {
+      task_seq: updated.seq,
+      stub: stubId,
+      errors: payload.errors,
+      error_message: updated.error_message,
+    });
     webNs.emit("task.update", updated);
     notifyFailed(updated).catch(() => {});
     if (updated.grid_id) checkGridCompletion(updated.grid_id, webNs);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Task, TaskStatus, tasksApi } from "../lib/api";
 import { formatRelTime, taskDuration, generateDisplayName } from "../lib/format";
@@ -26,6 +26,7 @@ const PAGE_LIMIT = 50;
 export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [total, setTotal] = useState(0);
+  const [counts, setCounts] = useState<Record<string, number>>({});
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<Filter>("all");
@@ -41,12 +42,13 @@ export default function TasksPage() {
   const navigate = useNavigate();
 
   const fetchTasks = useCallback(() => {
-    const params: { page: number; limit: number; status?: string } = { page, limit: PAGE_LIMIT };
-    // For active/terminal filters we don't pass a single status — we fetch all and rely on page
+    const params: { page: number; limit: number; status_group?: string } = { page, limit: PAGE_LIMIT };
+    if (filter === "active") params.status_group = "active";
+    if (filter === "terminal") params.status_group = "terminal";
     tasksApi.list(params)
-      .then((r) => { setTasks(r.tasks); setTotal(r.total); setLoading(false); })
+      .then((r) => { setTasks(r.tasks); setTotal(r.total); if (r.counts) setCounts(r.counts); setLoading(false); })
       .catch(() => setLoading(false));
-  }, [page]);
+  }, [page, filter]);
 
   useEffect(() => {
     fetchTasks();
@@ -56,19 +58,6 @@ export default function TasksPage() {
 
   // Reset to page 1 when filter changes
   useEffect(() => { setPage(1); }, [filter]);
-
-  const filtered = useMemo(() => {
-    let list = tasks;
-    if (filter === "active") list = list.filter((t) => ["running", "dispatched", "queued", "pending", "paused"].includes(t.status));
-    if (filter === "terminal") list = list.filter((t) => ["completed", "failed", "killed", "lost"].includes(t.status));
-    return list;
-  }, [tasks, filter]);
-
-  const counts = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const t of tasks) c[t.status] = (c[t.status] || 0) + 1;
-    return c;
-  }, [tasks]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_LIMIT));
 
@@ -150,7 +139,7 @@ export default function TasksPage() {
             </tr>
           </thead>
           <tbody>
-            {filtered.map((t) => {
+            {tasks.map((t) => {
               const isActive = ["running", "paused", "queued", "dispatched", "pending"].includes(t.status);
               const canRetry = ["failed", "killed", "lost"].includes(t.status);
               const displayName = generateDisplayName(t);
@@ -203,7 +192,7 @@ export default function TasksPage() {
             })}
           </tbody>
         </table>
-        {filtered.length === 0 && (
+        {tasks.length === 0 && (
           <div className="text-center py-12 text-gray-600">No tasks</div>
         )}
       </div>

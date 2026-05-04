@@ -107,6 +107,7 @@ export interface TaskInput {
   param_overrides?: Record<string, any>;
   idempotency_key?: string;
   stub_id?: string;
+  target_stub_id?: string;
   target_tags?: string[];
   python_env?: string;
   submitted_by?: string;
@@ -161,6 +162,7 @@ export function createTask(input: TaskInput): Task {
     status: input.depends_on && input.depends_on.length > 0 ? "blocked" : "pending",
     priority: input.priority ?? 5,
     stub_id: input.stub_id,
+    target_stub_id: input.target_stub_id,
     target_tags: input.target_tags,
     grid_id: input.grid_id,
     param_overrides: input.param_overrides,
@@ -194,17 +196,30 @@ const TERMINAL_STATUSES = ["completed", "failed", "killed", "lost", "cancelled"]
 export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): Router {
   const router = Router();
 
-  // GET /tasks — paginated: ?page=1&limit=50&status=running
+  // GET /tasks — paginated: ?page=1&limit=50&status=running&status_group=active|terminal
   router.get("/", (req: Request, res: Response) => {
     const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
     const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
     const statusFilter = req.query.status ? String(req.query.status) : undefined;
+    const statusGroup = req.query.status_group ? String(req.query.status_group) : undefined;
     const includeLogs = req.query.logs === "true";
+
+    const ACTIVE_STATUSES = ["running", "dispatched", "queued", "pending", "paused"];
 
     let tasks = store.getAllTasks();
 
+    // Compute counts across ALL tasks before filtering
+    const counts: Record<string, number> = {};
+    for (const t of tasks) {
+      counts[t.status] = (counts[t.status] ?? 0) + 1;
+    }
+
     if (statusFilter) {
       tasks = tasks.filter((t) => t.status === statusFilter);
+    } else if (statusGroup === "active") {
+      tasks = tasks.filter((t) => ACTIVE_STATUSES.includes(t.status));
+    } else if (statusGroup === "terminal") {
+      tasks = tasks.filter((t) => TERMINAL_STATUSES.includes(t.status));
     }
 
     // Sort: newest first by seq
@@ -224,7 +239,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       return stub_name ? { ...rest, stub_name } : rest;
     });
 
-    res.json({ tasks: enriched, total, page, limit });
+    res.json({ tasks: enriched, total, page, limit, counts });
   });
 
   // POST /tasks/batch — must be before /:id routes
@@ -346,8 +361,11 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, target_tags, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs,
-      auto_retry_on,
+      auto_retry_on, stub_id,
+      target_stub_id: _target_stub_id,
     } = req.body;
+    // target_stub_id pins the task to a specific stub; stub_id is accepted as an alias
+    const target_stub_id: string | undefined = _target_stub_id ?? stub_id;
 
     if (!script) {
       res.status(400).json({ error: "script required" }); return;
@@ -358,6 +376,32 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       const invalidKey = Object.keys(env).find((k) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k));
       if (invalidKey) {
         res.status(400).json({ error: `Invalid env key: "${invalidKey}"` }); return;
+      }
+    }
+
+    // Validate script is an absolute path
+    if (!script.startsWith("/")) {
+      res.status(400).json({ error: `Script must be an absolute path, got: "${script}"` }); return;
+    }
+
+    // Validate cwd is absolute if provided
+    if (cwd && !cwd.startsWith("/")) {
+      res.status(400).json({ error: `cwd must be an absolute path, got: "${cwd}"` }); return;
+    }
+
+    // Validate run_dir is absolute if provided
+    if (run_dir && !run_dir.startsWith("/")) {
+      res.status(400).json({ error: `run_dir must be an absolute path, got: "${run_dir}"` }); return;
+    }
+
+    // Validate target_stub_id references a known online stub
+    if (target_stub_id) {
+      const stub = store.getStub(target_stub_id);
+      if (!stub) {
+        res.status(400).json({ error: `Unknown stub_id: "${target_stub_id}"` }); return;
+      }
+      if (stub.status !== "online") {
+        res.status(400).json({ error: `Stub "${target_stub_id}" (${stub.name}) is offline` }); return;
       }
     }
 
@@ -402,6 +446,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs, auto_retry_on,
+      stub_id, target_stub_id,
     });
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected
@@ -424,6 +469,48 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     triggerSchedule();
+
+    const waitForResult = req.query.wait === "true";
+    const waitTimeout = Math.min(Number(req.query.wait_timeout) || 15, 30); // max 30s
+
+    if (waitForResult) {
+      // Poll for task state change: wait until task is running, failed, or completed.
+      // Uses setTimeout to avoid blocking the Node.js event loop.
+      const deadline = Date.now() + waitTimeout * 1000;
+      const pollInterval = 200; // ms
+
+      const poll = () => {
+        const found = store.findTask(task.id);
+        if (!found) {
+          res.status(201).json({ ...task, _wait: "task_lost" });
+          return;
+        }
+        const t = found.task;
+        // Terminal or running = we have a result
+        if (["running", "completed", "failed", "killed", "lost"].includes(t.status)) {
+          res.status(t.status === "failed" ? 422 : 201).json({
+            ...t,
+            _wait: t.status === "failed" ? "preflight_or_start_failed" : "started",
+          });
+          return;
+        }
+        if (Date.now() >= deadline) {
+          // Timeout — return current state
+          res.status(202).json({
+            ...t,
+            _wait: "timeout",
+            _wait_message: `Task still in ${t.status} after ${waitTimeout}s`,
+          });
+          return;
+        }
+        setTimeout(poll, pollInterval);
+      };
+
+      // Start polling after a short initial delay (give scheduler time to assign)
+      setTimeout(poll, 100);
+      return;
+    }
+
     res.status(201).json(task);
   });
 

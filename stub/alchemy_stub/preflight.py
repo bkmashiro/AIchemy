@@ -176,11 +176,36 @@ async def run_preflight(
                 errors.append(err)
                 break  # one error is enough
 
+    # 2b. Python binary exists (if command uses absolute python path)
+    if command:
+        import shlex as _shlex
+        try:
+            _cmd_parts = _shlex.split(command.strip())
+        except ValueError:
+            _cmd_parts = command.strip().split()
+        if _cmd_parts and os.path.isabs(_cmd_parts[0]) and os.path.basename(_cmd_parts[0]).startswith("python"):
+            _py_bin = _cmd_parts[0]
+            if not os.access(_py_bin, os.X_OK):
+                errors.append(f"Python binary not found: {_py_bin}")
+
     # 3. run_dir parent writable (if declared)
     if run_dir:
         parent = os.path.dirname(run_dir.rstrip("/")) or run_dir
         if not os.access(parent, os.W_OK):
             errors.append(f"run_dir parent not writable: {parent}")
+
+    # 3b. Output dir pre-creation (if declared)
+    outputs: list[str] = task.get("outputs") or []
+    for out_path in outputs:
+        out_parent = os.path.dirname(out_path) or "."
+        if not os.path.isdir(out_parent):
+            try:
+                os.makedirs(out_parent, exist_ok=True)
+            except Exception:
+                errors.append(f"Output dir not writable: {out_parent}")
+                continue
+        if not os.access(out_parent, os.W_OK):
+            errors.append(f"Output dir not writable: {out_parent}")
 
     # Early exit on basic errors
     if errors:

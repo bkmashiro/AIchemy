@@ -18,6 +18,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { store } from "./store";
 import { logger } from "./log";
+import { sshExec } from "./ssh";
 
 const execAsync = promisify(exec);
 
@@ -78,17 +79,9 @@ function buildSbatchScript(deployConfig: NonNullable<import("./types").Stub["dep
   return directives.join("\n");
 }
 
-async function sshExec(host: string, user: string | undefined, command: string): Promise<string> {
-  const userPrefix = user ? `${user}@` : "";
-  const keyFlag = SSH_KEY_PATH ? `-i ${SSH_KEY_PATH}` : "";
-  const sshCmd = `ssh ${keyFlag} -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${userPrefix}${host} ${JSON.stringify(command)}`;
-  const { stdout } = await execAsync(sshCmd, { timeout: 30_000 });
-  return stdout.trim();
-}
-
 async function checkForExistingPendingSbatch(host: string, user: string | undefined): Promise<boolean> {
   try {
-    const result = await sshExec(host, user, `squeue -u ${user || "$(whoami)"} -h --state=PD -o "%j" | grep -c "^train_alchemy$" || true`);
+    const result = await sshExec(host, user, `squeue -u ${user || "$(whoami)"} -h --state=PD -o "%j" | grep -c "^train_alchemy$" || true`, { keyPath: SSH_KEY_PATH || undefined });
     const count = parseInt(result, 10);
     return count > 0;
   } catch {
@@ -129,7 +122,7 @@ async function submitAutoRenew(stubId: string): Promise<void> {
     await execAsync(writeCmd, { timeout: 30_000 });
 
     // Submit sbatch
-    const result = await sshExec(dc.ssh_host, dc.ssh_user, `sbatch ${tmpScript} && rm -f ${tmpScript}`);
+    const result = await sshExec(dc.ssh_host, dc.ssh_user, `sbatch ${tmpScript} && rm -f ${tmpScript}`, { keyPath: SSH_KEY_PATH || undefined });
     const jobIdMatch = result.match(/Submitted batch job (\d+)/);
     const newJobId = jobIdMatch ? jobIdMatch[1] : "unknown";
 

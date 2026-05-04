@@ -8,15 +8,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-def _compute_identity_hash(hostname: str, gpu_name: str, gpu_count: int, default_cwd: str, slurm_job_id: str | None = None) -> str:
+def _compute_identity_hash(hostname: str, gpu_name: str, gpu_count: int, cuda_visible_devices: str = "") -> str:
     """Compute stable stub identity hash.
 
-    Formula: sha256(hostname|gpu.name|gpu.count|defaultCwd|slurmJobId)[:12]
+    Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count)[:12]
+
+    Intentionally excludes default_cwd and slurm_job_id so identity survives
+    SLURM job restarts on the same physical GPU.
 
     IMPORTANT: This must match the server's computeStubId in
     server/src/socket/stub.ts. If you change this, update both sides.
     """
-    raw = f"{hostname}|{gpu_name}|{gpu_count}|{default_cwd}|{slurm_job_id or ''}"
+    raw = f"{hostname}|{cuda_visible_devices}|{gpu_name}|{gpu_count}"
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
@@ -140,6 +143,7 @@ class Config:
     slurm_job_id: str | None = None
     slurm_partition: str | None = None
     slurm_node: str | None = None
+    warm_workers: bool = True  # --no-warm-workers disables warm pool
 
     @property
     def identity_hash(self) -> str:
@@ -157,8 +161,10 @@ class Config:
 
         Must match server's computeStubId in server/src/socket/stub.ts.
         Call this after GPU info is available (from GpuMonitor).
+        Uses CUDA_VISIBLE_DEVICES (gpu_indices) for stable identity across SLURM restarts.
         """
-        return _compute_identity_hash(self.hostname, gpu_name, gpu_count, self.default_cwd, self.slurm_job_id)
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", self.gpu_indices)
+        return _compute_identity_hash(self.hostname, gpu_name, gpu_count, cuda_visible_devices)
 
     @property
     def stub_type(self) -> str:
@@ -243,6 +249,18 @@ def parse_args() -> Config:
             "on this stub via POST /api/stubs/:id/exec2. Disabled by default for security."
         ),
     )
+    parser.add_argument(
+        "--warm-workers",
+        action="store_true",
+        default=True,
+        help="Enable warm worker pool for fast task execution (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-warm-workers",
+        dest="warm_workers",
+        action="store_false",
+        help="Disable warm worker pool (fall back to per-task subprocess spawn).",
+    )
 
     args = parser.parse_args()
 
@@ -307,4 +325,5 @@ def parse_args() -> Config:
         slurm_job_id=slurm_job_id,
         slurm_partition=os.environ.get("SLURM_JOB_PARTITION"),
         slurm_node=os.environ.get("SLURMD_NODENAME"),
+        warm_workers=args.warm_workers,
     )

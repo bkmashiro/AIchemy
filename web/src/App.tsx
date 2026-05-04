@@ -9,7 +9,9 @@ import GridsPage from "./pages/GridsPage";
 import TasksPage from "./pages/TasksPage";
 import TaskDetailPage from "./pages/TaskDetailPage";
 import StubDetailPage from "./pages/StubDetail";
+import StubsPage from "./pages/StubsPage";
 import ExperimentsPage from "./pages/ExperimentsPage";
+import DeployPage from "./pages/DeployPage";
 import LoginPage from "./pages/LoginPage";
 
 function NavItem({ to, label, badge, end }: { to: string; label: string; badge?: number; end?: boolean }) {
@@ -59,9 +61,11 @@ function AppInner(_props: { onLogout: () => void }) {
         <nav className="flex items-center gap-1 flex-1">
           <NavItem to="/" label="Dashboard" end />
           <NavItem to="/tasks" label="Tasks" />
+          <NavItem to="/stubs" label="Stubs" />
           <NavItem to="/grids" label="Grids" />
           <NavItem to="/experiments" label="Experiments" />
           <NavItem to="/resources" label="Resources" />
+          <NavItem to="/deploy" label="Deploy" />
         </nav>
 
         <div className="flex items-center gap-3 ml-4">
@@ -108,11 +112,13 @@ function AppInner(_props: { onLogout: () => void }) {
             />
             <Route path="/tasks" element={<TasksPage />} />
             <Route path="/tasks/:id" element={<TaskDetailPage />} />
+            <Route path="/stubs" element={<StubsPage />} />
             <Route path="/stubs/:id" element={<StubDetailPage socket={socket} />} />
             <Route path="/grids" element={<GridsPage />} />
             <Route path="/grids/:id" element={<GridView />} />
             <Route path="/experiments" element={<ExperimentsPage />} />
             <Route path="/experiments/:id" element={<ExperimentsPage />} />
+            <Route path="/deploy" element={<DeployPage />} />
             <Route
               path="/resources"
               element={

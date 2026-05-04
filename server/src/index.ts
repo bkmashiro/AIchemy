@@ -28,8 +28,21 @@ import { backupState, listBackups, restoreFromBackup, pruneBackups } from "./sto
 import { BACKUPS_DIR } from "./store";
 import { logger } from "./log";
 import { startAutoRenew } from "./autorenew";
+import { loadDeployConfig } from "./deploy";
+import { createTunnelManager, TunnelManager } from "./tunnel";
+import { createDeployRouter } from "./api/deploy";
 
 const PORT = parseInt(process.env.PORT || "3002", 10);
+
+// ─── Deploy config ──────────────────────────────────────────────────────────
+
+const DEPLOY_CONFIG_PATH = process.env.DEPLOY_CONFIG || path.join(__dirname, "../../deploy-config.yaml");
+const deployConfig = loadDeployConfig(DEPLOY_CONFIG_PATH);
+
+let tunnelMgr: TunnelManager | null = null;
+if (deployConfig?.tunnel?.enabled) {
+  tunnelMgr = createTunnelManager(deployConfig.tunnel);
+}
 
 // ─── Express + socket.io ──────────────────────────────────────────────────────
 
@@ -53,7 +66,7 @@ const webNs = io.of("/web");
 const controllerNs = io.of("/controller");
 
 setupWebNamespace(webNs);
-setupStubNamespace(stubNs, webNs);
+setupStubNamespace(stubNs, webNs, deployConfig);
 setupControllerNamespace(controllerNs, webNs);
 startScheduler(webNs, stubNs);
 
@@ -180,6 +193,7 @@ api.use("/stubs", createStubsRouter(stubNs, webNs));
 api.use("/grids", createGridsRouter(stubNs, webNs));
 api.use("/experiments", createExperimentsRouter(stubNs, webNs));
 api.use("/cluster", createClusterRouter());
+api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
 
 // Health check — no auth required
 app.get("/api/health", (_req, res) => {
@@ -227,8 +241,9 @@ app.get("*", (req, res) => {
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
 
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
   logger.info("server.stop", { reason: "SIGTERM" });
+  if (tunnelMgr) await tunnelMgr.stop().catch(() => {});
   store.save();
   stubNs.emit("server.restarting", {});
   httpServer.close(() => {
@@ -237,8 +252,9 @@ process.on("SIGTERM", () => {
   setTimeout(() => process.exit(1), 10_000);
 });
 
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   logger.info("server.stop", { reason: "SIGINT" });
+  if (tunnelMgr) await tunnelMgr.stop().catch(() => {});
   store.save();
   process.exit(0);
 });
@@ -251,6 +267,9 @@ httpServer.listen(PORT, () => {
 
   // Start auto-renew checker (SLURM walltime)
   startAutoRenew();
+
+  // Start CF tunnel if configured
+  if (tunnelMgr) tunnelMgr.start();
 
   // Ensure a default token exists
   if (store.getAllTokens().length === 0) {

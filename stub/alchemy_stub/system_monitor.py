@@ -5,6 +5,7 @@ Collects CPU/MEM for the stub host and per-task resource usage.
 from __future__ import annotations
 
 import logging
+import os
 from collections import deque
 from typing import Any
 
@@ -78,7 +79,13 @@ class SystemMonitor:
         try:
             mem = psutil.virtual_memory()
             mem_used_mb = mem.used // (1024 ** 2)
-            mem_total_mb = mem.total // (1024 ** 2)
+            # If running under SLURM, use SLURM-allocated memory as the limit
+            slurm_mem = os.environ.get("SLURM_MEM_PER_NODE")  # in MB
+            if slurm_mem:
+                mem_total_mb = int(slurm_mem)
+            else:
+                # Fallback to physical memory for workstation stubs
+                mem_total_mb = mem.total // (1024 ** 2)
             if mem_total_mb == 0:
                 log.warning(
                     "system_monitor: psutil.virtual_memory() returned total=0 "

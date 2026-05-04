@@ -24,6 +24,9 @@ from typing import Any, Callable, Awaitable
 from .config import _parse_env_value
 from .error_classifier import classify_death, has_checkpoint
 from .task_socket import task_socket_path
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .warm_pool import WarmPool
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +75,45 @@ def _log_path(task_id: str) -> str:
     return os.path.join(_log_dir(), f"{task_id}.log")
 
 
+def _is_runpy_compatible(command: str) -> bool:
+    """Return True if the command looks like a plain Python script invocation.
+
+    Warm pool uses runpy.run_path() which only works for .py scripts.
+    We accept commands that end with `.py` (possibly with arguments) and
+    have no shell operators that we can't pass via sys.argv.
+    """
+    import shlex
+    _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>", "2>>"}
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    if any(p in _SHELL_OPS for p in parts):
+        return False
+    script = parts[0]
+    return script.endswith(".py")
+
+
+def _extract_script_path(command: str) -> str | None:
+    """Extract the script path from a plain Python command.
+
+    Returns the absolute path of the .py script, or None if not applicable.
+    """
+    import shlex
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    script = parts[0]
+    if not script.endswith(".py"):
+        return None
+    return script
+
+
 class ProcessInfo:
     """Tracks a single running subprocess."""
 
@@ -106,6 +148,52 @@ class ProcessInfo:
             return -1
         except PermissionError:
             return None  # alive but different user
+
+
+class _WarmProcessInfo(ProcessInfo):
+    """ProcessInfo variant for tasks running on warm pool workers.
+
+    poll() checks whether the warm pool worker is still alive for this task.
+    The warm pool notifies the pool manager when a task completes; the monitor
+    loop detects completion by checking if the worker is still busy.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        pid: int,
+        warm_pool: Any,
+        run_dir: str | None = None,
+        outputs: list[str] | None = None,
+        start_time: float | None = None,
+    ) -> None:
+        super().__init__(
+            task_id=task_id,
+            pid=pid,
+            proc=None,
+            run_dir=run_dir,
+            outputs=outputs,
+            start_time=start_time,
+        )
+        self._warm_pool = warm_pool
+
+    def poll(self) -> int | None:
+        """Return None if task is still on warm pool, or exit_code when done."""
+        # Still running on a worker?
+        worker_pid = self._warm_pool.get_worker_for_task(self.task_id)
+        if worker_pid is not None:
+            return None
+        # Check if pool has recorded an exit code for us
+        exit_code = self._warm_pool.pop_task_result(self.task_id)
+        if exit_code is not None:
+            self._cached_exit_code = exit_code
+            return exit_code
+        # Already polled once (exit code consumed) — return cached value
+        cached = getattr(self, "_cached_exit_code", None)
+        if cached is not None:
+            return cached
+        # Not yet in results dict (race: pool hasn't stored it yet) — still running
+        return None
 
 
 def _is_safe_output_path(path: str) -> bool:
@@ -182,6 +270,7 @@ class ProcessManager:
         on_completed: Callable[[str, int, str, bool], Awaitable[None]] | None = None,
         on_failed: Callable[[str, int, str, str, bool], Awaitable[None]] | None = None,
         on_zombie: Callable[[str], Awaitable[None]] | None = None,
+        warm_pool: "WarmPool | None" = None,
     ) -> None:
         self.max_concurrent = max_concurrent
         self.env_setup = env_setup
@@ -195,6 +284,7 @@ class ProcessManager:
         self.on_completed = on_completed
         self.on_failed = on_failed
         self.on_zombie = on_zombie
+        self.warm_pool = warm_pool
 
         # SLURM job ID for death classification (walltime detection)
         self._slurm_job_id: str | None = os.environ.get("SLURM_JOB_ID")
@@ -231,6 +321,52 @@ class ProcessManager:
             return self._procs[task_id].pid
 
         effective_cwd = cwd or self.default_cwd or None
+
+        # -------------------------------------------------------------- #
+        # Warm pool fast path: send to pre-started Python worker          #
+        # Only used when: pool is configured, task has no custom          #
+        # env_setup, and command is a plain Python script path.           #
+        # -------------------------------------------------------------- #
+        if self.warm_pool and not task_env_setup and _is_runpy_compatible(command):
+            script_path = _extract_script_path(command)
+            if script_path:
+                task_start_time = time.time()
+                combined_env = dict(env or {})
+                combined_env.update(env_overrides or {})
+                stub_socket = task_socket_path(task_id)
+
+                pid = await self.warm_pool.submit(
+                    task_id=task_id,
+                    script=script_path,
+                    cwd=effective_cwd,
+                    env=combined_env,
+                    params=params,
+                    run_dir=run_dir,
+                    config_path=config_path,
+                    stub_socket=stub_socket,
+                )
+
+                # Create a synthetic log file so monitor loop can tail it
+                log_path = _log_path(task_id)
+                if not os.path.exists(log_path):
+                    open(log_path, "w").close()
+
+                # Create ProcessInfo with a fake proc-like object for monitoring
+                info = _WarmProcessInfo(
+                    task_id=task_id,
+                    pid=pid,
+                    warm_pool=self.warm_pool,
+                    run_dir=run_dir,
+                    outputs=outputs,
+                    start_time=task_start_time,
+                )
+                self._procs[task_id] = info  # type: ignore[assignment]
+                self._save_pid(task_id, pid)
+
+                log.info("Task %s dispatched to warm pool (pid=%d)", task_id, pid)
+                if self.on_started:
+                    await self.on_started(task_id, pid)
+                return pid
 
         # Build wrapper shell script
         script = self._build_script(task_id, task_env_setup, env or {}, command)
@@ -323,6 +459,14 @@ class ProcessManager:
         """
         info = self._procs.get(task_id)
         if not info:
+            return
+
+        # Warm pool path: delegate kill to pool (which kills worker + respawns)
+        if isinstance(info, _WarmProcessInfo) and self.warm_pool:
+            self._stub_killed.add(task_id)
+            self._procs.pop(task_id, None)
+            self._remove_pid(task_id)
+            await self.warm_pool.kill_task(task_id, grace_period=grace_period_s)
             return
 
         self._stub_killed.add(task_id)
