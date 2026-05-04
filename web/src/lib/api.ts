@@ -338,14 +338,37 @@ export const costApi = {
 
 export interface DeployTarget {
   name: string;
-  host: string;
+  type?: "ssh" | "slurm";
+  host?: string;
   user?: string;
   jump_host?: string;
+  ssh_host?: string;
+  ssh_user?: string;
+  partition?: string;
+  gres?: string;
+  mem?: string;
+  time?: string;
+  qos?: string;
   python_path?: string;
   default_cwd?: string;
   env_setup?: string;
-  tags?: string[];
+  tags?: string[] | string;
   max_concurrent?: number;
+}
+
+export interface DeployResult {
+  ok: boolean;
+  target: string;
+  step?: string;
+  error?: string;
+  pid?: number;
+  job_id?: string;
+}
+
+export interface StubStatus {
+  running: boolean;
+  pid?: number;
+  job_id?: string;
 }
 
 export interface TunnelStatus {
@@ -357,4 +380,12 @@ export interface TunnelStatus {
 export const deployApi = {
   targets: () => api.get<DeployTarget[]>("/deploy/targets").then((r) => r.data),
   tunnelStatus: () => api.get<TunnelStatus>("/deploy/tunnel").then((r) => r.data),
+  status: (name: string, jobId?: string) =>
+    api.get<StubStatus>(`/deploy/stubs/${name}/status`, { params: jobId ? { job_id: jobId } : undefined }).then((r) => r.data),
+  deploy: (name: string, opts?: { mem?: string; time?: string }) =>
+    api.post<DeployResult>(`/deploy/stubs/${name}`, opts ?? {}).then((r) => r.data),
+  restart: (name: string, opts?: { mem?: string; time?: string }) =>
+    api.post<DeployResult>(`/deploy/stubs/${name}/restart`, opts ?? {}).then((r) => r.data),
+  stop: (name: string, jobId?: string) =>
+    api.post<DeployResult>(`/deploy/stubs/${name}/stop`, jobId ? { job_id: jobId } : {}).then((r) => r.data),
 };

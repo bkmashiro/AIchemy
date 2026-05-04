@@ -10,7 +10,7 @@
 
 import { Router, Request, Response } from "express";
 import { DeployFileConfig } from "../types";
-import { deployStub, getStubStatus, restartStub } from "../deploy";
+import { deployStub, getStubStatus, restartStub, stopStub } from "../deploy";
 import { TunnelManager } from "../tunnel";
 
 export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: TunnelManager | null): Router {
@@ -21,8 +21,20 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     if (!config) { res.json([]); return; }
     res.json(config.stubs.map((s) => ({
       name: s.name,
+      type: s.type ?? "ssh",
       host: s.host,
       user: s.user,
+      ssh_host: s.ssh_host,
+      ssh_user: s.ssh_user,
+      partition: s.partition,
+      gres: s.gres,
+      mem: s.mem,
+      time: s.time,
+      qos: s.qos,
+      jump_host: s.jump_host,
+      python_path: s.python_path,
+      default_cwd: s.default_cwd,
+      env_setup: s.env_setup,
       tags: s.tags,
       max_concurrent: s.max_concurrent,
     })));
@@ -36,9 +48,12 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
 
     const serverUrl = req.body?.server_url || process.env.ALCHEMY_SERVER_URL || "";
     const token = process.env.ALCHEMY_TOKEN || "";
+    const slurmOverrides = req.body?.mem || req.body?.time
+      ? { mem: req.body.mem, time: req.body.time }
+      : undefined;
     const result = await deployStub(
       target, serverUrl, token,
-      config.ssh?.key_path, config.stub_package?.local_path,
+      config.ssh?.key_path, config.stub_package?.local_path, slurmOverrides,
     );
     res.json(result);
   });
@@ -68,13 +83,14 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     res.json(results);
   });
 
-  // GET /deploy/stubs/:name/status — SSH check if stub process is running
+  // GET /deploy/stubs/:name/status — SSH/SLURM check if stub process is running
   router.get("/stubs/:name/status", async (req: Request, res: Response): Promise<void> => {
     if (!config) { res.status(404).json({ error: "No deploy config" }); return; }
     const target = config.stubs.find((s) => s.name === req.params.name);
     if (!target) { res.status(404).json({ error: "Target not found" }); return; }
 
-    const status = await getStubStatus(target, config.ssh?.key_path);
+    const jobId = req.query.job_id as string | undefined;
+    const status = await getStubStatus(target, config.ssh?.key_path, jobId);
     res.json(status);
   });
 
@@ -85,10 +101,24 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     if (!target) { res.status(404).json({ error: "Target not found" }); return; }
 
     const serverUrl = req.body?.server_url || process.env.ALCHEMY_SERVER_URL || "";
+    const slurmOverrides = req.body?.mem || req.body?.time
+      ? { mem: req.body.mem, time: req.body.time }
+      : undefined;
     const result = await restartStub(
       target, serverUrl, process.env.ALCHEMY_TOKEN || "",
-      config.ssh?.key_path,
+      config.ssh?.key_path, slurmOverrides,
     );
+    res.json(result);
+  });
+
+  // POST /deploy/stubs/:name/stop — stop stub (SSH: kill PID; SLURM: scancel)
+  router.post("/stubs/:name/stop", async (req: Request, res: Response): Promise<void> => {
+    if (!config) { res.status(404).json({ error: "No deploy config" }); return; }
+    const target = config.stubs.find((s) => s.name === req.params.name);
+    if (!target) { res.status(404).json({ error: "Target not found" }); return; }
+
+    const jobId = req.body?.job_id as string | undefined;
+    const result = await stopStub(target, config.ssh?.key_path, jobId);
     res.json(result);
   });
 

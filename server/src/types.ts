@@ -427,7 +427,9 @@ export interface ExecResponsePayload {
 
 export interface StubTarget {
   name: string;
-  host: string;
+  // SSH/workstation fields
+  type?: "ssh" | "slurm";
+  host?: string;        // SSH: target host; optional for slurm
   user?: string;
   jump_host?: string;
   remote_dir: string;
@@ -438,6 +440,14 @@ export interface StubTarget {
   env_setup?: string;
   default_env?: Record<string, string>;
   allow_exec?: boolean;
+  // SLURM-specific fields
+  ssh_host?: string;    // SLURM: host to run sbatch from
+  ssh_user?: string;    // SLURM: user for sbatch SSH
+  partition?: string;
+  gres?: string;
+  mem?: string;
+  time?: string;
+  qos?: string;
 }
 
 export interface TunnelConfig {
@@ -460,4 +470,5 @@ export interface DeployResult {
   step?: string;
   error?: string;
   pid?: number;
+  job_id?: string;    // SLURM: submitted job ID
 }

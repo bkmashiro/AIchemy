@@ -6,6 +6,8 @@
  *   2. pkill old alchemy_stub process (ignore errors)
  *   3. nohup PYTHONPATH={remote_dir}/stub {python_path} -m alchemy_stub ...
  *
+ * For SLURM targets, step 3 submits an sbatch job instead.
+ *
  * NOTE: requires the `yaml` package — add to package.json:
  *   "yaml": "^2.4.0"
  */
@@ -50,7 +52,13 @@ export function loadDeployConfig(filePath: string): DeployFileConfig | null {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function userAtHost(target: StubTarget): string {
-  return target.user ? `${target.user}@${target.host}` : target.host;
+  const host = target.host ?? "";
+  return target.user ? `${target.user}@${host}` : host;
+}
+
+function slurmUserAtHost(target: StubTarget): string {
+  const host = target.ssh_host ?? "";
+  return target.ssh_user ? `${target.ssh_user}@${host}` : host;
 }
 
 /** Step 1: sync stub package to remote_dir. */
@@ -94,7 +102,8 @@ async function startStub(
   token: string,
   sshKeyPath?: string,
 ): Promise<number | undefined> {
-  const { host, user, jump_host, python_path, remote_dir, max_concurrent, tags, default_cwd, name } = target;
+  const { user, jump_host, python_path, remote_dir, max_concurrent, tags, default_cwd, name } = target;
+  const host = target.host ?? "";
   const opts = { keyPath: sshKeyPath, jumpHost: jump_host, timeout: 30_000 };
   const pidFile = `/tmp/alchemy_stub_${name}.pid`;
   const logFile = `${remote_dir}/stub_${name}.log`;
@@ -132,6 +141,119 @@ async function startStub(
   return Number.isFinite(pid) && pid > 0 ? pid : undefined;
 }
 
+// ─── SLURM helpers ───────────────────────────────────────────────────────────
+
+/** Sync code to SLURM submit host (ssh_host acts as the target). */
+async function syncCodeSlurm(
+  target: StubTarget,
+  stubLocalPath: string,
+  sshKeyPath?: string,
+): Promise<void> {
+  const sshHost = target.ssh_host ?? "";
+  const sshUser = target.ssh_user;
+  const flags = [
+    "-o StrictHostKeyChecking=no",
+    "-o ConnectTimeout=10",
+    ...(sshKeyPath ? [`-i ${sshKeyPath}`] : []),
+  ].join(" ");
+  const userAtH = sshUser ? `${sshUser}@${sshHost}` : sshHost;
+
+  const mkdirCmd = `ssh ${flags} ${userAtH} "mkdir -p ${target.remote_dir}"`;
+  await execAsync(mkdirCmd, { timeout: 30_000 });
+
+  const tarLocal = `tar czf - -C "${stubLocalPath}" .`;
+  const extractCmd = `ssh ${flags} ${userAtH} "find ${target.remote_dir} -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; tar xzf - -C ${target.remote_dir}"`;
+  await execAsync(`${tarLocal} | ${extractCmd}`, { timeout: 120_000, shell: "/bin/bash" });
+}
+
+interface SlurmSubmitOptions {
+  mem?: string;
+  time?: string;
+}
+
+/** Submit sbatch job for a SLURM target. Returns job ID. */
+async function submitSlurmJob(
+  target: StubTarget,
+  serverUrl: string,
+  token: string,
+  sshKeyPath?: string,
+  overrides?: SlurmSubmitOptions,
+): Promise<string> {
+  const sshHost = target.ssh_host ?? "";
+  const sshUser = target.ssh_user;
+  const jobName = `train_stub_${target.name}`;
+  const mem = overrides?.mem ?? target.mem ?? "60G";
+  const time = overrides?.time ?? target.time ?? "24:00:00";
+
+  const script = [
+    "#!/bin/bash",
+    `#SBATCH --job-name=${jobName}`,
+    `#SBATCH --partition=${target.partition ?? "gpgpu"}`,
+    ...(target.gres ? [`#SBATCH --gres=${target.gres}`] : []),
+    `#SBATCH --mem=${mem}`,
+    `#SBATCH --time=${time}`,
+    ...(target.qos ? [`#SBATCH --qos=${target.qos}`] : []),
+    "#SBATCH --output=/dev/null",
+    "#SBATCH --error=/dev/null",
+    "",
+    `PYTHONPATH=${target.remote_dir} ${target.python_path} -m alchemy_stub \\`,
+    `  --server ${JSON.stringify(serverUrl)} \\`,
+    `  --token ${JSON.stringify(token)} \\`,
+    `  --max-concurrent ${target.max_concurrent}` +
+      (target.tags ? ` \\\n  --tags ${JSON.stringify(target.tags)}` : "") +
+      (target.default_cwd ? ` \\\n  --default-cwd ${JSON.stringify(target.default_cwd)}` : ""),
+  ].join("\n");
+
+  const flags = [
+    "-o StrictHostKeyChecking=no",
+    "-o ConnectTimeout=10",
+    ...(sshKeyPath ? [`-i ${sshKeyPath}`] : []),
+  ].join(" ");
+  const userAtH = sshUser ? `${sshUser}@${sshHost}` : sshHost;
+
+  // Pipe script to sbatch via heredoc
+  const escapedScript = script.replace(/'/g, "'\\''");
+  const submitCmd = `ssh ${flags} ${userAtH} 'cat <<'"'"'SBATCH_EOF'"'"' | sbatch\n${escapedScript}\nSBATCH_EOF'`;
+  const { stdout } = await execAsync(submitCmd, { timeout: 30_000, shell: "/bin/bash" });
+  const match = stdout.match(/Submitted batch job (\d+)/);
+  if (!match) throw new Error(`Unexpected sbatch output: ${stdout.trim()}`);
+  return match[1];
+}
+
+/** Check SLURM job status via squeue. */
+async function getSlurmJobStatus(
+  target: StubTarget,
+  jobId: string,
+  sshKeyPath?: string,
+): Promise<{ running: boolean; job_id?: string }> {
+  const sshHost = target.ssh_host ?? "";
+  const sshUser = target.ssh_user;
+  try {
+    const out = await sshExec(
+      sshHost,
+      sshUser,
+      `squeue -j ${jobId} -h -o "%i" 2>/dev/null || true`,
+      { keyPath: sshKeyPath, timeout: 15_000 },
+    );
+    const running = out.trim().includes(jobId);
+    return { running, job_id: running ? jobId : undefined };
+  } catch (err) {
+    logger.warn("deploy.slurm_status_failed", { target: target.name, error: String(err) });
+    return { running: false };
+  }
+}
+
+/** Cancel a SLURM job. */
+async function cancelSlurmJob(
+  target: StubTarget,
+  jobId: string,
+  sshKeyPath?: string,
+): Promise<void> {
+  const sshHost = target.ssh_host ?? "";
+  const sshUser = target.ssh_user;
+  await sshExec(sshHost, sshUser, `scancel ${jobId}`, { keyPath: sshKeyPath, timeout: 15_000 });
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 export async function deployStub(
@@ -140,11 +262,34 @@ export async function deployStub(
   token: string,
   sshKeyPath?: string,
   stubLocalPath?: string,
+  slurmOverrides?: { mem?: string; time?: string },
 ): Promise<DeployResult> {
   const localPath = stubLocalPath ?? DEFAULT_STUB_LOCAL_PATH;
-  logger.info("deploy.start", { target: target.name, host: target.host });
+  logger.info("deploy.start", { target: target.name, type: target.type ?? "ssh" });
 
-  // Step 1: sync code
+  if (target.type === "slurm") {
+    // SLURM: sync code to ssh_host, then sbatch
+    try {
+      await syncCodeSlurm(target, localPath, sshKeyPath);
+      logger.info("deploy.synced", { target: target.name });
+    } catch (err) {
+      logger.error("deploy.sync_failed", { target: target.name, error: String(err) });
+      return { ok: false, target: target.name, step: "sync", error: String(err) };
+    }
+
+    let jobId: string;
+    try {
+      jobId = await submitSlurmJob(target, serverUrl, token, sshKeyPath, slurmOverrides);
+      logger.info("deploy.slurm_submitted", { target: target.name, job_id: jobId });
+    } catch (err) {
+      logger.error("deploy.slurm_submit_failed", { target: target.name, error: String(err) });
+      return { ok: false, target: target.name, step: "start", error: String(err) };
+    }
+
+    return { ok: true, target: target.name, job_id: jobId };
+  }
+
+  // SSH target
   try {
     await syncCode(target, localPath, sshKeyPath);
     logger.info("deploy.synced", { target: target.name });
@@ -153,7 +298,6 @@ export async function deployStub(
     return { ok: false, target: target.name, step: "sync", error: String(err) };
   }
 
-  // Steps 2+3: kill + start
   let pid: number | undefined;
   try {
     pid = await startStub(target, serverUrl, token, sshKeyPath);
@@ -169,12 +313,17 @@ export async function deployStub(
 export async function getStubStatus(
   target: StubTarget,
   sshKeyPath?: string,
-): Promise<{ running: boolean; pid?: number }> {
+  jobId?: string,
+): Promise<{ running: boolean; pid?: number; job_id?: string }> {
+  if (target.type === "slurm") {
+    if (!jobId) return { running: false };
+    return getSlurmJobStatus(target, jobId, sshKeyPath);
+  }
+
   const pidFile = `/tmp/alchemy_stub_${target.name}.pid`;
   try {
-    // Check PID file first (precise), fall back to pgrep
     const out = await sshExec(
-      target.host,
+      target.host ?? "",
       target.user,
       `if [ -f ${pidFile} ]; then pid=$(cat ${pidFile}); kill -0 $pid 2>/dev/null && echo $pid || echo 0; else echo 0; fi`,
       { keyPath: sshKeyPath, jumpHost: target.jump_host, timeout: 15_000 },
@@ -195,8 +344,22 @@ export async function restartStub(
   serverUrl: string,
   token: string,
   sshKeyPath?: string,
+  slurmOverrides?: { mem?: string; time?: string },
 ): Promise<DeployResult> {
-  logger.info("deploy.restart", { target: target.name, host: target.host });
+  logger.info("deploy.restart", { target: target.name });
+
+  if (target.type === "slurm") {
+    // SLURM restart = submit new sbatch job
+    try {
+      const jobId = await submitSlurmJob(target, serverUrl, token, sshKeyPath, slurmOverrides);
+      logger.info("deploy.slurm_restarted", { target: target.name, job_id: jobId });
+      return { ok: true, target: target.name, job_id: jobId };
+    } catch (err) {
+      logger.error("deploy.slurm_restart_failed", { target: target.name, error: String(err) });
+      return { ok: false, target: target.name, step: "start", error: String(err) };
+    }
+  }
+
   try {
     const pid = await startStub(target, serverUrl, token, sshKeyPath);
     logger.info("deploy.restarted", { target: target.name, pid });
@@ -204,5 +367,48 @@ export async function restartStub(
   } catch (err) {
     logger.error("deploy.restart_failed", { target: target.name, error: String(err) });
     return { ok: false, target: target.name, step: "start", error: String(err) };
+  }
+}
+
+export async function stopStub(
+  target: StubTarget,
+  sshKeyPath?: string,
+  jobId?: string,
+): Promise<DeployResult> {
+  logger.info("deploy.stop", { target: target.name });
+
+  if (target.type === "slurm") {
+    if (!jobId) {
+      return { ok: false, target: target.name, step: "stop", error: "No job ID provided" };
+    }
+    try {
+      await cancelSlurmJob(target, jobId, sshKeyPath);
+      logger.info("deploy.slurm_stopped", { target: target.name, job_id: jobId });
+      return { ok: true, target: target.name, job_id: jobId };
+    } catch (err) {
+      logger.error("deploy.slurm_stop_failed", { target: target.name, error: String(err) });
+      return { ok: false, target: target.name, step: "stop", error: String(err) };
+    }
+  }
+
+  // SSH: kill via PID file
+  const pidFile = `/tmp/alchemy_stub_${target.name}.pid`;
+  const opts = { keyPath: sshKeyPath, jumpHost: target.jump_host, timeout: 30_000 };
+  try {
+    const killCmd =
+      `if [ -f ${pidFile} ]; then` +
+      ` pid=$(cat ${pidFile});` +
+      ` kill $pid 2>/dev/null || true;` +
+      ` sleep 1;` +
+      ` kill -9 $pid 2>/dev/null || true;` +
+      ` rm -f ${pidFile};` +
+      ` echo "stopped $pid";` +
+      ` else echo "no pid file"; fi`;
+    const out = await sshExec(target.host ?? "", target.user, killCmd, opts);
+    logger.info("deploy.stopped", { target: target.name, out });
+    return { ok: true, target: target.name };
+  } catch (err) {
+    logger.error("deploy.stop_failed", { target: target.name, error: String(err) });
+    return { ok: false, target: target.name, step: "stop", error: String(err) };
   }
 }
