@@ -1,0 +1,40 @@
+# Alchemy v2 deployment configuration
+# Server reads this at startup from DEPLOY_CONFIG env var
+# (default: ../deploy-config.yaml relative to server/)
+
+# ─── Cloudflare tunnel ────────────────────────────────────────────────────────
+tunnel:
+  enabled: true
+  cloudflared: "cloudflared"
+  token: "eyJhIjoiNTYyMDZlZDMxMTEyZDllOWJhMWFhMmI0ODhjZGFmNzciLCJ0IjoiZDNjMTBkOWItNjZlMC00ZjJmLTlhM2EtNDJkMjE5NDA3YmRkIiwicyI6Ik5EWXdOekV4T1RVdE9UUTJZaTAwWm1OaUxUZ3lPR010WmpOaVpHSTRPREUxTkRWaSJ9"
+  restart_on_failure: true
+
+# ─── SSH ──────────────────────────────────────────────────────────────────────
+ssh:
+  key_path: "/home/node/.ssh/id_ed25519"
+
+# ─── Stub package source ─────────────────────────────────────────────────────
+stub_package:
+  local_path: "./stub"
+
+# ─── Stub targets ────────────────────────────────────────────────────────────
+stubs:
+  - name: gpu32
+    host: gpu32
+    user: ys25
+    jump_host: gpucluster2
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 5
+    tags: "rtx4080,workstation"
+    default_cwd: /vol/bitbucket/ys25/jema
+
+  - name: gpu33
+    host: gpu33
+    user: ys25
+    jump_host: gpucluster2
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 2
+    tags: "rtx4080,workstation"
+    default_cwd: /vol/bitbucket/ys25

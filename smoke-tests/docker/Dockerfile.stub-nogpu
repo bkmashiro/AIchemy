@@ -1,0 +1,13 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Explicitly do NOT install nvidia-smi or any GPU tooling.
+# Stub should register with empty GPU info and run in CPU-only mode.
+
+COPY stub/ ./stub/
+COPY sdk/ ./sdk/
+
+RUN pip install --no-cache-dir ./sdk ./stub
+
+ENTRYPOINT ["python", "-m", "alchemy_stub"]

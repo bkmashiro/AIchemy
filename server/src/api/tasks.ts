@@ -1,701 +1,721 @@
+/**
+ * api/tasks.ts — Global task CRUD.
+ *
+ * POST /tasks — submit to global queue with fingerprint dedup + write lock check.
+ * PATCH /tasks/:id — status/priority/name/should_stop.
+ * POST /tasks/batch — batch kill/retry/requeue/delete.
+ * POST /tasks/:id/retry — manual retry.
+ */
+
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
+import path from "path";
 import { store } from "../store";
-import { dispatchQueuedTasks } from "../socket/stub";
 import { Task } from "../types";
 import { Namespace } from "socket.io";
-import { pickBestStub } from "../scheduler";
-import { hasCycleInTaskDag } from "../utils/graph";
-import { logAudit } from "../audit";
-import { TERMINAL_STATUSES } from "../constants";
+import {
+  computeFingerprint, writeLockTable, idempotencyCache,
+  isActiveStatus,
+} from "../dedup";
+import { triggerSchedule, maybeDispatch } from "../scheduler";
+import { notifySubmitted } from "../discord";
+import { initiateKillChain } from "../socket/stub";
+import { killTask, killGlobalTask, pauseTask, resumeTask, createRetryTask } from "../task-actions";
+import { reliableEmitToStub } from "../reliable";
+import { logger } from "../log";
 
-export function createTasksRouter(stubNs: Namespace, webNs: Namespace): Router {
-  const router = Router({ mergeParams: true });
+// ─── Display name generation ──────────────────────────────────────────────────
 
-  // GET /stubs/:id/tasks
-  router.get("/", (req: Request, res: Response) => {
-    const stub = store.getStub(req.params.id);
-    if (!stub) {
-      res.status(404).json({ error: "Stub not found" });
-      return;
+export function generateDisplayName(task: Partial<Task>): string {
+  if (task.name) return task.name;
+  if (task.script) {
+    const base = path.basename(task.script);
+    if (task.args && Object.keys(task.args).length > 0) {
+      const argsSummary = Object.entries(task.args)
+        .map(([k, v]) => {
+          // Remove leading dashes from key
+          const shortKey = k.replace(/^-+/, "");
+          return `${shortKey}=${v}`;
+        })
+        .join(" ");
+      return `${base} ${argsSummary}`;
     }
-    res.json(stub.tasks);
-  });
-
-  // POST /stubs/:id/tasks
-  router.post("/", (req: Request, res: Response) => {
-    const stub = store.getStub(req.params.id);
-    if (!stub) {
-      res.status(404).json({ error: "Stub not found" });
-      return;
-    }
-
-    const { command, cwd, env, env_setup, depends_on, post_hooks, run_dir, resumable,
-            estimated_vram_mb, auto_estimate, force, max_retries, priority, timeout_s } = req.body;
-    if (!command) {
-      res.status(400).json({ error: "command required" });
-      return;
-    }
-
-    // run_dir conflict detection
-    if (run_dir && !force) {
-      const COMPLETED_STATUSES: string[] = ["completed", "completed_with_errors"];
-      const conflict = store.getAllTasks().find(
-        (t) => t.run_dir === run_dir && COMPLETED_STATUSES.includes(t.status)
-      );
-      if (conflict) {
-        res.status(409).json({
-          error: `A completed task already exists with run_dir "${run_dir}"`,
-          conflicting_task_id: conflict.id,
-          hint: "Use force: true to override",
-        });
-        return;
-      }
-    }
-
-    // Validate dependencies
-    if (depends_on && !Array.isArray(depends_on)) {
-      res.status(400).json({ error: "depends_on must be an array of task IDs" });
-      return;
-    }
-
-    // Cycle detection
-    const allTasks = store.getAllTasks();
-    if (depends_on && depends_on.length > 0) {
-      const newId = uuidv4(); // temp ID for cycle check — we'll reuse below
-      if (hasCycleInTaskDag(newId, depends_on, allTasks)) {
-        res.status(400).json({ error: "Circular dependency detected" });
-        return;
-      }
-    }
-
-    const hasUnmetDeps = depends_on && depends_on.length > 0 && depends_on.some((depId: string) => {
-      const dep = allTasks.find((t) => t.id === depId);
-      return dep && !["completed", "completed_with_errors"].includes(dep.status);
-    });
-
-    const task: Task = {
-      id: uuidv4(),
-      stub_id: stub.id,
-      command,
-      cwd,
-      env,
-      env_setup,
-      status: hasUnmetDeps ? "waiting" : "queued",
-      created_at: new Date().toISOString(),
-      log_buffer: [],
-      depends_on: depends_on || [],
-      post_hooks: post_hooks || [],
-      run_dir,
-      resumable: resumable || false,
-      estimated_vram_mb,
-      auto_estimate,
-      max_retries: max_retries ?? 0,
-      retry_count: 0,
-      priority: priority ?? 5,
-      timeout_s,
-    };
-
-    stub.tasks.push(task);
-    store.setStub(stub);
-    webNs.emit("task.update", task);
-    logAudit("task.create", { task_id: task.id, stub_id: stub.id, command: task.command, priority: task.priority });
-
-    // Try to dispatch immediately (only if not waiting)
-    if (task.status === "queued") {
-      dispatchQueuedTasks(stub.id, stubNs);
-    }
-
-    res.status(201).json(task);
-  });
-
-  // GET /stubs/:id/tasks/:tid
-  router.get("/:tid", (req: Request, res: Response) => {
-    const task = store.getTask(req.params.id, req.params.tid);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-    res.json(task);
-  });
-
-  // PATCH /stubs/:id/tasks/:tid
-  router.patch("/:tid", (req: Request, res: Response) => {
-    const stub = store.getStub(req.params.id);
-    if (!stub) {
-      res.status(404).json({ error: "Stub not found" });
-      return;
-    }
-    const task = store.getTask(req.params.id, req.params.tid);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-
-    const { action, signal } = req.body;
-
-    switch (action) {
-      case "pause":
-        if (task.status !== "running") {
-          res.status(400).json({ error: "Task not running" });
-          return;
-        }
-        stubNs.to(`stub:${stub.id}`).emit("task.pause", { task_id: task.id });
-        store.updateTask(stub.id, task.id, { status: "paused" });
-        webNs.emit("task.update", { ...task, status: "paused" });
-        logAudit("task.pause", { task_id: task.id, stub_id: stub.id });
-        break;
-
-      case "resume":
-        if (task.status !== "paused") {
-          res.status(400).json({ error: "Task not paused" });
-          return;
-        }
-        stubNs.to(`stub:${stub.id}`).emit("task.resume", { task_id: task.id });
-        store.updateTask(stub.id, task.id, { status: "running" });
-        webNs.emit("task.update", { ...task, status: "running" });
-        logAudit("task.resume", { task_id: task.id, stub_id: stub.id });
-        break;
-
-      case "kill":
-        if (!["running", "paused", "queued", "dispatched"].includes(task.status)) {
-          res.status(400).json({ error: "Task cannot be killed in current state" });
-          return;
-        }
-        if (task.status === "queued" || task.status === "dispatched") {
-          store.updateTask(stub.id, task.id, { status: "killed", finished_at: new Date().toISOString() });
-          webNs.emit("task.update", { ...task, status: "killed" });
-        } else {
-          stubNs.to(`stub:${stub.id}`).emit("task.kill", { task_id: task.id, signal: signal || "SIGTERM" });
-          store.updateTask(stub.id, task.id, { status: "killed", finished_at: new Date().toISOString() });
-          webNs.emit("task.update", { ...task, status: "killed" });
-        }
-        logAudit("task.kill", { task_id: task.id, stub_id: stub.id, signal: signal || "SIGTERM" });
-        break;
-
-      default:
-        res.status(400).json({ error: "Unknown action" });
-        return;
-    }
-
-    const updated = store.getTask(req.params.id, req.params.tid);
-    res.json(updated);
-  });
-
-  // POST /stubs/:id/tasks/:tid/kill — convenience endpoint
-  router.post("/:tid/kill", (req: Request, res: Response) => {
-    const stub = store.getStub(req.params.id);
-    if (!stub) {
-      res.status(404).json({ error: "Stub not found" });
-      return;
-    }
-    const task = store.getTask(req.params.id, req.params.tid);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-    if (!["running", "paused", "queued"].includes(task.status)) {
-      res.status(400).json({ error: "Task cannot be killed in current state" });
-      return;
-    }
-    const signal = req.body?.signal || "SIGTERM";
-    if (task.status === "queued") {
-      store.updateTask(stub.id, task.id, { status: "killed", finished_at: new Date().toISOString() });
-    } else {
-      stubNs.to(`stub:${stub.id}`).emit("task.kill", { task_id: task.id, signal });
-      store.updateTask(stub.id, task.id, { status: "killed", finished_at: new Date().toISOString() });
-    }
-    const updated = store.getTask(req.params.id, req.params.tid);
-    webNs.emit("task.update", updated);
-    res.json(updated);
-  });
-
-  // POST /stubs/:id/tasks/:tid/stop — set should_stop flag
-  router.post("/:tid/stop", (req: Request, res: Response) => {
-    const stub = store.getStub(req.params.id);
-    if (!stub) {
-      res.status(404).json({ error: "Stub not found" });
-      return;
-    }
-    const task = store.getTask(req.params.id, req.params.tid);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-    store.updateTask(stub.id, task.id, { should_stop: true });
-    const updated = store.getTask(req.params.id, req.params.tid);
-    logAudit("task.stop", { task_id: task.id, stub_id: stub.id });
-    res.json(updated);
-  });
-
-  // DELETE /stubs/:id/tasks/:tid
-  router.delete("/:tid", (req: Request, res: Response) => {
-    const stub = store.getStub(req.params.id);
-    if (!stub) {
-      res.status(404).json({ error: "Stub not found" });
-      return;
-    }
-    const task = store.getTask(req.params.id, req.params.tid);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-
-    // Kill if running
-    if (task.status === "running" || task.status === "paused") {
-      stubNs.to(`stub:${stub.id}`).emit("task.kill", { task_id: task.id, signal: "SIGKILL" });
-    }
-
-    stub.tasks = stub.tasks.filter((t) => t.id !== task.id);
-    store.setStub(stub);
-    webNs.emit("task.update", { ...task, status: "killed" });
-
-    res.json({ ok: true });
-  });
-
-  // GET /stubs/:id/tasks/:tid/logs
-  router.get("/:tid/logs", (req: Request, res: Response) => {
-    const task = store.getTask(req.params.id, req.params.tid);
-    if (!task) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-    res.json({ task_id: task.id, lines: task.log_buffer });
-  });
-
-  return router;
+    return base;
+  }
+  if (task.command) {
+    // Extract last meaningful segment
+    const parts = task.command.trim().split(/\s+/);
+    const lastPart = parts[parts.length - 1];
+    return path.basename(lastPart) || task.command.slice(0, 60);
+  }
+  return "task";
 }
 
-// GET /tasks — global task list (includes global queue)
-// POST /tasks — add to global queue, dispatch to best stub if available
+// ─── Command assembly ─────────────────────────────────────────────────────────
+
+export function assembleCommand(task: Partial<Task>): string {
+  const parts: string[] = [];
+  const envSetup = task.env_setup;
+  const cwd = task.cwd;
+  const env = task.env;
+  const script = task.script || "";
+  const args = task.args;
+  const rawArgs = task.raw_args;
+
+  if (envSetup) {
+    parts.push(`${envSetup} &&`);
+  }
+  if (cwd) {
+    parts.push(`cd '${cwd.replace(/'/g, "'\\''")}' &&`);
+  }
+  if (env && Object.keys(env).length > 0) {
+    const envStr = Object.entries(env)
+      .filter(([k]) => !k.startsWith("ALCHEMY_"))
+      .map(([k, v]) => `export ${k}='${String(v).replace(/'/g, "'\\''")}'`) // keys validated at submission
+      .join(" && ");
+    if (envStr) parts.push(`${envStr} &&`);
+  }
+  // If script looks like a Python file and has no shebang prefix, prepend python
+  if (script.endsWith(".py") && !script.startsWith("python")) {
+    parts.push(`python ${script}`);
+  } else {
+    parts.push(script);
+  }
+  if (args && Object.keys(args).length > 0) {
+    const argsStr = Object.entries(args)
+      .map(([k, v]) => `${k} ${v}`)
+      .join(" ");
+    parts.push(argsStr);
+  }
+  if (rawArgs) {
+    parts.push(rawArgs);
+  }
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+// ─── Task creation helper ─────────────────────────────────────────────────────
+
+export interface TaskInput {
+  script: string;
+  args?: Record<string, string>;
+  raw_args?: string;
+  name?: string;
+  cwd?: string;
+  env_setup?: string;
+  env?: Record<string, string>;
+  env_overrides?: Record<string, string>;
+  requirements?: Task["requirements"];
+  priority?: number;
+  max_retries?: number;
+  run_dir?: string;
+  grid_id?: string;
+  param_overrides?: Record<string, any>;
+  idempotency_key?: string;
+  stub_id?: string;
+  target_stub_id?: string;
+  target_tags?: string[];
+  python_env?: string;
+  submitted_by?: string;
+  depends_on?: string[];
+  ref?: string;
+  args_template?: Record<string, string>;
+  experiment_id?: string;
+  outputs?: string[];
+  resolved_config?: Record<string, any>;
+  auto_retry_on?: number[];
+}
+
+export function createTask(input: TaskInput): Task {
+  const fingerprint = computeFingerprint({
+    script: input.script,
+    args: input.args,
+    raw_args: input.raw_args,
+    param_overrides: input.param_overrides,
+    cwd: input.cwd,
+  });
+
+  const seq = store.nextSeq();
+
+  const partial: Partial<Task> = {
+    script: input.script,
+    args: input.args,
+    raw_args: input.raw_args,
+    name: input.name,
+    cwd: input.cwd,
+    env_setup: input.env_setup,
+    env: input.env,
+  };
+
+  const command = assembleCommand(partial);
+  const display_name = generateDisplayName({ ...partial, command });
+
+  const task: Task = {
+    id: uuidv4(),
+    seq,
+    fingerprint,
+    name: input.name,
+    display_name,
+    script: input.script,
+    args: input.args,
+    raw_args: input.raw_args,
+    cwd: input.cwd,
+    env_setup: input.env_setup,
+    env: input.env,
+    env_overrides: input.env_overrides,
+    command,
+    requirements: input.requirements,
+    status: input.depends_on && input.depends_on.length > 0 ? "blocked" : "pending",
+    priority: input.priority ?? 5,
+    stub_id: input.stub_id,
+    target_stub_id: input.target_stub_id,
+    target_tags: input.target_tags,
+    grid_id: input.grid_id,
+    param_overrides: input.param_overrides,
+    created_at: new Date().toISOString(),
+    log_buffer: [],
+    retry_count: 0,
+    max_retries: input.max_retries ?? 0,
+    auto_retry_on: input.auto_retry_on,
+    should_stop: false,
+    should_checkpoint: false,
+    run_dir: input.run_dir,
+    python_env: input.python_env,
+    submitted_by: input.submitted_by,
+    depends_on: input.depends_on,
+    ref: input.ref,
+    args_template: input.args_template,
+    experiment_id: input.experiment_id,
+    outputs: input.outputs,
+    resolved_config: input.resolved_config,
+  };
+
+  return task;
+}
+
+// ─── Terminal statuses ────────────────────────────────────────────────────────
+
+const TERMINAL_STATUSES = ["completed", "failed", "killed", "lost", "cancelled"];
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+
 export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): Router {
   const router = Router();
 
-  // GET /tasks — all tasks including global queue
-  router.get("/", (_req: Request, res: Response) => {
-    res.json(store.getAllTasks());
-  });
+  // GET /tasks — paginated: ?page=1&limit=50&status=running&status_group=active|terminal
+  router.get("/", (req: Request, res: Response) => {
+    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+    const statusFilter = req.query.status ? String(req.query.status) : undefined;
+    const statusGroup = req.query.status_group ? String(req.query.status_group) : undefined;
+    const includeLogs = req.query.logs === "true";
 
-  // POST /tasks — add to global queue, dispatch immediately if a stub is available
-  router.post("/", (req: Request, res: Response) => {
-    const { command, cwd, env, env_setup, depends_on, post_hooks, run_dir, resumable,
-            estimated_vram_mb, auto_estimate, force, max_retries, priority, timeout_s } = req.body;
-    if (!command) {
-      res.status(400).json({ error: "command required" });
-      return;
+    const ACTIVE_STATUSES = ["running", "dispatched", "queued", "pending", "paused"];
+
+    let tasks = store.getAllTasks();
+
+    // Compute counts across ALL tasks before filtering
+    const counts: Record<string, number> = {};
+    for (const t of tasks) {
+      counts[t.status] = (counts[t.status] ?? 0) + 1;
     }
 
-    // run_dir conflict detection
-    if (run_dir && !force) {
-      const COMPLETED_STATUSES_GLOBAL: string[] = ["completed", "completed_with_errors"];
-      const conflict = store.getAllTasks().find(
-        (t) => t.run_dir === run_dir && COMPLETED_STATUSES_GLOBAL.includes(t.status)
-      );
-      if (conflict) {
-        res.status(409).json({
-          error: `A completed task already exists with run_dir "${run_dir}"`,
-          conflicting_task_id: conflict.id,
-          hint: "Use force: true to override",
-        });
-        return;
+    if (statusFilter) {
+      tasks = tasks.filter((t) => t.status === statusFilter);
+    } else if (statusGroup === "active") {
+      tasks = tasks.filter((t) => ACTIVE_STATUSES.includes(t.status));
+    } else if (statusGroup === "terminal") {
+      tasks = tasks.filter((t) => TERMINAL_STATUSES.includes(t.status));
+    }
+
+    // Sort: newest first by seq
+    tasks = tasks.sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0));
+
+    const total = tasks.length;
+    const start = (page - 1) * limit;
+    const paginated = tasks.slice(start, start + limit);
+
+    const enriched = paginated.map((t) => {
+      const stub = t.stub_id ? store.getStub(t.stub_id) : undefined;
+      const stub_name = stub ? (stub.name || stub.hostname) : undefined;
+      if (includeLogs) {
+        return stub_name ? { ...t, stub_name } : t;
       }
-    }
-
-    const allTasks = store.getAllTasks();
-    const hasUnmetDeps = depends_on && depends_on.length > 0 && depends_on.some((depId: string) => {
-      const dep = allTasks.find((t) => t.id === depId);
-      return dep && !["completed", "completed_with_errors"].includes(dep.status);
+      const { log_buffer, ...rest } = t;
+      return stub_name ? { ...rest, stub_name } : rest;
     });
 
-    const task: Task = {
-      id: uuidv4(),
-      stub_id: "",   // no stub yet — lives in global queue
-      command,
-      cwd,
-      env,
-      env_setup,
-      status: hasUnmetDeps ? "waiting" : "queued",
-      created_at: new Date().toISOString(),
-      log_buffer: [],
-      depends_on: depends_on || [],
-      post_hooks: post_hooks || [],
-      run_dir,
-      resumable: resumable || false,
-      estimated_vram_mb,
-      auto_estimate,
-      max_retries: max_retries ?? 0,
-      retry_count: 0,
-      priority: priority ?? 5,
-      timeout_s,
-    };
-
-    // Add to global queue
-    store.addToGlobalQueue(task);
-    if (webNs) webNs.emit("task.update", task);
-    logAudit("task.create", { task_id: task.id, stub_id: "", command: task.command, priority: task.priority });
-
-    // Try to dispatch immediately to a stub if one is available
-    if (task.status === "queued" && stubNs) {
-      const targetStub = pickBestStub(estimated_vram_mb);
-      if (targetStub) {
-        dispatchQueuedTasks(targetStub.id, stubNs);
-      }
-    }
-
-    res.status(201).json(task);
+    res.json({ tasks: enriched, total, page, limit, counts });
   });
 
-  // POST /tasks/batch/retry — retry multiple failed tasks
-  router.post("/batch/retry", (req: Request, res: Response) => {
-    if (!stubNs || !webNs) {
-      res.status(503).json({ error: "Service not ready" });
-      return;
-    }
-
-    const { task_ids } = req.body;
+  // POST /tasks/batch — must be before /:id routes
+  router.post("/batch", (req: Request, res: Response) => {
+    if (!stubNs || !webNs) { res.status(503).json({ error: "Not ready" }); return; }
+    const { action, task_ids } = req.body;
     if (!Array.isArray(task_ids)) {
-      res.status(400).json({ error: "task_ids must be an array" });
-      return;
+      res.status(400).json({ error: "task_ids required" }); return;
     }
 
     const results: Array<{ id: string; ok: boolean; new_task_id?: string; error?: string }> = [];
 
     for (const taskId of task_ids) {
       const found = store.findTask(taskId);
-      if (!found) {
-        results.push({ id: taskId, ok: false, error: "Not found" });
-        continue;
+      if (!found) { results.push({ id: taskId, ok: false, error: "Not found" }); continue; }
+      const { task, stubId } = found;
+
+      switch (action) {
+        case "kill": {
+          if (!["running", "paused", "queued", "dispatched", "pending", "blocked"].includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot kill in status '${task.status}'` }); break;
+          }
+          if (stubId && (task.status === "running" || task.status === "dispatched")) {
+            initiateKillChain(stubId, taskId);
+          } else if (stubId) {
+            const updated = killTask(stubId, taskId);
+            if (updated) webNs.emit("task.update", updated);
+          } else {
+            killGlobalTask(taskId);
+            const updated = store.findTask(taskId)?.task;
+            if (updated) webNs.emit("task.update", updated);
+          }
+          results.push({ id: taskId, ok: true }); break;
+        }
+        case "retry": {
+          if (!TERMINAL_STATUSES.includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot retry in status '${task.status}'` }); break;
+          }
+          const retryTask = createRetryTask(task);
+          store.addToGlobalQueue(retryTask);
+          webNs.emit("task.update", retryTask);
+          triggerSchedule();
+          results.push({ id: taskId, ok: true, new_task_id: retryTask.id }); break;
+        }
+        case "requeue": {
+          const requeueable = [...TERMINAL_STATUSES, "queued", "pending"];
+          if (!requeueable.includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot requeue in status '${task.status}'` }); break;
+          }
+          if (found.archived) {
+            store.removeFromArchive(taskId);
+          } else if (stubId) {
+            const stub = store.getStub(stubId);
+            if (stub) {
+              stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
+              store.setStub(stub);
+            }
+          } else {
+            store.removeFromGlobalQueue(taskId);
+          }
+          const requeuedTask: Task = {
+            ...task,
+            stub_id: undefined,
+            status: "pending",
+            exit_code: undefined,
+            finished_at: undefined,
+            started_at: undefined,
+            pid: undefined,
+          };
+          store.addToGlobalQueue(requeuedTask);
+          webNs.emit("task.update", requeuedTask);
+          triggerSchedule();
+          results.push({ id: taskId, ok: true }); break;
+        }
+        case "cancel": {
+          if (!["pending", "blocked", "queued"].includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot cancel in status '${task.status}'` }); break;
+          }
+          const now = new Date().toISOString();
+          let cancelled: Task | undefined;
+          if (stubId) {
+            cancelled = store.updateTask(stubId, taskId, { status: "cancelled" as any, finished_at: now });
+          } else {
+            cancelled = store.updateGlobalQueueTask(taskId, { status: "cancelled" as any, finished_at: now });
+          }
+          if (cancelled) webNs.emit("task.update", cancelled);
+          results.push({ id: taskId, ok: true }); break;
+        }
+        case "delete": {
+          if (!TERMINAL_STATUSES.includes(task.status)) {
+            results.push({ id: taskId, ok: false, error: `Cannot delete in status '${task.status}'` }); break;
+          }
+          if (found.archived) {
+            store.removeFromArchive(taskId);
+          } else if (stubId) {
+            const stub = store.getStub(stubId);
+            if (stub) {
+              stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
+              store.setStub(stub);
+            }
+          } else {
+            store.removeFromGlobalQueue(taskId);
+          }
+          webNs.emit("task.deleted", { task_id: taskId });
+          results.push({ id: taskId, ok: true }); break;
+        }
+        default:
+          results.push({ id: taskId, ok: false, error: `Unknown action '${action}'` });
       }
-
-      const { task } = found;
-      const retryTask: Task = {
-        id: uuidv4(),
-        stub_id: "",
-        command: task.command,
-        cwd: task.cwd,
-        env: task.env,
-        env_setup: task.env_setup,
-        status: "queued",
-        created_at: new Date().toISOString(),
-        log_buffer: [],
-        depends_on: [],
-        post_hooks: task.post_hooks || [],
-        run_dir: task.run_dir,
-        resumable: task.resumable,
-        estimated_vram_mb: task.estimated_vram_mb,
-        auto_estimate: task.auto_estimate,
-        retry_of: task.id,
-        retry_count: 0,
-        max_retries: task.max_retries ?? 0,
-      };
-
-      store.addToGlobalQueue(retryTask);
-      webNs.emit("task.update", retryTask);
-
-      const targetStub = pickBestStub(retryTask.estimated_vram_mb);
-      if (targetStub) {
-        dispatchQueuedTasks(targetStub.id, stubNs);
-      }
-
-      results.push({ id: taskId, ok: true, new_task_id: retryTask.id });
     }
 
     res.json({ results });
   });
 
-  // GET /tasks/:id — find task anywhere (stub or global queue)
-  router.get("/:id", (req: Request, res: Response) => {
-    const found = store.findTask(req.params.id);
-    if (!found) {
-      res.status(404).json({ error: "Task not found" });
+  // POST /tasks
+  router.post("/", (req: Request, res: Response) => {
+    const {
+      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      requirements, priority, max_retries, run_dir,
+      idempotency_key, param_overrides, target_tags, python_env,
+      submitted_by, depends_on, ref, args_template, experiment_id, outputs,
+      auto_retry_on, stub_id,
+      target_stub_id: _target_stub_id,
+    } = req.body;
+    // target_stub_id pins the task to a specific stub; stub_id is accepted as an alias
+    const target_stub_id: string | undefined = _target_stub_id ?? stub_id;
+
+    if (!script) {
+      res.status(400).json({ error: "script required" }); return;
+    }
+
+    // Validate env variable keys to prevent shell injection
+    if (env && typeof env === "object") {
+      const invalidKey = Object.keys(env).find((k) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k));
+      if (invalidKey) {
+        res.status(400).json({ error: `Invalid env key: "${invalidKey}"` }); return;
+      }
+    }
+
+    // Validate script is an absolute path
+    if (!script.startsWith("/")) {
+      res.status(400).json({ error: `Script must be an absolute path, got: "${script}"` }); return;
+    }
+
+    // Validate cwd is absolute if provided
+    if (cwd && !cwd.startsWith("/")) {
+      res.status(400).json({ error: `cwd must be an absolute path, got: "${cwd}"` }); return;
+    }
+
+    // Validate run_dir is absolute if provided
+    if (run_dir && !run_dir.startsWith("/")) {
+      res.status(400).json({ error: `run_dir must be an absolute path, got: "${run_dir}"` }); return;
+    }
+
+    // Validate target_stub_id references a known online stub
+    if (target_stub_id) {
+      const stub = store.getStub(target_stub_id);
+      if (!stub) {
+        res.status(400).json({ error: `Unknown stub_id: "${target_stub_id}"` }); return;
+      }
+      if (stub.status !== "online") {
+        res.status(400).json({ error: `Stub "${target_stub_id}" (${stub.name}) is offline` }); return;
+      }
+    }
+
+    // Idempotency check
+    if (idempotency_key) {
+      const existing = idempotencyCache.get(idempotency_key);
+      if (existing) {
+        const found = store.findTask(existing);
+        if (found) { res.status(200).json(found.task); return; }
+      }
+    }
+
+    // Fingerprint dedup
+    const fingerprint = computeFingerprint({ script, args, raw_args, param_overrides, cwd });
+    const existingId = store.findActiveByFingerprint(fingerprint);
+    if (existingId) {
+      const found = store.findTask(existingId);
+      if (found) {
+        logger.info("task.dedup_reject", { fingerprint, existing_task_id: existingId });
+        res.status(409).json({
+          error: "Task with same fingerprint is already active",
+          existing_task_id: existingId,
+          task: found.task,
+        });
+        return;
+      }
+    }
+
+    // Write lock check
+    if (run_dir) {
+      const conflict = writeLockTable.getTaskId(run_dir);
+      if (conflict) {
+        res.status(409).json({
+          error: `run_dir "${run_dir}" is locked by task ${conflict}`,
+          conflicting_task_id: conflict,
+        });
+        return;
+      }
+    }
+
+    const task = createTask({
+      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
+      submitted_by, depends_on, ref, args_template, experiment_id, outputs, auto_retry_on,
+      stub_id, target_stub_id,
+    });
+
+    // Acquire write lock now so subsequent submits with the same run_dir are rejected
+    if (run_dir) {
+      writeLockTable.acquire(run_dir, task.id);
+    }
+
+    try {
+      store.addToGlobalQueue(task);
+    } catch (e) {
+      if (run_dir) writeLockTable.release(run_dir);
+      throw e;
+    }
+    if (webNs) webNs.emit("task.update", task);
+    logger.info("task.submit", { task_seq: task.seq, fingerprint: task.fingerprint, display_name: task.display_name });
+    notifySubmitted(task).catch(() => {});
+
+    if (idempotency_key) {
+      idempotencyCache.set(idempotency_key, task.id);
+    }
+
+    triggerSchedule();
+
+    const waitForResult = req.query.wait === "true";
+    const waitTimeout = Math.min(Number(req.query.wait_timeout) || 15, 30); // max 30s
+
+    if (waitForResult) {
+      // Poll for task state change: wait until task is running, failed, or completed.
+      // Uses setTimeout to avoid blocking the Node.js event loop.
+      const deadline = Date.now() + waitTimeout * 1000;
+      const pollInterval = 200; // ms
+
+      const poll = () => {
+        const found = store.findTask(task.id);
+        if (!found) {
+          res.status(201).json({ ...task, _wait: "task_lost" });
+          return;
+        }
+        const t = found.task;
+        // Terminal or running = we have a result
+        if (["running", "completed", "failed", "killed", "lost"].includes(t.status)) {
+          res.status(t.status === "failed" ? 422 : 201).json({
+            ...t,
+            _wait: t.status === "failed" ? "preflight_or_start_failed" : "started",
+          });
+          return;
+        }
+        if (Date.now() >= deadline) {
+          // Timeout — return current state
+          res.status(202).json({
+            ...t,
+            _wait: "timeout",
+            _wait_message: `Task still in ${t.status} after ${waitTimeout}s`,
+          });
+          return;
+        }
+        setTimeout(poll, pollInterval);
+      };
+
+      // Start polling after a short initial delay (give scheduler time to assign)
+      setTimeout(poll, 100);
       return;
     }
+
+    res.status(201).json(task);
+  });
+
+  // GET /tasks/:id
+  router.get("/:id", (req: Request, res: Response) => {
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
     res.json(found.task);
   });
 
-  // POST /tasks/:id/retry — create a new task with same command/cwd/env, linked via retry_of
-  router.post("/:id/retry", (req: Request, res: Response) => {
-    if (!stubNs || !webNs) {
-      res.status(503).json({ error: "Service not ready" });
-      return;
-    }
-
+  // PATCH /tasks/:id
+  router.patch("/:id", (req: Request, res: Response) => {
+    if (!webNs) { res.status(503).json({ error: "Not ready" }); return; }
     const found = store.findTask(req.params.id);
-    if (!found) {
-      res.status(404).json({ error: "Task not found" });
-      return;
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const { task, stubId } = found;
+
+    const { status, priority, name, should_stop, should_checkpoint } = req.body;
+    const update: Partial<Task> = {};
+
+    if (priority !== undefined) {
+      update.priority = priority;
+    }
+    if (name !== undefined) {
+      update.name = name;
+      update.display_name = name; // user-set name takes over display_name
+    }
+    if (should_stop !== undefined) {
+      update.should_stop = should_stop;
+      if (should_stop && stubId && (task.status === "running" || task.status === "dispatched")) {
+        // Initiate kill chain
+        initiateKillChain(stubId, task.id);
+      }
+    }
+    if (should_checkpoint !== undefined) {
+      update.should_checkpoint = should_checkpoint;
+      if (should_checkpoint && stubId) {
+        reliableEmitToStub(stubId, "task.signal", { task_id: task.id, signal: "should_checkpoint" });
+      }
+    }
+    if (status !== undefined) {
+      // Status override — limited transitions
+      if (status === "cancelled" && ["pending", "blocked", "queued"].includes(task.status)) {
+        // pending/blocked/queued → cancelled (no stub interaction needed)
+        const now = new Date().toISOString();
+        let cancelled: Task | undefined;
+        if (stubId) {
+          cancelled = store.updateTask(stubId, task.id, { status: "cancelled" as any, finished_at: now });
+        } else {
+          cancelled = store.updateGlobalQueueTask(task.id, { status: "cancelled" as any, finished_at: now });
+        }
+        if (cancelled) webNs.emit("task.update", cancelled);
+        res.json(cancelled || task);
+        return;
+      } else if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused", "blocked"].includes(task.status)) {
+        if (stubId && (task.status === "running" || task.status === "dispatched")) {
+          initiateKillChain(stubId, task.id);
+          // Return the updated task with should_stop=true (set by initiateKillChain)
+          const updated = store.getTask(stubId, task.id);
+          return res.json(updated || task);
+        } else if (stubId) {
+          const killed = killTask(stubId, task.id);
+          if (killed) webNs.emit("task.update", killed);
+          res.json(killed || task);
+          return;
+        } else {
+          killGlobalTask(task.id);
+          const killed = store.findTask(task.id)?.task;
+          if (killed) webNs.emit("task.update", killed);
+          res.json(killed || task);
+          return;
+        }
+      } else if (status === "paused" && stubId) {
+        const paused = pauseTask(stubId, task.id);
+        if (paused) webNs.emit("task.update", paused);
+        res.json(paused || task);
+        return;
+      } else if (status === "running" && task.status === "paused" && stubId) {
+        const resumed = resumeTask(stubId, task.id);
+        if (resumed) webNs.emit("task.update", resumed);
+        res.json(resumed || task);
+        return;
+      } else {
+        res.status(400).json({ error: `Unsupported status transition: ${task.status} → ${status}` });
+        return;
+      }
     }
 
-    const { task } = found;
-    const retryTask: Task = {
-      id: uuidv4(),
-      stub_id: "",
-      command: task.command,
-      cwd: task.cwd,
-      env: task.env,
-      env_setup: task.env_setup,
-      status: "queued",
-      created_at: new Date().toISOString(),
-      log_buffer: [],
-      depends_on: [],
-      post_hooks: task.post_hooks || [],
-      run_dir: task.run_dir,
-      resumable: task.resumable,
-      estimated_vram_mb: task.estimated_vram_mb,
-      auto_estimate: task.auto_estimate,
-      retry_of: task.id,
-      retry_count: 0,
-      max_retries: task.max_retries ?? 0,
-    };
-
-    store.addToGlobalQueue(retryTask);
-    if (webNs) webNs.emit("task.update", retryTask);
-
-    const targetStub = pickBestStub(retryTask.estimated_vram_mb);
-    if (targetStub && stubNs) {
-      dispatchQueuedTasks(targetStub.id, stubNs);
-    }
-
-    res.status(201).json(retryTask);
-  });
-
-  // POST /tasks/:id/move — move a queued task to a specific stub
-  router.post("/:id/move", (req: Request, res: Response) => {
-    if (!stubNs || !webNs) {
-      res.status(503).json({ error: "Service not ready" });
-      return;
-    }
-
-    const { stub_id } = req.body;
-    if (!stub_id) {
-      res.status(400).json({ error: "stub_id required" });
-      return;
-    }
-
-    const targetStub = store.getStub(stub_id);
-    if (!targetStub) {
-      res.status(404).json({ error: "Target stub not found" });
-      return;
-    }
-
-    const found = store.findTask(req.params.id);
-    if (!found) {
-      res.status(404).json({ error: "Task not found" });
-      return;
-    }
-
-    const { task, stubId: currentStubId } = found;
-
-    if (task.status !== "queued") {
-      res.status(400).json({ error: "Only queued tasks can be moved" });
-      return;
-    }
-
-    if (currentStubId === stub_id) {
-      res.json(task); // already there
-      return;
-    }
-
-    // Remove from current location
-    if (currentStubId === null) {
-      // From global queue
-      store.removeFromGlobalQueue(task.id);
+    let updated: Task | undefined;
+    if (stubId) {
+      updated = store.updateTask(stubId, task.id, update);
     } else {
-      // From a stub
-      const currentStub = store.getStub(currentStubId);
-      if (currentStub) {
-        currentStub.tasks = currentStub.tasks.filter((t) => t.id !== task.id);
-        store.setStub(currentStub);
-      }
+      updated = store.updateGlobalQueueTask(task.id, update);
     }
 
-    // Assign to target stub
-    task.stub_id = stub_id;
-    targetStub.tasks.push(task);
-    store.setStub(targetStub);
-    webNs.emit("task.update", task);
-
-    // Trigger dispatch on target
-    dispatchQueuedTasks(stub_id, stubNs);
-
-    res.json(task);
+    if (updated) webNs.emit("task.update", updated);
+    res.json(updated || task);
   });
 
-  // POST /tasks/batch/kill — kill multiple tasks
-  router.post("/batch/kill", (req: Request, res: Response) => {
-    if (!stubNs || !webNs) {
-      res.status(503).json({ error: "Service not ready" });
-      return;
+  // POST /tasks/:id/reschedule — kill + requeue with optional new target_tags
+  router.post("/:id/reschedule", (req: Request, res: Response) => {
+    if (!webNs || !stubNs) { res.status(503).json({ error: "Not ready" }); return; }
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const { task, stubId } = found;
+
+    // Only active tasks can be rescheduled
+    if (["completed", "failed", "killed", "lost", "cancelled"].includes(task.status)) {
+      res.status(400).json({ error: `Cannot reschedule in terminal status '${task.status}'` }); return;
     }
 
-    const { task_ids } = req.body;
-    if (!Array.isArray(task_ids)) {
-      res.status(400).json({ error: "task_ids must be an array" });
-      return;
+    const { target_tags, priority } = req.body;
+
+    // Kill the current execution if running/dispatched
+    if (stubId && (task.status === "running" || task.status === "dispatched")) {
+      initiateKillChain(stubId, task.id);
+    } else if (stubId) {
+      const killed = killTask(stubId, task.id);
+      if (killed) webNs.emit("task.update", killed);
+    } else {
+      killGlobalTask(task.id);
+      const killed = store.findTask(task.id)?.task;
+      if (killed) webNs.emit("task.update", killed);
     }
 
-    const results: Array<{ id: string; ok: boolean; error?: string }> = [];
+    // Create a new task preserving original config, with optional overrides
+    const newTask = createTask({
+      script: task.script,
+      args: task.args,
+      raw_args: task.raw_args,
+      name: task.name,
+      cwd: task.cwd,
+      env_setup: task.env_setup,
+      env: task.env,
+      env_overrides: task.env_overrides,
+      requirements: task.requirements,
+      priority: priority ?? task.priority,
+      max_retries: task.max_retries,
+      target_tags: target_tags ?? task.target_tags,
+      python_env: task.python_env,
+      submitted_by: task.submitted_by,
+      grid_id: task.grid_id,
+      param_overrides: task.param_overrides,
+      ref: task.ref,
+      args_template: task.args_template,
+      experiment_id: task.experiment_id,
+      outputs: task.outputs,
+    });
 
-    for (const taskId of task_ids) {
-      const found = store.findTask(taskId);
-      if (!found) {
-        results.push({ id: taskId, ok: false, error: "Not found" });
-        continue;
-      }
-
-      const { task, stubId } = found;
-
-      if (!["running", "paused", "queued", "dispatched"].includes(task.status)) {
-        results.push({ id: taskId, ok: false, error: `Cannot kill task in status '${task.status}'` });
-        continue;
-      }
-
-      const now = new Date().toISOString();
-
-      if (stubId === null) {
-        // In global queue
-        store.updateGlobalQueueTask(taskId, { status: "killed", finished_at: now });
-        const updated = store.findTask(taskId)?.task;
-        if (updated) webNs.emit("task.update", updated);
-      } else {
-        if (task.status === "running" || task.status === "paused") {
-          stubNs.to(`stub:${stubId}`).emit("task.kill", { task_id: taskId, signal: "SIGTERM" });
-        }
-        store.updateTask(stubId, taskId, { status: "killed", finished_at: now });
-        const updated = store.getTask(stubId, taskId);
-        if (updated) webNs.emit("task.update", updated);
-      }
-
-      results.push({ id: taskId, ok: true });
-    }
-
-    res.json({ results });
+    store.addToGlobalQueue(newTask);
+    webNs.emit("task.update", newTask);
+    logger.info("task.reschedule", { old_seq: task.seq, new_seq: newTask.seq, target_tags: newTask.target_tags });
+    triggerSchedule();
+    res.status(201).json(newTask);
   });
 
-  // POST /tasks/batch/requeue — requeue multiple tasks back to global queue
-  router.post("/batch/requeue", (req: Request, res: Response) => {
-    if (!stubNs || !webNs) {
-      res.status(503).json({ error: "Service not ready" });
-      return;
+  // POST /tasks/:id/retry
+  router.post("/:id/retry", (req: Request, res: Response) => {
+    if (!webNs) { res.status(503).json({ error: "Not ready" }); return; }
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const { task } = found;
+
+    if (!TERMINAL_STATUSES.includes(task.status)) {
+      res.status(400).json({ error: `Cannot retry in status '${task.status}'` }); return;
     }
 
-    const { task_ids } = req.body;
-    if (!Array.isArray(task_ids)) {
-      res.status(400).json({ error: "task_ids must be an array" });
-      return;
-    }
-
-    const results: Array<{ id: string; ok: boolean; error?: string }> = [];
-
-    for (const taskId of task_ids) {
-      const found = store.findTask(taskId);
-      if (!found) {
-        results.push({ id: taskId, ok: false, error: "Not found" });
-        continue;
-      }
-
-      const { task, stubId } = found;
-
-      // Only requeue terminal or queued tasks
-      const requeueable: string[] = [...TERMINAL_STATUSES, "queued"];
-      if (!requeueable.includes(task.status)) {
-        results.push({ id: taskId, ok: false, error: `Cannot requeue task in status '${task.status}'` });
-        continue;
-      }
-
-      // Remove from current location
-      if (stubId === null) {
-        // Already in global queue — just reset status
-        store.updateGlobalQueueTask(taskId, {
-          status: "queued",
-          exit_code: undefined,
-          finished_at: undefined,
-          started_at: undefined,
-          pid: undefined,
-          requeued_at: new Date().toISOString(),
+    const force = req.query.force === "true";
+    if (!force) {
+      // Dedup: reject if a pending/running copy already exists for the same fingerprint root
+      const retryRoot = task.retry_of || task.id;
+      const existingActive = store.getAllTasks().find(
+        (t) =>
+          t.id !== task.id &&
+          (t.retry_of === retryRoot || t.retry_of === task.id || t.id === retryRoot) &&
+          ["pending", "queued", "dispatched", "running"].includes(t.status),
+      );
+      if (existingActive) {
+        res.status(409).json({
+          error: "Active retry already exists for this task",
+          existing_task_id: existingActive.id,
+          task: existingActive,
         });
-        const updated = store.findTask(taskId)?.task;
-        if (updated) webNs.emit("task.update", updated);
-      } else {
-        // Remove from stub
-        const stub = store.getStub(stubId);
-        if (stub) {
-          stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
-          store.setStub(stub);
-        }
-        // Add fresh to global queue
-        const requeuedTask: Task = {
-          ...task,
-          stub_id: "",
-          status: "queued",
-          exit_code: undefined,
-          finished_at: undefined,
-          started_at: undefined,
-          pid: undefined,
-          requeued_at: new Date().toISOString(),
-        };
-        store.addToGlobalQueue(requeuedTask);
-        webNs.emit("task.update", requeuedTask);
+        return;
       }
-
-      // Try to dispatch to an available stub
-      const targetStub = pickBestStub(task.estimated_vram_mb);
-      if (targetStub && stubNs) {
-        dispatchQueuedTasks(targetStub.id, stubNs);
-      }
-
-      results.push({ id: taskId, ok: true });
     }
 
-    res.json({ results });
-  });
-
-  // DELETE /tasks/batch — delete/clean up completed/killed/failed tasks
-  router.delete("/batch", (req: Request, res: Response) => {
-    if (!webNs) {
-      res.status(503).json({ error: "Service not ready" });
-      return;
+    let retryTask: Task;
+    try {
+      retryTask = createRetryTask(task);
+    } catch (e: any) {
+      logger.error("retry.create_failed", { error: e.message, stack: e.stack });
+      res.status(500).json({ error: e.message }); return;
     }
-
-    const { task_ids } = req.body;
-    if (!Array.isArray(task_ids)) {
-      res.status(400).json({ error: "task_ids must be an array" });
-      return;
-    }
-
-    const results: Array<{ id: string; ok: boolean; error?: string }> = [];
-    const deletable: string[] = [...TERMINAL_STATUSES];
-
-    for (const taskId of task_ids) {
-      const found = store.findTask(taskId);
-      if (!found) {
-        results.push({ id: taskId, ok: false, error: "Not found" });
-        continue;
-      }
-
-      const { task, stubId } = found;
-
-      if (!deletable.includes(task.status)) {
-        results.push({ id: taskId, ok: false, error: `Cannot delete task in status '${task.status}' — kill it first` });
-        continue;
-      }
-
-      if (stubId === null) {
-        store.removeFromGlobalQueue(taskId);
-      } else {
-        const stub = store.getStub(stubId);
-        if (stub) {
-          stub.tasks = stub.tasks.filter((t) => t.id !== taskId);
-          store.setStub(stub);
-        }
-      }
-
-      webNs.emit("task.deleted", { task_id: taskId });
-      results.push({ id: taskId, ok: true });
-    }
-
-    res.json({ results });
+    store.addToGlobalQueue(retryTask);
+    webNs.emit("task.update", retryTask);
+    triggerSchedule();
+    res.status(201).json(retryTask);
   });
 
   return router;
 }
+
