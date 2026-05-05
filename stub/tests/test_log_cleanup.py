@@ -16,10 +16,8 @@ def _make_process_mgr(tmp_path, processes=None):
         max_concurrent=3,
         pid_file=str(tmp_path / "pids.json"),
     )
-    # Patch _log_dir to return our temp dir
-    pm._log_dir = lambda: str(log_dir)
     if processes is not None:
-        pm.processes = processes
+        pm._procs = processes
     return pm, log_dir
 
 
@@ -32,7 +30,8 @@ class TestCleanupOldLogs:
         old_mtime = time.time() - 25 * 3600
         os.utime(str(log_file), (old_mtime, old_mtime))
 
-        pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=24)
 
         assert not log_file.exists()
 
@@ -42,7 +41,8 @@ class TestCleanupOldLogs:
         log_file.write_text("fresh output")
         # mtime is NOW — should not be deleted
 
-        pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=24)
 
         assert log_file.exists()
 
@@ -55,7 +55,8 @@ class TestCleanupOldLogs:
         old_mtime = time.time() - 48 * 3600
         os.utime(str(log_file), (old_mtime, old_mtime))
 
-        pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=24)
 
         # Running task log must NOT be deleted
         assert log_file.exists()
@@ -67,7 +68,8 @@ class TestCleanupOldLogs:
         old_mtime = time.time() - 48 * 3600
         os.utime(str(other_file), (old_mtime, old_mtime))
 
-        pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=24)
 
         assert other_file.exists()
 
@@ -83,7 +85,8 @@ class TestCleanupOldLogs:
         os.utime(str(old_log), (old_mtime, old_mtime))
         # new_log has current mtime
 
-        pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=24)
 
         assert not old_log.exists()
         assert new_log.exists()
@@ -91,7 +94,8 @@ class TestCleanupOldLogs:
     def test_empty_log_dir_no_error(self, tmp_path):
         pm, log_dir = _make_process_mgr(tmp_path)
         # Should not raise even if dir is empty
-        pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=24)
 
     def test_custom_max_age(self, tmp_path):
         pm, log_dir = _make_process_mgr(tmp_path)
@@ -102,7 +106,8 @@ class TestCleanupOldLogs:
         os.utime(str(log_file), (mtime, mtime))
 
         # max_age_hours=2 → 3h old file should be deleted
-        pm.cleanup_old_logs(max_age_hours=2)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            pm.cleanup_old_logs(max_age_hours=2)
         assert not log_file.exists()
 
     def test_file_permission_error_silently_skipped(self, tmp_path):
@@ -112,6 +117,7 @@ class TestCleanupOldLogs:
         old_mtime = time.time() - 48 * 3600
         os.utime(str(log_file), (old_mtime, old_mtime))
 
-        with patch("os.remove", side_effect=PermissionError("denied")):
-            # Should not raise
-            pm.cleanup_old_logs(max_age_hours=24)
+        with patch("alchemy_stub.process_mgr._log_dir", return_value=str(log_dir)):
+            with patch("os.remove", side_effect=PermissionError("denied")):
+                # Should not raise
+                pm.cleanup_old_logs(max_age_hours=24)

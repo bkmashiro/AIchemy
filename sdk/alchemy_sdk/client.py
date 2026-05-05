@@ -1,57 +1,125 @@
-"""Main SDK client class."""
+"""Main Alchemy SDK client class."""
+from __future__ import annotations
+
 import json
 import os
+import time
 from typing import Any, Optional
 
-from .transport import ThrottledReporter
+from .transport import make_transport, NoopTransport, HttpTransport, UnixSocketTransport
+
+_MISSING = object()
 
 
 class Alchemy:
     """
     Alchemy SDK client for training scripts.
 
-    Usage:
-        al = Alchemy(server="http://localhost:3001")
-        al.log(step=100, total=1000, loss=0.5)
-        al.checkpoint("path/to/checkpoint.pt")
+    Auto-initialised from environment variables:
+      ALCHEMY_TASK_ID       - Task UUID assigned by stub
+      ALCHEMY_STUB_SOCKET   - Path to Unix socket (e.g. /tmp/alchemy_task_xxx.sock)
+      ALCHEMY_SERVER        - HTTP server base URL (fallback)
+      ALCHEMY_PARAMS        - JSON-encoded parameter dict
+
+    Missing vars → no-op mode: all methods return defaults silently.
+
+    Usage (manual):
+        al = Alchemy()
+        for step in range(total):
+            loss = train_step()
+            al.log(step, total, loss=loss)
+            if al.should_stop():
+                break
         al.done()
 
-        # Or as context manager:
-        with Alchemy(server="...") as al:
-            for step in range(1000):
-                al.log(step=step, total=1000)
-                if al.should_stop:
-                    break
+    Usage (context manager):
+        with Alchemy() as al:
+            ...
+
+    Usage (AOP decorator):
+        @al.managed(total_steps=500_000, eval_every=10_000)
+        def train(ctx: TrainingContext):
+            ...
     """
 
-    def __init__(
-        self,
-        server: str,
-        task_id: str = "auto",
-        collect_gpu: bool = True,
-    ):
-        self.server = server.rstrip("/")
-        if task_id == "auto":
-            task_id = os.environ.get("ALCHEMY_TASK_ID", "")
-        self.task_id = task_id
+    _THROTTLE_S = 10.0  # max 1 log() call per 10s
 
-        if not self.task_id:
-            self._reporter: Optional[ThrottledReporter] = None
-        else:
-            self._reporter = ThrottledReporter(self.server, self.task_id, collect_gpu=collect_gpu)
+    def __init__(self) -> None:
+        self._task_id: Optional[str] = os.environ.get("ALCHEMY_TASK_ID") or None
+        stub_socket: Optional[str] = os.environ.get("ALCHEMY_STUB_SOCKET") or None
+        server: Optional[str] = os.environ.get("ALCHEMY_SERVER") or None
+
+        # Managed mode: alchemy is in control → strict, zero tolerance
+        self._managed: bool = self._task_id is not None
+
+        # Parse params once at init — immutable for lifetime
+        raw_params = os.environ.get("ALCHEMY_PARAMS", "{}")
+        try:
+            self._params: dict[str, Any] = json.loads(raw_params)
+        except Exception:
+            if self._managed:
+                raise RuntimeError("ALCHEMY_PARAMS is set but not valid JSON")
+            self._params = {}
+
+        # Build transport (no-op if nothing available)
+        self._transport = make_transport(self._task_id, stub_socket, server)
+
+        # Throttle state for log()
+        self._last_log_time: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Pure reads (no IO)
+    # ------------------------------------------------------------------
 
     @property
-    def should_checkpoint(self) -> bool:
-        if self._reporter is None:
-            return False
-        return self._reporter.should_checkpoint
+    def is_managed(self) -> bool:
+        """True when running under alchemy (ALCHEMY_TASK_ID present). Strict mode."""
+        return self._managed
 
-    @property
+    def params(self) -> dict[str, Any]:
+        """Return all params from ALCHEMY_PARAMS. Same value every call."""
+        return dict(self._params)
+
+    def param(self, key: str, default: Any = _MISSING) -> Any:
+        """
+        Return a single param.
+
+        Under alchemy (managed mode): default is FORBIDDEN. Missing param = crash.
+        This prevents silent typos like param("seeed", default=42) producing wrong experiments.
+
+        Standalone (noop mode): default is allowed for convenience.
+        """
+        if key in self._params:
+            return self._params[key]
+        if self._managed:
+            raise KeyError(
+                f"Parameter '{key}' not found in ALCHEMY_PARAMS. "
+                f"Available: {list(self._params.keys())}. "
+                f"Under alchemy management, all params must be explicitly provided — no defaults."
+            )
+        if default is _MISSING:
+            raise KeyError(f"Parameter '{key}' not found. Available: {list(self._params.keys())}")
+        return default
+
+    # ------------------------------------------------------------------
+    # Signal queries (pure — reads cached signals, no IO)
+    # ------------------------------------------------------------------
+
     def should_stop(self) -> bool:
-        """Server requests early termination."""
-        if self._reporter is None:
-            return False
-        return self._reporter.should_stop
+        """Return True if the server/stub requests graceful stop."""
+        return self._transport.should_stop()
+
+    def should_checkpoint(self) -> bool:
+        """Return True if the server/stub requests an immediate checkpoint."""
+        return self._transport.should_checkpoint()
+
+    def should_eval(self) -> bool:
+        """Return True if the server/stub requests an evaluation pass."""
+        return self._transport.should_eval()
+
+    # ------------------------------------------------------------------
+    # Reports (side-effects only — never modify training state)
+    # ------------------------------------------------------------------
 
     def log(
         self,
@@ -59,43 +127,95 @@ class Alchemy:
         total: int,
         loss: Optional[float] = None,
         metrics: Optional[dict[str, Any]] = None,
-    ):
-        """Report training progress. Throttled to 1 req/10s."""
-        if self._reporter is None:
+    ) -> None:
+        """
+        Report training progress.
+        Throttled to at most one message per 10 seconds. Non-blocking.
+        """
+        now = time.monotonic()
+        if now - self._last_log_time < self._THROTTLE_S:
             return
-        payload: dict[str, Any] = {"step": step, "total": total}
+        self._last_log_time = now
+
+        msg: dict[str, Any] = {"type": "progress", "step": step, "total": total}
         if loss is not None:
-            payload["loss"] = loss
+            msg["loss"] = loss
         if metrics:
-            payload["metrics"] = metrics
-        self._reporter.report(**payload)
+            msg["metrics"] = metrics
+        self._transport.send(msg)
 
-    def checkpoint(self, path: str):
-        """Report a checkpoint was saved."""
-        if self._reporter is None:
-            return
-        self._reporter.report(checkpoint=path)
-        self._reporter.flush()
+    def log_eval(self, metrics: dict[str, Any]) -> None:
+        """Report evaluation metrics immediately (not throttled)."""
+        self._transport.send({"type": "eval", "metrics": metrics})
 
-    def done(self):
-        """Flush any pending reports."""
-        if self._reporter is None:
-            return
-        self._reporter.flush()
+    def log_config(self, config: dict[str, Any]) -> None:
+        """Report training config snapshot (e.g. hyperparams)."""
+        self._transport.send({"type": "config", "config": config})
 
-    def param(self, key: str, default: Any = None) -> Any:
-        """Get a parameter from ALCHEMY_PARAMS env var."""
-        params = json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
-        if key not in params and default is None:
-            raise KeyError(f"Parameter '{key}' not found. Available: {list(params.keys())}")
-        return params.get(key, default)
+    def checkpoint(self, path: str) -> None:
+        """
+        Declare that a checkpoint has been saved at the given path.
+        Does NOT call torch.save — caller is responsible for saving.
+        """
+        self._transport.send({"type": "checkpoint", "path": path})
 
-    def params(self) -> dict[str, Any]:
-        """Get all parameters from ALCHEMY_PARAMS env var."""
-        return json.loads(os.environ.get("ALCHEMY_PARAMS", "{}"))
+    def done(self, metrics: Optional[dict[str, Any]] = None) -> None:
+        """Signal that training is complete. Sends final metrics if provided."""
+        msg: dict[str, Any] = {"type": "done"}
+        if metrics:
+            msg["metrics"] = metrics
+        self._transport.send(msg)
 
-    def __enter__(self):
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "Alchemy":
         return self
 
-    def __exit__(self, *_):
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.done()
+
+    # ------------------------------------------------------------------
+    # AOP decorator
+    # ------------------------------------------------------------------
+
+    def managed(
+        self,
+        total_steps: int = 0,
+        eval_every: int = 0,
+        checkpoint_every: int = 0,
+        reads: Optional[list[str]] = None,
+        writes: Optional[list[str]] = None,
+    ):
+        """
+        Decorator that wraps a training function with a TrainingContext.
+
+        run_dir comes from ALCHEMY_RUN_DIR env var (set by stub at launch).
+        The server is the single source of truth for run_dir.
+
+        @al.managed(total_steps=500_000, eval_every=10_000, checkpoint_every=50_000,
+                    reads=["data/atari/"])
+        def train(ctx: TrainingContext):
+            ...
+        """
+        def decorator(fn):
+            import functools
+            from .preflight import run_preflight
+            from .context import TrainingContext
+
+            @functools.wraps(fn)
+            def wrapper(*args, **kwargs):
+                ctx = TrainingContext(
+                    al=self,
+                    total_steps=total_steps,
+                    eval_every=eval_every,
+                    checkpoint_every=checkpoint_every,
+                )
+                run_preflight(ctx, reads=reads or [])
+                result = fn(ctx, *args, **kwargs)
+                self.done(metrics=result if isinstance(result, dict) else None)
+                return result
+
+            return wrapper
+        return decorator
