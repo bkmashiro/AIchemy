@@ -2,17 +2,14 @@ import { TaskStatus } from "./types";
 import { logger } from "./log";
 
 const LEGAL_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
-  pending:    ["queued", "killed", "cancelled"],
-  queued:     ["dispatched", "pending", "killed", "cancelled"],
-  dispatched: ["running", "failed", "lost", "killed", "pending"],
-  running:    ["completed", "failed", "paused", "killed", "lost"],
-  paused:     ["running", "killed", "lost"],
+  pending:    ["assigned", "cancelled"],
+  assigned:   ["running", "failed", "pending", "cancelled"],
+  running:    ["completed", "failed", "paused", "cancelled"],
+  paused:     ["running", "cancelled"],
   completed:  [],
   failed:     ["pending"],
-  killed:     ["pending"],
-  lost:       ["pending", "failed", "running"],  // running = recover on reconnect
-  blocked:    ["pending", "cancelled", "killed"],
   cancelled:  ["pending"],  // allow manual re-queue
+  blocked:    ["pending", "cancelled"],
 };
 
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {

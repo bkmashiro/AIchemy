@@ -12,15 +12,17 @@ import { computeStubId } from "../socket/stub";
  * Reference implementation of the Python stub's _compute_identity_hash.
  * Used to verify cross-language consistency.
  *
- * Python formula: sha256(f"{hostname}|{cuda_visible_devices}|{gpu_name}|{gpu_count}")[:12]
+ * Python formula: sha256(f"{hostname}|{cuda_visible_devices}|{gpu_name}|{gpu_count}|{user}|{slurm_job_id}")[:12]
  */
 function pythonStubId(
   hostname: string,
   gpuName: string,
   gpuCount: number,
   cudaVisibleDevices: string = "",
+  user: string = "",
+  slurmJobId: string = "",
 ): string {
-  const raw = `${hostname}|${cudaVisibleDevices}|${gpuName}|${gpuCount}`;
+  const raw = `${hostname}|${cudaVisibleDevices}|${gpuName}|${gpuCount}|${user}|${slurmJobId}`;
   return createHash("sha256").update(raw).digest("hex").slice(0, 12);
 }
 
@@ -60,10 +62,21 @@ describe("computeStubId", () => {
     expect(a).not.toBe(b);
   });
 
-  it("is stable across SLURM job restarts (slurm_job_id not in hash)", () => {
-    // Same physical GPU, different SLURM job IDs → same stub identity
-    const a = computeStubId("gpu32", { name: "NVIDIA A40", count: 1 }, "0");
-    const b = computeStubId("gpu32", { name: "NVIDIA A40", count: 1 }, "0");
+  it("differs when user changes (multi-user same node)", () => {
+    const a = computeStubId("clapper", { name: "NVIDIA A30", count: 1 }, "0", "ys25");
+    const b = computeStubId("clapper", { name: "NVIDIA A30", count: 1 }, "0", "hw2025");
+    expect(a).not.toBe(b);
+  });
+
+  it("differs when slurm_job_id changes (multi-job same user same node)", () => {
+    const a = computeStubId("dipper", { name: "NVIDIA A30", count: 1 }, "0", "hw2025", "12345");
+    const b = computeStubId("dipper", { name: "NVIDIA A30", count: 1 }, "0", "hw2025", "12346");
+    expect(a).not.toBe(b);
+  });
+
+  it("workstation stubs (no user/slurm) remain stable", () => {
+    const a = computeStubId("gpu32", { name: "NVIDIA RTX 4080", count: 1 }, "0");
+    const b = computeStubId("gpu32", { name: "NVIDIA RTX 4080", count: 1 }, "0");
     expect(a).toBe(b);
   });
 
@@ -81,8 +94,8 @@ describe("computeStubId", () => {
   });
 
   it("matches Python stub _compute_identity_hash for SLURM job", () => {
-    const serverId = computeStubId("gpu33", { name: "NVIDIA A100-SXM4-80GB", count: 2 }, "0,1");
-    const stubId = pythonStubId("gpu33", "NVIDIA A100-SXM4-80GB", 2, "0,1");
+    const serverId = computeStubId("gpu33", { name: "NVIDIA A100-SXM4-80GB", count: 2 }, "0,1", "ys25", "238291");
+    const stubId = pythonStubId("gpu33", "NVIDIA A100-SXM4-80GB", 2, "0,1", "ys25", "238291");
     expect(serverId).toBe(stubId);
   });
 

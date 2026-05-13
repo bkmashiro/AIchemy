@@ -201,7 +201,8 @@ async function submitSlurmJob(
     `  --token ${JSON.stringify(token)} \\`,
     `  --max-concurrent ${target.max_concurrent}` +
       (target.tags ? ` \\\n  --tags ${JSON.stringify(target.tags)}` : "") +
-      (target.default_cwd ? ` \\\n  --default-cwd ${JSON.stringify(target.default_cwd)}` : ""),
+      (target.default_cwd ? ` \\\n  --default-cwd ${JSON.stringify(target.default_cwd)}` : "") +
+      (target.env_setup ? ` \\\n  --env-setup ${JSON.stringify(target.env_setup)}` : ""),
   ].join("\n");
 
   const flags = [

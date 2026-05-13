@@ -18,6 +18,9 @@ export interface SocketState {
   lossHistory: Map<string, number[]>;
 }
 
+// Interval for periodic count correction (ms). WS incremental updates can drift.
+const COUNT_REFRESH_INTERVAL_MS = 30_000;
+
 export function useSocket() {
   const [stubs, setStubs] = useState<Stub[]>([]);
   const [globalQueue, setGlobalQueue] = useState<Task[]>([]);
@@ -115,18 +118,23 @@ export function useSocket() {
         appendLoss(task.id, task.progress.loss);
       }
 
+      const TERMINAL = ["completed", "failed", "killed", "lost", "cancelled"];
+
       if (!task.stub_id || task.stub_id === "") {
-        // No stub — belongs to global queue
-        setGlobalQueue((prev) => {
-          const exists = prev.find((t) => t.id === task.id);
-          if (exists) return prev.map((t) => (t.id === task.id ? task : t));
-          return [...prev, task];
-        });
+        // No stub — belongs to global queue (or is terminal, remove it)
+        if (TERMINAL.includes(task.status)) {
+          setGlobalQueue((prev) => prev.filter((t) => t.id !== task.id));
+        } else {
+          setGlobalQueue((prev) => {
+            const exists = prev.find((t) => t.id === task.id);
+            if (exists) return prev.map((t) => (t.id === task.id ? task : t));
+            return [...prev, task];
+          });
+        }
         return;
       }
       // Remove from global queue when assigned to stub
       setGlobalQueue((prev) => prev.filter((t) => t.id !== task.id));
-      const TERMINAL = ["completed", "failed", "killed", "lost"];
       setStubs((prev) =>
         prev.map((s) => {
           if (s.id !== task.stub_id) return s;
@@ -139,6 +147,14 @@ export function useSocket() {
             : [...s.tasks, task];
           return { ...s, tasks };
         })
+      );
+    });
+
+    // Server → Web: task.deleted — remove task from all lists
+    socket.on("task.deleted", ({ task_id }: { task_id: string }) => {
+      setGlobalQueue((prev) => prev.filter((t) => t.id !== task_id));
+      setStubs((prev) =>
+        prev.map((s) => ({ ...s, tasks: s.tasks.filter((t) => t.id !== task_id) }))
       );
     });
 
@@ -177,7 +193,32 @@ export function useSocket() {
       }
     });
 
+    // Periodic re-fetch of global queue to correct WS incremental drift.
+    // Stubs are fully updated via WS events; only globalQueue needs correction
+    // because tasks moving between pending/queued/dispatched may be missed.
+    const countRefreshInterval = setInterval(() => {
+      fetch("/api/tasks?status_group=active&limit=500", {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data: any) => {
+          if (!data?.tasks) return;
+          const tasks: Task[] = data.tasks;
+          setGlobalQueue((prev) => {
+            // Keep only tasks that are still active and have no stub
+            const unassigned = tasks.filter((t) => !t.stub_id || t.stub_id === "");
+            // Preserve any tasks in prev that are missing from the API response
+            // (could be very new tasks submitted after this fetch)
+            const freshIds = new Set(unassigned.map((t) => t.id));
+            const keptPrev = prev.filter((t) => !freshIds.has(t.id) && ["pending", "queued", "blocked"].includes(t.status));
+            return [...unassigned, ...keptPrev];
+          });
+        })
+        .catch(() => {});
+    }, COUNT_REFRESH_INTERVAL_MS);
+
     return () => {
+      clearInterval(countRefreshInterval);
       socket.disconnect();
     };
   }, [appendLoss]);

@@ -21,7 +21,7 @@ function sortKeys(obj: Record<string, any>): Record<string, any> {
 
 export interface FingerprintInput {
   script: string;
-  args?: Record<string, string>;
+  args?: Record<string, string> | string;
   raw_args?: string;
   param_overrides?: Record<string, any>;
   cwd?: string;
@@ -30,7 +30,7 @@ export interface FingerprintInput {
 export function computeFingerprint(input: FingerprintInput): string {
   const parts = [
     input.script,
-    JSON.stringify(sortKeys(input.args || {})),
+    typeof input.args === "string" ? input.args : JSON.stringify(sortKeys(input.args || {})),
     input.raw_args || "",
     JSON.stringify(sortKeys(input.param_overrides || {})),
     input.cwd || "",
@@ -40,7 +40,7 @@ export function computeFingerprint(input: FingerprintInput): string {
 
 // ─── Active statuses for dedup check ─────────────────────────────────────────
 
-const ACTIVE_STATUSES: TaskStatus[] = ["pending", "queued", "dispatched", "running", "paused", "blocked"];
+const ACTIVE_STATUSES: TaskStatus[] = ["pending", "assigned", "running", "paused", "blocked"];
 
 export function isActiveStatus(status: TaskStatus): boolean {
   return ACTIVE_STATUSES.includes(status);

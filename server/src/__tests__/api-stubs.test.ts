@@ -214,12 +214,22 @@ describe("PATCH /stubs/:id", () => {
     expect(maybeDispatch).toHaveBeenCalled();
   });
 
-  it("rejects max_concurrent below 1", async () => {
+  it("allows max_concurrent=0 (drain mode)", async () => {
     const app = makeApp();
     const stub = makeStub();
     store.setStub(stub);
 
     const res = await request(app).patch(`/stubs/${stub.id}`).send({ max_concurrent: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body.stub.max_concurrent).toBe(0);
+  });
+
+  it("rejects max_concurrent below 0", async () => {
+    const app = makeApp();
+    const stub = makeStub();
+    store.setStub(stub);
+
+    const res = await request(app).patch(`/stubs/${stub.id}`).send({ max_concurrent: -1 });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/max_concurrent/i);
   });
@@ -314,7 +324,7 @@ describe("POST /stubs/:id/tasks", () => {
     expect(res.body.error).toMatch(/script required/i);
   });
 
-  it("creates a task with queued status (not pending)", async () => {
+  it("creates a task with assigned status (not pending)", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
     const stub = makeStub();
@@ -324,7 +334,7 @@ describe("POST /stubs/:id/tasks", () => {
       .post(`/stubs/${stub.id}/tasks`)
       .send({ script: "train.py", args: { "--seed": "1" } });
     expect(res.status).toBe(201);
-    expect(res.body.status).toBe("queued");
+    expect(res.body.status).toBe("assigned");
   });
 
   it("assigns stub_id to the task", async () => {
@@ -547,7 +557,7 @@ describe("DELETE /stubs/:id", () => {
 
   it("rejects deletion when stub has active tasks", async () => {
     const app = makeApp();
-    const task = makeTask({ status: "queued" });
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ status: "offline", tasks: [task] });
     store.setStub(stub);
 
@@ -570,9 +580,9 @@ describe("DELETE /stubs/:id", () => {
     expect(webNs.emit).toHaveBeenCalledWith("stub.deleted", { stub_id: stub.id });
   });
 
-  it("considers running/dispatched/queued/paused as active", async () => {
+  it("considers running/assigned/paused as active", async () => {
     const app = makeApp();
-    for (const status of ["running", "dispatched", "queued", "paused"] as const) {
+    for (const status of ["running", "assigned", "paused"] as const) {
       store.reset();
       const task = makeTask({ status });
       const stub = makeStub({ status: "offline", tasks: [task] });

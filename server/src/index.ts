@@ -71,6 +71,23 @@ setupStubNamespace(stubNs, webNs, deployConfig);
 setupControllerNamespace(controllerNs, webNs);
 startScheduler(webNs, stubNs);
 
+// ─── Startup requeue: on restart, move queued/dispatched tasks off offline stubs ──
+// This prevents tasks from being stuck in stub.tasks for up to 3 minutes until
+// the heartbeat checker detects the stubs are offline.
+{
+  const allStubs = store.getAllStubs();
+  let requeuedCount = 0;
+  for (const stub of allStubs) {
+    // All stubs are "offline" on startup (_loadFromDb resets status)
+    if (stub.status !== "offline") continue;
+    const requeued = store.requeueStubTasks(stub.id);
+    requeuedCount += requeued.length;
+  }
+  if (requeuedCount > 0) {
+    logger.info("startup.requeue", { count: requeuedCount, stubs: allStubs.length });
+  }
+}
+
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 
 function authMiddleware(

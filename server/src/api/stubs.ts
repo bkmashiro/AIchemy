@@ -42,15 +42,21 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     }
     if (req.body.max_concurrent !== undefined) {
       const mc = Number(req.body.max_concurrent);
-      if (!Number.isFinite(mc) || mc < 1 || mc > 64) { res.status(400).json({ error: "max_concurrent must be 1-64" }); return; }
+      // 0 = drain mode (no new tasks accepted, lets running ones finish)
+      if (!Number.isFinite(mc) || mc < 0 || mc > 64) { res.status(400).json({ error: "max_concurrent must be 0-64 (0 = drain)" }); return; }
       stub.max_concurrent = mc;
       // Notify stub of config change (reliable)
       reliableEmitToStub(stub.id, "config.update", { max_concurrent: stub.max_concurrent });
       // Trigger dispatch in case new slots opened
-      maybeDispatch(stub);
+      if (mc > 0) maybeDispatch(stub);
     }
     if (req.body.tags !== undefined) {
       stub.tags = req.body.tags;
+    }
+    if (req.body.idle_timeout_s !== undefined) {
+      const ito = Number(req.body.idle_timeout_s);
+      if (!Number.isFinite(ito) || ito < 0) { res.status(400).json({ error: "idle_timeout_s must be >= 0" }); return; }
+      stub.idle_timeout_s = ito > 0 ? ito : undefined;
     }
     if (req.body.auto_renew !== undefined) {
       stub.auto_renew = req.body.auto_renew;
@@ -80,8 +86,18 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
 
     stub.status = "offline";
     stub.socket_id = undefined;
+    stub.released = true;
     store.setStub(stub);
     webNs.emit("stub.offline", { stub_id: stub.id });
+    res.json({ ok: true });
+  });
+
+  // POST /stubs/:id/unrelease — clear released flag so stub can reconnect
+  router.post("/:id/unrelease", (req: Request, res: Response) => {
+    const stub = store.getStub(req.params.id);
+    if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
+    stub.released = false;
+    store.setStub(stub);
     res.json({ ok: true });
   });
 
@@ -142,7 +158,7 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     const stub = store.getStub(req.params.id);
     if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
     if (stub.status === "online") { res.status(409).json({ error: "Stub is online — release first" }); return; }
-    const activeTasks = stub.tasks.filter((t) => ["running", "dispatched", "queued", "paused"].includes(t.status));
+    const activeTasks = stub.tasks.filter((t) => ["running", "assigned", "paused"].includes(t.status));
     if (activeTasks.length > 0) { res.status(409).json({ error: "Stub has active tasks" }); return; }
     store.deleteStub(req.params.id);
     webNs.emit("stub.deleted", { stub_id: req.params.id });
@@ -205,8 +221,8 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
       stub_id: stub.id, target_tags, python_env, submitted_by,
     });
 
-    // Direct to stub queue — status is queued, not pending
-    task.status = "queued";
+    // Direct to stub queue — status is assigned, not pending
+    task.status = "assigned";
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected
     if (run_dir) {

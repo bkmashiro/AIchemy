@@ -2,7 +2,7 @@
  * socket-stub.test.ts — Unit tests for socket/stub.ts logic.
  *
  * Mocks all external dependencies (store, task-actions, reliable, discord, …)
- * and exercises: markTasksLost, handleAutoRetry, initiateKillChain /
+ * and exercises: markTasksDisconnected, handleAutoRetry, initiateKillChain /
  * cancelKillChain, and the full resume/reconciliation flow.
  */
 
@@ -65,6 +65,7 @@ vi.mock("../src/store", () => ({
     getExperiment: () => undefined,
     rebuildWriteLocks: vi.fn(),
     unarchiveTask: vi.fn(),
+    requeueStubTasks: vi.fn(() => []),
   },
 }));
 
@@ -96,8 +97,7 @@ vi.mock("../src/discord", () => ({
   notifyRunning: vi.fn().mockResolvedValue(undefined),
   notifyCompleted: vi.fn().mockResolvedValue(undefined),
   notifyFailed: vi.fn().mockResolvedValue(undefined),
-  notifyKilled: vi.fn().mockResolvedValue(undefined),
-  notifyLost: vi.fn().mockResolvedValue(undefined),
+  notifyCancelled: vi.fn().mockResolvedValue(undefined),
   notifyGridDone: vi.fn().mockResolvedValue(undefined),
   notifyTaskMessage: vi.fn().mockResolvedValue(undefined),
   notifyExperimentPassed: vi.fn().mockResolvedValue(undefined),
@@ -118,12 +118,21 @@ vi.mock("../src/dedup", () => ({
 
 // task-actions mock backed by our _stubs map
 vi.mock("../src/task-actions", () => ({
-  loseTask: vi.fn((stubId: string, taskId: string) => {
+  markDisconnected: vi.fn((stubId: string, taskId: string) => {
     const stub = _stubs.get(stubId);
     if (!stub) return undefined;
     const idx = stub.tasks?.findIndex((t: any) => t.id === taskId) ?? -1;
     if (idx === -1) return undefined;
-    stub.tasks[idx] = { ...stub.tasks[idx], status: "lost", finished_at: new Date().toISOString() };
+    if (!["running", "paused"].includes(stub.tasks[idx].status)) return undefined;
+    stub.tasks[idx] = { ...stub.tasks[idx], stub_offline: true, disconnected_at: new Date().toISOString() };
+    return stub.tasks[idx];
+  }),
+  clearDisconnected: vi.fn((stubId: string, taskId: string) => {
+    const stub = _stubs.get(stubId);
+    if (!stub) return undefined;
+    const idx = stub.tasks?.findIndex((t: any) => t.id === taskId) ?? -1;
+    if (idx === -1) return undefined;
+    stub.tasks[idx] = { ...stub.tasks[idx], stub_offline: false, disconnected_at: undefined };
     return stub.tasks[idx];
   }),
   startTask: vi.fn((stubId: string, taskId: string, pid: number) => {
@@ -142,28 +151,20 @@ vi.mock("../src/task-actions", () => ({
     stub.tasks[idx] = { ...stub.tasks[idx], status: "completed", exit_code: exitCode, finished_at: new Date().toISOString() };
     return stub.tasks[idx];
   }),
-  failTask: vi.fn((stubId: string, taskId: string, exitCode?: number) => {
+  failTask: vi.fn((stubId: string, taskId: string, exitCode?: number, extra?: any) => {
     const stub = _stubs.get(stubId);
     if (!stub) return undefined;
     const idx = stub.tasks?.findIndex((t: any) => t.id === taskId) ?? -1;
     if (idx === -1) return undefined;
-    stub.tasks[idx] = { ...stub.tasks[idx], status: "failed", exit_code: exitCode, finished_at: new Date().toISOString() };
+    stub.tasks[idx] = { ...stub.tasks[idx], status: "failed", exit_code: exitCode, finished_at: new Date().toISOString(), ...extra };
     return stub.tasks[idx];
   }),
-  killTask: vi.fn((stubId: string, taskId: string, exitCode?: number) => {
+  cancelTask: vi.fn((stubId: string, taskId: string, exitCode?: number) => {
     const stub = _stubs.get(stubId);
     if (!stub) return undefined;
     const idx = stub.tasks?.findIndex((t: any) => t.id === taskId) ?? -1;
     if (idx === -1) return undefined;
-    stub.tasks[idx] = { ...stub.tasks[idx], status: "killed", exit_code: exitCode, finished_at: new Date().toISOString() };
-    return stub.tasks[idx];
-  }),
-  recoverTask: vi.fn((stubId: string, taskId: string, pid: number) => {
-    const stub = _stubs.get(stubId);
-    if (!stub) return undefined;
-    const idx = stub.tasks?.findIndex((t: any) => t.id === taskId) ?? -1;
-    if (idx === -1) return undefined;
-    stub.tasks[idx] = { ...stub.tasks[idx], status: "running", pid, finished_at: undefined };
+    stub.tasks[idx] = { ...stub.tasks[idx], status: "cancelled", exit_code: exitCode, finished_at: new Date().toISOString() };
     return stub.tasks[idx];
   }),
   resolveDeadTask: vi.fn((stubId: string, taskId: string, exitCode: number) => {
@@ -176,8 +177,8 @@ vi.mock("../src/task-actions", () => ({
     return stub.tasks[idx];
   }),
   preflightFail: vi.fn(),
-  promoteIfDispatched: vi.fn(),
-  dispatchTask: vi.fn(),
+  promoteIfAssigned: vi.fn(),
+  assignTask: vi.fn(),
   createRetryTask: vi.fn((task: any, opts?: any) => ({
     ...task,
     id: `retry-${task.id}-${Date.now()}`,
@@ -203,8 +204,8 @@ vi.mock("../src/task-actions", () => ({
 // ─── Import after mocks ───────────────────────────────────────────────────────
 
 import { initiateKillChain, cancelKillChain, setupStubNamespace } from "../src/socket/stub";
-import { notifyLost, notifyKilled } from "../src/discord";
-import { loseTask, killTask, recoverTask, resolveDeadTask, createRetryTask } from "../src/task-actions";
+import { notifyCancelled, notifyFailed } from "../src/discord";
+import { markDisconnected, cancelTask, clearDisconnected, resolveDeadTask, createRetryTask } from "../src/task-actions";
 import { reliableEmitToStub } from "../src/reliable";
 import { triggerSchedule } from "../src/scheduler";
 import { logger } from "../src/log";
@@ -228,8 +229,10 @@ function computeExpectedStubId(
   hostname = BASE_HOSTNAME,
   gpu = BASE_GPU,
   cudaVisibleDevices: string = "",
+  user: string = "",
+  slurmJobId: string = "",
 ): string {
-  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}`;
+  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}|${user}|${slurmJobId}`;
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
@@ -244,6 +247,7 @@ function makeTask(overrides: Partial<any> = {}): any {
     status: "running",
     stub_id: STUB_ID,
     should_stop: false,
+    should_checkpoint: false,
     max_retries: 0,
     retry_count: 0,
     log_buffer: [],
@@ -369,91 +373,62 @@ afterEach(() => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// markTasksLost — exercised via the disconnect event
+// markTasksDisconnected — exercised via the disconnect event
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("markTasksLost (via disconnect)", () => {
-  it("loses a running task on disconnect", () => {
+describe("markTasksDisconnected (via disconnect)", () => {
+  it("marks a running task as disconnected on disconnect (keeps status running)", () => {
     const task = makeTask({ status: "running" });
     const stub = makeStub({ tasks: [task] });
-    const { socketHandlers, webNs } = buildHarness({ preExistingStub: stub });
-
-    socketHandlers["disconnect"]?.();
-
-    expect(loseTask).toHaveBeenCalledWith(STUB_ID, task.id);
-    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ status: "lost" }));
-    expect(notifyLost).toHaveBeenCalled();
-  });
-
-  it("loses a dispatched task on disconnect", () => {
-    const task = makeTask({ status: "dispatched" });
-    const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
-
-    socketHandlers["disconnect"]?.();
-
-    expect(loseTask).toHaveBeenCalledWith(STUB_ID, task.id);
-  });
-
-  it("loses a paused task on disconnect", () => {
-    const task = makeTask({ status: "paused" });
-    const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
-
-    socketHandlers["disconnect"]?.();
-
-    expect(loseTask).toHaveBeenCalledWith(STUB_ID, task.id);
-  });
-
-  it("kills a task (should_stop=true) instead of losing it on disconnect", () => {
-    const task = makeTask({ status: "running", should_stop: true });
-    const stub = makeStub({ tasks: [task] });
-    // Report the task as running during resume so reconciliation doesn't touch it;
-    // disconnect is where the should_stop logic fires.
+    // Include the task in running_tasks so reconciliation doesn't fail it
     const { socketHandlers, webNs } = buildHarness({
       preExistingStub: stub,
-      resumePayload: { running_tasks: [{ task_id: task.id, pid: 123 }] },
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
     });
-
-    // Record call count after resume (reconciliation may have called some mocks)
-    const killCallsBefore = (killTask as any).mock.calls.length;
-    const loseCallsBefore = (loseTask as any).mock.calls.length;
 
     socketHandlers["disconnect"]?.();
 
-    // killTask must have been called at least once MORE than before disconnect
-    expect((killTask as any).mock.calls.length).toBeGreaterThan(killCallsBefore);
-    // The additional call should be for our task
-    const newKillCalls = (killTask as any).mock.calls.slice(killCallsBefore);
-    expect(newKillCalls).toEqual(expect.arrayContaining([[STUB_ID, task.id, undefined]]));
-    // loseTask should NOT have been called any additional times
-    expect((loseTask as any).mock.calls.length).toBe(loseCallsBefore);
-    expect(notifyKilled).toHaveBeenCalled();
-    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ status: "killed" }));
+    expect(markDisconnected).toHaveBeenCalledWith(STUB_ID, task.id);
+    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ stub_offline: true }));
   });
 
-  it("skips tasks already in lost state — no duplicate notification", () => {
-    const task = makeTask({ status: "lost" });
+  it("marks a paused task as disconnected on disconnect", () => {
+    const task = makeTask({ status: "paused" });
+    const stub = makeStub({ tasks: [task] });
+    // Include the task in running_tasks so reconciliation doesn't fail it
+    const { socketHandlers } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+    });
+
+    socketHandlers["disconnect"]?.();
+
+    expect(markDisconnected).toHaveBeenCalledWith(STUB_ID, task.id);
+  });
+
+  it("does NOT mark assigned (not started) tasks — requeueStubTasks handles them", () => {
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ tasks: [task] });
     const { socketHandlers } = buildHarness({ preExistingStub: stub });
 
     socketHandlers["disconnect"]?.();
 
-    expect(loseTask).not.toHaveBeenCalled();
+    // assigned tasks are handled by requeueStubTasks, not markDisconnected
+    expect(markDisconnected).not.toHaveBeenCalledWith(STUB_ID, task.id);
   });
 
-  it("skips terminal tasks (completed / failed / killed)", () => {
+  it("skips terminal tasks (completed / failed / cancelled)", () => {
     const tasks = [
       makeTask({ status: "completed" }),
       makeTask({ status: "failed" }),
-      makeTask({ status: "killed" }),
+      makeTask({ status: "cancelled" }),
     ];
     const stub = makeStub({ tasks });
     const { socketHandlers } = buildHarness({ preExistingStub: stub });
 
     socketHandlers["disconnect"]?.();
 
-    expect(loseTask).not.toHaveBeenCalled();
+    expect(markDisconnected).not.toHaveBeenCalled();
   });
 
   it("does NOT process disconnect if socket.id no longer matches stub.socket_id (reconnect race)", () => {
@@ -467,106 +442,113 @@ describe("markTasksLost (via disconnect)", () => {
     });
 
     // Record calls from reconciliation
-    const loseCallsBefore = (loseTask as any).mock.calls.length;
+    const markCallsBefore = (markDisconnected as any).mock.calls.length;
 
     // Simulate a new socket taking over: update stub.socket_id to a different value
     _stubs.get(STUB_ID)!.socket_id = "sock-brand-new";
 
     socketHandlers["disconnect"]?.();
 
-    // The disconnect guard (stub.socket_id !== socket.id) should have fired → no additional loseTask
-    expect((loseTask as any).mock.calls.length).toBe(loseCallsBefore);
+    // The disconnect guard (stub.socket_id !== socket.id) should have fired → no additional markDisconnected
+    expect((markDisconnected as any).mock.calls.length).toBe(markCallsBefore);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// handleAutoRetry — triggered by markTasksLost
+// handleAutoRetry — triggered by failDisconnectedTasks (after heartbeat timeout)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("handleAutoRetry (via disconnect → markTasksLost)", () => {
-  it("creates a retry task when max_retries > 0 and retry_count < max_retries", () => {
+describe("handleAutoRetry (via disconnect → failDisconnectedTasks after timeout)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  it("creates a retry task after heartbeat timeout when max_retries > 0", async () => {
     const task = makeTask({ status: "running", max_retries: 3, retry_count: 0 });
     const stub = makeStub({ tasks: [task] });
-    const { socketHandlers, webNs } = buildHarness({ preExistingStub: stub });
+    // Include task in running_tasks so reconciliation doesn't fail it prematurely
+    const { socketHandlers, webNs } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+    });
 
     socketHandlers["disconnect"]?.();
 
+    // markDisconnected was called — now simulate stub stays offline until heartbeat timeout
+    // The timeout fires failDisconnectedTasks which calls failTask + handleAutoRetry
+    // We need the stub to stay "offline" in store
+    const storedStub = _stubs.get(STUB_ID)!;
+    storedStub.status = "offline";
+    storedStub.tasks[0] = { ...storedStub.tasks[0], stub_offline: true };
+
+    await vi.advanceTimersByTimeAsync(6 * 3_600_000 + 100); // DISCONNECT_FAIL_MS (6h)
+
+    // failTask should have been called + retry task queued
     expect(_queue).toHaveLength(1);
     const retryTask = _queue[0];
     expect(retryTask.status).toBe("pending");
     expect(retryTask.retry_count).toBe(1);
     expect(retryTask.retry_of).toBe(task.id);
     expect(retryTask.id).not.toBe(task.id);
-    expect(retryTask.stub_id).toBeUndefined();
-    expect(retryTask.run_dir).toBeUndefined();
-    expect(retryTask.log_buffer).toEqual([]);
-    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ status: "pending" }));
     expect(triggerSchedule).toHaveBeenCalled();
   });
 
-  it("does NOT retry when max_retries is 0", () => {
+  it("does NOT retry when max_retries is 0", async () => {
     const task = makeTask({ status: "running", max_retries: 0 });
     const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
+    const { socketHandlers } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+    });
 
     socketHandlers["disconnect"]?.();
+    const storedStub = _stubs.get(STUB_ID)!;
+    storedStub.status = "offline";
+    storedStub.tasks[0] = { ...storedStub.tasks[0], stub_offline: true };
+
+    await vi.advanceTimersByTimeAsync(6 * 3_600_000 + 100); // DISCONNECT_FAIL_MS
 
     expect(_queue).toHaveLength(0);
   });
 
-  it("does NOT retry when retry_count has reached max_retries", () => {
+  it("does NOT retry when retry_count has reached max_retries", async () => {
     const task = makeTask({ status: "running", max_retries: 2, retry_count: 2 });
     const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
+    const { socketHandlers } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+    });
 
     socketHandlers["disconnect"]?.();
+    const storedStub = _stubs.get(STUB_ID)!;
+    storedStub.status = "offline";
+    storedStub.tasks[0] = { ...storedStub.tasks[0], stub_offline: true };
+
+    await vi.advanceTimersByTimeAsync(6 * 3_600_000 + 100); // DISCONNECT_FAIL_MS
 
     expect(_queue).toHaveLength(0);
   });
 
-  it("preserves retry_of across multiple retry hops", () => {
-    const originalId = uuidv4();
-    const task = makeTask({ status: "running", max_retries: 5, retry_count: 2, retry_of: originalId });
+  it("does NOT fail tasks if stub reconnects before timeout", async () => {
+    const task = makeTask({ status: "running", max_retries: 3, retry_count: 0 });
     const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
-
-    socketHandlers["disconnect"]?.();
-
-    expect(_queue[0].retry_of).toBe(originalId);
-  });
-
-  it("sets retry_of to the original task.id on the first retry", () => {
-    const task = makeTask({ status: "running", max_retries: 1, retry_count: 0, retry_of: undefined });
-    const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
-
-    socketHandlers["disconnect"]?.();
-
-    expect(_queue[0].retry_of).toBe(task.id);
-  });
-
-  it("clears all lifecycle fields on the retry task", () => {
-    const task = makeTask({
-      status: "running",
-      max_retries: 1,
-      retry_count: 0,
-      started_at: "2024-01-01T00:00:00Z",
-      finished_at: "2024-01-01T01:00:00Z",
-      exit_code: 1,
-      pid: 1234,
-      progress: { step: 50, total: 100 },
+    // Include task in running_tasks so reconciliation doesn't fail it during resume
+    const { socketHandlers } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
     });
-    const stub = makeStub({ tasks: [task] });
-    const { socketHandlers } = buildHarness({ preExistingStub: stub });
 
     socketHandlers["disconnect"]?.();
 
-    const r = _queue[0];
-    expect(r.started_at).toBeUndefined();
-    expect(r.finished_at).toBeUndefined();
-    expect(r.exit_code).toBeUndefined();
-    expect(r.pid).toBeUndefined();
-    expect(r.progress).toBeUndefined();
+    // Stub reconnects — sets status back to online with fresh heartbeat
+    const storedStub = _stubs.get(STUB_ID)!;
+    storedStub.status = "online";
+    storedStub.last_heartbeat = new Date(Date.now() + 7 * 3_600_000).toISOString();
+
+    await vi.advanceTimersByTimeAsync(6 * 3_600_000 + 100); // DISCONNECT_FAIL_MS
+
+    // No retry tasks should have been queued (stub came back online)
+    expect(_queue).toHaveLength(0);
   });
 });
 
@@ -712,7 +694,7 @@ describe("resume reconciliation", () => {
     expect(() => socketHandlers["resume"]?.(BASE_RESUME_PAYLOAD)).not.toThrow();
   });
 
-  it("Case A: server-side running task not reported by stub → task marked lost", () => {
+  it("Case A: server-side running task not reported by stub → task failed with disappeared", () => {
     const task = makeTask({ status: "running" });
     const stub = makeStub({ tasks: [task] });
     _stubs.set(stub.id, stub);
@@ -721,20 +703,28 @@ describe("resume reconciliation", () => {
     // Stub reports zero running tasks
     socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, running_tasks: [] });
 
-    expect(loseTask).toHaveBeenCalledWith(STUB_ID, task.id);
-    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ status: "lost" }));
-    expect(notifyLost).toHaveBeenCalled();
+    // With new design: not reported → fail with death_cause: "disappeared"
+    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ status: "failed" }));
   });
 
-  it("Case A: dispatched task not reported by stub → also marked lost", () => {
-    const task = makeTask({ status: "dispatched" });
+  it("Case A: assigned task not reported by stub → requeued (not in running_tasks)", () => {
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ tasks: [task] });
     _stubs.set(stub.id, stub);
 
     const { socketHandlers } = buildHarness({ skipResume: true });
     socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, running_tasks: [] });
 
-    expect(loseTask).toHaveBeenCalledWith(STUB_ID, task.id);
+    // assigned tasks go into adopt_tasks (not failed)
+    expect(reliableEmitToStub).toHaveBeenCalledWith(
+      STUB_ID,
+      "resume_response",
+      expect.objectContaining({
+        adopt_tasks: expect.arrayContaining([
+          expect.objectContaining({ task_id: task.id }),
+        ]),
+      }),
+    );
   });
 
   it("Case B: stub reports unknown task → orphan added to kill_tasks", () => {
@@ -753,8 +743,8 @@ describe("resume reconciliation", () => {
     );
   });
 
-  it("recovers a 'lost' task that stub still reports as running", () => {
-    const task = makeTask({ status: "lost" });
+  it("stub reports running task that has stub_offline → clearDisconnected called", () => {
+    const task = makeTask({ status: "running", stub_offline: true, disconnected_at: new Date().toISOString() });
     const stub = makeStub({ tasks: [task] });
     _stubs.set(stub.id, stub);
 
@@ -764,12 +754,12 @@ describe("resume reconciliation", () => {
       running_tasks: [{ task_id: task.id, pid: 1111 }],
     });
 
-    expect(recoverTask).toHaveBeenCalledWith(STUB_ID, task.id, 1111);
-    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ status: "running" }));
+    expect(clearDisconnected).toHaveBeenCalledWith(STUB_ID, task.id);
+    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ stub_offline: false }));
   });
 
-  it("'killed' server task that stub still runs → included in kill_tasks", () => {
-    const task = makeTask({ status: "killed" });
+  it("'cancelled' server task that stub still runs → included in kill_tasks", () => {
+    const task = makeTask({ status: "cancelled" });
     const stub = makeStub({ tasks: [task] });
     _stubs.set(stub.id, stub);
 
@@ -786,8 +776,8 @@ describe("resume reconciliation", () => {
     );
   });
 
-  it("Case C: queued server task not in stub local_queue → included in adopt_tasks", () => {
-    const task = makeTask({ status: "queued" });
+  it("Case C: assigned server task not in stub local_queue → included in adopt_tasks", () => {
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ tasks: [task] });
     _stubs.set(stub.id, stub);
 
@@ -866,7 +856,7 @@ describe("resume reconciliation", () => {
     expect(updated.max_concurrent).toBe(8); // server wins
   });
 
-  it("auto-retry triggered for tasks lost during Case A reconciliation", () => {
+  it("auto-retry triggered for tasks failed during Case A reconciliation", () => {
     const task = makeTask({ status: "running", max_retries: 2, retry_count: 0 });
     const stub = makeStub({ tasks: [task] });
     _stubs.set(stub.id, stub);

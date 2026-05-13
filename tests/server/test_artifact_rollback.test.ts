@@ -70,6 +70,7 @@ let serverProcess: ChildProcess;
 let BASE_URL: string;
 const TOKEN = "alchemy-v2-token";
 const STATE_FILE = `/tmp/alchemy_test_rollback_state_${process.pid}.json`;
+const DB_FILE = `/tmp/alchemy_test_rollback_state_${process.pid}.db`;
 const SERVER_DIR = path.join(__dirname, "../../server");
 
 beforeAll(async () => {
@@ -80,6 +81,7 @@ beforeAll(async () => {
     ...process.env,
     PORT: String(port),
     STATE_FILE,
+    DB_FILE,
     NO_PROXY: "*",
     no_proxy: "*",
   };
@@ -100,10 +102,13 @@ afterAll(async () => {
   serverProcess?.kill("SIGTERM");
   await new Promise((r) => setTimeout(r, 500));
   try { require("fs").unlinkSync(STATE_FILE); } catch {}
+  try { require("fs").unlinkSync(DB_FILE); } catch {}
+  try { require("fs").unlinkSync(DB_FILE + "-wal"); } catch {}
+  try { require("fs").unlinkSync(DB_FILE + "-shm"); } catch {}
 });
 
 function uniqueScript(suffix: string) {
-  return `python rollback_${suffix}_${Date.now()}.py`;
+  return `/tmp/test_rollback_${suffix}_${Date.now()}.py`;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -34,9 +34,14 @@ function resolveTemplate(template: string, taskRefMap: Map<string, Task>): strin
 }
 
 /** Resolve all args_template on a task, returns concrete args */
-function resolveTaskArgs(task: Task, taskRefMap: Map<string, Task>): Record<string, string> {
-  if (!task.args_template) return task.args || {};
-  const resolved: Record<string, string> = { ...(task.args || {}) };
+function resolveTaskArgs(task: Task, taskRefMap: Map<string, Task>): Record<string, string> | string {
+  if (!task.args_template) {
+    // No template — return args as-is (preserves string args)
+    if (typeof task.args === "string") return task.args;
+    return task.args || {};
+  }
+  const baseArgs = (typeof task.args === "string") ? {} : (task.args || {});
+  const resolved: Record<string, string> = { ...baseArgs };
   for (const [k, v] of Object.entries(task.args_template)) {
     resolved[k] = resolveTemplate(v, taskRefMap);
   }
@@ -62,7 +67,7 @@ function hasFailedDependency(task: Task): boolean {
     const found = store.findTask(depId);
     if (!found) continue;
     const s = found.task.status;
-    if (s === "failed" || s === "killed" || s === "cancelled") return true;
+    if (s === "failed" || s === "cancelled") return true;
   }
   return false;
 }

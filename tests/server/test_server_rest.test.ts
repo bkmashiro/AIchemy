@@ -77,6 +77,7 @@ let serverProcess: ChildProcess;
 let BASE_URL: string;
 let TOKEN: string;
 const STATE_FILE = `/tmp/alchemy_test_state_${process.pid}.json`;
+const DB_FILE = `/tmp/alchemy_test_state_${process.pid}.db`;
 
 const SERVER_DIR = path.join(__dirname, "../../server");
 
@@ -88,6 +89,7 @@ beforeAll(async () => {
     ...process.env,
     PORT: String(port),
     STATE_FILE,
+    DB_FILE,
     NO_PROXY: "*",
     no_proxy: "*",
   };
@@ -111,13 +113,16 @@ afterAll(async () => {
   serverProcess?.kill("SIGTERM");
   await new Promise((r) => setTimeout(r, 500));
   try { require("fs").unlinkSync(STATE_FILE); } catch {}
+  try { require("fs").unlinkSync(DB_FILE); } catch {}
+  try { require("fs").unlinkSync(DB_FILE + "-wal"); } catch {}
+  try { require("fs").unlinkSync(DB_FILE + "-shm"); } catch {}
 });
 
 // ─── Helper: reset state between test groups ──────────────────────────────────
 // We use unique scripts per test to avoid fingerprint collision
 
 function uniqueScript(suffix: string) {
-  return `python train_${suffix}_${Date.now()}.py`;
+  return `/tmp/train_${suffix}_${Date.now()}.py`;
 }
 
 // ─── 1. Task CRUD ─────────────────────────────────────────────────────────────
@@ -192,7 +197,7 @@ describe("Task CRUD", () => {
 
     const taskRes = await apiGet(`${BASE_URL}/api/tasks/${id}`, TOKEN);
     const task = await taskRes.json();
-    expect(task.status).toBe("killed");
+    expect(task.status).toBe("cancelled");
   });
 
   it("POST /tasks/batch delete removes completed task", async () => {
@@ -249,22 +254,22 @@ describe("Display name generation", () => {
   });
 
   it("script + args produces basename args_summary", async () => {
-    const script = `python train_atari_${Date.now()}.py`;
+    const script = `/tmp/train_atari_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, {
       script,
       args: { "--config": "atari_ctx512.yaml", "--seed": "42" },
     });
     const task = await r.json();
-    const basename = script.split(" ")[1]; // "train_atari_XXX.py"
+    const basename = script.split("/").pop()!; // "train_atari_XXX.py"
     // display_name should start with the script basename
-    expect(task.display_name).toContain(basename.split("/").pop()!);
+    expect(task.display_name).toContain(basename);
     expect(task.display_name).toContain("config=atari_ctx512.yaml");
     expect(task.display_name).toContain("seed=42");
   });
 
   it("script only produces basename", async () => {
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, {
-      script: `python scripts/train_model_${Date.now()}.py`,
+      script: `/tmp/scripts/train_model_${Date.now()}.py`,
     });
     const task = await r.json();
     expect(task.display_name).toMatch(/train_model_\d+\.py/);
@@ -275,7 +280,7 @@ describe("Display name generation", () => {
 
 describe("Command assembly", () => {
   it("assembles env_setup + cwd + env + script + args + raw_args", async () => {
-    const script = `python train_${Date.now()}.py`;
+    const script = `/tmp/train_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, {
       script,
       args: { "--seed": "42" },
@@ -294,10 +299,11 @@ describe("Command assembly", () => {
   });
 
   it("script only produces minimal command", async () => {
-    const script = `python train_min_${Date.now()}.py`;
+    const script = `/tmp/train_min_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await r.json();
-    expect(task.command).toBe(script);
+    // .py scripts get python prepended automatically
+    expect(task.command).toBe(`python ${script}`);
   });
 });
 
@@ -305,7 +311,7 @@ describe("Command assembly", () => {
 
 describe("Fingerprint dedup", () => {
   it("T1: Same fingerprint while active → 409 with existing task", async () => {
-    const script = `python dedup_test_${Date.now()}.py`;
+    const script = `/tmp/dedup_test_${Date.now()}.py`;
     const r1 = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     expect(r1.status).toBe(201);
     const task1 = await r1.json();
@@ -319,7 +325,7 @@ describe("Fingerprint dedup", () => {
   });
 
   it("T2: Same fingerprint after completed → allowed", async () => {
-    const script = `python dedup_completed_${Date.now()}.py`;
+    const script = `/tmp/dedup_completed_${Date.now()}.py`;
 
     // Create and kill task (terminal state)
     const r1 = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
@@ -330,9 +336,9 @@ describe("Fingerprint dedup", () => {
       task_ids: [task1.id],
     });
 
-    // Verify killed
+    // Verify cancelled
     const check = await (await apiGet(`${BASE_URL}/api/tasks/${task1.id}`, TOKEN)).json();
-    expect(check.status).toBe("killed");
+    expect(check.status).toBe("cancelled");
 
     // Now resubmit — should be allowed
     const r2 = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
@@ -342,7 +348,7 @@ describe("Fingerprint dedup", () => {
   });
 
   it("Idempotency key: same key within 60s returns same task", async () => {
-    const script = `python idempotent_${Date.now()}.py`;
+    const script = `/tmp/idempotent_${Date.now()}.py`;
     const key = `idem-key-${Date.now()}`;
 
     const r1 = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, {
@@ -373,8 +379,8 @@ describe("Fingerprint dedup", () => {
 describe("Write lock", () => {
   it("T3: Two tasks with same run_dir → second rejected", async () => {
     const runDir = `/tmp/alchemy_test_lock_${Date.now()}`;
-    const s1 = `python lock_task_a_${Date.now()}.py`;
-    const s2 = `python lock_task_b_${Date.now()}.py`;
+    const s1 = `/tmp/lock_task_a_${Date.now()}.py`;
+    const s2 = `/tmp/lock_task_b_${Date.now()}.py`;
 
     const r1 = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, {
       script: s1,
@@ -394,8 +400,8 @@ describe("Write lock", () => {
 
   it("Prefix path conflict: sub-path conflicts with parent", async () => {
     const base = `/tmp/alchemy_prefix_${Date.now()}`;
-    const s1 = `python prefix_a_${Date.now()}.py`;
-    const s2 = `python prefix_b_${Date.now()}.py`;
+    const s1 = `/tmp/prefix_a_${Date.now()}.py`;
+    const s2 = `/tmp/prefix_b_${Date.now()}.py`;
 
     const r1 = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, {
       script: s1,
@@ -416,7 +422,7 @@ describe("Write lock", () => {
 
 describe("Grid creation", () => {
   it("POST /grids creates correct number of tasks (cartesian product)", async () => {
-    const script = `python grid_train_${Date.now()}.py`;
+    const script = `/tmp/grid_train_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/grids`, TOKEN, {
       script,
       param_space: {
@@ -472,11 +478,11 @@ describe("Grid creation", () => {
     const result = await cancelR.json();
     expect(result.cancelled).toBeGreaterThanOrEqual(3);
 
-    // All tasks should be killed now
+    // All tasks should be cancelled now
     const detailR = await apiGet(`${BASE_URL}/api/grids/${grid.id}`, TOKEN);
     const detail = await detailR.json();
     for (const task of detail.tasks) {
-      expect(task.status).toBe("killed");
+      expect(task.status).toBe("cancelled");
     }
   });
 
@@ -488,10 +494,10 @@ describe("Grid creation", () => {
     });
     const grid = await r.json();
 
-    // Cancel all (→ killed status)
+    // Cancel all (→ cancelled status)
     await apiPost(`${BASE_URL}/api/grids/${grid.id}/cancel`, TOKEN, {});
 
-    // retry-failed only retries "failed"/"killed"/"lost" tasks
+    // retry-failed retries "failed"/"cancelled" tasks
     const retryR = await apiPost(`${BASE_URL}/api/grids/${grid.id}/retry-failed`, TOKEN, {});
     expect(retryR.status).toBe(200);
     const result = await retryR.json();

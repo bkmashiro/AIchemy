@@ -75,6 +75,7 @@ class StubDaemon:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        os.umask(0o022)  # Ensure output files are group/world-readable
 
         self.gpu_monitor = GpuMonitor()
         self.system_monitor = SystemMonitor(gpu_monitor=self.gpu_monitor)
@@ -1037,10 +1038,14 @@ class StubDaemon:
             if self.process_mgr.running_count() == 0:
                 idle_s = time.time() - self.last_task_time
                 if idle_s >= self.config.idle_timeout:
+                    slurm_jid = os.environ.get("SLURM_JOB_ID")
                     jlog("info", "stub.stop",
                          reason="idle_timeout",
                          idle_s=round(idle_s),
-                         timeout_s=self.config.idle_timeout)
+                         timeout_s=self.config.idle_timeout,
+                         slurm_job_id=slurm_jid)
+                    if slurm_jid:
+                        os.system(f"scancel {slurm_jid}")
                     os._exit(0)
 
     async def _log_cleanup_loop(self) -> None:

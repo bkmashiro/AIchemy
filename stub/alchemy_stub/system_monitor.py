@@ -13,6 +13,52 @@ log = logging.getLogger(__name__)
 
 _WINDOW = 5  # samples kept for sliding-window mean
 
+
+def _read_cgroup_mem_used_mb() -> int | None:
+    """Read per-job memory usage from SLURM cgroup (v1 or v2).
+
+    Returns used memory in MB, or None if cgroup files are not accessible.
+
+    Cgroup v1 path: /sys/fs/cgroup/memory/slurm/uid_*/job_*/memory.usage_in_bytes
+    Cgroup v2 path: /sys/fs/cgroup/memory.current  (also checked via SLURM uid/job hierarchy)
+    """
+    import glob
+
+    # Cgroup v1: SLURM creates per-job directories under /sys/fs/cgroup/memory/slurm/
+    patterns_v1 = [
+        "/sys/fs/cgroup/memory/slurm/uid_*/job_*/memory.usage_in_bytes",
+        "/sys/fs/cgroup/memory/slurm/uid_*/job_*/step_*/memory.usage_in_bytes",
+    ]
+    for pattern in patterns_v1:
+        matches = glob.glob(pattern)
+        if matches:
+            # Use the job-level file (not step) if available
+            job_level = [m for m in matches if "step_" not in m]
+            path = job_level[0] if job_level else matches[0]
+            try:
+                with open(path) as f:
+                    usage_bytes = int(f.read().strip())
+                if usage_bytes > 0:
+                    return usage_bytes // (1024 ** 2)
+            except (OSError, ValueError):
+                pass
+
+    # Cgroup v2: /sys/fs/cgroup/memory.current (process's own cgroup)
+    cgroup2_usage = "/sys/fs/cgroup/memory.current"
+    if os.path.exists(cgroup2_usage):
+        try:
+            with open(cgroup2_usage) as f:
+                val = f.read().strip()
+                if val != "max":
+                    usage_bytes = int(val)
+                    if usage_bytes > 0:
+                        return usage_bytes // (1024 ** 2)
+        except (OSError, ValueError):
+            pass
+
+    return None
+
+
 try:
     import psutil
     _PSUTIL_OK = True
@@ -78,14 +124,18 @@ class SystemMonitor:
 
         try:
             mem = psutil.virtual_memory()
-            mem_used_mb = mem.used // (1024 ** 2)
             # If running under SLURM, use SLURM-allocated memory as the limit
             slurm_mem = os.environ.get("SLURM_MEM_PER_NODE")  # in MB
             if slurm_mem:
                 mem_total_mb = int(slurm_mem)
+                # Try to read cgroup memory usage for accuracy (per-job, not global)
+                mem_used_mb = _read_cgroup_mem_used_mb()
+                if mem_used_mb is None:
+                    mem_used_mb = mem.used // (1024 ** 2)
             else:
                 # Fallback to physical memory for workstation stubs
                 mem_total_mb = mem.total // (1024 ** 2)
+                mem_used_mb = mem.used // (1024 ** 2)
             if mem_total_mb == 0:
                 log.warning(
                     "system_monitor: psutil.virtual_memory() returned total=0 "

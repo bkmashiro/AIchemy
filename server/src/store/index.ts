@@ -27,6 +27,7 @@ const STATE_DIR = process.env.STATE_DIR || process.cwd();
 const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, "state.json");
 const DB_FILE = process.env.DB_FILE || path.join(path.dirname(STATE_FILE), "state.db");
 const BACKUP_INTERVAL = 30 * 60_000;
+const WAL_CHECKPOINT_INTERVAL = 30_000; // 30s periodic WAL flush
 const BACKUP_KEEP_COUNT = 48;
 const ARCHIVE_LOG_TAIL = 50;
 const ARCHIVE_MAX = 500;
@@ -68,6 +69,12 @@ class Store {
     this.db = new Database(DB_FILE);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
+    // NORMAL is safe with WAL — each write is atomic; only risk is losing
+    // the very last transaction on OS crash (acceptable, WAL replays on open).
+    this.db.pragma("synchronous = NORMAL");
+    // Increase WAL auto-checkpoint threshold (pages). Default is 1000 (~4MB).
+    // Lower to 500 (~2MB) so SQLite auto-checkpoints more aggressively.
+    this.db.pragma("wal_autocheckpoint = 500");
 
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS stubs (
@@ -112,6 +119,13 @@ class Store {
     `);
 
     this._stmts = this._prepareStatements();
+
+    // State machine migration: normalize old status values to new ones
+    this.db.exec(`
+      UPDATE tasks SET status = 'failed' WHERE status = 'lost';
+      UPDATE tasks SET status = 'cancelled' WHERE status = 'killed';
+      UPDATE tasks SET status = 'assigned' WHERE status IN ('queued', 'dispatched');
+    `);
 
     if (needsMigration) {
       this._migrateFromJson();
@@ -278,9 +292,8 @@ class Store {
         }
       }
 
-      // Truncate existing archive log_buffers, dedup lost, prune
+      // Truncate existing archive log_buffers and prune
       for (const t of this.archive) this._truncateLogBuffer(t);
-      this.deduplicateLost();
       this._pruneArchiveInMemory();
 
       // Rebuild indices
@@ -411,11 +424,23 @@ class Store {
   // ─── Tasks ────────────────────────────────────────────────────────────────
 
   getAllTasks(): Task[] {
+    // Active tasks from memory + ALL archived tasks from DB (not just in-memory archive)
     const tasks: Task[] = [...this.globalQueue];
     for (const stub of this.stubs.values()) {
       tasks.push(...stub.tasks);
     }
-    tasks.push(...this.archive);
+    const activeIds = new Set(tasks.map((t) => t.id));
+
+    // Query all archived tasks from DB — includes evicted ones
+    const dbRows = this.db.prepare("SELECT data FROM tasks WHERE location = 'archive'").all() as { data: string }[];
+    for (const row of dbRows) {
+      try {
+        const task = JSON.parse(row.data) as Task;
+        if (!activeIds.has(task.id)) {
+          tasks.push(task);
+        }
+      } catch { /* skip corrupt rows */ }
+    }
     return tasks;
   }
 
@@ -466,16 +491,6 @@ class Store {
         this._saveStub(stub);
       }
       this._truncateLogBuffer(task);
-      // Dedup lost
-      if (task.status === "lost") {
-        const existingIdx = this.archive.findIndex((t) => t.id === taskId && t.status === "lost");
-        if (existingIdx !== -1) {
-          this.archive[existingIdx] = task;
-          this._saveTask(task, "archive");
-          this._taskIndex.set(taskId, { location: "archive" });
-          return;
-        }
-      }
       this.archive.push(task);
       this._saveTask(task, "archive");
       this._taskIndex.set(taskId, { location: "archive" });
@@ -490,97 +505,90 @@ class Store {
     }
   }
 
-  deduplicateLost(): number {
-    const lostByKey = new Map<string, Task[]>();
-    const nonLost: Task[] = [];
-
-    for (const task of this.archive) {
-      if (task.status === "lost") {
-        const key = `${task.name ?? ""}\0${task.script}`;
-        let group = lostByKey.get(key);
-        if (!group) { group = []; lostByKey.set(key, group); }
-        group.push(task);
-      } else {
-        nonLost.push(task);
-      }
-    }
-
-    let removed = 0;
-    const keptLost: Task[] = [];
-    for (const group of lostByKey.values()) {
-      group.sort((a, b) => (b.finished_at ?? b.created_at).localeCompare(a.finished_at ?? a.created_at));
-      keptLost.push(group[0]);
-      for (let i = 1; i < group.length; i++) {
-        this._taskIndex.delete(group[i].id);
-        this._stmts.deleteTask.run(group[i].id);
-        removed++;
-      }
-    }
-
-    this.archive = [...nonLost, ...keptLost];
-    if (removed > 0) {
-      logger.info("archive.dedup_lost", { removed, remaining: this.archive.length });
-    }
-    return removed;
-  }
-
-  /** In-memory-only prune (no DB writes for individual tasks — caller does them). */
+  /** Prune archive: evict old tasks from memory, strip logs from DB (keep metadata). */
   private _pruneArchiveInMemory(): void {
     if (this.archive.length <= ARCHIVE_MAX) return;
     const sorted = [...this.archive].sort((a, b) => {
-      const aLost = a.status === "lost" ? 0 : 1;
-      const bLost = b.status === "lost" ? 0 : 1;
-      if (aLost !== bLost) return aLost - bLost;
       return (a.finished_at ?? a.created_at).localeCompare(b.finished_at ?? b.created_at);
     });
     const toRemove = sorted.length - ARCHIVE_MAX;
+    const evicted = sorted.slice(0, toRemove);
     const kept = new Set(sorted.slice(toRemove).map((t) => t.id));
-    for (const task of sorted.slice(0, toRemove)) {
-      this._taskIndex.delete(task.id);
-    }
+
+    // Strip logs from evicted tasks in DB to save space, but keep the task record
+    const doStrip = this.db.transaction(() => {
+      for (const task of evicted) {
+        const stripped = { ...task, log_buffer: [] };
+        this._stmts.upsertTask.run(
+          task.id, task.status, task.stub_id || null,
+          task.priority, task.seq, task.created_at, "archive",
+          JSON.stringify(stripped)
+        );
+        this._taskIndex.delete(task.id);
+      }
+    });
+    doStrip();
+
     this.archive = this.archive.filter((t) => kept.has(t.id));
+    if (evicted.length > 0) {
+      logger.info("archive.prune_memory", { evicted: evicted.length, remaining: this.archive.length });
+    }
   }
 
   private _pruneArchive(): void {
     if (this.archive.length <= ARCHIVE_MAX) return;
 
     const sorted = [...this.archive].sort((a, b) => {
-      const aLost = a.status === "lost" ? 0 : 1;
-      const bLost = b.status === "lost" ? 0 : 1;
-      if (aLost !== bLost) return aLost - bLost;
       return (a.finished_at ?? a.created_at).localeCompare(b.finished_at ?? b.created_at);
     });
 
     const toRemove = sorted.length - ARCHIVE_MAX;
-    const removedTasks = sorted.slice(0, toRemove);
+    const evicted = sorted.slice(0, toRemove);
     const kept = new Set(sorted.slice(toRemove).map((t) => t.id));
 
-    const doPrune = this.db.transaction(() => {
-      for (const task of removedTasks) {
+    // Strip logs from evicted tasks in DB, keep metadata
+    const doStrip = this.db.transaction(() => {
+      for (const task of evicted) {
+        const stripped = { ...task, log_buffer: [] };
+        this._stmts.upsertTask.run(
+          task.id, task.status, task.stub_id || null,
+          task.priority, task.seq, task.created_at, "archive",
+          JSON.stringify(stripped)
+        );
         this._taskIndex.delete(task.id);
-        this._stmts.deleteTask.run(task.id);
       }
     });
-    doPrune();
+    doStrip();
 
     this.archive = this.archive.filter((t) => kept.has(t.id));
-    logger.info("archive.prune", { removed: toRemove, remaining: this.archive.length });
+    logger.info("archive.prune_memory", { evicted: toRemove, remaining: this.archive.length });
   }
 
   unarchiveTask(stubId: string, taskId: string, update: Partial<Task>): Task | undefined {
-    const idx = this.archive.findIndex((t) => t.id === taskId);
-    if (idx === -1) return undefined;
     const stub = this.stubs.get(stubId);
     if (!stub) return undefined;
-    const [task] = this.archive.splice(idx, 1);
+    let task: Task;
+    const idx = this.archive.findIndex((t) => t.id === taskId);
+    if (idx !== -1) {
+      [task] = this.archive.splice(idx, 1);
+    } else {
+      // DB fallback: task may have been evicted from memory but still in DB
+      const row = this.db.prepare("SELECT data FROM tasks WHERE id = ?").get(taskId) as { data: string } | undefined;
+      if (!row) return undefined;
+      try { task = JSON.parse(row.data) as Task; } catch { return undefined; }
+      logger.info("unarchiveTask.db_fallback", { taskId, status: task.status });
+    }
     if (update.status && !canTransition(task.status, update.status)) {
       logger.warn("unarchiveTask.illegal_transition", { taskId, from: task.status, to: update.status });
-      this.archive.push(task);
+      if (idx !== -1) this.archive.push(task); // put back if it was in memory
       return undefined;
     }
     const recovered = { ...task, ...update };
 
     const doUnarchive = this.db.transaction(() => {
+      // Prevent duplicate: remove any existing entry with same id before pushing
+      const existingIdx = stub.tasks.findIndex((t) => t.id === taskId);
+      if (existingIdx !== -1) stub.tasks.splice(existingIdx, 1);
       stub.tasks.push(recovered);
       this._saveTask(recovered, "stub");
       this._saveStub(stub);
@@ -690,6 +698,14 @@ class Store {
       this._taskIndex.set(taskId, { location: "archive" });
       return { task: arch, stubId: arch.stub_id || null, archived: true };
     }
+    // DB fallback for evicted archive tasks
+    const row = this.db.prepare("SELECT data FROM tasks WHERE id = ?").get(taskId) as { data: string } | undefined;
+    if (row) {
+      try {
+        const task = JSON.parse(row.data) as Task;
+        return { task, stubId: task.stub_id || null, archived: true };
+      } catch { /* skip */ }
+    }
     return undefined;
   }
 
@@ -731,14 +747,14 @@ class Store {
       this.addToGlobalQueue(task);
       return undefined;
     }
-    if (!canTransition(task.status, "queued")) {
-      logger.warn("moveToStubQueue.illegal_transition", { taskId, from: task.status, to: "queued" });
+    if (!canTransition(task.status, "assigned")) {
+      logger.warn("moveToStubQueue.illegal_transition", { taskId, from: task.status, to: "assigned" });
       this.addToGlobalQueue(task);
       return undefined;
     }
     const prev = { ...task };
     task.stub_id = stubId;
-    task.status = "queued";
+    task.status = "assigned";
 
     const doMove = this.db.transaction(() => {
       stub.tasks.push(task);
@@ -752,6 +768,25 @@ class Store {
     return task;
   }
 
+  /**
+   * Atomically move a single dispatched task back to the global queue as pending.
+   * Caller must have already removed the task from stub.tasks before calling this.
+   * Used by dispatch timeout recovery in scheduler.ts.
+   */
+  requeueDispatchedTask(stub: Stub, recovered: Task): void {
+    const doRequeue = this.db.transaction(() => {
+      recovered.stub_id = undefined;
+      this.globalQueue.push(recovered);
+      this._saveTask(recovered, "global");
+      this._taskIndex.set(recovered.id, { location: "global" });
+      this._saveStub(stub);
+    });
+    doRequeue();
+    if (recovered.fingerprint) {
+      this._indexFingerprint(recovered);
+    }
+  }
+
   requeueStubTasks(stubId: string): Task[] {
     const stub = this.stubs.get(stubId);
     if (!stub) return [];
@@ -760,7 +795,7 @@ class Store {
 
     const doRequeue = this.db.transaction(() => {
       for (const task of stub.tasks) {
-        if (task.status === "queued" || task.status === "dispatched") {
+        if (task.status === "assigned") {
           const prev = { ...task };
           task.status = "pending";
           task.stub_id = undefined;
@@ -785,7 +820,7 @@ class Store {
   // ─── Fingerprint Index ────────────────────────────────────────────────────
 
   private _activeStatuses: Set<TaskStatus> = new Set([
-    "pending", "queued", "dispatched", "running", "paused", "blocked",
+    "pending", "assigned", "running", "paused", "blocked",
   ]);
 
   private _isActive(status: TaskStatus): boolean {
@@ -821,6 +856,8 @@ class Store {
       return undefined;
     }
     if (found.task.should_stop) return undefined;
+    // Stub-offline tasks (disconnected) should not block resubmission
+    if (found.task.stub_offline) return undefined;
     return taskId;
   }
 
@@ -887,8 +924,8 @@ class Store {
 
     const statuses = tasks.map((t) => t.status);
     const allCompleted = statuses.every((s) => s === "completed");
-    const anyRunning = statuses.some((s) => ["running", "dispatched", "queued"].includes(s));
-    const anyFailed = statuses.some((s) => ["failed", "killed", "lost", "cancelled"].includes(s));
+    const anyRunning = statuses.some((s) => ["running", "assigned"].includes(s));
+    const anyFailed = statuses.some((s) => ["failed", "cancelled"].includes(s));
     const anyCompleted = statuses.some((s) => s === "completed");
 
     if (allCompleted) {
@@ -956,9 +993,18 @@ class Store {
 
   // ─── Persistence ──────────────────────────────────────────────────────────
 
-  /** Start the backup timer. No more periodic JSON dump needed. */
+  /** Start backup and WAL checkpoint timers. */
   startPersistence(): void {
     setInterval(() => this._autoBackup(), BACKUP_INTERVAL);
+    // Periodic WAL checkpoint to prevent unbounded WAL growth and ensure
+    // DB file is durable even without an explicit save() call.
+    setInterval(() => {
+      try {
+        this.db.pragma("wal_checkpoint(PASSIVE)");
+      } catch (err) {
+        logger.error("state.wal_checkpoint_failed", { error: String(err) });
+      }
+    }, WAL_CHECKPOINT_INTERVAL);
   }
 
   /** Export current state as a ServerState JSON object (for backups and restore). */
@@ -993,20 +1039,22 @@ class Store {
     }
   }
 
-  /** Sync save — kept for API compatibility with shutdown handlers. SQLite writes are immediate. */
+  /** Sync save — called on graceful shutdown. Forces a full WAL checkpoint. */
   save(): void {
     try {
-      this.db.pragma("wal_checkpoint(PASSIVE)");
+      // TRUNCATE: blocks until all WAL pages are flushed to main DB, then
+      // truncates the WAL file. Use this on shutdown for maximum durability.
+      this.db.pragma("wal_checkpoint(TRUNCATE)");
       logger.info("state.save", { file: DB_FILE, sync: true });
     } catch (err) {
       logger.error("state.save_failed", { error: String(err) });
     }
   }
 
-  /** Async save — kept for API compatibility. SQLite writes are immediate. */
+  /** Async save — kept for API compatibility. Forces a full WAL checkpoint. */
   async saveAsync(): Promise<void> {
     try {
-      this.db.pragma("wal_checkpoint(PASSIVE)");
+      this.db.pragma("wal_checkpoint(TRUNCATE)");
       logger.info("state.save", { file: DB_FILE });
     } catch (err) {
       logger.error("state.save_failed", { error: String(err) });
@@ -1099,7 +1147,6 @@ class Store {
     apply();
 
     for (const t of this.archive) this._truncateLogBuffer(t);
-    this.deduplicateLost();
     this._pruneArchive();
 
     this.rebuildFingerprintIndex();

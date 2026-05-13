@@ -33,11 +33,18 @@ export function LossChart({ data, height = 160, startedAt, totalSteps }: SingleS
   let eta: string | null = null;
   if (startedAt && totalSteps && data.length > 0) {
     const elapsed = Date.now() - new Date(startedAt).getTime();
-    if (elapsed > 0 && data.length < totalSteps) {
-      const speed = data.length / elapsed;
-      const remainMs = (totalSteps - data.length) / speed;
-      const m = Math.round(remainMs / 60000);
-      eta = m >= 60 ? `~${Math.floor(m / 60)}h${m % 60}m` : `~${m}m`;
+    // Use the last step index (data.length) as a proxy for steps completed,
+    // mirroring the taskEta formula in format.ts: remainMs = ((total - step) / step) * elapsed
+    const step = data.length;
+    if (elapsed > 0 && step > 0 && step < totalSteps) {
+      const remainMs = ((totalSteps - step) / step) * elapsed;
+      const totalSec = Math.round(remainMs / 1000);
+      if (totalSec < 60) {
+        eta = `~${totalSec}s`;
+      } else {
+        const m = Math.floor(totalSec / 60);
+        eta = m >= 60 ? `~${Math.floor(m / 60)}h${m % 60}m` : `~${m}m`;
+      }
     }
   }
 

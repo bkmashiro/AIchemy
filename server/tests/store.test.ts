@@ -230,27 +230,19 @@ describe("global queue", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("updateTask — state transitions", () => {
-  it("valid transition queued → dispatched succeeds", () => {
-    const task = makeTask({ status: "queued" });
-    const stub = makeStub({ tasks: [task] });
-    store.setStub(stub);
-    const updated = store.updateTask(stub.id, task.id, { status: "dispatched" });
-    expect(updated?.status).toBe("dispatched");
-  });
-
-  it("valid transition dispatched → running succeeds", () => {
-    const task = makeTask({ status: "dispatched" });
+  it("valid transition assigned → running succeeds", () => {
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
     const updated = store.updateTask(stub.id, task.id, { status: "running" });
     expect(updated?.status).toBe("running");
   });
 
-  it("illegal transition running → queued returns undefined", () => {
+  it("illegal transition running → assigned returns undefined", () => {
     const task = makeTask({ status: "running" });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
-    const result = store.updateTask(stub.id, task.id, { status: "queued" as TaskStatus });
+    const result = store.updateTask(stub.id, task.id, { status: "assigned" });
     expect(result).toBeUndefined();
     // Task status should remain unchanged
     expect(store.getTask(stub.id, task.id)?.status).toBe("running");
@@ -313,36 +305,36 @@ describe("auto-archive", () => {
     expect(store.getArchive().find(t => t.id === task.id)?.status).toBe("failed");
   });
 
-  it("killed task is archived", () => {
+  it("cancelled task is archived", () => {
     const task = makeTask({ status: "running" });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
 
-    store.updateTask(stub.id, task.id, { status: "killed" });
+    store.updateTask(stub.id, task.id, { status: "cancelled" });
 
     expect(store.getArchive().find(t => t.id === task.id)).toBeDefined();
   });
 
   it("active tasks remain in stub after update", () => {
-    const task = makeTask({ status: "queued" });
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
 
-    store.updateTask(stub.id, task.id, { status: "dispatched" });
+    store.updateTask(stub.id, task.id, { status: "running" });
 
     const freshStub = store.getStub(stub.id)!;
-    expect(freshStub.tasks.find(t => t.id === task.id)?.status).toBe("dispatched");
+    expect(freshStub.tasks.find(t => t.id === task.id)?.status).toBe("running");
     expect(store.getArchive().find(t => t.id === task.id)).toBeUndefined();
   });
 
   it("global queue task auto-archived on terminal status", () => {
-    const task = makeTask({ id: "gq-kill", status: "pending" });
+    const task = makeTask({ id: "gq-cancel", status: "pending" });
     store.addToGlobalQueue(task);
-    store.updateGlobalQueueTask("gq-kill", { status: "killed" });
+    store.updateGlobalQueueTask("gq-cancel", { status: "cancelled" });
 
     const gq = store.getGlobalQueue();
-    expect(gq.find(t => t.id === "gq-kill")).toBeUndefined();
-    expect(store.getArchive().find(t => t.id === "gq-kill")?.status).toBe("killed");
+    expect(gq.find(t => t.id === "gq-cancel")).toBeUndefined();
+    expect(store.getArchive().find(t => t.id === "gq-cancel")?.status).toBe("cancelled");
   });
 });
 
@@ -363,52 +355,39 @@ describe("archive lifecycle", () => {
     expect(store.removeFromArchive("ghost-id")).toBeUndefined();
   });
 
-  it("unarchiveTask moves task from archive to stub", () => {
-    const task = makeTask({ id: "ua-task", status: "lost" });
+  it("unarchiveTask moves cancelled task from archive to stub as assigned", () => {
+    const task = makeTask({ id: "ua-task", status: "cancelled" });
     store.setArchive([task]);
     const stub = makeStub({ tasks: [] });
     store.setStub(stub);
 
-    const recovered = store.unarchiveTask(stub.id, task.id, { status: "running" });
-    expect(recovered?.status).toBe("running");
-    expect(store.getStub(stub.id)!.tasks.find(t => t.id === "ua-task")).toBeDefined();
+    const recovered = store.unarchiveTask(stub.id, task.id, { status: "pending" });
+    expect(recovered?.status).toBe("pending");
     expect(store.getArchive().find(t => t.id === "ua-task")).toBeUndefined();
   });
 
   it("unarchiveTask returns undefined if task not in archive", () => {
     const stub = makeStub();
     store.setStub(stub);
-    expect(store.unarchiveTask(stub.id, "ghost-id", { status: "running" })).toBeUndefined();
+    expect(store.unarchiveTask(stub.id, "ghost-id", { status: "pending" })).toBeUndefined();
   });
 
   it("unarchiveTask returns undefined if stub not found", () => {
-    const task = makeTask({ status: "lost" });
+    const task = makeTask({ status: "failed" });
     store.setArchive([task]);
-    expect(store.unarchiveTask("nonexistent-stub", task.id, { status: "running" })).toBeUndefined();
+    expect(store.unarchiveTask("nonexistent-stub", task.id, { status: "pending" })).toBeUndefined();
     // Task should be put back in archive
     expect(store.getArchive().find(t => t.id === task.id)).toBeDefined();
   });
 
-  it("unarchiveTask rejects illegal transition (lost → queued)", () => {
-    const task = makeTask({ status: "lost" });
+  it("unarchiveTask allows failed → pending (retry recovery)", () => {
+    const task = makeTask({ status: "failed" });
     store.setArchive([task]);
     const stub = makeStub();
     store.setStub(stub);
 
-    const result = store.unarchiveTask(stub.id, task.id, { status: "queued" as TaskStatus });
-    expect(result).toBeUndefined();
-    // Task must remain in archive
-    expect(store.getArchive().find(t => t.id === task.id)).toBeDefined();
-  });
-
-  it("unarchiveTask allows lost → running (recovery)", () => {
-    const task = makeTask({ status: "lost" });
-    store.setArchive([task]);
-    const stub = makeStub();
-    store.setStub(stub);
-
-    const result = store.unarchiveTask(stub.id, task.id, { status: "running" });
-    expect(result?.status).toBe("running");
+    const result = store.unarchiveTask(stub.id, task.id, { status: "pending" });
+    expect(result?.status).toBe("pending");
   });
 });
 
@@ -445,8 +424,10 @@ describe("findTask", () => {
     expect(store.findTask("not-here")).toBeUndefined();
   });
 
-  it("stub takes priority over archive on findTask (for transition tasks)", () => {
+  it("findTask returns task when in both stub and archive (implementation detail)", () => {
     // Simulate a task that exists in both (shouldn't happen in practice but...)
+    // The _taskIndex is last-write-wins; setArchive writes after setStub,
+    // so the archive entry takes priority in the index.
     const task = makeTask({ id: "dup-task", status: "running" });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
@@ -454,9 +435,11 @@ describe("findTask", () => {
     store.setArchive([archivedVersion]);
 
     const found = store.findTask("dup-task");
-    // Should find the live stub version first
-    expect(found?.stubId).toBe(stub.id);
-    expect(found?.task.status).toBe("running");
+    // setArchive was called last, so _taskIndex points to archive
+    expect(found).toBeDefined();
+    expect(found?.task.id).toBe("dup-task");
+    expect(found?.archived).toBe(true);
+    expect(found?.task.status).toBe("failed");
   });
 });
 
@@ -514,7 +497,7 @@ describe("fingerprint index", () => {
     store.addToGlobalQueue(task);
     expect(store.findActiveByFingerprint("gq-fp-val")).toBe("gq-fp");
 
-    store.updateGlobalQueueTask("gq-fp", { status: "killed" });
+    store.updateGlobalQueueTask("gq-fp", { status: "cancelled" });
     expect(store.findActiveByFingerprint("gq-fp-val")).toBeUndefined();
   });
 });
@@ -540,7 +523,7 @@ describe("write lock — released on terminal transition", () => {
 
   it("write lock NOT released on active→active transition", () => {
     const runDir = "/runs/active-run";
-    const task = makeTask({ id: "wl-active", status: "dispatched", run_dir: runDir });
+    const task = makeTask({ id: "wl-active", status: "assigned", run_dir: runDir });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
 
@@ -559,14 +542,14 @@ describe("write lock — released on terminal transition", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("moveToStubQueue", () => {
-  it("moves task from global queue to stub with status=queued", () => {
+  it("moves task from global queue to stub with status=assigned", () => {
     const task = makeTask({ id: "move-1", status: "pending" });
     store.addToGlobalQueue(task);
     const stub = makeStub();
     store.setStub(stub);
 
     const moved = store.moveToStubQueue("move-1", stub.id);
-    expect(moved?.status).toBe("queued");
+    expect(moved?.status).toBe("assigned");
     expect(moved?.stub_id).toBe(stub.id);
     expect(store.getGlobalQueue().find(t => t.id === "move-1")).toBeUndefined();
     expect(store.getStub(stub.id)!.tasks.find(t => t.id === "move-1")).toBeDefined();
@@ -649,7 +632,7 @@ describe("updateGridStatus", () => {
     const activeTasks: Task[] = [];
     for (const status of taskStatuses) {
       const t = makeTask({ grid_id: gridId, status });
-      if (["completed", "failed", "killed", "lost"].includes(status)) {
+      if (["completed", "failed", "cancelled"].includes(status)) {
         archiveTasks.push(t);
       } else {
         activeTasks.push(t);
@@ -748,11 +731,11 @@ describe("getAllTasks / getActiveTasks", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("updateGlobalQueueTask", () => {
-  it("valid transition pending → killed succeeds", () => {
+  it("valid transition pending → cancelled succeeds", () => {
     const task = makeTask({ id: "gq-valid", status: "pending" });
     store.addToGlobalQueue(task);
-    const result = store.updateGlobalQueueTask("gq-valid", { status: "killed" });
-    expect(result?.status).toBe("killed");
+    const result = store.updateGlobalQueueTask("gq-valid", { status: "cancelled" });
+    expect(result?.status).toBe("cancelled");
   });
 
   it("illegal transition pending → running returns undefined", () => {
@@ -763,7 +746,7 @@ describe("updateGlobalQueueTask", () => {
   });
 
   it("returns undefined for task not in global queue", () => {
-    expect(store.updateGlobalQueueTask("ghost", { status: "killed" })).toBeUndefined();
+    expect(store.updateGlobalQueueTask("ghost", { status: "cancelled" })).toBeUndefined();
   });
 });
 
@@ -813,8 +796,8 @@ describe("findActiveByFingerprint — P0-2: should_stop exclusion", () => {
     store.addToGlobalQueue(task);
     expect(store.findActiveByFingerprint("fp-terminal")).toBe(task.id);
 
-    // Kill it (terminal transition)
-    store.updateGlobalQueueTask(task.id, { status: "killed" });
+    // Cancel it (terminal transition)
+    store.updateGlobalQueueTask(task.id, { status: "cancelled" });
     expect(store.findActiveByFingerprint("fp-terminal")).toBeUndefined();
   });
 

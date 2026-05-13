@@ -31,7 +31,7 @@ const renewalInFlight: Set<string> = new Set();
 
 function hasPendingTasksForStub(stubId: string, tags?: string[]): boolean {
   const allTasks = store.getAllTasks();
-  const pending = allTasks.filter((t) => t.status === "pending" || t.status === "queued");
+  const pending = allTasks.filter((t) => t.status === "pending" || t.status === "assigned");
 
   if (pending.length === 0) return false;
 

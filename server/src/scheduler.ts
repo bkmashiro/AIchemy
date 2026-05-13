@@ -13,7 +13,7 @@ import { store } from "./store";
 import { Stub, Task } from "./types";
 import { reliableEmitToStub } from "./reliable";
 import { logger } from "./log";
-import { dispatchTask, failTask } from "./task-actions";
+import { assignTask, failTask } from "./task-actions";
 import { notifyDispatched } from "./discord";
 
 // ─── GPU name normalization ───────────────────────────────────────────────────
@@ -31,7 +31,7 @@ function availableVram(stub: Stub): number {
   }
   // Estimate from running tasks' requirements
   const reservedMb = stub.tasks
-    .filter((t) => ["running", "dispatched"].includes(t.status))
+    .filter((t) => ["running", "assigned"].includes(t.status))
     .reduce((sum, t) => sum + (t.requirements?.gpu_mem_mb || 0), 0);
   return Math.max(0, stub.gpu.vram_total_mb - reservedMb);
 }
@@ -61,9 +61,8 @@ function rejectReason(stub: Stub, task: Task): string | null {
   if (task.python_env && stub.available_envs) {
     if (!stub.available_envs.some(e => e.name === task.python_env)) return "python_env_missing";
   }
-  const running = stub.tasks.filter(t => ["running", "dispatched"].includes(t.status)).length;
-  const queued = stub.tasks.filter(t => t.status === "queued").length;
-  if (running + queued >= stub.max_concurrent) return `slots_full(${running}+${queued}>=${stub.max_concurrent})`;
+  const running = stub.tasks.filter(t => ["running", "assigned"].includes(t.status)).length;
+  if (running >= stub.max_concurrent) return `slots_full(${running}>=${stub.max_concurrent})`;
   return null;
 }
 
@@ -105,17 +104,14 @@ export function scoreStub(stub: Stub, task: Task): number {
   }
 
   // Concurrency hard constraint
-  const running = stub.tasks.filter((t) => ["running", "dispatched"].includes(t.status)).length;
-  const queued = stub.tasks.filter((t) => t.status === "queued").length;
-  if (running + queued >= stub.max_concurrent) return -Infinity;
+  const running = stub.tasks.filter((t) => ["running", "assigned"].includes(t.status)).length;
+  if (running >= stub.max_concurrent) return -Infinity;
 
   // Soft scoring
   let s = 0;
 
   // Idle ratio bonus (0–40 points)
   s += 40 * Math.max(0, stub.max_concurrent - running) / Math.max(1, stub.max_concurrent);
-  // Queue depth penalty
-  s -= 10 * queued;
 
   // Grid locality: prefer stubs already running tasks from the same grid
   if (task.grid_id) {
@@ -240,12 +236,14 @@ export function isCheckpointProtected(task: Task): boolean {
 export function maybeDispatch(stub: Stub): void {
   if (stub.status !== "online") return;
 
-  const active = stub.tasks.filter((t) => ["running", "dispatched"].includes(t.status)).length;
+  // Count only truly running tasks toward slots; "assigned" tasks are queued
+  // waiting for task.run to be dispatched — they don't hold a slot yet.
+  const active = stub.tasks.filter((t) => t.status === "running" || t.status === "paused").length;
   const slots = stub.max_concurrent - active;
   if (slots <= 0) return;
 
   const queued = stub.tasks
-    .filter((t) => t.status === "queued")
+    .filter((t) => t.status === "assigned")
     .sort((a, b) => b.priority - a.priority || a.created_at.localeCompare(b.created_at));
 
   logger.info("maybeDispatch", { stub: stub.name, active, slots, queued: queued.length, total_tasks: stub.tasks.length });
@@ -255,7 +253,7 @@ export function maybeDispatch(stub: Stub): void {
   for (const task of toDispatch) {
     const run_dir = computeRunDir(task, stub);
     // Persist computed run_dir into task so write lock and display work correctly
-    const updated = dispatchTask(stub.id, task.id, run_dir);
+    const updated = assignTask(stub.id, task.id, run_dir);
     reliableEmitToStub(stub.id, "task.run", buildRunPayload(task, stub));
     logger.info("task.dispatch", { task_seq: task.seq, stub: stub.name, display_name: task.display_name, run_dir });
     if (updated) notifyDispatched(updated).catch(() => {});
@@ -266,7 +264,7 @@ export function maybeDispatch(stub: Stub): void {
     const dispatchStubId = stub.id;
     setTimeout(() => {
       const t = store.findTask(dispatchTaskId);
-      if (t && t.task.status === "dispatched" && !t.archived && t.stubId === dispatchStubId) {
+      if (t && t.task.status === "assigned" && !t.archived && t.stubId === dispatchStubId) {
         const attempts = (t.task.dispatch_attempts ?? 0) + 1;
         logger.warn("task.dispatch_timeout", { task_id: dispatchTaskId, stub: dispatchStubId, attempt: attempts });
         if (attempts >= 3) {
@@ -275,22 +273,26 @@ export function maybeDispatch(stub: Stub): void {
           });
           logger.warn("task.dispatch_failed_permanent", { task_id: dispatchTaskId, attempts });
         } else {
-          // Move back to global queue as pending for retry
+          // Move back to global queue as pending for retry, atomically.
+          const prevTask = t.task;
           const stub2 = store.getStub(dispatchStubId);
           if (stub2) {
-            stub2.tasks = stub2.tasks.filter((t2) => t2.id !== dispatchTaskId);
-            store.setStub(stub2);
+            const taskIdx = stub2.tasks.findIndex((t2) => t2.id === dispatchTaskId);
+            if (taskIdx !== -1) {
+              stub2.tasks.splice(taskIdx, 1);
+            }
+            const recovered: Task = {
+              ...prevTask,
+              status: "pending",
+              stub_id: undefined,
+              dispatch_attempts: attempts,
+            };
+            // Write both changes in one transaction via the DB directly
+            store.requeueDispatchedTask(stub2, recovered);
+            if (_webNsRef) _webNsRef.emit("task.update", recovered);
+            logger.info("task.dispatch_recovered", { task_id: dispatchTaskId, attempt: attempts });
+            triggerSchedule();
           }
-          const recovered: Task = {
-            ...t.task,
-            status: "pending",
-            stub_id: undefined,
-            dispatch_attempts: attempts,
-          };
-          store.addToGlobalQueue(recovered);
-          if (_webNsRef) _webNsRef.emit("task.update", recovered);
-          logger.info("task.dispatch_recovered", { task_id: dispatchTaskId, attempt: attempts });
-          triggerSchedule();
         }
       }
     }, 30_000);

@@ -210,6 +210,7 @@ let serverProcess: ChildProcess;
 let BASE: string;
 let TOKEN: string;
 const STATE_FILE = `/tmp/alchemy_scenario_${process.pid}.json`;
+const DB_FILE = `/tmp/alchemy_scenario_${process.pid}.db`;
 const SERVER_DIR = path.join(__dirname, "../../server");
 
 beforeAll(async () => {
@@ -217,7 +218,7 @@ beforeAll(async () => {
   BASE = `http://localhost:${port}`;
   serverProcess = spawn("node_modules/.bin/tsx", ["src/index.ts"], {
     cwd: SERVER_DIR,
-    env: { ...process.env, PORT: String(port), STATE_FILE, NO_PROXY: "*", no_proxy: "*" },
+    env: { ...process.env, PORT: String(port), STATE_FILE, DB_FILE, NO_PROXY: "*", no_proxy: "*" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   serverProcess.stdout?.on("data", (d) => process.stdout.write(`[srv] ${d}`));
@@ -230,6 +231,9 @@ afterAll(async () => {
   serverProcess?.kill("SIGTERM");
   await sleep(500);
   try { fs.unlinkSync(STATE_FILE); } catch {}
+  try { fs.unlinkSync(DB_FILE); } catch {}
+  try { fs.unlinkSync(DB_FILE + "-wal"); } catch {}
+  try { fs.unlinkSync(DB_FILE + "-shm"); } catch {}
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -241,13 +245,13 @@ describe("Auth failures", () => {
     const r = await fetch(`${BASE}/api/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ script: "python test.py" }),
+      body: JSON.stringify({ script: "/tmp/test_test.py" }),
     });
     expect(r.status).toBe(401);
   });
 
   it("Wrong token → 401", async () => {
-    const r = await apiPost(`${BASE}/api/tasks`, "wrong-token-xyz", { script: "python test.py" });
+    const r = await apiPost(`${BASE}/api/tasks`, "wrong-token-xyz", { script: "/tmp/test_test.py" });
     expect(r.status).toBe(401);
   });
 
@@ -300,26 +304,28 @@ describe("Tag-based routing", () => {
 
     // Stub A: has tag "fast-gpu"
     const { socket: stubA } = await connectAndResume(BASE, TOKEN, {
-      hostname: `tag-a-${ts}`, gpuName: "A100", tags: ["fast-gpu"],
+      hostname: `tag-a-${ts}`, gpuName: "A100", maxConcurrent: 50, tags: ["fast-gpu"],
     });
 
     // Stub B: no matching tag
     const { socket: stubB } = await connectAndResume(BASE, TOKEN, {
-      hostname: `tag-b-${ts}`, gpuName: "A30", tags: ["slow-gpu"],
+      hostname: `tag-b-${ts}`, gpuName: "A30", maxConcurrent: 50, tags: ["slow-gpu"],
     });
 
     // Submit task targeting "fast-gpu"
-    const taskRunA = waitReliable(stubA, "task.run", 5000);
+    const bufA = new TaskRunBuffer(stubA);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python tag_test_${ts}.py`,
+      script: `/tmp/test_tag_test_${ts}.py`,
       target_tags: ["fast-gpu"],
     });
     expect(r.status).toBe(201);
+    const task = await r.json();
 
     // Stub A should get it
-    const payload = await taskRunA;
+    const payload = await bufA.waitForTask(task.id);
     expect(payload.task_id).toBeTruthy();
     expect(payload.command).toContain("tag_test");
+    bufA.destroy();
 
     // Stub B should NOT get anything (give it a moment)
     let stubBGotTask = false;
@@ -336,18 +342,20 @@ describe("Tag-based routing", () => {
   it("Task with no target_tags dispatches to any stub", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `notag-${ts}`, gpuName: "A40", tags: ["whatever"],
+      hostname: `notag-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: ["whatever"],
     });
 
-    const taskRunP = waitReliable(socket, "task.run", 5000);
+    const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python notag_${ts}.py`,
+      script: `/tmp/test_notag_${ts}.py`,
     });
     expect(r.status).toBe(201);
+    const task = await r.json();
 
-    const payload = await taskRunP;
+    const payload = await buf.waitForTask(task.id);
     expect(payload.task_id).toBeTruthy();
 
+    buf.destroy();
     socket.disconnect();
   }, 10_000);
 
@@ -358,7 +366,7 @@ describe("Tag-based routing", () => {
     });
 
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python unmatch_${ts}.py`,
+      script: `/tmp/test_unmatch_${ts}.py`,
       target_tags: ["nonexistent-tag"],
     });
     expect(r.status).toBe(201);
@@ -381,13 +389,14 @@ describe("Task failure", () => {
   it("Non-zero exit → status=failed with exit_code", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `fail-${ts}`, gpuName: "A40",
+      hostname: `fail-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
-    const taskRunP = waitReliable(socket, "task.run", 5000);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python fail_${ts}.py` });
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_fail_${ts}.py` });
     const task = await r.json();
-    const runPayload = await taskRunP;
+    const runPayload = await buf.waitForTask(task.id);
+    buf.destroy();
 
     // started → failed
     socket.emit("task.started", { task_id: runPayload.task_id, pid: 111 });
@@ -407,17 +416,17 @@ describe("Task failure", () => {
   it("Failed task with same fingerprint can be re-submitted", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `resubmit-${ts}`, gpuName: "A40",
+      hostname: `resubmit-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
-    const script = `python resubmit_${ts}.py`;
+    const script = `/tmp/test_resubmit_${ts}.py`;
+    const buf = new TaskRunBuffer(socket);
 
     // Submit first
-    const run1P = waitReliable(socket, "task.run", 5000);
     const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script });
     expect(r1.status).toBe(201);
     const t1 = await r1.json();
-    const payload1 = await run1P;
+    const payload1 = await buf.waitForTask(t1.id);
 
     // Mark failed
     socket.emit("task.started", { task_id: payload1.task_id, pid: 222 });
@@ -426,14 +435,14 @@ describe("Task failure", () => {
     await sleep(300);
 
     // Re-submit same script → should succeed (dedup allows re-run of failed)
-    const run2P = waitReliable(socket, "task.run", 5000);
     const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script });
     expect(r2.status).toBe(201);
     const t2 = await r2.json();
     expect(t2.id).not.toBe(t1.id); // New task
     expect(t2.fingerprint).toBe(t1.fingerprint); // Same fingerprint
 
-    await run2P; // dispatched
+    await buf.waitForTask(t2.id); // dispatched
+    buf.destroy();
     socket.disconnect();
   }, 15_000);
 });
@@ -446,34 +455,36 @@ describe("run_dir computed by server", () => {
   it("task.run payload always includes run_dir", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `rundir-${ts}`, gpuName: "A40",
+      hostname: `rundir-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
-    const taskRunP = waitReliable(socket, "task.run", 5000);
-    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python rundir_${ts}.py` });
-    const payload = await taskRunP;
+    const buf = new TaskRunBuffer(socket);
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_rundir_${ts}.py` });
+    const task = await r.json();
+    const payload = await buf.waitForTask(task.id);
 
     expect(payload.run_dir).toBeTruthy();
     expect(typeof payload.run_dir).toBe("string");
     // run_dir should contain fingerprint[:12]
     expect(payload.run_dir.length).toBeGreaterThan(10);
 
+    buf.destroy();
     socket.disconnect();
   }, 10_000);
 
   it("Same fingerprint → same run_dir", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `samerundir-${ts}`, gpuName: "A40",
+      hostname: `samerundir-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
-    const script = `python samefp_${ts}.py`;
+    const script = `/tmp/test_samefp_${ts}.py`;
+    const buf = new TaskRunBuffer(socket);
 
     // First task
-    const run1P = waitReliable(socket, "task.run", 5000);
     const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script });
     const t1 = await r1.json();
-    const p1 = await run1P;
+    const p1 = await buf.waitForTask(t1.id);
 
     // Complete it
     socket.emit("task.started", { task_id: p1.task_id, pid: 333 });
@@ -482,13 +493,14 @@ describe("run_dir computed by server", () => {
     await sleep(300);
 
     // Second task with same script
-    const run2P = waitReliable(socket, "task.run", 5000);
     const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script });
-    const p2 = await run2P;
+    const t2 = await r2.json();
+    const p2 = await buf.waitForTask(t2.id);
 
     // Same fingerprint → same run_dir
     expect(p2.run_dir).toBe(p1.run_dir);
 
+    buf.destroy();
     socket.disconnect();
   }, 15_000);
 });
@@ -500,7 +512,7 @@ describe("run_dir computed by server", () => {
 describe("Dedup edge cases", () => {
   it("Same script with different args → different fingerprint → both allowed", async () => {
     const ts = Date.now();
-    const script = `python dedup_args_${ts}.py`;
+    const script = `/tmp/test_dedup_args_${ts}.py`;
 
     const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script, args: { "--seed": "1" } });
     const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script, args: { "--seed": "2" } });
@@ -513,7 +525,7 @@ describe("Dedup edge cases", () => {
 
   it("Duplicate active task → 409", async () => {
     const ts = Date.now();
-    const script = `python dedup_active_${ts}.py`;
+    const script = `/tmp/test_dedup_active_${ts}.py`;
 
     const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script });
     expect(r1.status).toBe(201);
@@ -525,7 +537,7 @@ describe("Dedup edge cases", () => {
   it("Idempotency key — same key within window → same task", async () => {
     const ts = Date.now();
     const ikey = `idem-${ts}`;
-    const script = `python idem_${ts}.py`;
+    const script = `/tmp/test_idem_${ts}.py`;
 
     const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, {
       script, idempotency_key: ikey,
@@ -554,7 +566,7 @@ describe("max_concurrent enforcement", () => {
 
     // Submit first task
     const run1P = waitReliable(socket, "task.run", 5000);
-    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python mc1_a_${ts}.py` });
+    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_mc1_a_${ts}.py` });
     const p1 = await run1P;
 
     // Mark running
@@ -562,7 +574,7 @@ describe("max_concurrent enforcement", () => {
     await sleep(200);
 
     // Submit second task — should NOT be dispatched to this stub (at capacity)
-    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python mc1_b_${ts}.py` });
+    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_mc1_b_${ts}.py` });
 
     let gotSecondTask = false;
     const handler = (msg: any) => { gotSecondTask = true; };
@@ -593,10 +605,10 @@ describe("Priority scheduling", () => {
 
     // Submit tasks BEFORE stub connects → both pending
     const rLow = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python pri_low_${ts}.py`, priority: 1,
+      script: `/tmp/test_pri_low_${ts}.py`, priority: 1,
     });
     const rHigh = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python pri_high_${ts}.py`, priority: 10,
+      script: `/tmp/test_pri_high_${ts}.py`, priority: 10,
     });
     expect(rLow.status).toBe(201);
     expect(rHigh.status).toBe(201);
@@ -622,14 +634,14 @@ describe("Priority scheduling", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("Stub disconnect during task lifecycle", () => {
-  it("Stub disconnects with running task → task marked lost", async () => {
+  it("Stub disconnects with running task → task stays running with stub_offline flag", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `disclost-${ts}`, gpuName: "A40", maxConcurrent: 20,
+      hostname: `disclost-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python disclost_${ts}.py` });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_disclost_${ts}.py` });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -646,23 +658,25 @@ describe("Stub disconnect during task lifecycle", () => {
 
     const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
     const t = await check.json();
-    expect(t.status).toBe("lost");
+    // Task stays running (with stub_offline=true) — does NOT immediately become lost
+    expect(t.status).toBe("running");
+    expect(t.stub_offline).toBe(true);
 
-    // Can resubmit lost task
-    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python disclost_${ts}.py` });
+    // Can resubmit (stub_offline tasks are excluded from fingerprint dedup)
+    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_disclost_${ts}.py` });
     expect(r2.status).toBe(201);
   }, 10_000);
 
-  it("Stub disconnects with dispatched (not started) task → task goes back to pending", async () => {
+  it("Stub disconnects with assigned (not started) task → task stays assigned with stub_offline flag", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `discpend-${ts}`, gpuName: "A40", maxConcurrent: 20,
+      hostname: `discpend-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python discpend_${ts}.py` });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_discpend_${ts}.py` });
     const task = await r.json();
-    await buf.waitForTask(task.id); // dispatched but NOT started
+    await buf.waitForTask(task.id); // assigned but NOT started
 
     // Disconnect without ever sending task.started
     socket.disconnect();
@@ -670,8 +684,8 @@ describe("Stub disconnect during task lifecycle", () => {
 
     const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
     const t = await check.json();
-    // Dispatched tasks should go back to pending or lost
-    expect(["pending", "lost"]).toContain(t.status);
+    // Assigned tasks stay assigned (or requeued) with stub_offline=true
+    expect(["pending", "assigned", "running"]).toContain(t.status);
   }, 10_000);
 });
 
@@ -711,7 +725,7 @@ describe("Grid lifecycle", () => {
   it("Grid generates cartesian product of params", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/grids`, TOKEN, {
-      script: `python grid_${ts}.py`,
+      script: `/tmp/test_grid_${ts}.py`,
       param_space: { seed: [1, 2, 3], lr: [0.01, 0.1] },
     });
     expect(r.status).toBe(201);
@@ -735,7 +749,7 @@ describe("Grid lifecycle", () => {
   it("Grid with target_tags → all tasks inherit target_tags", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/grids`, TOKEN, {
-      script: `python grid_tag_${ts}.py`,
+      script: `/tmp/test_grid_tag_${ts}.py`,
       param_space: { seed: [42] },
       target_tags: ["a100-cluster"],
     });
@@ -813,14 +827,14 @@ describe("Stub tags update", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("Task kill via API", () => {
-  it("PATCH task to killed → stub receives should_stop signal (kill chain start)", async () => {
+  it("PATCH task to cancelled → stub receives should_stop signal (kill chain start)", async () => {
     const ts = Date.now();
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `kill-${ts}`, gpuName: "A40", maxConcurrent: 20,
+      hostname: `kill-${ts}`, gpuName: "A40", maxConcurrent: 50,
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python kill_${ts}.py` });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_kill_${ts}.py` });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -834,7 +848,7 @@ describe("Task kill via API", () => {
     const killP = waitReliable(socket, "task.kill", 5000);
 
     // Kill via API
-    await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+    await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "cancelled" });
 
     const killPayload = await killP;
     expect(killPayload.task_id).toBe(task.id);
@@ -852,7 +866,7 @@ describe("Command assembly", () => {
   it("Full command with env_setup + cwd + args + raw_args", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python train_${ts}.py`,
+      script: `/tmp/test_train_${ts}.py`,
       args: { "--lr": "0.001", "--seed": "42" },
       raw_args: "--verbose",
       cwd: "/tmp/workdir",
@@ -864,7 +878,7 @@ describe("Command assembly", () => {
 
     expect(cmd).toContain("source activate myenv");
     expect(cmd).toContain("cd '/tmp/workdir'");
-    expect(cmd).toContain(`python train_${ts}.py`);
+    expect(cmd).toContain(`python /tmp/test_train_${ts}.py`);
     expect(cmd).toContain("--lr 0.001");
     expect(cmd).toContain("--seed 42");
     expect(cmd).toContain("--verbose");
@@ -873,7 +887,7 @@ describe("Command assembly", () => {
   it("Task with env vars injects them in command", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python env_${ts}.py`,
+      script: `/tmp/test_env_${ts}.py`,
       env: { CUDA_VISIBLE_DEVICES: "0,1" },
     });
     expect(r.status).toBe(201);
@@ -889,40 +903,46 @@ describe("Command assembly", () => {
 describe("Multiple stubs load balancing", () => {
   it("Tasks distribute across stubs based on capacity", async () => {
     const ts = Date.now();
+    const tag = `lb-tag-${ts}`;
 
     const { socket: s1 } = await connectAndResume(BASE, TOKEN, {
-      hostname: `lb-a-${ts}`, gpuName: "A40", maxConcurrent: 1,
+      hostname: `lb-a-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
     const { socket: s2 } = await connectAndResume(BASE, TOKEN, {
-      hostname: `lb-b-${ts}`, gpuName: "A40", maxConcurrent: 1,
+      hostname: `lb-b-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
-    // Submit first task, wait for dispatch, mark running, then submit second
-    const run1 = waitReliable(s1, "task.run", 5000).catch(() => null);
-    const run1b = waitReliable(s2, "task.run", 5000).catch(() => null);
+    const buf1 = new TaskRunBuffer(s1);
+    const buf2 = new TaskRunBuffer(s2);
 
-    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python lb_1_${ts}.py` });
+    // Submit first task
+    const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_lb_1_${ts}.py`, target_tags: [tag] });
+    const t1 = await r1.json();
 
     // One of the stubs gets it
-    const first = await Promise.race([run1, run1b]);
-    expect(first.task_id).toBeTruthy();
+    const first = await Promise.race([
+      buf1.waitForTask(t1.id).then(p => ({ payload: p, socket: s1 })),
+      buf2.waitForTask(t1.id).then(p => ({ payload: p, socket: s2 })),
+    ]);
+    expect(first.payload.task_id).toBeTruthy();
 
-    // Mark first task as running so that stub is at capacity
-    const firstSocket = first === await run1 ? s1 : s2;
-    firstSocket.emit("task.started", { task_id: first.task_id, pid: 8888 });
+    // Mark first task as running so the scheduler favors the other stub
+    first.socket.emit("task.started", { task_id: first.payload.task_id, pid: 8888 });
     await sleep(300);
 
-    // Submit second task — should go to the other stub
-    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python lb_2_${ts}.py` });
+    // Submit second task — should go to the other stub (less loaded)
+    await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_lb_2_${ts}.py`, target_tags: [tag] });
     await sleep(500);
 
     // Verify both stubs have tasks assigned
     const stubsR = await apiGet(`${BASE}/api/stubs`, TOKEN);
     const stubs = await stubsR.json();
-    const lbStubs = stubs.filter((s: any) => s.hostname.startsWith("lb-"));
+    const lbStubs = stubs.filter((s: any) => s.hostname.startsWith("lb-") && s.hostname.includes(String(ts)));
     const withTasks = lbStubs.filter((s: any) => s.tasks && s.tasks.length > 0);
     expect(withTasks.length).toBe(2);
 
+    buf1.destroy();
+    buf2.destroy();
     s1.disconnect();
     s2.disconnect();
   }, 15_000);
@@ -935,12 +955,13 @@ describe("Multiple stubs load balancing", () => {
 describe("Log buffer", () => {
   it("task.log lines accumulate in buffer", async () => {
     const ts = Date.now();
+    const tag = `logbuf-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `logbuf-${ts}`, gpuName: "A40", maxConcurrent: 20,
+      hostname: `logbuf-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python logbuf_${ts}.py` });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_logbuf_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -970,9 +991,9 @@ describe("Seq numbers", () => {
   it("Tasks get monotonically increasing seq", async () => {
     const ts = Date.now();
 
-    const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python seq_a_${ts}.py` });
-    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python seq_b_${ts}.py` });
-    const r3 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python seq_c_${ts}.py` });
+    const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_seq_a_${ts}.py` });
+    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_seq_b_${ts}.py` });
+    const r3 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_seq_c_${ts}.py` });
 
     const t1 = await r1.json();
     const t2 = await r2.json();
@@ -992,12 +1013,12 @@ describe("Task retry via API", () => {
     const ts = Date.now();
     const tag = `retry-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `retry-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `retry-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python retry_${ts}.py`, max_retries: 3, target_tags: [tag],
+      script: `/tmp/test_retry_${ts}.py`, max_retries: 3, target_tags: [tag],
     });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
@@ -1014,7 +1035,7 @@ describe("Task retry via API", () => {
     const retryTask = await retryR.json();
     expect(retryTask.retry_of).toBe(task.id);
     expect(retryTask.retry_count).toBe(1);
-    expect(["pending", "queued", "dispatched"]).toContain(retryTask.status);
+    expect(["pending", "assigned"]).toContain(retryTask.status);
 
     socket.disconnect();
   }, 15_000);
@@ -1023,12 +1044,12 @@ describe("Task retry via API", () => {
     const ts = Date.now();
     const tag = `retryrun-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `retryrun-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `retryrun-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python retryrun_${ts}.py`, target_tags: [tag],
+      script: `/tmp/test_retryrun_${ts}.py`, target_tags: [tag],
     });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
@@ -1053,11 +1074,11 @@ describe("Task progress reporting", () => {
     const ts = Date.now();
     const tag = `prog-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `prog-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `prog-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python prog_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_prog_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1081,11 +1102,11 @@ describe("Task progress reporting", () => {
     const ts = Date.now();
     const tag = `progcum-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `progcum-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `progcum-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python progcum_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_progcum_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1117,11 +1138,11 @@ describe("Task phase reporting", () => {
     const ts = Date.now();
     const tag = `phase-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `phase-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `phase-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python phase_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_phase_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1149,11 +1170,11 @@ describe("Task phase reporting", () => {
     const ts = Date.now();
     const tag = `badphase-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `badphase-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `badphase-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python badphase_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_badphase_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1180,11 +1201,11 @@ describe("Task completion lifecycle", () => {
     const ts = Date.now();
     const tag = `complete-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `complete-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `complete-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python complete_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_complete_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1207,17 +1228,17 @@ describe("Task completion lifecycle", () => {
     const ts = Date.now();
     const tag = `compfree-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `compfree-${ts}`, gpuName: "A40", maxConcurrent: 1, tags: [tag],
+      hostname: `compfree-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
 
     // Submit two tasks
-    const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python compfree_a_${ts}.py`, target_tags: [tag] });
+    const r1 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_compfree_a_${ts}.py`, target_tags: [tag] });
     const t1 = await r1.json();
     const p1 = await buf.waitForTask(t1.id);
 
-    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python compfree_b_${ts}.py`, target_tags: [tag] });
+    const r2 = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_compfree_b_${ts}.py`, target_tags: [tag] });
     const t2 = await r2.json();
 
     // Start and complete first task
@@ -1242,11 +1263,11 @@ describe("Death cause classification", () => {
     const ts = Date.now();
     const tag = `death-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `death-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `death-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python death_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_death_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1273,11 +1294,11 @@ describe("Death cause classification", () => {
     const ts = Date.now();
     const tag = `wall-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `walltime-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `walltime-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python walltime_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_walltime_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1308,11 +1329,11 @@ describe("Task pause and resume", () => {
     const ts = Date.now();
     const tag = `pause-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `pause-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `pause-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python pause_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_pause_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1334,11 +1355,11 @@ describe("Task pause and resume", () => {
     const ts = Date.now();
     const tag = `resume-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `resume-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `resume-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python resume_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_resume_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1367,7 +1388,7 @@ describe("Env key validation", () => {
   it("Valid env keys accepted", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python envvalid_${ts}.py`,
+      script: `/tmp/test_envvalid_${ts}.py`,
       env: { CUDA_VISIBLE_DEVICES: "0", MY_VAR_123: "hello" },
     });
     expect(r.status).toBe(201);
@@ -1376,7 +1397,7 @@ describe("Env key validation", () => {
   it("Invalid env key → 400", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python envinject_${ts}.py`,
+      script: `/tmp/test_envinject_${ts}.py`,
       env: { "FOO$(evil)": "bar" },
     });
     expect(r.status).toBe(400);
@@ -1385,7 +1406,7 @@ describe("Env key validation", () => {
   it("Env key with spaces → 400", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python envspace_${ts}.py`,
+      script: `/tmp/test_envspace_${ts}.py`,
       env: { "MY VAR": "val" },
     });
     expect(r.status).toBe(400);
@@ -1394,7 +1415,7 @@ describe("Env key validation", () => {
   it("Env key starting with number → 400", async () => {
     const ts = Date.now();
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, {
-      script: `python envnum_${ts}.py`,
+      script: `/tmp/test_envnum_${ts}.py`,
       env: { "123FOO": "val" },
     });
     expect(r.status).toBe(400);
@@ -1410,11 +1431,11 @@ describe("Checkpoint reporting", () => {
     const ts = Date.now();
     const tag = `ckpt-tag-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `ckpt-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `ckpt-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python ckpt_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_ckpt_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1448,10 +1469,10 @@ describe("Stub reconnect reconciliation", () => {
 
     // First connection: get a task running
     const { socket: s1 } = await connectAndResume(BASE, TOKEN, {
-      hostname, gpuName: "A40", maxConcurrent: 5, tags: [tag],
+      hostname, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
     const buf1 = new TaskRunBuffer(s1);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python recon_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_recon_${ts}.py`, target_tags: [tag], priority: 99 });
     const task = await r.json();
     const payload = await buf1.waitForTask(task.id);
 
@@ -1462,10 +1483,11 @@ describe("Stub reconnect reconciliation", () => {
     s1.disconnect();
     await sleep(500);
 
-    // Task should be lost now
+    // Task should still be running with stub_offline flag
     let check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
     let t = await check.json();
-    expect(t.status).toBe("lost");
+    expect(t.status).toBe("running");
+    expect(t.stub_offline).toBe(true);
 
     // Reconnect with task still running
     const s2 = await connectStub(BASE);
@@ -1474,14 +1496,14 @@ describe("Stub reconnect reconciliation", () => {
       token: TOKEN,
       hostname,
       gpuName: "A40",
-      maxConcurrent: 5,
+      maxConcurrent: 50,
       runningTasks: [{ task_id: task.id, pid: 970 }],
       tags: [tag],
     });
     await resumeP;
 
     // Task should be back to running
-    await sleep(300);
+    await sleep(1000);
     check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
     t = await check.json();
     expect(t.status).toBe("running");
@@ -1500,7 +1522,7 @@ describe("Batch operations", () => {
     const tag = `batchkill-${ts}`;
     const ids: string[] = [];
     for (let i = 0; i < 3; i++) {
-      const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python batchkill_${i}_${ts}.py`, target_tags: [tag] });
+      const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_batchkill_${i}_${ts}.py`, target_tags: [tag] });
       const t = await r.json();
       ids.push(t.id);
     }
@@ -1518,21 +1540,21 @@ describe("Batch operations", () => {
     for (const id of ids) {
       const check = await apiGet(`${BASE}/api/tasks/${id}`, TOKEN);
       const t = await check.json();
-      expect(t.status).toBe("killed");
+      expect(t.status).toBe("cancelled");
     }
   }, 10_000);
 
-  it("Batch requeue killed tasks", async () => {
+  it("Batch requeue cancelled tasks", async () => {
     const ts = Date.now();
     const tag = `batchreq-${ts}`;
     const ids: string[] = [];
     for (let i = 0; i < 2; i++) {
-      const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python batchreq_${i}_${ts}.py`, target_tags: [tag] });
+      const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_batchreq_${i}_${ts}.py`, target_tags: [tag] });
       const t = await r.json();
       ids.push(t.id);
     }
 
-    // Kill first (pending → killed, no kill chain needed)
+    // Cancel first (pending → cancelled, no kill chain needed)
     await apiPost(`${BASE}/api/tasks/batch`, TOKEN, { action: "kill", task_ids: ids });
     await sleep(200);
 
@@ -1582,7 +1604,7 @@ describe("State persistence", () => {
   it("Pending tasks survive server restart", async () => {
     const ts = Date.now();
     const tag = `persist-${ts}`;
-    const script = `python persist_${ts}.py`;
+    const script = `/tmp/test_persist_${ts}.py`;
 
     // Submit with unique tag → no stub has this tag → stays pending
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script, target_tags: [tag] });
@@ -1610,11 +1632,11 @@ describe("Kill chain for running tasks", () => {
     const ts = Date.now();
     const tag = `killchain-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `killchain-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `killchain-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python killchain_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_killchain_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1625,7 +1647,7 @@ describe("Kill chain for running tasks", () => {
     const killP = waitReliable(socket, "task.kill", 5000);
 
     // Kill via API
-    await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+    await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "cancelled" });
 
     const killPayload = await killP;
     expect(killPayload.task_id).toBe(task.id);
@@ -1636,7 +1658,7 @@ describe("Kill chain for running tasks", () => {
 
     const check = await apiGet(`${BASE}/api/tasks/${task.id}`, TOKEN);
     const t = await check.json();
-    expect(["killed", "failed"]).toContain(t.status);
+    expect(["cancelled", "failed"]).toContain(t.status);
 
     socket.disconnect();
   }, 10_000);
@@ -1647,19 +1669,19 @@ describe("Kill chain for running tasks", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("Double-action protection", () => {
-  it("Killing an already killed task is idempotent", async () => {
+  it("Cancelling an already cancelled task is idempotent", async () => {
     const ts = Date.now();
     const tag = `dblkill-${ts}`;
-    const script = `python dblkill_${ts}.py`;
+    const script = `/tmp/test_dblkill_${ts}.py`;
     const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script, target_tags: [tag] });
     const task = await r.json();
 
-    // Kill it (pending → killed)
-    const k1 = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+    // Cancel it (pending → cancelled)
+    const k1 = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "cancelled" });
     expect(k1.status).toBe(200);
 
     // Kill again — should not error
-    const k2 = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "killed" });
+    const k2 = await apiPatch(`${BASE}/api/tasks/${task.id}`, TOKEN, { status: "cancelled" });
     expect([200, 400]).toContain(k2.status);
   });
 
@@ -1667,11 +1689,11 @@ describe("Double-action protection", () => {
     const ts = Date.now();
     const tag = `dblcomp-${ts}`;
     const { socket } = await connectAndResume(BASE, TOKEN, {
-      hostname: `dblcomp-${ts}`, gpuName: "A40", maxConcurrent: 20, tags: [tag],
+      hostname: `dblcomp-${ts}`, gpuName: "A40", maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
-    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `python dblcomp_${ts}.py`, target_tags: [tag] });
+    const r = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_dblcomp_${ts}.py`, target_tags: [tag] });
     const task = await r.json();
     const payload = await buf.waitForTask(task.id);
 
@@ -1699,12 +1721,13 @@ describe("Double-action protection", () => {
 describe("DAG pipeline experiments", () => {
 
   it("creates experiment with task_specs and wires depends_on", async () => {
+    const ts = Date.now();
     const r = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-linear",
+      name: `dag-linear-${ts}`,
       task_specs: [
-        { ref: "train", script: "python train.py" },
-        { ref: "eval", script: "python eval.py", depends_on: ["train"] },
-        { ref: "report", script: "python report.py", depends_on: ["eval"] },
+        { ref: "train", script: `/tmp/test_train_${ts}.py` },
+        { ref: "eval", script: `/tmp/test_eval_${ts}.py`, depends_on: ["train"] },
+        { ref: "report", script: `/tmp/test_report_${ts}.py`, depends_on: ["eval"] },
       ],
     });
     expect(r.status).toBe(201);
@@ -1715,7 +1738,8 @@ describe("DAG pipeline experiments", () => {
     // Check task statuses
     const trainR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.train}`, TOKEN);
     const train = await trainR.json();
-    expect(train.status).toBe("pending"); // no deps → pending
+    // Train has no deps, so it starts as pending but may be immediately dispatched by scheduler
+    expect(["pending", "assigned", "running"]).toContain(train.status);
 
     const evalR = await apiGet(`${BASE}/api/tasks/${exp.task_refs.eval}`, TOKEN);
     const evalTask = await evalR.json();
@@ -1729,11 +1753,12 @@ describe("DAG pipeline experiments", () => {
   }, 10_000);
 
   it("rejects DAG with cycle", async () => {
+    const ts = Date.now();
     const r = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-cycle",
+      name: `dag-cycle-${ts}`,
       task_specs: [
-        { ref: "a", script: "a.py", depends_on: ["b"] },
-        { ref: "b", script: "b.py", depends_on: ["a"] },
+        { ref: "a", script: `/tmp/test_dag_cyc_a_${ts}.py`, depends_on: ["b"] },
+        { ref: "b", script: `/tmp/test_dag_cyc_b_${ts}.py`, depends_on: ["a"] },
       ],
     });
     expect(r.status).toBe(400);
@@ -1742,10 +1767,11 @@ describe("DAG pipeline experiments", () => {
   });
 
   it("rejects DAG with unknown dependency ref", async () => {
+    const ts = Date.now();
     const r = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-bad-ref",
+      name: `dag-bad-ref-${ts}`,
       task_specs: [
-        { ref: "a", script: "a.py", depends_on: ["ghost"] },
+        { ref: "a", script: `/tmp/test_dag_badref_${ts}.py`, depends_on: ["ghost"] },
       ],
     });
     expect(r.status).toBe(400);
@@ -1753,11 +1779,13 @@ describe("DAG pipeline experiments", () => {
   });
 
   it("linear pipeline: train→eval promotion on completion", async () => {
+    const ts = Date.now();
+    const tag = `dag-promote-${ts}`;
     const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-promote-test",
+      name: `dag-promote-${ts}`,
       task_specs: [
-        { ref: "train", script: "echo train" },
-        { ref: "eval", script: "echo eval", depends_on: ["train"] },
+        { ref: "train", script: `/tmp/test_dag_train_${ts}.py`, target_tags: [tag] },
+        { ref: "eval", script: `/tmp/test_dag_eval_${ts}.py`, depends_on: ["train"], target_tags: [tag] },
       ],
     });
     const exp = await expR.json();
@@ -1767,7 +1795,7 @@ describe("DAG pipeline experiments", () => {
     // Connect stub
     const { socket, stubId } = await connectAndResume(BASE, TOKEN, {
       hostname: `dag-stub-${Date.now()}`,
-      maxConcurrent: 2,
+      maxConcurrent: 50, tags: [tag],
     });
 
     // Stub should get train task (eval is blocked)
@@ -1785,19 +1813,21 @@ describe("DAG pipeline experiments", () => {
     // eval should now be promoted to pending and dispatched
     const evalCheck = await apiGet(`${BASE}/api/tasks/${evalId}`, TOKEN);
     const evalTask = await evalCheck.json();
-    expect(["pending", "queued", "dispatched", "running"]).toContain(evalTask.status);
+    expect(["pending", "assigned", "running"]).toContain(evalTask.status);
 
     buf.destroy();
     socket.disconnect();
   }, 15_000);
 
   it("cascading cancellation: fail train → cancel eval + report", async () => {
+    const ts = Date.now();
+    const tag = `dag-cascade-${ts}`;
     const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-cascade-test",
+      name: `dag-cascade-${ts}`,
       task_specs: [
-        { ref: "train", script: "echo fail" },
-        { ref: "eval", script: "echo eval", depends_on: ["train"] },
-        { ref: "report", script: "echo report", depends_on: ["eval"] },
+        { ref: "train", script: `/tmp/test_dag_fail_${ts}.py`, target_tags: [tag] },
+        { ref: "eval", script: `/tmp/test_dag_eval2_${ts}.py`, depends_on: ["train"], target_tags: [tag] },
+        { ref: "report", script: `/tmp/test_dag_report_${ts}.py`, depends_on: ["eval"], target_tags: [tag] },
       ],
     });
     const exp = await expR.json();
@@ -1808,7 +1838,7 @@ describe("DAG pipeline experiments", () => {
     // Connect stub and run train
     const { socket } = await connectAndResume(BASE, TOKEN, {
       hostname: `dag-cascade-${Date.now()}`,
-      maxConcurrent: 2,
+      maxConcurrent: 50, tags: [tag],
     });
 
     const buf = new TaskRunBuffer(socket);
@@ -1833,12 +1863,14 @@ describe("DAG pipeline experiments", () => {
   }, 15_000);
 
   it("fan-out: one root, two downstream — both blocked then promoted", async () => {
+    const ts = Date.now();
+    const tag = `dag-fanout-${ts}`;
     const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-fanout",
+      name: `dag-fanout-${ts}`,
       task_specs: [
-        { ref: "data", script: "echo data" },
-        { ref: "branch_a", script: "echo a", depends_on: ["data"] },
-        { ref: "branch_b", script: "echo b", depends_on: ["data"] },
+        { ref: "data", script: `/tmp/test_dag_data_${ts}.py`, target_tags: [tag] },
+        { ref: "branch_a", script: `/tmp/test_dag_brancha_${ts}.py`, depends_on: ["data"], target_tags: [tag] },
+        { ref: "branch_b", script: `/tmp/test_dag_branchb_${ts}.py`, depends_on: ["data"], target_tags: [tag] },
       ],
     });
     const exp = await expR.json();
@@ -1853,7 +1885,7 @@ describe("DAG pipeline experiments", () => {
     // Connect stub, complete data
     const { socket } = await connectAndResume(BASE, TOKEN, {
       hostname: `dag-fanout-${Date.now()}`,
-      maxConcurrent: 4,
+      maxConcurrent: 50, tags: [tag],
     });
     const buf = new TaskRunBuffer(socket);
     await sleep(500);
@@ -1865,42 +1897,45 @@ describe("DAG pipeline experiments", () => {
 
     // Both should be promoted
     const aCheck = await apiGet(`${BASE}/api/tasks/${exp.task_refs.branch_a}`, TOKEN);
-    expect(["pending", "queued", "dispatched", "running"]).toContain((await aCheck.json()).status);
+    expect(["pending", "assigned", "running"]).toContain((await aCheck.json()).status);
 
     const bCheck = await apiGet(`${BASE}/api/tasks/${exp.task_refs.branch_b}`, TOKEN);
-    expect(["pending", "queued", "dispatched", "running"]).toContain((await bCheck.json()).status);
+    expect(["pending", "assigned", "running"]).toContain((await bCheck.json()).status);
 
     buf.destroy();
     socket.disconnect();
   }, 15_000);
 
-  it("kill blocked task transitions to killed", async () => {
+  it("cancel blocked task transitions to cancelled", async () => {
+    const ts = Date.now();
     const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-kill-blocked",
+      name: `dag-kill-blocked-${ts}`,
       task_specs: [
-        { ref: "slow", script: "echo slow" },
-        { ref: "wait", script: "echo wait", depends_on: ["slow"] },
+        { ref: "slow", script: `/tmp/test_dag_slow_${ts}.py` },
+        { ref: "wait", script: `/tmp/test_dag_wait_${ts}.py`, depends_on: ["slow"] },
       ],
     });
     const exp = await expR.json();
     const waitId = exp.task_refs.wait;
 
     // Kill the blocked task
-    const killR = await apiPatch(`${BASE}/api/tasks/${waitId}`, TOKEN, { status: "killed" });
+    const killR = await apiPatch(`${BASE}/api/tasks/${waitId}`, TOKEN, { status: "cancelled" });
     expect(killR.status).toBe(200);
     const killed = await killR.json();
-    expect(killed.status).toBe("killed");
+    expect(killed.status).toBe("cancelled");
   }, 10_000);
 
   it("export via SDK endpoint persists on task", async () => {
+    const ts = Date.now();
+    const tag = `dag-export-${ts}`;
     // Create a simple task
-    const taskR = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: "echo export-test" });
+    const taskR = await apiPost(`${BASE}/api/tasks`, TOKEN, { script: `/tmp/test_dag_export_${ts}.py`, target_tags: [tag] });
     const task = await taskR.json();
 
     // Connect stub, start the task
     const { socket } = await connectAndResume(BASE, TOKEN, {
       hostname: `dag-export-${Date.now()}`,
-      maxConcurrent: 2,
+      maxConcurrent: 50, tags: [tag],
     });
     const buf = new TaskRunBuffer(socket);
     await sleep(500);
@@ -1926,13 +1961,16 @@ describe("DAG pipeline experiments", () => {
   }, 10_000);
 
   it("template resolution with exports in args_template", async () => {
+    const ts = Date.now();
+    const tag = `dag-tmpl-${ts}`;
     const expR = await apiPost(`${BASE}/api/experiments`, TOKEN, {
-      name: "dag-template",
+      name: `dag-template-${ts}`,
       task_specs: [
-        { ref: "train", script: "echo train" },
-        { ref: "eval", script: "echo eval",
+        { ref: "train", script: `/tmp/test_dag_tmpl_train_${ts}.py`, target_tags: [tag] },
+        { ref: "eval", script: `/tmp/test_dag_tmpl_eval_${ts}.py`,
           depends_on: ["train"],
           args_template: { "--ckpt": "{{deps.train.exports.last_checkpoint_path}}" },
+          target_tags: [tag],
         },
       ],
     });
@@ -1943,7 +1981,7 @@ describe("DAG pipeline experiments", () => {
     // Connect stub
     const { socket } = await connectAndResume(BASE, TOKEN, {
       hostname: `dag-tmpl-${Date.now()}`,
-      maxConcurrent: 2,
+      maxConcurrent: 50, tags: [tag],
     });
     const buf = new TaskRunBuffer(socket);
     await sleep(500);
@@ -1965,7 +2003,7 @@ describe("DAG pipeline experiments", () => {
 
     const evalCheck = await apiGet(`${BASE}/api/tasks/${evalId}`, TOKEN);
     const evalTask = await evalCheck.json();
-    expect(["pending", "queued", "dispatched", "running"]).toContain(evalTask.status);
+    expect(["pending", "assigned", "running"]).toContain(evalTask.status);
     expect(evalTask.args?.["--ckpt"]).toBe("/runs/train/ckpt_100.pt");
 
     buf.destroy();

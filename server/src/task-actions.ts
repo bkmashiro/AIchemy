@@ -18,12 +18,12 @@ const now = () => new Date().toISOString();
 
 // ─── Stub-scoped actions ────────────────────────────────────────────────────
 
-/** queued → dispatched */
-export function dispatchTask(stubId: string, taskId: string, run_dir: string): Task | undefined {
-  return store.updateTask(stubId, taskId, { status: "dispatched" as TaskStatus, run_dir });
+/** pending → assigned (stub owns the task) */
+export function assignTask(stubId: string, taskId: string, run_dir: string): Task | undefined {
+  return store.updateTask(stubId, taskId, { status: "assigned" as TaskStatus, run_dir });
 }
 
-/** dispatched → running */
+/** assigned → running */
 export function startTask(stubId: string, taskId: string, pid: number): Task | undefined {
   return store.updateTask(stubId, taskId, {
     status: "running" as TaskStatus,
@@ -32,10 +32,10 @@ export function startTask(stubId: string, taskId: string, pid: number): Task | u
   });
 }
 
-/** dispatched → running (auto-promote on first log/progress, no-op if already running) */
-export function promoteIfDispatched(stubId: string, taskId: string): void {
+/** assigned → running (auto-promote on first log/progress, no-op if already running) */
+export function promoteIfAssigned(stubId: string, taskId: string): void {
   const task = store.getTask(stubId, taskId);
-  if (task?.status === "dispatched") {
+  if (task?.status === "assigned") {
     store.updateTask(stubId, taskId, {
       status: "running" as TaskStatus,
       started_at: now(),
@@ -52,7 +52,7 @@ export function completeTask(stubId: string, taskId: string, exitCode: number): 
   });
 }
 
-/** running/dispatched → failed */
+/** running/assigned → failed */
 export function failTask(stubId: string, taskId: string, exitCode?: number, extra?: Partial<Task>): Task | undefined {
   return store.updateTask(stubId, taskId, {
     ...extra,
@@ -62,29 +62,30 @@ export function failTask(stubId: string, taskId: string, exitCode?: number, extr
   });
 }
 
-/** any active → killed */
-export function killTask(stubId: string, taskId: string, exitCode?: number): Task | undefined {
+/** any active → cancelled */
+export function cancelTask(stubId: string, taskId: string, exitCode?: number): Task | undefined {
   return store.updateTask(stubId, taskId, {
-    status: "killed" as TaskStatus,
+    status: "cancelled" as TaskStatus,
     exit_code: exitCode,
     finished_at: now(),
   });
 }
 
-/** running/dispatched/paused → lost (stub offline or sync detected dead) */
-export function loseTask(stubId: string, taskId: string): Task | undefined {
+/** Set disconnected_at flag on a running/paused task without changing status */
+export function markDisconnected(stubId: string, taskId: string): Task | undefined {
+  const found = store.findTask(taskId);
+  if (!found || !["running", "paused"].includes(found.task.status)) return undefined;
   return store.updateTask(stubId, taskId, {
-    status: "lost" as TaskStatus,
-    finished_at: now(),
+    disconnected_at: now(),
+    stub_offline: true,
   });
 }
 
-/** lost → running (stub reconnects and reports task still alive) */
-export function recoverTask(stubId: string, taskId: string, pid: number): Task | undefined {
+/** Clear disconnected_at flag when stub reconnects */
+export function clearDisconnected(stubId: string, taskId: string): Task | undefined {
   return store.updateTask(stubId, taskId, {
-    status: "running" as TaskStatus,
-    pid,
-    finished_at: undefined,
+    disconnected_at: undefined,
+    stub_offline: undefined,
   });
 }
 
@@ -133,7 +134,7 @@ export interface RetryTaskOpts {
 
 /**
  * Create a retry copy of a terminal task.
- * Unified helper — used by auto-retry (lost), OOM retry, and manual retry.
+ * Unified helper — used by auto-retry, OOM retry, and manual retry.
  */
 export function createRetryTask(task: Task, opts?: RetryTaskOpts): Task {
   const clearRunDir = opts?.clearRunDir ?? true;
@@ -155,16 +156,18 @@ export function createRetryTask(task: Task, opts?: RetryTaskOpts): Task {
     progress: undefined,
     should_stop: false,
     should_checkpoint: false,
+    disconnected_at: undefined,
+    stub_offline: undefined,
     requirements: opts?.requirements ?? task.requirements,
   };
 }
 
 // ─── Global queue actions ───────────────────────────────────────────────────
 
-/** Kill a task in the global queue (pending → killed) */
-export function killGlobalTask(taskId: string): Task | undefined {
+/** Cancel a task in the global queue (pending → cancelled) */
+export function cancelGlobalTask(taskId: string): Task | undefined {
   return store.updateGlobalQueueTask(taskId, {
-    status: "killed" as TaskStatus,
+    status: "cancelled" as TaskStatus,
     finished_at: now(),
   });
 }

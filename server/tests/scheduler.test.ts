@@ -235,11 +235,11 @@ describe("scoreStub — hard constraints", () => {
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
 
-  it("running+queued count both toward max_concurrent", () => {
+  it("running+assigned count both toward max_concurrent", () => {
     const r1 = makeTask({ status: "running" });
     const r2 = makeTask({ status: "running" });
-    const q1 = makeTask({ status: "queued" });
-    const q2 = makeTask({ status: "queued" });
+    const q1 = makeTask({ status: "assigned" });
+    const q2 = makeTask({ status: "assigned" });
     const stub = makeStub({ max_concurrent: 4, tasks: [r1, r2, q1, q2] });
     const task = makeTask();
     expect(scoreStub(stub, task)).toBe(-Infinity);
@@ -294,12 +294,12 @@ describe("scoreStub — soft scoring", () => {
     expect(scoreStub(tight, task)).toBeGreaterThan(scoreStub(wasteful, task));
   });
 
-  it("queue depth penalizes stubs with many queued tasks", () => {
+  it("queue depth penalizes stubs with many assigned tasks", () => {
     const noQueue = makeStub({ id: "nq", max_concurrent: 4, tasks: [] });
     const highQueue = makeStub({
       id: "hq",
       max_concurrent: 4,
-      tasks: [makeTask({ status: "queued" }), makeTask({ status: "queued" })],
+      tasks: [makeTask({ status: "assigned" }), makeTask({ status: "assigned" })],
     });
     const task = makeTask();
     expect(scoreStub(noQueue, task)).toBeGreaterThan(scoreStub(highQueue, task));
@@ -437,7 +437,7 @@ describe("buildRunPayload", () => {
 
 describe("maybeDispatch", () => {
   it("does nothing for offline stub", () => {
-    const task = makeTask({ status: "queued" });
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ status: "offline", tasks: [task], max_concurrent: 4 });
     store.setStub(stub);
     maybeDispatch(stub);
@@ -446,17 +446,17 @@ describe("maybeDispatch", () => {
 
   it("does nothing when slots are full (running >= max_concurrent)", () => {
     const running = Array.from({ length: 4 }, () => makeTask({ status: "running" }));
-    const queued = makeTask({ status: "queued" });
+    const queued = makeTask({ status: "assigned" });
     const stub = makeStub({ max_concurrent: 4, tasks: [...running, queued] });
     store.setStub(stub);
     maybeDispatch(stub);
     expect(reliableEmitToStub).not.toHaveBeenCalled();
   });
 
-  it("dispatches queued tasks up to available slots", () => {
-    const q1 = makeTask({ id: "q1", status: "queued", priority: 0 });
-    const q2 = makeTask({ id: "q2", status: "queued", priority: 0 });
-    const q3 = makeTask({ id: "q3", status: "queued", priority: 0 });
+  it("dispatches assigned tasks up to available slots", () => {
+    const q1 = makeTask({ id: "q1", status: "assigned", priority: 0 });
+    const q2 = makeTask({ id: "q2", status: "assigned", priority: 0 });
+    const q3 = makeTask({ id: "q3", status: "assigned", priority: 0 });
     const stub = makeStub({ id: "s-dispatch", max_concurrent: 2, tasks: [q1, q2, q3] });
     store.setStub(stub);
 
@@ -468,8 +468,8 @@ describe("maybeDispatch", () => {
   });
 
   it("dispatches higher priority tasks first", () => {
-    const low = makeTask({ id: "low", status: "queued", priority: 1 });
-    const high = makeTask({ id: "high", status: "queued", priority: 10 });
+    const low = makeTask({ id: "low", status: "assigned", priority: 1 });
+    const high = makeTask({ id: "high", status: "assigned", priority: 10 });
     const stub = makeStub({ id: "s-prio", max_concurrent: 1, tasks: [low, high] });
     store.setStub(stub);
 
@@ -483,13 +483,13 @@ describe("maybeDispatch", () => {
   it("among equal priority, earlier created_at dispatched first", () => {
     const early = makeTask({
       id: "early",
-      status: "queued",
+      status: "assigned",
       priority: 5,
       created_at: "2025-01-01T00:00:00.000Z",
     });
     const late = makeTask({
       id: "late",
-      status: "queued",
+      status: "assigned",
       priority: 5,
       created_at: "2025-01-02T00:00:00.000Z",
     });
@@ -502,7 +502,7 @@ describe("maybeDispatch", () => {
     expect(call[2].task_id).toBe("early");
   });
 
-  it("does nothing when no queued tasks", () => {
+  it("does nothing when no assigned tasks", () => {
     const running = makeTask({ status: "running" });
     const stub = makeStub({ max_concurrent: 4, tasks: [running] });
     store.setStub(stub);
@@ -510,26 +510,28 @@ describe("maybeDispatch", () => {
     expect(reliableEmitToStub).not.toHaveBeenCalled();
   });
 
-  it("sets dispatch timeout to fail task after 30s if not started", () => {
+  it("sets dispatch timeout to recover task after 30s if not started", () => {
     vi.useFakeTimers();
-    const task = makeTask({ id: "timeout-task", status: "queued" });
+    const task = makeTask({ id: "timeout-task", status: "assigned" });
     const stub = makeStub({ id: "s-timeout", max_concurrent: 4, tasks: [task] });
     store.setStub(stub);
 
     maybeDispatch(store.getStub(stub.id)!);
 
     // Task should now be "dispatched" in store
-    // Fast-forward 30s without task.started → should be failed
+    // Fast-forward 30s without task.started → timeout fires, moves to pending, then re-dispatched
     vi.advanceTimersByTime(31_000);
 
     const found = store.findTask("timeout-task");
-    // Dispatched → failed via timeout
-    expect(found?.task.status).toBe("failed");
+    // Task gets requeued as pending then immediately re-dispatched by triggerSchedule(),
+    // so it's dispatched again but with dispatch_attempts incremented
+    expect(found?.task.status).toBe("assigned");
+    expect(found?.task.dispatch_attempts).toBe(1);
   });
 
   it("dispatch timeout does NOT fail task if already started", () => {
     vi.useFakeTimers();
-    const task = makeTask({ id: "started-task", status: "queued" });
+    const task = makeTask({ id: "started-task", status: "assigned" });
     const stub = makeStub({ id: "s-started", max_concurrent: 4, tasks: [task] });
     store.setStub(stub);
 

@@ -224,6 +224,7 @@ let serverProcess: ChildProcess;
 let BASE_URL: string;
 let TOKEN: string;
 const STATE_FILE = `/tmp/alchemy_stub_test_state_${process.pid}.json`;
+const DB_FILE = `/tmp/alchemy_stub_test_state_${process.pid}.db`;
 
 const SERVER_DIR = path.join(__dirname, "../../server");
 
@@ -235,6 +236,7 @@ beforeAll(async () => {
     ...process.env,
     PORT: String(port),
     STATE_FILE,
+    DB_FILE,
     NO_PROXY: "*",
     no_proxy: "*",
   };
@@ -256,6 +258,9 @@ afterAll(async () => {
   serverProcess?.kill("SIGTERM");
   await sleep(500);
   try { require("fs").unlinkSync(STATE_FILE); } catch {}
+  try { require("fs").unlinkSync(DB_FILE); } catch {}
+  try { require("fs").unlinkSync(DB_FILE + "-wal"); } catch {}
+  try { require("fs").unlinkSync(DB_FILE + "-shm"); } catch {}
 });
 
 // ─── 1. Unified resume — fresh connect ───────────────────────────────────────
@@ -353,7 +358,7 @@ describe("Task dispatch", () => {
     const buf = new TaskRunBuffer(socket);
 
     // Submit task to global queue
-    const script = `python dispatch_test_${Date.now()}.py`;
+    const script = `/tmp/test_dispatch_test_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     expect(r.status).toBe(201);
     const task = await r.json();
@@ -389,7 +394,7 @@ describe("Task lifecycle", () => {
     const buf = new TaskRunBuffer(socket);
 
     // Submit task
-    const script = `python lifecycle_test_${Date.now()}.py`;
+    const script = `/tmp/test_lifecycle_test_${Date.now()}.py`;
     const r = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await r.json();
 
@@ -459,7 +464,7 @@ describe("Task lifecycle", () => {
     const buf = new TaskRunBuffer(socket);
 
     // Submit task and wait for dispatch
-    const script = `python autopromote_${Date.now()}.py`;
+    const script = `/tmp/test_autopromote_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
     const runPayload = await buf.waitForTask(task.id, 8000);
@@ -577,7 +582,7 @@ describe("Reconciliation on reconnect", () => {
     const buf1 = new TaskRunBuffer(socket1);
 
     // Submit a task and dispatch it
-    const script = `python reconcile_${Date.now()}.py`;
+    const script = `/tmp/test_reconcile_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
     const runPayload = await buf1.waitForTask(task.id, 8000);
@@ -589,8 +594,8 @@ describe("Reconciliation on reconnect", () => {
       setTimeout(resolve, 500); // fallback
     });
 
-    // Kill the task via API BEFORE disconnecting (task is running → kill valid)
-    await apiPatch(`${BASE_URL}/api/tasks/${taskId}`, TOKEN, { status: "killed" });
+    // Cancel the task via API BEFORE disconnecting (task is running → cancel valid)
+    await apiPatch(`${BASE_URL}/api/tasks/${taskId}`, TOKEN, { status: "cancelled" });
     await sleep(200);
 
     // Disconnect stub (simulating it going offline after kill was issued)
@@ -633,7 +638,7 @@ describe("Reconciliation on reconnect", () => {
     const buf1 = new TaskRunBuffer(socket1);
 
     // Submit + dispatch
-    const script = `python crash_test_${Date.now()}.py`;
+    const script = `/tmp/test_crash_test_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
     const runPayload = await buf1.waitForTask(task.id, 8000);
@@ -663,10 +668,10 @@ describe("Reconciliation on reconnect", () => {
     await resumeP2;
     await sleep(300);
 
-    // Task should now be "lost"
+    // Task should now be "failed" (stub reconnected with empty state → disappeared)
     const taskCheck = await apiGet(`${BASE_URL}/api/tasks/${taskId}`, TOKEN);
     const t = await taskCheck.json();
-    expect(t.status).toBe("lost");
+    expect(t.status).toBe("failed");
 
     socket2.disconnect();
   }, 20_000);
@@ -688,7 +693,7 @@ describe("Kill chain", () => {
     const buf = new TaskRunBuffer(socket);
 
     // Submit + dispatch task
-    const script = `python kill_test_${Date.now()}.py`;
+    const script = `/tmp/test_kill_test_${Date.now()}.py`;
     const taskR = await apiPost(`${BASE_URL}/api/tasks`, TOKEN, { script });
     const task = await taskR.json();
     const runPayload = await buf.waitForTask(task.id, 8000);
@@ -702,7 +707,7 @@ describe("Kill chain", () => {
     const killP = waitForReliableEvent(socket, "task.kill", 6000);
 
     // Cancel the task via API
-    await apiPatch(`${BASE_URL}/api/tasks/${taskId}`, TOKEN, { status: "killed" });
+    await apiPatch(`${BASE_URL}/api/tasks/${taskId}`, TOKEN, { status: "cancelled" });
 
     const killPayload = await killP;
     expect(killPayload.task_id).toBe(taskId);

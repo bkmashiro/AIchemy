@@ -70,8 +70,7 @@ const COLOR = {
   running:    0x57f287, // green
   completed:  0x2ecc71, // dark green
   failed:     0xed4245, // red
-  killed:     0xe67e22, // orange
-  lost:       0x95a5a6, // grey
+  cancelled:  0xe67e22, // orange
 } as const;
 
 // ─── Human channel (embeds) ──────────────────────────────────────────────────
@@ -141,20 +140,11 @@ export async function notifyFailed(task: Task, exitCode?: number): Promise<void>
   await sendPlainText(WEBHOOK_AI, `❌ #${task.seq} ${task.display_name} failed${exitStr}`);
 }
 
-export async function notifyKilled(task: Task): Promise<void> {
-  await humanEmbed(task, "🛑 Task Killed", COLOR.killed);
-
-  // AI: treat as failed
-  await sendPlainText(WEBHOOK_AI, `🛑 #${task.seq} ${task.display_name} killed`);
-}
-
-export async function notifyLost(task: Task): Promise<void> {
-  const stub = stubName(task);
-  const stubStr = stub ? ` (stub ${stub} disconnected)` : "";
-  await humanEmbed(task, "⚠️ Task Lost", COLOR.lost);
+export async function notifyCancelled(task: Task): Promise<void> {
+  await humanEmbed(task, "🛑 Task Cancelled", COLOR.cancelled);
 
   // AI: plain text
-  await sendPlainText(WEBHOOK_AI, `⚠️ #${task.seq} ${task.display_name} lost${stubStr}`);
+  await sendPlainText(WEBHOOK_AI, `🛑 #${task.seq} ${task.display_name} cancelled`);
 }
 
 // ─── Task notify (user-defined) ──────────────────────────────────────────────
@@ -227,7 +217,7 @@ export async function notifyExperimentPartial(exp: Experiment): Promise<void> {
 
   await sendEmbed(WEBHOOK_HUMAN, {
     title: `⚠️ Experiment "${exp.name}" PARTIAL`,
-    color: COLOR.killed,
+    color: COLOR.cancelled,
     fields: [
       { name: "Result", value: `${passed}/${total} passed, ${failed} failed`, inline: true },
       ...(failDetails ? [{ name: "Failed", value: failDetails.slice(0, 1024), inline: false }] : []),

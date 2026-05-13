@@ -28,7 +28,7 @@ import {
 } from "../reliable";
 import {
   notifySubmitted, notifyDispatched, notifyRunning,
-  notifyCompleted, notifyFailed, notifyKilled, notifyLost,
+  notifyCompleted, notifyFailed, notifyCancelled,
   notifyGridDone, notifyTaskMessage,
   notifyExperimentPassed, notifyExperimentPartial,
 } from "../discord";
@@ -36,10 +36,11 @@ import { evaluateCriteria } from "../criteria";
 import { deriveExperimentStatus } from "../api/experiments";
 import { writeLockTable } from "../dedup";
 import { logger } from "../log";
-import { loseTask, startTask, completeTask, failTask, killTask, recoverTask, resolveDeadTask, preflightFail, promoteIfDispatched, createRetryTask } from "../task-actions";
+import { startTask, completeTask, failTask, cancelTask, markDisconnected, clearDisconnected, resolveDeadTask, preflightFail, promoteIfAssigned, createRetryTask } from "../task-actions";
 import { updateExperimentManifest } from "../git-tracking";
 
 const HEARTBEAT_TIMEOUT_MS = 180_000; // 6 missed × 30s — generous for CF tunnel latency
+const DISCONNECT_FAIL_MS = 6 * 3_600_000; // 6 hours — disconnected tasks stay "running" a long time
 const REQUEST_SYNC_INTERVAL_MS = 5 * 60_000;
 
 // Module-level stub namespace reference for internal helpers (set in setupStubNamespace)
@@ -51,21 +52,25 @@ const stubSyncIntervals: Map<string, ReturnType<typeof setInterval>> = new Map()
 // Map: socket.id → stub_id (for the duration of the connection)
 const socketToStub: Map<string, string> = new Map();
 
+// After disconnect: heartbeat timeout before running tasks are failed
+// Tasks stay "running" with a disconnected_at flag; only failTask after full timeout
+const disconnectFailTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
 // ─── Stable stub ID ───────────────────────────────────────────────────────────
 
 /**
  * Compute a stable stub identity hash.
  *
- * Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count)[:12]
+ * Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count|user|slurm_job_id)[:12]
  *
- * Intentionally excludes defaultCwd and slurmJobId so identity survives
- * SLURM job restarts on the same physical GPU.
+ * Includes user and slurm_job_id to prevent collisions when multiple users
+ * or multiple SLURM jobs share the same node and GPU type.
  *
  * IMPORTANT: This must match the Python stub's _compute_identity_hash in
  * stub/alchemy_stub/config.py. If you change this, update both sides.
  */
-export function computeStubId(hostname: string, gpu: { name: string; count: number }, cudaVisibleDevices: string = ""): string {
-  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}`;
+export function computeStubId(hostname: string, gpu: { name: string; count: number }, cudaVisibleDevices: string = "", user: string = "", slurmJobId: string = ""): string {
+  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}|${user}|${slurmJobId}`;
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
@@ -85,29 +90,41 @@ function generateStubName(hostname: string, gpuName: string, slurmJobId?: string
   return slurmJobId ? `${base}-${slurmJobId}` : base;
 }
 
-// ─── Fail stub tasks → lost ───────────────────────────────────────────────────
+// ─── Mark running tasks as disconnected (flag only, no status change) ────────
 
-function markTasksLost(stub: Stub, webNs: Namespace): void {
+function markTasksDisconnected(stub: Stub, webNs: Namespace): void {
   const tasksSnapshot = [...stub.tasks];
   for (const task of tasksSnapshot) {
-    if (task.status === "lost") continue; // already lost — don't create duplicate
-    // Note: dispatched/queued tasks are re-queued by requeueStubTasks() before this runs
     if (["running", "paused"].includes(task.status)) {
+      const updated = markDisconnected(stub.id, task.id);
+      if (updated) {
+        webNs.emit("task.update", updated);
+        logger.info("task.disconnected", { task_seq: updated.seq, stub: stub.name });
+      }
+    }
+  }
+}
+
+// ─── Fail disconnected running tasks after heartbeat timeout ─────────────────
+
+function failDisconnectedTasks(stub: Stub, webNs: Namespace): void {
+  const tasksSnapshot = [...stub.tasks];
+  for (const task of tasksSnapshot) {
+    if (["running", "paused"].includes(task.status) && task.stub_offline) {
       if (task.should_stop) {
-        // Task was being killed — mark as killed instead of lost
-        const updated = killTask(stub.id, task.id, undefined);
+        // Task was being killed — mark as cancelled
+        const updated = cancelTask(stub.id, task.id, undefined);
         if (updated) {
           webNs.emit("task.update", updated);
-          logger.warn("task.killed_on_disconnect", { task_seq: updated.seq, stub: stub.name });
-          notifyKilled(updated).catch(() => {});
+          logger.warn("task.cancelled_on_disconnect", { task_seq: updated.seq, stub: stub.name });
+          notifyCancelled(updated).catch(() => {});
         }
       } else {
-        const updated = loseTask(stub.id, task.id);
+        const updated = failTask(stub.id, task.id, undefined, { death_cause: "disappeared" });
         if (updated) {
           webNs.emit("task.update", updated);
-          logger.warn("task.lost", { task_seq: updated.seq, stub: stub.name, reason: "stub offline" });
-          notifyLost(updated).catch(() => {});
-          // Auto-retry for lost tasks
+          logger.warn("task.failed_on_disconnect", { task_seq: updated.seq, stub: stub.name, reason: "heartbeat_timeout" });
+          notifyFailed(updated).catch(() => {});
           handleAutoRetry(updated, webNs);
         }
       }
@@ -118,14 +135,13 @@ function markTasksLost(stub: Stub, webNs: Namespace): void {
 function handleAutoRetry(task: Task, webNs: Namespace): void {
   if (task.max_retries > 0 && task.retry_count < task.max_retries) {
     // Dedup: check if a retry already exists for this task (or its retry chain root)
-    // Include "lost" to prevent duplicate retries when disconnect→lost→retry→disconnect repeats
     const retryRoot = task.retry_of || task.id;
     const allTasks = store.getAllTasks();
     const existingRetry = allTasks.find(
       (t) =>
         (t.retry_of === retryRoot || t.retry_of === task.id) &&
         t.id !== task.id &&
-        ["pending", "queued", "dispatched", "running", "lost"].includes(t.status),
+        ["pending", "assigned", "running"].includes(t.status),
     );
     if (existingRetry) {
       logger.info("task.retry_dedup", { task_seq: task.seq, existing_retry: existingRetry.seq });
@@ -152,7 +168,7 @@ function checkGridCompletion(gridId: string, webNs: Namespace): void {
   if (updated.status === "completed" || updated.status === "partial" || updated.status === "failed") {
     const tasks = store.getGridTasks(gridId);
     const completed = tasks.filter((t) => t.status === "completed").length;
-    const failed = tasks.filter((t) => ["failed", "killed", "lost"].includes(t.status)).length;
+    const failed = tasks.filter((t) => ["failed", "cancelled"].includes(t.status)).length;
     const bestLoss = tasks
       .filter((t) => t.status === "completed" && t.progress?.loss !== undefined)
       .reduce((best: { loss: number; params?: Record<string, any> } | null, t) => {
@@ -200,7 +216,7 @@ export function initiateKillChain(
   const timer = setTimeout(() => {
     killTimers.delete(taskId);
     const task = store.getTask(stubId, taskId);
-    if (!task || ["completed", "failed", "killed", "lost"].includes(task.status)) return;
+    if (!task || ["completed", "failed", "cancelled"].includes(task.status)) return;
     reliableEmitToStub(stubId, "task.kill", { task_id: taskId, grace_period_s: 5 });
   }, gracePeriodS * 2 * 1000);
 
@@ -228,12 +244,15 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       if (now - lastHb > HEARTBEAT_TIMEOUT_MS) {
         logger.warn("stub.offline", { stub: stub.name, reason: "heartbeat_timeout", elapsed_s: Math.floor((now - lastHb) / 1000) });
         stub.status = "offline";
-        // Re-queue dispatched/queued tasks back to global pending so they can be rescheduled
+        // Re-queue assigned tasks back to global pending so they can be rescheduled
         const requeued = store.requeueStubTasks(stub.id);
         for (const task of requeued) {
           webNs.emit("task.update", task);
         }
-        markTasksLost(stub, webNs);
+        // Heartbeat timeout = fail running tasks immediately (not just flag them)
+        failDisconnectedTasks(stub, webNs);
+        // Also fail any tasks that were flagged as disconnected but not yet timed out
+        // (this handles the case where heartbeat checker fires before the disconnect timer)
         store.setStub(stub);
         webNs.emit("stub.offline", { stub_id: stub.id });
       }
@@ -361,7 +380,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       const existing = store.getTask(stubId, payload.task_id);
       if (!existing) return;
       // Auto-promote dispatched → running
-      promoteIfDispatched(stubId, payload.task_id);
+      promoteIfAssigned(stubId, payload.task_id);
       const updated = store.updateTask(stubId, payload.task_id, {
         progress: { step: payload.step, total: payload.total, loss: payload.loss, metrics: payload.metrics },
       });
@@ -377,7 +396,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       const task = store.getTask(stubId, payload.task_id);
       if (!task) return;
       // Auto-promote dispatched → running
-      promoteIfDispatched(stubId, payload.task_id);
+      promoteIfAssigned(stubId, payload.task_id);
       const freshTask = store.getTask(stubId, payload.task_id);
       if (!freshTask) return;
       const buf = freshTask.log_buffer;
@@ -482,7 +501,7 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       // Only process disconnect if this socket is still the current one
       if (stub.socket_id !== socket.id) return;
 
-      logger.info("stub.offline", { stub: stub.name, stub_id: stubId, reason: "disconnect" });
+      logger.info("stub.disconnect", { stub: stub.name, stub_id: stubId, reason: "disconnect" });
       stub.status = "offline";
       stub.socket_id = undefined;
       // L1: Clear any pending killTimers for this stub's tasks
@@ -495,15 +514,28 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
         clearInterval(syncIv);
         stubSyncIntervals.delete(stubId);
       }
-      // Re-queue dispatched/queued tasks back to global pending so they can be rescheduled
+      // Re-queue assigned tasks back to global pending so they can be rescheduled
       const requeued = store.requeueStubTasks(stubId);
       for (const task of requeued) {
         webNs.emit("task.update", task);
       }
-      markTasksLost(stub, webNs);
+      // Flag running/paused tasks as disconnected (keeps status as "running")
+      markTasksDisconnected(stub, webNs);
       store.setStub(stub);
       webNs.emit("stub.offline", { stub_id: stubId });
       triggerSchedule();
+
+      // After heartbeat timeout, fail tasks that are still disconnected
+      // (stub didn't reconnect within HEARTBEAT_TIMEOUT_MS)
+      const failTimer = setTimeout(() => {
+        disconnectFailTimers.delete(stubId);
+        const currentStub = store.getStub(stubId);
+        if (!currentStub || currentStub.status === "online") return; // reconnected in time
+        logger.info("stub.heartbeat_timeout", { stub: currentStub.name, stub_id: stubId });
+        failDisconnectedTasks(currentStub, webNs);
+        store.setStub(currentStub);
+      }, DISCONNECT_FAIL_MS);
+      disconnectFailTimers.set(stubId, failTimer);
     });
   });
 }
@@ -532,7 +564,7 @@ function handleResume(
   // Compute stable stub ID.
   // If the stub sends a pre-computed stub_id (aligned formula), use it.
   // Otherwise fall back to server-side computation for backward compat.
-  const serverComputedId = computeStubId(hostname, gpu, cuda_visible_devices ?? "");
+  const serverComputedId = computeStubId(hostname, gpu, cuda_visible_devices ?? "", user ?? "", slurm_job_id ?? "");
   let stubId: string;
   if (payload.stub_id) {
     if (payload.stub_id !== serverComputedId) {
@@ -550,6 +582,14 @@ function handleResume(
     stubId = payload.stub_id;
   } else {
     stubId = serverComputedId;
+  }
+
+  // Cancel disconnect fail timer if stub is reconnecting within heartbeat timeout
+  const pendingFailTimer = disconnectFailTimers.get(stubId);
+  if (pendingFailTimer) {
+    clearTimeout(pendingFailTimer);
+    disconnectFailTimers.delete(stubId);
+    logger.info("stub.reconnected_before_timeout", { stub_id: stubId, hostname });
   }
 
   // Kick any existing connection for this stub.
@@ -584,13 +624,21 @@ function handleResume(
   // Determine stub type
   const stubType: "slurm" | "workstation" = slurm_job_id ? "slurm" : "workstation";
 
-  // Look up deploy config target for this stub by hostname
+  // Look up deploy config target for this stub by hostname (support FQDN matching)
+  const shortHostname = hostname.split(".")[0];
   const deployTarget = deployConfig?.stubs?.find(
-    (t) => t.host === hostname || t.name === hostname,
+    (t) => t.host === hostname || t.host === shortHostname || t.name === hostname || t.name === shortHostname,
   );
 
   let stub: Stub;
   const now = new Date().toISOString();
+
+  if (existingStub?.released) {
+    logger.info("stub.reject_released", { stub_id: stubId, hostname });
+    socket.emit("resume_response", { error: "Stub was explicitly released. Re-register to reconnect." });
+    socket.disconnect(true);
+    return;
+  }
 
   if (existingStub) {
     // Reconnect — update fields
@@ -657,32 +705,44 @@ function handleResume(
 
   const reportedRunning = new Map(running_tasks.map((r) => [r.task_id, r]));
   const reportedQueue = new Set(local_queue);
+  // Tasks in dead_tasks are handled separately — skip Case A for them
+  const deadTaskIds = new Set((payload.dead_tasks ?? []).map((d: any) => d.task_id));
 
   // Register socket for reliable emit
   registerStubSocket(stubId, socket);
 
-  // Case A: Server has task on this stub, stub didn't report → lost
+  // Case A: Server has task on this stub, stub didn't report → fail it
   const adoptTasks: string[] = [];
   const killTasks: string[] = [];
 
   const stubTasksSnapshot = [...stub.tasks];
   for (const task of stubTasksSnapshot) {
-    if (["running", "dispatched", "paused"].includes(task.status)) {
-      if (!reportedRunning.has(task.id)) {
-        // Case A: server thinks it's running, stub doesn't know about it
-        const updated = loseTask(stubId, task.id);
+    if (["running", "paused"].includes(task.status)) {
+      if (!reportedRunning.has(task.id) && !deadTaskIds.has(task.id)) {
+        // Case A: server thinks it's running, stub doesn't know about it → fail
+        const updated = failTask(stubId, task.id, undefined, { death_cause: "disappeared" });
         if (updated) {
           webNs.emit("task.update", updated);
-          notifyLost(updated).catch(() => {});
+          notifyFailed(updated).catch(() => {});
           handleAutoRetry(updated, webNs);
         }
+      } else {
+        // Stub reports it running — clear any disconnected flag
+        if (task.stub_offline) {
+          const cleared = clearDisconnected(stubId, task.id);
+          if (cleared) webNs.emit("task.update", cleared);
+        }
+        // Re-send kill if task was being killed when stub disconnected
+        if (task.should_stop && reportedRunning.has(task.id)) {
+          killTasks.push(task.id);
+        }
       }
-    } else if (task.status === "queued") {
-      // Case C: server has queued task, stub should have it — include in adopt
+    } else if (task.status === "assigned") {
+      // Case C: server has assigned task, stub should have it — include in adopt
       if (!reportedQueue.has(task.id)) {
         adoptTasks.push(task.id);
       }
-    } else if (task.status === "killed") {
+    } else if (task.status === "cancelled") {
       // If stub reports it as running, tell it to kill
       if (reportedRunning.has(task.id)) {
         killTasks.push(task.id);
@@ -691,22 +751,14 @@ function handleResume(
   }
 
   // Case B: Stub reports task, server doesn't know it → kill (orphan)
-  // Also: recover "lost" tasks that are actually still running on stub
   for (const [reportedId, reported] of reportedRunning) {
     const found = store.findTask(reportedId);
     if (!found) {
       killTasks.push(reportedId);
-    } else if (found.task.status === "killed") {
+    } else if (found.task.status === "cancelled") {
       killTasks.push(reportedId);
-    } else if (found.task.status === "lost") {
-      // Task was marked lost during disconnect but stub says it's still running — recover
-      const recovered = found.archived
-        ? store.unarchiveTask(stubId, reportedId, { status: "running" as const, pid: reported.pid, finished_at: undefined })
-        : recoverTask(stubId, reportedId, reported.pid);
-      if (recovered) {
-        logger.info("task.recovered", { task_seq: recovered.seq, stub: stub.name, from_archive: !!found.archived });
-        webNs.emit("task.update", recovered);
-      }
+    } else if (found.task.status === "running" && store.getTask(stubId, reportedId)) {
+      // Already running on this stub — no action needed (prevents duplicate on rapid reconnect)
     }
   }
 
@@ -722,7 +774,7 @@ function handleResume(
       if (!taskEntry) continue;
       const task = taskEntry.task;
       const taskStubId = taskEntry.stubId ?? stubId;
-      if (task && ["running", "dispatched", "paused", "lost"].includes(task.status)) {
+      if (task && ["running", "assigned", "paused"].includes(task.status)) {
         const newStatus = dead.exit_code === 0 ? "completed" : "failed";
         const updated = resolveDeadTask(taskStubId, dead.task_id, dead.exit_code);
         if (updated) {
@@ -754,9 +806,9 @@ function handleResume(
     return buildRunPayload(task, stub);
   }).filter(Boolean);
 
-  // Get queued tasks for the stub — use server-computed run_dir
+  // Get assigned tasks for the stub — use server-computed run_dir
   const queuePayloads = stub.tasks
-    .filter((t) => t.status === "queued")
+    .filter((t) => t.status === "assigned")
     .map((t) => buildRunPayload(t, stub));
 
   // Send resume_response via reliable emit (native ack)
@@ -795,11 +847,11 @@ function handleResume(
       for (const reported of response.running_tasks as Array<{ task_id: string; pid: number; alive: boolean }>) {
         if (!reported.alive) {
           const t = store.getTask(stubId, reported.task_id);
-          if (t && ["running", "dispatched"].includes(t.status)) {
-            const updated = loseTask(stubId, reported.task_id);
+          if (t && ["running", "assigned"].includes(t.status)) {
+            const updated = failTask(stubId, reported.task_id, undefined, { death_cause: "disappeared" });
             if (updated) {
               webNs.emit("task.update", updated);
-              logger.warn("task.lost_via_sync", { task_seq: updated.seq, stub: currentStub.name });
+              logger.warn("task.failed_via_sync", { task_seq: updated.seq, stub: currentStub.name });
               handleAutoRetry(updated, webNs);
             }
           }
@@ -808,11 +860,11 @@ function handleResume(
       // Check for tasks server has that stub didn't report at all
       const reportedIds = new Set(response.running_tasks.map((r: any) => r.task_id));
       for (const t of currentStub.tasks) {
-        if (["running", "dispatched"].includes(t.status) && !reportedIds.has(t.id)) {
-          const updated = loseTask(stubId, t.id);
+        if (["running", "assigned"].includes(t.status) && !reportedIds.has(t.id)) {
+          const updated = failTask(stubId, t.id, undefined, { death_cause: "disappeared" });
           if (updated) {
             webNs.emit("task.update", updated);
-            logger.warn("task.lost_via_sync", { task_seq: updated.seq, stub: currentStub.name, reason: "not_reported" });
+            logger.warn("task.failed_via_sync", { task_seq: updated.seq, stub: currentStub.name, reason: "not_reported" });
             handleAutoRetry(updated, webNs);
           }
         }
@@ -906,7 +958,7 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
       (t) =>
         (t.retry_of === retryRoot || t.retry_of === task.id) &&
         t.id !== task.id &&
-        ["pending", "queued", "dispatched", "running", "lost"].includes(t.status),
+        ["pending", "assigned", "running"].includes(t.status),
     );
     if (!existingRetry) {
       const retryTask = createRetryTask(task);
@@ -940,14 +992,14 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
     task.retry_count < task.max_retries &&
     (hasCheckpoint || deathCause === "walltime" || deathCause === "preempt")
   ) {
-    // Dedup: check if a retry already exists (include "lost" to prevent duplicates)
+    // Dedup: check if a retry already exists
     const retryRoot = task.retry_of || task.id;
     const allTasks = store.getAllTasks();
     const existingRetry = allTasks.find(
       (t) =>
         (t.retry_of === retryRoot || t.retry_of === task.id) &&
         t.id !== task.id &&
-        ["pending", "queued", "dispatched", "running", "lost"].includes(t.status),
+        ["pending", "assigned", "running"].includes(t.status),
     );
     if (existingRetry) {
       logger.info("task.auto_resume_dedup", { task_seq: task.seq, existing_retry: existingRetry.seq, death_cause: deathCause });
@@ -992,7 +1044,7 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
 
   let updated: Task | undefined;
   if (isKilled) {
-    updated = killTask(stubId, payload.task_id, payload.exit_code);
+    updated = cancelTask(stubId, payload.task_id, payload.exit_code);
   } else {
     const extra: Partial<Task> = {
       death_cause: deathCause,
@@ -1004,7 +1056,7 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
   if (!updated) return;
 
   if (isKilled) {
-    logger.warn("task.killed", { task_seq: updated.seq, stub: stubId, exit_code: payload.exit_code });
+    logger.warn("task.cancelled", { task_seq: updated.seq, stub: stubId, exit_code: payload.exit_code });
   } else {
     logger.warn("task.failed", {
       task_seq: updated.seq,
@@ -1018,7 +1070,7 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
   webNs.emit("task.update", updated);
 
   if (isKilled) {
-    notifyKilled(updated).catch(() => {});
+    notifyCancelled(updated).catch(() => {});
   } else {
     notifyFailed(updated, payload.exit_code).catch(() => {});
   }

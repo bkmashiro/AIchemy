@@ -43,7 +43,11 @@ vi.mock("../scheduler", () => ({
 }));
 
 vi.mock("../api/tasks", () => ({
-  assembleCommand: (t: any) => `cmd:${t.script} ${JSON.stringify(t.args || {})}`,
+  assembleCommand: (t: any) => {
+    const args = t.args;
+    if (typeof args === "string") return `cmd:${t.script} ${args}`;
+    return `cmd:${t.script} ${JSON.stringify(args || {})}`;
+  },
   generateDisplayName: (t: any) => t.name || t.script || "task",
 }));
 
@@ -238,6 +242,35 @@ describe("promoteBlockedTasks", () => {
     const ns = fakeNs();
     promoteBlockedTasks("up", ns);
     expect(ns.emit).not.toHaveBeenCalled();
+  });
+
+  it("preserves string args when promoting blocked task", () => {
+    const upstream = addTask({ id: "ppo-1", status: "completed" });
+    const blocked = addTask({
+      id: "eval-1", status: "blocked", depends_on: ["ppo-1"],
+      script: "eval.py",
+      args: "--checkpoint /runs/ckpt.pt --seed 42",
+    });
+
+    const ns = fakeNs();
+    promoteBlockedTasks("ppo-1", ns);
+
+    expect(blocked.status).toBe("pending");
+    // The string args must survive promotion — this was the DAG args-drop bug
+    expect(blocked.args).toBe("--checkpoint /runs/ckpt.pt --seed 42");
+  });
+
+  it("preserves Record args when promoting blocked task", () => {
+    addTask({ id: "train-1", status: "completed" });
+    const blocked = addTask({
+      id: "eval-2", status: "blocked", depends_on: ["train-1"],
+      script: "eval.py",
+      args: { "--seed": "42", "--lr": "0.001" },
+    });
+
+    promoteBlockedTasks("train-1", fakeNs());
+    expect(blocked.status).toBe("pending");
+    expect(blocked.args).toEqual({ "--seed": "42", "--lr": "0.001" });
   });
 });
 

@@ -21,9 +21,15 @@ import time
 from collections import deque
 from typing import Any, Callable, Awaitable
 
+from pathlib import Path
+
 from .config import _parse_env_value
 from .error_classifier import classify_death, has_checkpoint
 from .task_socket import task_socket_path
+
+# Auto-discover SDK directory (sibling of stub package root)
+_STUB_ROOT = Path(__file__).resolve().parent.parent   # .../stub/
+_SDK_DIR = _STUB_ROOT.parent / "sdk"                  # .../sdk/
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .warm_pool import WarmPool
@@ -333,6 +339,14 @@ class ProcessManager:
                 task_start_time = time.time()
                 combined_env = dict(env or {})
                 combined_env.update(env_overrides or {})
+                # Force unbuffered Python output for log streaming
+                combined_env["PYTHONUNBUFFERED"] = "1"
+                # Auto-inject SDK into PYTHONPATH for warm pool tasks too
+                if _SDK_DIR.is_dir():
+                    sdk_str = str(_SDK_DIR)
+                    existing = combined_env.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+                    if sdk_str not in existing.split(os.pathsep):
+                        combined_env["PYTHONPATH"] = f"{sdk_str}{os.pathsep}{existing}" if existing else sdk_str
                 stub_socket = task_socket_path(task_id)
 
                 pid = await self.warm_pool.submit(
@@ -374,6 +388,8 @@ class ProcessManager:
         # Build ALCHEMY_* vars
         alchemy_vars: dict[str, str] = {"ALCHEMY_TASK_ID": task_id}
         alchemy_vars["ALCHEMY_STUB_SOCKET"] = task_socket_path(task_id)
+        # Force unbuffered Python output so logs appear in the frontend without delay
+        alchemy_vars["PYTHONUNBUFFERED"] = "1"
         if params:
             alchemy_vars["ALCHEMY_PARAMS"] = json.dumps(params)
         if run_dir:
@@ -385,12 +401,21 @@ class ProcessManager:
         # Combine task env and env_overrides into one layer (overrides win)
         combined_task_env = dict(env or {})
         combined_task_env.update(env_overrides or {})
+
+        # Auto-inject SDK into PYTHONPATH so tasks can `from alchemy_sdk import Alchemy`
+        if _SDK_DIR.is_dir():
+            sdk_str = str(_SDK_DIR)
+            existing = combined_task_env.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+            if sdk_str not in existing.split(os.pathsep):
+                combined_task_env["PYTHONPATH"] = f"{sdk_str}{os.pathsep}{existing}" if existing else sdk_str
+
         proc_env = merge_env(
             base=dict(os.environ),
             default_env=self.default_env,
             task_overrides=combined_task_env,
             alchemy_vars=alchemy_vars,
         )
+        proc_env.setdefault("PYTHONUNBUFFERED", "1")
 
         # preexec_fn: set umask in child before exec so output files are
         # world-readable (rw-r--r-- with umask=022), preventing EPERM when a

@@ -30,16 +30,13 @@ export interface SystemStats {
 
 export type TaskStatus =
   | "pending"      // In global queue, unassigned
-  | "queued"       // In stub local queue, waiting
-  | "dispatched"   // Sent to stub, awaiting task.started
+  | "assigned"     // Owned by stub (queued locally or dispatched), awaiting task.started
   | "running"      // Executing
   | "paused"       // SIGSTOP
   | "completed"    // Exit 0
   | "failed"       // Non-zero exit
-  | "killed"       // User cancelled
-  | "lost"         // Stub disconnected, fate unknown
-  | "blocked"      // Waiting for dependency tasks to complete
-  | "cancelled";   // Cancelled because a dependency failed
+  | "cancelled"    // User cancelled or dependency failed
+  | "blocked";     // Waiting for dependency tasks to complete
 
 export interface Task {
   // === Identity ===
@@ -51,7 +48,7 @@ export interface Task {
 
   // === Structured Command ===
   script: string;
-  args?: Record<string, string>;
+  args?: Record<string, string> | string;
   raw_args?: string;
 
   // === Environment ===
@@ -139,6 +136,10 @@ export interface Task {
   // === Server Signals ===
   should_stop: boolean;
   should_checkpoint: boolean;
+
+  // === Disconnect tracking (not a status change) ===
+  disconnected_at?: string;   // ISO timestamp: when stub went offline (task stays "running")
+  stub_offline?: boolean;     // true while stub is disconnected
 }
 
 export interface Stub {
@@ -180,6 +181,7 @@ export interface Stub {
 
   // Internal — not serialized to API
   socket_id?: string;
+  released?: boolean;              // Set when user explicitly releases stub; blocks auto-reconnect
 }
 
 export interface DeployConfig {
@@ -220,7 +222,7 @@ export interface TaskSpec {
   ref: string;
   script: string;
   raw_args?: string;
-  args?: Record<string, string>;
+  args?: Record<string, string> | string;
   args_template?: Record<string, string>;
   depends_on?: string[];  // ref names within experiment
   cwd?: string;

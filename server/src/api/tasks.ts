@@ -20,7 +20,7 @@ import {
 import { triggerSchedule, maybeDispatch } from "../scheduler";
 import { notifySubmitted } from "../discord";
 import { initiateKillChain } from "../socket/stub";
-import { killTask, killGlobalTask, pauseTask, resumeTask, createRetryTask } from "../task-actions";
+import { cancelTask, cancelGlobalTask, pauseTask, resumeTask, createRetryTask } from "../task-actions";
 import { reliableEmitToStub } from "../reliable";
 import { logger } from "../log";
 
@@ -30,15 +30,20 @@ export function generateDisplayName(task: Partial<Task>): string {
   if (task.name) return task.name;
   if (task.script) {
     const base = path.basename(task.script);
-    if (task.args && Object.keys(task.args).length > 0) {
-      const argsSummary = Object.entries(task.args)
-        .map(([k, v]) => {
-          // Remove leading dashes from key
-          const shortKey = k.replace(/^-+/, "");
-          return `${shortKey}=${v}`;
-        })
-        .join(" ");
-      return `${base} ${argsSummary}`;
+    if (task.args) {
+      if (typeof task.args === "string") {
+        const trimmed = task.args.trim();
+        if (trimmed) return `${base} ${trimmed}`;
+      } else if (Object.keys(task.args).length > 0) {
+        const argsSummary = Object.entries(task.args)
+          .map(([k, v]) => {
+            // Remove leading dashes from key
+            const shortKey = k.replace(/^-+/, "");
+            return `${shortKey}=${v}`;
+          })
+          .join(" ");
+        return `${base} ${argsSummary}`;
+      }
     }
     return base;
   }
@@ -81,11 +86,20 @@ export function assembleCommand(task: Partial<Task>): string {
   } else {
     parts.push(script);
   }
-  if (args && Object.keys(args).length > 0) {
-    const argsStr = Object.entries(args)
-      .map(([k, v]) => `${k} ${v}`)
-      .join(" ");
-    parts.push(argsStr);
+  if (args) {
+    if (typeof args === "string") {
+      const trimmed = args.trim();
+      if (trimmed) parts.push(trimmed);
+    } else if (Array.isArray(args)) {
+      // Array of positional args — join with spaces, quote if needed
+      const argsStr = args.map((v: string) => String(v)).join(" ");
+      if (argsStr) parts.push(argsStr);
+    } else if (Object.keys(args).length > 0) {
+      const argsStr = Object.entries(args)
+        .map(([k, v]) => `${k} ${v}`)
+        .join(" ");
+      parts.push(argsStr);
+    }
   }
   if (rawArgs) {
     parts.push(rawArgs);
@@ -97,7 +111,7 @@ export function assembleCommand(task: Partial<Task>): string {
 
 export interface TaskInput {
   script: string;
-  args?: Record<string, string>;
+  args?: Record<string, string> | string;
   raw_args?: string;
   name?: string;
   cwd?: string;
@@ -194,22 +208,38 @@ export function createTask(input: TaskInput): Task {
 
 // ─── Terminal statuses ────────────────────────────────────────────────────────
 
-const TERMINAL_STATUSES = ["completed", "failed", "killed", "lost", "cancelled"];
+const TERMINAL_STATUSES = ["completed", "failed", "cancelled"];
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): Router {
   const router = Router();
 
-  // GET /tasks — paginated: ?page=1&limit=50&status=running&status_group=active|terminal
+  // GET /tasks — paginated:
+  //   ?page=1&limit=50          (page-based, legacy)
+  //   ?offset=0&limit=100       (offset-based, preferred)
+  //   &status=running           (single status filter)
+  //   &status_group=active|terminal
+  //   &sort=seq|created_at      (default: seq)
+  //   &order=asc|desc           (default: desc)
   router.get("/", (req: Request, res: Response) => {
-    const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
-    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50));
+    const limit = Math.min(500, Math.max(1, parseInt(String(req.query.limit || "100"), 10) || 100));
     const statusFilter = req.query.status ? String(req.query.status) : undefined;
     const statusGroup = req.query.status_group ? String(req.query.status_group) : undefined;
     const includeLogs = req.query.logs === "true";
+    const sortField = req.query.sort === "created_at" ? "created_at" : "seq";
+    const sortOrder = req.query.order === "asc" ? "asc" : "desc";
 
-    const ACTIVE_STATUSES = ["running", "dispatched", "queued", "pending", "paused"];
+    // Offset-based pagination (takes precedence over page-based)
+    let offset: number;
+    if (req.query.offset !== undefined) {
+      offset = Math.max(0, parseInt(String(req.query.offset), 10) || 0);
+    } else {
+      const page = Math.max(1, parseInt(String(req.query.page || "1"), 10) || 1);
+      offset = (page - 1) * limit;
+    }
+
+    const ACTIVE_STATUSES = ["running", "assigned", "pending", "paused", "blocked"];
 
     let tasks = store.getAllTasks();
 
@@ -227,12 +257,19 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       tasks = tasks.filter((t) => TERMINAL_STATUSES.includes(t.status));
     }
 
-    // Sort: newest first by seq
-    tasks = tasks.sort((a, b) => (b.seq ?? 0) - (a.seq ?? 0));
+    // Sort by requested field and order
+    tasks = tasks.sort((a, b) => {
+      let cmp: number;
+      if (sortField === "created_at") {
+        cmp = (a.created_at || "").localeCompare(b.created_at || "");
+      } else {
+        cmp = (a.seq ?? 0) - (b.seq ?? 0);
+      }
+      return sortOrder === "asc" ? cmp : -cmp;
+    });
 
     const total = tasks.length;
-    const start = (page - 1) * limit;
-    const paginated = tasks.slice(start, start + limit);
+    const paginated = tasks.slice(offset, offset + limit);
 
     const enriched = paginated.map((t) => {
       const stub = t.stub_id ? store.getStub(t.stub_id) : undefined;
@@ -244,7 +281,9 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       return stub_name ? { ...rest, stub_name } : rest;
     });
 
-    res.json({ tasks: enriched, total, page, limit, counts });
+    // Compute current page for backward compat
+    const page = Math.floor(offset / limit) + 1;
+    res.json({ tasks: enriched, total, page, limit, offset, counts });
   });
 
   // POST /tasks/batch — must be before /:id routes
@@ -264,16 +303,16 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
       switch (action) {
         case "kill": {
-          if (!["running", "paused", "queued", "dispatched", "pending", "blocked"].includes(task.status)) {
+          if (!["running", "paused", "assigned", "pending", "blocked"].includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot kill in status '${task.status}'` }); break;
           }
-          if (stubId && (task.status === "running" || task.status === "dispatched")) {
+          if (stubId && (task.status === "running" || task.status === "assigned")) {
             initiateKillChain(stubId, taskId);
           } else if (stubId) {
-            const updated = killTask(stubId, taskId);
+            const updated = cancelTask(stubId, taskId);
             if (updated) webNs.emit("task.update", updated);
           } else {
-            killGlobalTask(taskId);
+            cancelGlobalTask(taskId);
             const updated = store.findTask(taskId)?.task;
             if (updated) webNs.emit("task.update", updated);
           }
@@ -290,7 +329,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           results.push({ id: taskId, ok: true, new_task_id: retryTask.id }); break;
         }
         case "requeue": {
-          const requeueable = [...TERMINAL_STATUSES, "queued", "pending"];
+          const requeueable = [...TERMINAL_STATUSES, "assigned", "pending"];
           if (!requeueable.includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot requeue in status '${task.status}'` }); break;
           }
@@ -320,7 +359,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           results.push({ id: taskId, ok: true }); break;
         }
         case "cancel": {
-          if (!["pending", "blocked", "queued"].includes(task.status)) {
+          if (!["pending", "blocked", "assigned"].includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot cancel in status '${task.status}'` }); break;
           }
           const now = new Date().toISOString();
@@ -364,13 +403,17 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const {
       script, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
-      idempotency_key, param_overrides, target_tags, python_env,
+      idempotency_key, param_overrides, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs,
       auto_retry_on, stub_id,
       target_stub_id: _target_stub_id,
+      target_tags: _target_tags,
+      tags: _tags,
     } = req.body;
     // target_stub_id pins the task to a specific stub; stub_id is accepted as an alias
     const target_stub_id: string | undefined = _target_stub_id ?? stub_id;
+    // target_tags filters stubs by tag; tags is accepted as an alias
+    const target_tags: string[] | undefined = _target_tags ?? _tags;
 
     if (!script) {
       res.status(400).json({ error: "script required" }); return;
@@ -492,7 +535,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
         }
         const t = found.task;
         // Terminal or running = we have a result
-        if (["running", "completed", "failed", "killed", "lost"].includes(t.status)) {
+        if (["running", "completed", "failed", "cancelled"].includes(t.status)) {
           res.status(t.status === "failed" ? 422 : 201).json({
             ...t,
             _wait: t.status === "failed" ? "preflight_or_start_failed" : "started",
@@ -545,7 +588,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
     if (should_stop !== undefined) {
       update.should_stop = should_stop;
-      if (should_stop && stubId && (task.status === "running" || task.status === "dispatched")) {
+      if (should_stop && stubId && (task.status === "running" || task.status === "assigned")) {
         // Initiate kill chain
         initiateKillChain(stubId, task.id);
       }
@@ -558,8 +601,8 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
     if (status !== undefined) {
       // Status override — limited transitions
-      if (status === "cancelled" && ["pending", "blocked", "queued"].includes(task.status)) {
-        // pending/blocked/queued → cancelled (no stub interaction needed)
+      if (status === "cancelled" && ["pending", "blocked", "assigned"].includes(task.status)) {
+        // pending/blocked/assigned → cancelled (no stub interaction needed)
         const now = new Date().toISOString();
         let cancelled: Task | undefined;
         if (stubId) {
@@ -570,22 +613,22 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
         if (cancelled) webNs.emit("task.update", cancelled);
         res.json(cancelled || task);
         return;
-      } else if (status === "killed" && ["running", "dispatched", "queued", "pending", "paused", "blocked"].includes(task.status)) {
-        if (stubId && (task.status === "running" || task.status === "dispatched")) {
+      } else if ((status === "killed" || status === "cancelled") && ["running", "assigned", "pending", "paused", "blocked"].includes(task.status)) {
+        if (stubId && (task.status === "running" || task.status === "assigned")) {
           initiateKillChain(stubId, task.id);
           // Return the updated task with should_stop=true (set by initiateKillChain)
           const updated = store.getTask(stubId, task.id);
           return res.json(updated || task);
         } else if (stubId) {
-          const killed = killTask(stubId, task.id);
-          if (killed) webNs.emit("task.update", killed);
-          res.json(killed || task);
+          const cancelled = cancelTask(stubId, task.id);
+          if (cancelled) webNs.emit("task.update", cancelled);
+          res.json(cancelled || task);
           return;
         } else {
-          killGlobalTask(task.id);
-          const killed = store.findTask(task.id)?.task;
-          if (killed) webNs.emit("task.update", killed);
-          res.json(killed || task);
+          cancelGlobalTask(task.id);
+          const cancelled = store.findTask(task.id)?.task;
+          if (cancelled) webNs.emit("task.update", cancelled);
+          res.json(cancelled || task);
           return;
         }
       } else if (status === "paused" && stubId) {
@@ -623,22 +666,22 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const { task, stubId } = found;
 
     // Only active tasks can be rescheduled
-    if (["completed", "failed", "killed", "lost", "cancelled"].includes(task.status)) {
+    if (["completed", "failed", "cancelled"].includes(task.status)) {
       res.status(400).json({ error: `Cannot reschedule in terminal status '${task.status}'` }); return;
     }
 
     const { target_tags, priority } = req.body;
 
-    // Kill the current execution if running/dispatched
-    if (stubId && (task.status === "running" || task.status === "dispatched")) {
+    // Cancel the current execution if running/assigned
+    if (stubId && (task.status === "running" || task.status === "assigned")) {
       initiateKillChain(stubId, task.id);
     } else if (stubId) {
-      const killed = killTask(stubId, task.id);
-      if (killed) webNs.emit("task.update", killed);
+      const cancelled = cancelTask(stubId, task.id);
+      if (cancelled) webNs.emit("task.update", cancelled);
     } else {
-      killGlobalTask(task.id);
-      const killed = store.findTask(task.id)?.task;
-      if (killed) webNs.emit("task.update", killed);
+      cancelGlobalTask(task.id);
+      const cancelled = store.findTask(task.id)?.task;
+      if (cancelled) webNs.emit("task.update", cancelled);
     }
 
     // Create a new task preserving original config, with optional overrides
@@ -691,7 +734,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
         (t) =>
           t.id !== task.id &&
           (t.retry_of === retryRoot || t.retry_of === task.id || t.id === retryRoot) &&
-          ["pending", "queued", "dispatched", "running"].includes(t.status),
+          ["pending", "assigned", "running"].includes(t.status),
       );
       if (existingActive) {
         res.status(409).json({

@@ -39,8 +39,8 @@ vi.mock("../task-actions", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../task-actions")>();
   return {
     ...actual,
-    killTask: vi.fn(),
-    killGlobalTask: vi.fn(),
+    cancelTask: vi.fn(),
+    cancelGlobalTask: vi.fn(),
     pauseTask: vi.fn(),
     resumeTask: vi.fn(),
   };
@@ -56,7 +56,7 @@ import { store } from "../store";
 import { assembleCommand, generateDisplayName, createTask, createGlobalTasksRouter } from "../api/tasks";
 import { writeLockTable, idempotencyCache } from "../dedup";
 import { initiateKillChain } from "../socket/stub";
-import { killTask, killGlobalTask, pauseTask, resumeTask } from "../task-actions";
+import { cancelTask, cancelGlobalTask, pauseTask, resumeTask } from "../task-actions";
 import { Task, Stub } from "../types";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -125,17 +125,18 @@ afterEach(() => {
 
 describe("assembleCommand", () => {
   it("returns bare script when no options provided", () => {
-    expect(assembleCommand({ script: "train.py" })).toBe("train.py");
+    // .py scripts get python prepended automatically
+    expect(assembleCommand({ script: "train.py" })).toBe("python train.py");
   });
 
   it("prepends env_setup with &&", () => {
     const cmd = assembleCommand({ script: "train.py", env_setup: "source activate ml" });
-    expect(cmd).toBe("source activate ml && train.py");
+    expect(cmd).toBe("source activate ml && python train.py");
   });
 
   it("prepends cd with single-quote-escaped cwd", () => {
     const cmd = assembleCommand({ script: "train.py", cwd: "/home/user/work" });
-    expect(cmd).toBe("cd '/home/user/work' && train.py");
+    expect(cmd).toBe("cd '/home/user/work' && python train.py");
   });
 
   it("escapes single quotes in cwd", () => {
@@ -145,7 +146,7 @@ describe("assembleCommand", () => {
 
   it("prepends exported env vars in single quotes", () => {
     const cmd = assembleCommand({ script: "train.py", env: { FOO: "bar" } });
-    expect(cmd).toBe("export FOO='bar' && train.py");
+    expect(cmd).toBe("export FOO='bar' && python train.py");
   });
 
   it("escapes single quotes in env values", () => {
@@ -167,7 +168,7 @@ describe("assembleCommand", () => {
 
   it("appends raw_args verbatim", () => {
     const cmd = assembleCommand({ script: "train.py", raw_args: "--extra foo" });
-    expect(cmd).toBe("train.py --extra foo");
+    expect(cmd).toBe("python train.py --extra foo");
   });
 
   it("combines all parts in correct order", () => {
@@ -214,6 +215,27 @@ describe("assembleCommand", () => {
     const cmd = assembleCommand({ script: "train.py", raw_args: "; rm -rf /" });
     expect(cmd).toContain("; rm -rf /");
   });
+
+  it("handles string args (Sub-JEPA style)", () => {
+    const cmd = assembleCommand({ script: "eval.py", args: "--checkpoint /runs/ckpt.pt --seed 42" });
+    expect(cmd).toBe("python eval.py --checkpoint /runs/ckpt.pt --seed 42");
+  });
+
+  it("handles string args with cwd", () => {
+    const cmd = assembleCommand({ script: "eval.py", args: "--seed 42", cwd: "/workspace" });
+    expect(cmd).toBe("cd '/workspace' && python eval.py --seed 42");
+  });
+
+  it("handles empty string args gracefully", () => {
+    const cmd = assembleCommand({ script: "train.py", args: "  " });
+    expect(cmd).toBe("python train.py");
+  });
+
+  it("handles array args", () => {
+    const cmd = assembleCommand({ script: "run.sh", args: ["--seed", "42"] as any });
+    expect(cmd).toContain("--seed");
+    expect(cmd).toContain("42");
+  });
 });
 
 // ─── generateDisplayName ──────────────────────────────────────────────────────
@@ -240,6 +262,15 @@ describe("generateDisplayName", () => {
   it("returns command basename when only command present", () => {
     const name = generateDisplayName({ command: "python /workspace/run.py" });
     expect(name).toBe("run.py");
+  });
+
+  it("returns script basename + string args when args is a string", () => {
+    const name = generateDisplayName({
+      script: "eval.py",
+      args: "--checkpoint /runs/ckpt.pt --seed 42",
+    });
+    expect(name).toContain("eval.py");
+    expect(name).toContain("--checkpoint");
   });
 
   it("returns 'task' as final fallback", () => {
@@ -312,22 +343,22 @@ describe("POST /tasks", () => {
     const app = makeApp();
     const res = await request(app)
       .post("/tasks")
-      .send({ script: "train.py", args: { "--seed": "1" } });
+      .send({ script: "/tmp/train.py", args: { "--seed": "1" } });
     expect(res.status).toBe(201);
     expect(res.body.id).toBeDefined();
     expect(res.body.status).toBe("pending");
-    expect(res.body.script).toBe("train.py");
+    expect(res.body.script).toBe("/tmp/train.py");
   });
 
   it("adds task to global queue", async () => {
     const app = makeApp();
-    await request(app).post("/tasks").send({ script: "train.py" });
+    await request(app).post("/tasks").send({ script: "/tmp/train.py" });
     expect(store.getGlobalQueue()).toHaveLength(1);
   });
 
   it("rejects duplicate fingerprint with 409", async () => {
     const app = makeApp();
-    const body = { script: "train.py", args: { "--seed": "42" } };
+    const body = { script: "/tmp/train.py", args: { "--seed": "42" } };
     await request(app).post("/tasks").send(body);
     const res = await request(app).post("/tasks").send(body);
     expect(res.status).toBe(409);
@@ -337,7 +368,7 @@ describe("POST /tasks", () => {
 
   it("allows duplicate fingerprint after task completes", async () => {
     const app = makeApp();
-    const body = { script: "train.py", args: { "--seed": "99" } };
+    const body = { script: "/tmp/train.py", args: { "--seed": "99" } };
     const first = await request(app).post("/tasks").send(body);
     expect(first.status).toBe(201);
 
@@ -362,26 +393,26 @@ describe("POST /tasks", () => {
     // First task acquires the lock
     await request(app)
       .post("/tasks")
-      .send({ script: "train.py", args: { "--seed": "1" }, run_dir: "/runs/exp1" });
+      .send({ script: "/tmp/train.py", args: { "--seed": "1" }, run_dir: "/runs/exp1" });
 
     // Second task with same run_dir and different fingerprint
     const res = await request(app)
       .post("/tasks")
-      .send({ script: "other.py", run_dir: "/runs/exp1" });
+      .send({ script: "/tmp/other.py", run_dir: "/runs/exp1" });
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/locked/i);
   });
 
   it("idempotency key returns same task on repeat", async () => {
     const app = makeApp();
-    const body = { script: "train.py", idempotency_key: "idem-test-1" };
+    const body = { script: "/tmp/train.py", idempotency_key: "idem-test-1" };
     const first = await request(app).post("/tasks").send(body);
     expect(first.status).toBe(201);
 
     // Different fingerprint would normally be fine but idempotency short-circuits
     const second = await request(app)
       .post("/tasks")
-      .send({ script: "other.py", idempotency_key: "idem-test-1" });
+      .send({ script: "/tmp/other.py", idempotency_key: "idem-test-1" });
     expect(second.status).toBe(200);
     expect(second.body.id).toBe(first.body.id);
   });
@@ -389,15 +420,15 @@ describe("POST /tasks", () => {
   it("emits task.update via webNs", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
-    await request(app).post("/tasks").send({ script: "train.py" });
-    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ script: "train.py" }));
+    await request(app).post("/tasks").send({ script: "/tmp/train.py" });
+    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ script: "/tmp/train.py" }));
   });
 
   it("passes priority from request body", async () => {
     const app = makeApp();
     const res = await request(app)
       .post("/tasks")
-      .send({ script: "train.py", priority: 9 });
+      .send({ script: "/tmp/train.py", priority: 9 });
     expect(res.status).toBe(201);
     expect(res.body.priority).toBe(9);
   });
@@ -435,7 +466,7 @@ describe("GET /tasks", () => {
     const res = await request(app).get("/tasks");
     expect(res.body.total).toBe(5);
     expect(res.body.page).toBe(1);
-    expect(res.body.limit).toBe(50);
+    expect(res.body.limit).toBe(100);
     expect(res.body.tasks).toHaveLength(5);
   });
 
@@ -546,7 +577,7 @@ describe("POST /tasks/batch", () => {
       .send({ action: "kill", task_ids: [task.id] });
     expect(res.status).toBe(200);
     expect(res.body.results[0].ok).toBe(true);
-    expect(killGlobalTask).toHaveBeenCalledWith(task.id);
+    expect(cancelGlobalTask).toHaveBeenCalledWith(task.id);
   });
 
   it("batch kill: calls initiateKillChain for running task on stub", async () => {
@@ -818,14 +849,14 @@ describe("PATCH /tasks/:id", () => {
     expect(res.body.error).toMatch(/unsupported status transition/i);
   });
 
-  it("kill via PATCH calls killGlobalTask for pending task with no stub", async () => {
+  it("kill via PATCH calls cancelGlobalTask for pending task with no stub", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
     const task = makeTask({ status: "pending" });
     store.addToGlobalQueue(task);
 
     await request(app).patch(`/tasks/${task.id}`).send({ status: "killed" });
-    expect(killGlobalTask).toHaveBeenCalledWith(task.id);
+    expect(cancelGlobalTask).toHaveBeenCalledWith(task.id);
   });
 
   it("P1-2: kill via PATCH for running stub task returns updated task with should_stop=true", async () => {
@@ -853,10 +884,10 @@ describe("PATCH /tasks/:id", () => {
     expect(res.body.should_stop).toBe(true);
   });
 
-  it("P1-2: kill via PATCH for dispatched stub task returns updated task", async () => {
+  it("P1-2: kill via PATCH for assigned stub task returns updated task", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
-    const task = makeTask({ status: "dispatched" });
+    const task = makeTask({ status: "assigned" });
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
 
@@ -911,7 +942,7 @@ describe("PATCH /tasks/:id", () => {
 describe("P0-2: findActiveByFingerprint skips should_stop=true tasks", () => {
   it("allows resubmit after kill (should_stop=true) bypasses fingerprint dedup", async () => {
     const app = makeApp();
-    const body = { script: "train.py", args: { "--seed": "42" } };
+    const body = { script: "/tmp/train.py", args: { "--seed": "42" } };
 
     // Submit first task
     const first = await request(app).post("/tasks").send(body);
@@ -929,7 +960,7 @@ describe("P0-2: findActiveByFingerprint skips should_stop=true tasks", () => {
 
   it("still rejects duplicate when should_stop=false", async () => {
     const app = makeApp();
-    const body = { script: "train.py", args: { "--seed": "99" } };
+    const body = { script: "/tmp/train.py", args: { "--seed": "99" } };
 
     await request(app).post("/tasks").send(body);
     const second = await request(app).post("/tasks").send(body);
@@ -1061,34 +1092,58 @@ describe("Fuzzing: POST /tasks", () => {
 
   it("handles numeric priority edge values", async () => {
     const app = makeApp();
-    const res = await request(app).post("/tasks").send({ script: "train.py", priority: -999 });
+    const res = await request(app).post("/tasks").send({ script: "/tmp/train.py", priority: -999 });
     expect(res.status).toBe(201);
     expect(res.body.priority).toBe(-999);
   });
 
   it("handles very large priority", async () => {
     const app = makeApp();
-    const res = await request(app).post("/tasks").send({ script: "train.py", priority: Number.MAX_SAFE_INTEGER });
+    const res = await request(app).post("/tasks").send({ script: "/tmp/train.py", priority: Number.MAX_SAFE_INTEGER });
     expect(res.status).toBe(201);
   });
 
   it("handles args with empty object", async () => {
     const app = makeApp();
-    const res = await request(app).post("/tasks").send({ script: "train.py", args: {} });
+    const res = await request(app).post("/tasks").send({ script: "/tmp/train.py", args: {} });
     expect(res.status).toBe(201);
   });
 
   it("handles target_tags as empty array", async () => {
     const app = makeApp();
-    const res = await request(app).post("/tasks").send({ script: "train.py", target_tags: [] });
+    const res = await request(app).post("/tasks").send({ script: "/tmp/train.py", target_tags: [] });
     expect(res.status).toBe(201);
     expect(res.body.target_tags).toEqual([]);
+  });
+
+  it("accepts 'tags' as alias for 'target_tags'", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/tasks").send({ script: "/tmp/train.py", tags: ["a30", "jema-v2"] });
+    expect(res.status).toBe(201);
+    expect(res.body.target_tags).toEqual(["a30", "jema-v2"]);
+  });
+
+  it("prefers 'target_tags' over 'tags' when both are set", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/tasks").send({ script: "/tmp/train.py", target_tags: ["a100"], tags: ["a30"] });
+    expect(res.status).toBe(201);
+    expect(res.body.target_tags).toEqual(["a100"]);
+  });
+
+  it("accepts string args in task creation", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/tasks").send({
+      script: "/tmp/eval.py",
+      args: "--checkpoint /runs/ckpt.pt --seed 42",
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.command).toContain("--checkpoint /runs/ckpt.pt --seed 42");
   });
 
   it("handles extra unknown fields without error", async () => {
     const app = makeApp();
     const res = await request(app).post("/tasks").send({
-      script: "train.py",
+      script: "/tmp/train.py",
       nonexistent_field: "ignored",
       deeply_nested: { a: { b: { c: 1 } } },
     });

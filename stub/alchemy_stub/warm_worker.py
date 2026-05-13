@@ -182,6 +182,13 @@ def _run_task(payload: dict) -> dict:
     for k, v in env.items():
         os.environ[k] = v
 
+    # Sync PYTHONPATH into sys.path so runpy.run_path picks up SDK
+    _pp = os.environ.get("PYTHONPATH", "")
+    if _pp:
+        for _p in reversed(_pp.split(os.pathsep)):
+            if _p and _p not in sys.path:
+                sys.path.insert(0, _p)
+
     # --- Change cwd ---
     if cwd:
         try:

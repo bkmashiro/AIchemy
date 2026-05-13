@@ -9,6 +9,7 @@ export default defineConfig({
     env: {
       NO_PROXY: "127.0.0.1,localhost",
       no_proxy: "127.0.0.1,localhost",
+      DB_FILE: ":memory:",
     },
     // Include tests both in src/ and in ../tests/server/
     include: [

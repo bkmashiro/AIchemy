@@ -8,18 +8,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-def _compute_identity_hash(hostname: str, gpu_name: str, gpu_count: int, cuda_visible_devices: str = "") -> str:
+def _compute_identity_hash(hostname: str, gpu_name: str, gpu_count: int,
+                           cuda_visible_devices: str = "", user: str = "",
+                           slurm_job_id: str = "") -> str:
     """Compute stable stub identity hash.
 
-    Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count)[:12]
+    Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count|user|slurm_job_id)[:12]
 
-    Intentionally excludes default_cwd and slurm_job_id so identity survives
-    SLURM job restarts on the same physical GPU.
+    Includes user and slurm_job_id to prevent collisions when multiple users
+    or multiple SLURM jobs share the same node and GPU type.
 
     IMPORTANT: This must match the server's computeStubId in
     server/src/socket/stub.ts. If you change this, update both sides.
     """
-    raw = f"{hostname}|{cuda_visible_devices}|{gpu_name}|{gpu_count}"
+    raw = f"{hostname}|{cuda_visible_devices}|{gpu_name}|{gpu_count}|{user}|{slurm_job_id}"
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
@@ -134,7 +136,7 @@ class Config:
     tags: list[str] = field(default_factory=list)
     default_env: dict[str, str] = field(default_factory=dict)
     umask: int = 0o022  # applied before spawning task subprocesses
-    allow_exec: bool = False  # --allow-exec: enables exec.request handler (Spec 3)
+    allow_exec: bool = True  # exec.request handler enabled by default
 
     hostname: str = field(default_factory=socket.gethostname)
     gpu_indices: str = ""  # e.g. "0,1" — used for identity hash
@@ -161,10 +163,13 @@ class Config:
 
         Must match server's computeStubId in server/src/socket/stub.ts.
         Call this after GPU info is available (from GpuMonitor).
-        Uses CUDA_VISIBLE_DEVICES (gpu_indices) for stable identity across SLURM restarts.
         """
         cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", self.gpu_indices)
-        return _compute_identity_hash(self.hostname, gpu_name, gpu_count, cuda_visible_devices)
+        user = os.environ.get("USER", "")
+        return _compute_identity_hash(
+            self.hostname, gpu_name, gpu_count, cuda_visible_devices,
+            user=user, slurm_job_id=self.slurm_job_id or "",
+        )
 
     @property
     def stub_type(self) -> str:
