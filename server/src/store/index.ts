@@ -196,49 +196,46 @@ class Store {
 
   // ─── DB write helpers ───────────────────────────────────────────────────
 
+  /**
+   * Write task to DB. Throws on failure — callers inside transactions
+   * should let the error propagate so the transaction rolls back.
+   */
   private _saveTask(task: Task, location: "global" | "stub" | "archive"): void {
-    try {
-      this.db.insert(schema.tasks)
-        .values({
-          id: task.id,
+    this.db.insert(schema.tasks)
+      .values({
+        id: task.id,
+        status: task.status,
+        stub_id: task.stub_id ?? null,
+        priority: task.priority,
+        seq: task.seq,
+        created_at: task.created_at,
+        location,
+        data: JSON.stringify(task),
+      })
+      .onConflictDoUpdate({
+        target: schema.tasks.id,
+        set: {
           status: task.status,
           stub_id: task.stub_id ?? null,
           priority: task.priority,
           seq: task.seq,
-          created_at: task.created_at,
           location,
           data: JSON.stringify(task),
-        })
-        .onConflictDoUpdate({
-          target: schema.tasks.id,
-          set: {
-            status: task.status,
-            stub_id: task.stub_id ?? null,
-            priority: task.priority,
-            seq: task.seq,
-            location,
-            data: JSON.stringify(task),
-          },
-        })
-        .run();
-    } catch (err) {
-      logger.error("db.save_task_failed", { task_id: task.id, error: String(err) });
-    }
+        },
+      })
+      .run();
   }
 
+  /** Write stub to DB. Throws on failure — see _saveTask. */
   private _saveStub(stub: Stub): void {
-    try {
-      const toSave = { ...stub, socket_id: undefined, status: "offline" as const };
-      this.db.insert(schema.stubs)
-        .values({ id: stub.id, data: JSON.stringify(toSave) })
-        .onConflictDoUpdate({
-          target: schema.stubs.id,
-          set: { data: JSON.stringify(toSave) },
-        })
-        .run();
-    } catch (err) {
-      logger.error("db.save_stub_failed", { stub_id: stub.id, error: String(err) });
-    }
+    const toSave = { ...stub, socket_id: undefined, status: "offline" as const };
+    this.db.insert(schema.stubs)
+      .values({ id: stub.id, data: JSON.stringify(toSave) })
+      .onConflictDoUpdate({
+        target: schema.stubs.id,
+        set: { data: JSON.stringify(toSave) },
+      })
+      .run();
   }
 
   private _deleteTask(taskId: string): void {
@@ -295,7 +292,11 @@ class Store {
 
   setStub(stub: Stub): void {
     this.stubs.set(stub.id, stub);
-    this._saveStub(stub);
+    try {
+      this._saveStub(stub);
+    } catch (err) {
+      logger.error("db.save_stub_failed", { stub_id: stub.id, error: String(err) });
+    }
   }
 
   deleteStub(id: string): void {
@@ -585,7 +586,11 @@ class Store {
     task.stub_id = undefined;
     this.globalQueue.push(task);
     this._taskIndex.set(task.id, { location: "global" });
-    this._saveTask(task, "global");
+    try {
+      this._saveTask(task, "global");
+    } catch (err) {
+      logger.error("db.save_task_failed", { task_id: task.id, error: String(err) });
+    }
     if (task.fingerprint) {
       this._indexFingerprint(task);
     }
@@ -625,7 +630,11 @@ class Store {
       });
       this._pruneArchive();
     } else {
-      this._saveTask(updated, "global");
+      try {
+        this._saveTask(updated, "global");
+      } catch (err) {
+        logger.error("db.save_task_failed", { task_id: updated.id, error: String(err) });
+      }
     }
 
     this._reindexTask(prev, updated);

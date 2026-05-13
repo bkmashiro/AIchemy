@@ -220,7 +220,7 @@ app.get("/api/health", (_req, res) => {
   const allStubs = store.getAllStubs();
   const online = allStubs.filter(s => s.status === "online").length;
   const running = allStubs.reduce((n, s) => n + s.tasks.filter(t =>
-    ["running", "dispatched"].includes(t.status)).length, 0);
+    ["running", "assigned"].includes(t.status)).length, 0);
   const pending = store.getGlobalQueue().length;
   res.json({
     status: "ok",
