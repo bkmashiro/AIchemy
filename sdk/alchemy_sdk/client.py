@@ -3,19 +3,12 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import time
 from typing import Any, Optional
 
 from .transport import make_transport, NoopTransport, HttpTransport, UnixSocketTransport
 
 _MISSING = object()
-
-# Valid notification levels
-_NOTIFY_LEVELS = ("debug", "info", "warning", "critical")
-
-# Valid lifecycle phases
-_VALID_PHASES = ("warmup", "training", "eval", "checkpoint", "cooldown")
 
 
 class Alchemy:
@@ -73,51 +66,6 @@ class Alchemy:
 
         # Throttle state for log()
         self._last_log_time: float = 0.0
-        self._current_phase: str = "training"
-
-        # SIGTERM-based stop flag — set by signal handler, read by should_stop()
-        self._stop_flag: bool = False
-        self._install_sigterm_handler()
-
-    def _install_sigterm_handler(self) -> None:
-        """Install SIGTERM handler that sets the stop flag. Chains with existing handler."""
-        try:
-            prev = signal.getsignal(signal.SIGTERM)
-
-            def _handler(signum: int, frame: Any) -> None:
-                self._stop_flag = True
-                # Chain previous handler if callable
-                if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
-                    prev(signum, frame)
-
-            signal.signal(signal.SIGTERM, _handler)
-        except (OSError, ValueError):
-            # Can't install in some environments (e.g. non-main thread) — silently skip
-            pass
-
-    # ------------------------------------------------------------------
-    # Config (injected by stub via ALCHEMY_CONFIG env var)
-    # ------------------------------------------------------------------
-
-    @property
-    def config(self) -> dict[str, Any]:
-        """
-        Read experiment config injected by the stub.
-
-        The stub writes the resolved config (experiment config + task overrides)
-        to a temp JSON file and sets ALCHEMY_CONFIG to its path.
-        Returns empty dict if no config is available.
-        """
-        config_path = os.environ.get("ALCHEMY_CONFIG")
-        if not config_path:
-            return {}
-        try:
-            with open(config_path) as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            if self._managed:
-                raise RuntimeError(f"Failed to read ALCHEMY_CONFIG from {config_path}: {e}") from e
-            return {}
 
     # ------------------------------------------------------------------
     # Pure reads (no IO)
@@ -154,12 +102,20 @@ class Alchemy:
         return default
 
     # ------------------------------------------------------------------
-    # Signal queries
+    # Signal queries (pure — reads cached signals, no IO)
     # ------------------------------------------------------------------
 
     def should_stop(self) -> bool:
-        """Return True if SIGTERM was received (SLURM preemption, manual kill, server kill)."""
-        return self._stop_flag
+        """Return True if the server/stub requests graceful stop."""
+        return self._transport.should_stop()
+
+    def should_checkpoint(self) -> bool:
+        """Return True if the server/stub requests an immediate checkpoint."""
+        return self._transport.should_checkpoint()
+
+    def should_eval(self) -> bool:
+        """Return True if the server/stub requests an evaluation pass."""
+        return self._transport.should_eval()
 
     # ------------------------------------------------------------------
     # Reports (side-effects only — never modify training state)
@@ -188,15 +144,9 @@ class Alchemy:
             msg["metrics"] = metrics
         self._transport.send(msg)
 
-    def export(self, key: str, value: Any) -> None:
-        """Export a key-value pair for downstream DAG tasks to consume."""
-        self._transport.send({"type": "export", "key": key, "value": value})
-
     def log_eval(self, metrics: dict[str, Any]) -> None:
         """Report evaluation metrics immediately (not throttled)."""
         self._transport.send({"type": "eval", "metrics": metrics})
-        for k, v in metrics.items():
-            self.export(f"eval_{k}", v)
 
     def log_config(self, config: dict[str, Any]) -> None:
         """Report training config snapshot (e.g. hyperparams)."""
@@ -208,45 +158,6 @@ class Alchemy:
         Does NOT call torch.save — caller is responsible for saving.
         """
         self._transport.send({"type": "checkpoint", "path": path})
-        self.export("last_checkpoint_path", path)
-
-    def notify(self, msg: str, level: str = "info") -> None:
-        """
-        Send a user-defined notification via the transport.
-
-        Levels:
-          "debug"    — stored in task log only
-          "info"     — stored + emitted to web frontend
-          "warning"  — stored + emitted + Discord notification
-          "critical" — stored + emitted + Discord mention (emphasis)
-        """
-        if level not in _NOTIFY_LEVELS:
-            level = "info"
-        self._transport.send({"type": "notify", "message": msg, "level": level})
-
-    def set_phase(self, phase: str) -> None:
-        """
-        Report the current training lifecycle phase.
-
-        Valid phases: warmup, training, eval, checkpoint, cooldown.
-        Server uses this for scheduling decisions (e.g. won't preempt during checkpoint).
-        """
-        if phase not in _VALID_PHASES:
-            raise ValueError(
-                f"Invalid phase '{phase}'. Valid: {_VALID_PHASES}"
-            )
-        self._current_phase = phase
-        self._transport.send({"type": "phase", "phase": phase})
-
-    def phase(self, phase: str) -> "_PhaseContext":
-        """
-        Context manager for lifecycle phases.
-
-        Usage:
-            with alchemy.phase("eval"):
-                run_evaluation()
-        """
-        return _PhaseContext(self, phase)
 
     def done(self, metrics: Optional[dict[str, Any]] = None) -> None:
         """Signal that training is complete. Sends final metrics if provided."""
@@ -263,11 +174,7 @@ class Alchemy:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        if exc_type is None:
-            self.done()
-        else:
-            self.notify(f"Training crashed: {exc_type.__name__}: {exc_val}", level="critical")
-        self._transport.close()
+        self.done()
 
     # ------------------------------------------------------------------
     # AOP decorator
@@ -305,36 +212,10 @@ class Alchemy:
                     eval_every=eval_every,
                     checkpoint_every=checkpoint_every,
                 )
-                run_preflight(ctx, reads=reads or [], writes=writes or [])
-                try:
-                    result = fn(ctx, *args, **kwargs)
-                except KeyboardInterrupt:
-                    self.notify("Training interrupted (KeyboardInterrupt)", level="warning")
-                    raise
-                except Exception as e:
-                    # Emergency checkpoint if possible
-                    self.notify(f"Training crashed: {type(e).__name__}: {e}", level="critical")
-                    raise
-                else:
-                    self.done(metrics=result if isinstance(result, dict) else None)
-                    return result
+                run_preflight(ctx, reads=reads or [])
+                result = fn(ctx, *args, **kwargs)
+                self.done(metrics=result if isinstance(result, dict) else None)
+                return result
 
             return wrapper
         return decorator
-
-
-class _PhaseContext:
-    """Context manager for lifecycle phase reporting."""
-
-    def __init__(self, al: Alchemy, phase: str) -> None:
-        self._al = al
-        self._phase = phase
-        self._prev_phase: str = "training"
-
-    def __enter__(self) -> "_PhaseContext":
-        self._prev_phase = self._al._current_phase
-        self._al.set_phase(self._phase)
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self._al.set_phase(self._prev_phase)

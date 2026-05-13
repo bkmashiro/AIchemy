@@ -19,6 +19,15 @@ class NoopTransport:
     def send(self, msg: dict) -> None:
         pass
 
+    def should_stop(self) -> bool:
+        return False
+
+    def should_checkpoint(self) -> bool:
+        return False
+
+    def should_eval(self) -> bool:
+        return False
+
     def close(self) -> None:
         pass
 
@@ -28,7 +37,7 @@ class NoopTransport:
 # ---------------------------------------------------------------------------
 
 class HttpTransport:
-    """POST to /api/sdk/report. No back-channel."""
+    """POST to /api/sdk/report. Signals always False (no back-channel)."""
 
     def __init__(self, server: str, task_id: str) -> None:
         self._server = server.rstrip("/")
@@ -56,6 +65,15 @@ class HttpTransport:
             req = urllib.request.Request(self._url, data=body, headers=headers, method="POST")
             urllib.request.urlopen(req, timeout=5, context=ctx)
 
+    def should_stop(self) -> bool:
+        return False
+
+    def should_checkpoint(self) -> bool:
+        return False
+
+    def should_eval(self) -> bool:
+        return False
+
     def close(self) -> None:
         pass
 
@@ -67,7 +85,7 @@ class HttpTransport:
 class UnixSocketTransport:
     """
     Connect to /tmp/alchemy_task_{task_id}.sock.
-    Sends JSON-line messages to stub.
+    Sends JSON-line messages to stub; receives signal messages in background thread.
     Sends heartbeat every 10s.
     """
 
@@ -77,6 +95,14 @@ class UnixSocketTransport:
     def __init__(self, sock_path: str, task_id: str) -> None:
         self._sock_path = sock_path
         self._task_id = task_id
+
+        # Signal state — written by recv thread, read by main thread
+        self._signals: dict[str, bool] = {
+            "should_stop": False,
+            "should_checkpoint": False,
+            "should_eval": False,
+        }
+        self._signals_lock = threading.Lock()
 
         # Socket state
         self._sock: Optional[socket.socket] = None
@@ -133,7 +159,7 @@ class UnixSocketTransport:
                 self._sock = None
 
     # ------------------------------------------------------------------
-    # Receive loop (kept for future server→SDK messages)
+    # Receive loop
     # ------------------------------------------------------------------
 
     def _recv_loop(self) -> None:
@@ -153,16 +179,28 @@ class UnixSocketTransport:
                     with self._sock_lock:
                         self._sock = None
                     buf = ""
-                    time.sleep(self.RECONNECT_DELAY)
                     continue
                 buf += chunk.decode(errors="replace")
-                # Drain any complete lines (currently no messages to handle)
                 while "\n" in buf:
-                    _line, buf = buf.split("\n", 1)
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        self._handle_message(line)
             except Exception:
                 with self._sock_lock:
                     self._sock = None
                 buf = ""
+
+    def _handle_message(self, line: str) -> None:
+        try:
+            msg = json.loads(line)
+        except Exception:
+            return
+        if msg.get("type") == "signal":
+            sig = msg.get("signal", "")
+            with self._signals_lock:
+                if sig in self._signals:
+                    self._signals[sig] = True
 
     # ------------------------------------------------------------------
     # Heartbeat loop
@@ -173,6 +211,22 @@ class UnixSocketTransport:
             time.sleep(self.HEARTBEAT_INTERVAL)
             if not self._closed:
                 self.send({"type": "heartbeat"})
+
+    # ------------------------------------------------------------------
+    # Signal queries (pure — no IO)
+    # ------------------------------------------------------------------
+
+    def should_stop(self) -> bool:
+        with self._signals_lock:
+            return self._signals["should_stop"]
+
+    def should_checkpoint(self) -> bool:
+        with self._signals_lock:
+            return self._signals["should_checkpoint"]
+
+    def should_eval(self) -> bool:
+        with self._signals_lock:
+            return self._signals["should_eval"]
 
     # ------------------------------------------------------------------
     # Cleanup
@@ -207,14 +261,11 @@ def make_transport(
     if not task_id:
         return NoopTransport()
 
-    # Try Unix socket first — check path exists before constructing
+    # Try Unix socket first — probe before constructing to allow fallback
     if stub_socket:
-        if os.path.exists(stub_socket):
-            transport = UnixSocketTransport(stub_socket, task_id)
-            if transport._sock is not None:
-                return transport
-            transport.close()
-        # Socket not reachable — fall through to HTTP
+        if _probe_unix_socket(stub_socket):
+            return UnixSocketTransport(stub_socket, task_id)
+        # Socket path set but not reachable — fall through to HTTP
 
     # Try HTTP fallback
     if server:
