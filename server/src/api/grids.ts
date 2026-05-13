@@ -18,7 +18,7 @@ import { triggerSchedule } from "../scheduler";
 import { maybeDispatch } from "../scheduler";
 import { initiateKillChain } from "../socket/stub";
 import { computeFingerprint } from "../dedup";
-import { killTask, killGlobalTask } from "../task-actions";
+import { cancelTask, cancelGlobalTask } from "../task-actions";
 
 // ─── Cartesian product ────────────────────────────────────────────────────────
 
@@ -55,10 +55,10 @@ function deriveGridStatus(tasks: Task[]): Grid["status"] {
   if (tasks.length === 0) return "pending";
   const statuses = tasks.map((t) => t.status);
   if (statuses.every((s) => s === "completed")) return "completed";
-  if (statuses.some((s) => ["running", "dispatched", "queued"].includes(s))) return "running";
-  if (statuses.some((s) => ["failed", "killed", "lost"].includes(s)) &&
+  if (statuses.some((s) => ["running", "assigned"].includes(s))) return "running";
+  if (statuses.some((s) => ["failed", "cancelled"].includes(s)) &&
       statuses.some((s) => s === "completed")) return "partial";
-  if (statuses.every((s) => ["failed", "killed", "lost"].includes(s))) return "failed";
+  if (statuses.every((s) => ["failed", "cancelled"].includes(s))) return "failed";
   return "pending";
 }
 
@@ -171,14 +171,14 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
     let cancelled = 0;
 
     for (const task of tasks) {
-      if (["running", "dispatched", "queued", "pending"].includes(task.status)) {
-        if (task.stub_id && (task.status === "running" || task.status === "dispatched")) {
+      if (["running", "assigned", "pending"].includes(task.status)) {
+        if (task.stub_id && (task.status === "running" || task.status === "assigned")) {
           initiateKillChain(task.stub_id, task.id);
         } else if (task.stub_id) {
-          const updated = killTask(task.stub_id!, task.id);
+          const updated = cancelTask(task.stub_id!, task.id);
           if (updated) webNs.emit("task.update", updated);
         } else {
-          const updated = killGlobalTask(task.id);
+          const updated = cancelGlobalTask(task.id);
           if (updated) webNs.emit("task.update", updated);
         }
         cancelled++;
@@ -197,7 +197,7 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
     let retried = 0;
 
     for (const task of tasks) {
-      if (["failed", "killed", "lost"].includes(task.status)) {
+      if (["failed", "cancelled"].includes(task.status)) {
         const seq = store.nextSeq();
         const retryTask: Task = {
           ...task,
