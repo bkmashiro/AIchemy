@@ -93,6 +93,21 @@ stubs:
     default_cwd: /vol/bitbucket/ys25/jema
     env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH && export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && export TORCH_HOME=/vol/bitbucket/ys25/.cache/torch && export HF_HOME=/vol/bitbucket/ys25/.cache/huggingface && export TRANSFORMERS_CACHE=/vol/bitbucket/ys25/hf/transformers && export XDG_CACHE_HOME=/vol/bitbucket/ys25/.cache && export PIP_CACHE_DIR=/vol/bitbucket/ys25/.cache/pip'
 
+  - name: slurm-t4
+    type: slurm
+    ssh_host: gpucluster2
+    ssh_user: ys25
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 1
+    partition: t4
+    gres: "gpu:tesla_t4:1"
+    mem: "40G"
+    time: "3-00:00:00"
+    tags: "t4,slurm"
+    default_cwd: /vol/bitbucket/ys25/jema-v2
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH && export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && export TORCH_HOME=/vol/bitbucket/ys25/.cache/torch && export HF_HOME=/vol/bitbucket/ys25/.cache/huggingface && export TRANSFORMERS_CACHE=/vol/bitbucket/ys25/hf/transformers && export XDG_CACHE_HOME=/vol/bitbucket/ys25/.cache && export PIP_CACHE_DIR=/vol/bitbucket/ys25/.cache/pip'
+
   - name: hw-slurm-a40
     type: slurm
     ssh_host: gpucluster2
