@@ -303,10 +303,11 @@ export interface ReliableMessage {
 
 export interface ResumePayload {
   stub_id?: string;  // Client-computed stub ID (aligned with server formula). If provided, server validates and uses it.
+  stub_version?: string;  // Alchemy stub package version; must match server version.
   hostname: string;
   gpu: GpuInfo;
   slurm_job_id?: string;
-  cuda_visible_devices?: string;  // CUDA_VISIBLE_DEVICES value — part of stable identity hash
+  cuda_visible_devices?: string;  // CUDA_VISIBLE_DEVICES value; workstation identity discriminator
   max_concurrent: number;
   token: string;
   env_setup?: string;

@@ -8,20 +8,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-def _compute_identity_hash(hostname: str, gpu_name: str, gpu_count: int,
-                           cuda_visible_devices: str = "", user: str = "",
-                           slurm_job_id: str = "") -> str:
+def _compute_identity_hash(hostname: str, user: str = "",
+                           instance_id: str = "", slurm_job_id: str = "") -> str:
     """Compute stable stub identity hash.
 
-    Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count|user|slurm_job_id)[:12]
+    Formula: sha256(hostname|user|instance_id|slurm_job_id)[:12]
 
-    Includes user and slurm_job_id to prevent collisions when multiple users
-    or multiple SLURM jobs share the same node and GPU type.
+    instance_id is a stable per-stub discriminator. Workstation stubs use
+    CUDA_VISIBLE_DEVICES so same-host/same-user multi-stub setups do not collide;
+    SLURM stubs use the job id.
 
     IMPORTANT: This must match the server's computeStubId in
     server/src/socket/stub.ts. If you change this, update both sides.
     """
-    raw = f"{hostname}|{cuda_visible_devices}|{gpu_name}|{gpu_count}|{user}|{slurm_job_id}"
+    raw = f"{hostname}|{user}|{instance_id}|{slurm_job_id}"
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
@@ -158,17 +158,16 @@ class Config:
         raw = f"{self.hostname}|{self.gpu_indices}|{self.default_cwd}|{self.slurm_job_id or ''}"
         return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
-    def compute_stub_id(self, gpu_name: str, gpu_count: int) -> str:
+    def compute_stub_id(self) -> str:
         """Compute the server-compatible stub ID.
 
         Must match server's computeStubId in server/src/socket/stub.ts.
-        Call this after GPU info is available (from GpuMonitor).
+        Uses hostname + user + per-instance discriminator.
         """
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", self.gpu_indices)
         user = os.environ.get("USER", "")
+        instance_id = self.slurm_job_id or os.environ.get("CUDA_VISIBLE_DEVICES", self.gpu_indices) or ""
         return _compute_identity_hash(
-            self.hostname, gpu_name, gpu_count, cuda_visible_devices,
-            user=user, slurm_job_id=self.slurm_job_id or "",
+            self.hostname, user=user, instance_id=instance_id, slurm_job_id=self.slurm_job_id or "",
         )
 
     @property

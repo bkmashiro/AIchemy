@@ -32,6 +32,7 @@ import { startAutoRenew } from "./autorenew";
 import { loadDeployConfig } from "./deploy";
 import { createTunnelManager, TunnelManager } from "./tunnel";
 import { createDeployRouter } from "./api/deploy";
+import { ALCHEMY_VERSION } from "./version";
 
 const PORT = parseInt(process.env.PORT || "3002", 10);
 
@@ -207,6 +208,52 @@ api.get("/stats", (_req, res) => {
   res.json({ tasks: taskCounts, stubs: { online, offline } });
 });
 
+
+// GET /summary — one-page status for humans, CLI, and agents.
+api.get("/summary", (_req, res) => {
+  const allTasks = store.getAllTasks();
+  const counts: Record<string, number> = {};
+  for (const task of allTasks) counts[task.status] = (counts[task.status] ?? 0) + 1;
+
+  const stubs = store.getAllStubs().map((stub) => ({
+    id: stub.id,
+    name: stub.name,
+    hostname: stub.hostname,
+    status: stub.status,
+    type: stub.type,
+    running: stub.tasks.filter((task) => ["assigned", "running", "paused"].includes(task.status)).length,
+    max_concurrent: stub.max_concurrent,
+    tags: stub.tags ?? [],
+    slurm_job_id: stub.slurm_job_id,
+    last_seen: stub.last_seen ?? stub.last_heartbeat,
+  }));
+
+  const active_tasks = allTasks
+    .filter((task) => ["pending", "assigned", "running", "paused", "blocked"].includes(task.status))
+    .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+    .map((task) => ({
+      id: task.id,
+      seq: task.seq,
+      name: task.display_name ?? task.name ?? task.script,
+      status: task.status,
+      stub_id: task.stub_id,
+      priority: task.priority,
+      progress: task.progress,
+      started_at: task.started_at,
+      created_at: task.created_at,
+      last_log: task.log_buffer?.slice(-1)[0],
+    }));
+
+  res.json({
+    ok: true,
+    version: ALCHEMY_VERSION,
+    uptime_s: Math.floor(process.uptime()),
+    counts,
+    stubs,
+    active_tasks,
+  });
+});
+
 // Mount routers
 api.use("/tasks", createGlobalTasksRouter(stubNs, webNs));
 api.use("/stubs", createStubsRouter(stubNs, webNs));
@@ -242,7 +289,7 @@ app.use("/api", api);
 
 // Health check
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), version: "2.1.0" });
+  res.json({ ok: true, uptime: process.uptime(), version: ALCHEMY_VERSION });
 });
 
 // Serve dashboard static files
@@ -282,7 +329,7 @@ process.on("SIGINT", async () => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 httpServer.listen(PORT, () => {
-  logger.info("server.start", { port: PORT, version: "2.1.0" });
+  logger.info("server.start", { port: PORT, version: ALCHEMY_VERSION });
   store.startPersistence();
 
   // Start auto-renew checker (SLURM walltime)

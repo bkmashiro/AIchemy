@@ -131,6 +131,7 @@ async function connectFuzzStub(url: string, config: {
   });
 
   socket.emit("resume", {
+    stub_version: "2.1.0",
     hostname: config.hostname,
     gpu: { name: config.gpuName, vram_total_mb: 49140, count: config.gpuCount },
     max_concurrent: config.maxConcurrent,

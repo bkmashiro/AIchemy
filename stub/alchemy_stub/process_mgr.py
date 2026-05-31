@@ -23,6 +23,7 @@ from typing import Any, Callable, Awaitable
 
 from pathlib import Path
 
+from . import disk_monitor
 from .config import _parse_env_value
 from .error_classifier import classify_death, has_checkpoint
 from .task_socket import task_socket_path
@@ -302,9 +303,43 @@ class ProcessManager:
         self._dead_on_reattach: list[tuple[str, int]] = []
         self._stub_killed: set[str] = set()
 
+    @property
+    def processes(self) -> dict[str, ProcessInfo]:
+        """Compatibility accessor for tests and diagnostics."""
+        return self._procs
+
+    @processes.setter
+    def processes(self, value: dict[str, ProcessInfo]) -> None:
+        self._procs = value
+
     # ------------------------------------------------------------------ #
     # Public API                                                           #
     # ------------------------------------------------------------------ #
+
+    def validate_before_start(
+        self,
+        command: str,
+        cwd: str | None,
+        env: dict[str, str] | None,
+    ) -> tuple[bool, str]:
+        """Validate capacity, cwd, and disk before spawning a task."""
+        del command, env
+        if self.running_count() >= self.max_concurrent:
+            return False, f"max concurrent tasks reached ({self.max_concurrent})"
+
+        if cwd is not None and not os.path.isdir(cwd):
+            return False, f"cwd does not exist: {cwd}"
+
+        check_paths = [cwd] if cwd else None
+        warnings = disk_monitor.check_low_disk(check_paths, threshold_gb=2.0)
+        if warnings:
+            warning = warnings[0]
+            return False, (
+                f"low disk space on {warning['path']}: "
+                f"{warning['free_gb']}GB free"
+            )
+
+        return True, ""
 
     def start_monitoring(self) -> None:
         self._monitor_task = asyncio.get_running_loop().create_task(self._monitor_loop())

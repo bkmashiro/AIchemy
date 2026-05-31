@@ -98,6 +98,7 @@ function createMockStub(opts: MockStubOptions): Socket {
 
 function sendResume(socket: Socket, opts: MockStubOptions & { hostname: string; gpuName: string }): void {
   socket.emit("resume", {
+    stub_version: "2.1.0",
     hostname: opts.hostname,
     gpu: {
       name: opts.gpuName,

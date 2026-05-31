@@ -19,6 +19,17 @@ stub_package:
 
 # ─── Stub targets ────────────────────────────────────────────────────────────
 stubs:
+  - name: gpu31
+    host: gpu31
+    user: ys25
+    jump_host: gpucluster2
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 5
+    tags: "rtx4080,workstation"
+    default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH'
+
   - name: gpu32
     host: gpu32
     user: ys25
@@ -28,6 +39,7 @@ stubs:
     max_concurrent: 5
     tags: "rtx4080,workstation"
     default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH'
 
   - name: gpu33
     host: gpu33
@@ -37,4 +49,61 @@ stubs:
     python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
     max_concurrent: 2
     tags: "rtx4080,workstation"
-    default_cwd: /vol/bitbucket/ys25
+    default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH'
+
+  - name: gpu35
+    host: gpu35
+    user: ys25
+    jump_host: gpucluster2
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 5
+    tags: "rtx4080,workstation"
+    default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH'
+
+  - name: slurm-a40
+    type: slurm
+    ssh_host: gpucluster2
+    ssh_user: ys25
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 3
+    partition: a40
+    gres: "gpu:nvidia_a40:1"
+    mem: "60G"
+    time: "3-00:00:00"
+    tags: "a40,slurm"
+    default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH && export TORCH_HOME=/vol/bitbucket/ys25/.cache/torch && export HF_HOME=/vol/bitbucket/ys25/.cache/huggingface && export TRANSFORMERS_CACHE=/vol/bitbucket/ys25/hf/transformers && export XDG_CACHE_HOME=/vol/bitbucket/ys25/.cache && export PIP_CACHE_DIR=/vol/bitbucket/ys25/.cache/pip'
+
+  - name: slurm-a30
+    type: slurm
+    ssh_host: gpucluster2
+    ssh_user: ys25
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 3
+    partition: a30
+    gres: "gpu:nvidia_a30:1"
+    mem: "60G"
+    time: "3-00:00:00"
+    tags: "a30,slurm"
+    default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH && export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt && export TORCH_HOME=/vol/bitbucket/ys25/.cache/torch && export HF_HOME=/vol/bitbucket/ys25/.cache/huggingface && export TRANSFORMERS_CACHE=/vol/bitbucket/ys25/hf/transformers && export XDG_CACHE_HOME=/vol/bitbucket/ys25/.cache && export PIP_CACHE_DIR=/vol/bitbucket/ys25/.cache/pip'
+
+  - name: hw-slurm-a40
+    type: slurm
+    ssh_host: gpucluster2
+    ssh_user: hw2025
+    remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
+    python_path: /vol/bitbucket/ys25/conda-envs/jema/bin/python
+    max_concurrent: 3
+    partition: a40
+    gres: "gpu:nvidia_a40:1"
+    mem: "60G"
+    time: "24:00:00"
+    tags: "a40,slurm,hw2025"
+    default_cwd: /vol/bitbucket/ys25/jema
+    env_setup: 'export PATH=/vol/bitbucket/ys25/conda-envs/jema/bin:$PATH && export TORCH_HOME=/vol/bitbucket/hw2025/.cache/torch && export HF_HOME=/vol/bitbucket/hw2025/.cache/huggingface && export TRANSFORMERS_CACHE=/vol/bitbucket/hw2025/.cache/transformers && export XDG_CACHE_HOME=/vol/bitbucket/hw2025/.cache && export PIP_CACHE_DIR=/vol/bitbucket/hw2025/.cache/pip'

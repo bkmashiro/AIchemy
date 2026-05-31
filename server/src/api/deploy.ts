@@ -13,6 +13,19 @@ import { DeployFileConfig } from "../types";
 import { deployStub, getStubStatus, restartStub, stopStub } from "../deploy";
 import { TunnelManager } from "../tunnel";
 
+function resolveDeployConnection(req: Request, res: Response): { serverUrl: string; token: string } | undefined {
+  const serverUrl = req.body?.server_url || process.env.ALCHEMY_SERVER_URL;
+  const token = req.body?.token || process.env.ALCHEMY_TOKEN;
+  if (!serverUrl || !token) {
+    res.status(400).json({
+      error: "Missing deploy connection settings",
+      details: "Provide server_url and token in the request body, or set ALCHEMY_SERVER_URL and ALCHEMY_TOKEN.",
+    });
+    return undefined;
+  }
+  return { serverUrl, token };
+}
+
 export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: TunnelManager | null): Router {
   const router = Router();
 
@@ -46,8 +59,9 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     const target = config.stubs.find((s) => s.name === req.params.name);
     if (!target) { res.status(404).json({ error: "Target not found" }); return; }
 
-    const serverUrl = req.body?.server_url || process.env.ALCHEMY_SERVER_URL || "";
-    const token = process.env.ALCHEMY_TOKEN || "";
+    const conn = resolveDeployConnection(req, res);
+    if (!conn) return;
+    const { serverUrl, token } = conn;
     const slurmOverrides = req.body?.mem || req.body?.time
       ? { mem: req.body.mem, time: req.body.time }
       : undefined;
@@ -62,13 +76,14 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
   router.post("/stubs", async (req: Request, res: Response): Promise<void> => {
     if (!config) { res.json([]); return; }
 
-    const { names, skip, server_url } = req.body || {};
+    const { names, skip } = req.body || {};
     let targets = config.stubs;
     if (names) targets = targets.filter((s) => (names as string[]).includes(s.name));
     if (skip) targets = targets.filter((s) => !(skip as string[]).includes(s.name));
 
-    const serverUrl = server_url || process.env.ALCHEMY_SERVER_URL || "";
-    const token = process.env.ALCHEMY_TOKEN || "";
+    const conn = resolveDeployConnection(req, res);
+    if (!conn) return;
+    const { serverUrl, token } = conn;
 
     const results = [];
     for (let i = 0; i < targets.length; i += 3) {
@@ -100,12 +115,14 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     const target = config.stubs.find((s) => s.name === req.params.name);
     if (!target) { res.status(404).json({ error: "Target not found" }); return; }
 
-    const serverUrl = req.body?.server_url || process.env.ALCHEMY_SERVER_URL || "";
+    const conn = resolveDeployConnection(req, res);
+    if (!conn) return;
+    const { serverUrl, token } = conn;
     const slurmOverrides = req.body?.mem || req.body?.time
       ? { mem: req.body.mem, time: req.body.time }
       : undefined;
     const result = await restartStub(
-      target, serverUrl, process.env.ALCHEMY_TOKEN || "",
+      target, serverUrl, token,
       config.ssh?.key_path, slurmOverrides,
     );
     res.json(result);

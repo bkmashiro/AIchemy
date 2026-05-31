@@ -36,6 +36,7 @@ import { evaluateCriteria } from "../criteria";
 import { deriveExperimentStatus } from "../api/experiments";
 import { writeLockTable } from "../dedup";
 import { logger } from "../log";
+import { ALCHEMY_VERSION } from "../version";
 import { startTask, completeTask, failTask, cancelTask, markDisconnected, clearDisconnected, resolveDeadTask, preflightFail, promoteIfAssigned, createRetryTask } from "../task-actions";
 import { updateExperimentManifest } from "../git-tracking";
 
@@ -61,16 +62,17 @@ const disconnectFailTimers: Map<string, ReturnType<typeof setTimeout>> = new Map
 /**
  * Compute a stable stub identity hash.
  *
- * Formula: sha256(hostname|CUDA_VISIBLE_DEVICES|gpu.name|gpu.count|user|slurm_job_id)[:12]
+ * Formula: sha256(hostname|user|instance_id|slurm_job_id)[:12]
  *
- * Includes user and slurm_job_id to prevent collisions when multiple users
- * or multiple SLURM jobs share the same node and GPU type.
+ * `instance_id` is a stable per-stub discriminator. Workstation stubs use
+ * CUDA_VISIBLE_DEVICES so same-host/same-user multi-stub setups do not collide;
+ * SLURM stubs use the job id.
  *
  * IMPORTANT: This must match the Python stub's _compute_identity_hash in
  * stub/alchemy_stub/config.py. If you change this, update both sides.
  */
-export function computeStubId(hostname: string, gpu: { name: string; count: number }, cudaVisibleDevices: string = "", user: string = "", slurmJobId: string = ""): string {
-  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}|${user}|${slurmJobId}`;
+export function computeStubId(hostname: string, user: string = "", instanceId: string = "", slurmJobId: string = ""): string {
+  const input = `${hostname}|${user}|${instanceId}|${slurmJobId}`;
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
@@ -561,10 +563,23 @@ function handleResume(
     return;
   }
 
-  // Compute stable stub ID.
+  const stubVersion = payload.stub_version ?? "unknown";
+  if (stubVersion !== ALCHEMY_VERSION) {
+    const error = `Alchemy version mismatch: server=${ALCHEMY_VERSION} stub=${stubVersion}. Redeploy the stub package.`;
+    logger.error("stub.version_mismatch", { hostname, stub_version: stubVersion, server_version: ALCHEMY_VERSION });
+    socket.emit("resume_response", { error, server_version: ALCHEMY_VERSION, stub_version: stubVersion });
+    socket.disconnect(true);
+    return;
+  }
+
+  // Compute stable stub ID from hostname + user + per-instance discriminator.
   // If the stub sends a pre-computed stub_id (aligned formula), use it.
   // Otherwise fall back to server-side computation for backward compat.
-  const serverComputedId = computeStubId(hostname, gpu, cuda_visible_devices ?? "", user ?? "", slurm_job_id ?? "");
+  // New stubs send stub_id computed from SLURM/CUDA instance identity. For older
+  // stubs and tests that do not send stub_id/cuda_visible_devices, use gpu.name as
+  // a compatibility discriminator so same-host different-GPU workers do not collide.
+  const identityInstanceId = slurm_job_id || cuda_visible_devices || (payload.stub_id ? "" : gpu?.name) || "";
+  const serverComputedId = computeStubId(hostname, user ?? "", identityInstanceId, slurm_job_id ?? "");
   let stubId: string;
   if (payload.stub_id) {
     if (payload.stub_id !== serverComputedId) {
@@ -572,13 +587,12 @@ function handleResume(
         client_id: payload.stub_id,
         server_id: serverComputedId,
         hostname,
-        gpu_name: gpu.name,
-        gpu_count: gpu.count,
-        cuda_visible_devices,
+        user,
+        slurm_job_id,
+        identity_instance_id: identityInstanceId,
       });
     }
-    // Trust the client-provided ID — it was computed with the same formula
-    // and the same GPU info the stub actually sees.
+    // Trust the client-provided ID — it was computed with the same formula.
     stubId = payload.stub_id;
   } else {
     stubId = serverComputedId;
@@ -699,6 +713,61 @@ function handleResume(
       deploy_default_env: deployTarget?.default_env,
     };
     logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length, new: true });
+  }
+
+  // ─── Zombie cleanup: migrate tasks from old stale offline stubs (same host+user) ──
+  // Do not fail another offline stub merely because a same-host/user stub resumed;
+  // respect the disconnect grace window before declaring those tasks dead.
+  for (const oldStub of store.getAllStubs()) {
+    if (oldStub.id === stubId) continue; // skip self
+    if (oldStub.hostname !== hostname) continue;
+    if ((oldStub.user ?? "") !== (user ?? "")) continue;
+    if (oldStub.status === "online") continue; // don't touch live stubs
+    const lastSeen = new Date(oldStub.last_seen || oldStub.last_heartbeat || oldStub.connected_at).getTime();
+    const stale = Number.isFinite(lastSeen) && Date.now() - lastSeen >= DISCONNECT_FAIL_MS;
+    if (!stale) continue;
+
+    const migratedCount = { lost: 0, requeued: 0 };
+    const oldTasks = [...oldStub.tasks];
+    for (const task of oldTasks) {
+      if (["running", "paused"].includes(task.status)) {
+        // Task was "running" on a now-dead stub — mark as failed (lost)
+        const updated = failTask(oldStub.id, task.id, undefined, { death_cause: "disappeared" });
+        if (updated) {
+          webNs.emit("task.update", updated);
+          logger.info("task.migrated_lost", { task_seq: updated.seq, old_stub: oldStub.name, new_stub: stub.name });
+          notifyFailed(updated).catch(() => {});
+          handleAutoRetry(updated, webNs);
+          migratedCount.lost++;
+        }
+      } else if (task.status === "assigned") {
+        // Re-queue assigned tasks so they can be dispatched to the new stub
+        const requeued = store.requeueStubTasks(oldStub.id);
+        for (const t of requeued) {
+          webNs.emit("task.update", t);
+          migratedCount.requeued++;
+        }
+        break; // requeueStubTasks handles all assigned tasks at once
+      }
+    }
+
+    if (migratedCount.lost > 0 || migratedCount.requeued > 0) {
+      logger.info("stub.zombie_cleanup", {
+        zombie_stub: oldStub.name,
+        zombie_id: oldStub.id,
+        new_stub: stub.name,
+        lost: migratedCount.lost,
+        requeued: migratedCount.requeued,
+      });
+    }
+
+    // Remove the zombie stub if it has no more active tasks
+    const hasActive = oldStub.tasks.some((t) => ["running", "paused", "assigned"].includes(t.status));
+    if (!hasActive) {
+      store.deleteStub(oldStub.id);
+      webNs.emit("stub.removed", { stub_id: oldStub.id });
+      logger.info("stub.zombie_removed", { stub: oldStub.name, stub_id: oldStub.id });
+    }
   }
 
   // ─── Reconciliation ───────────────────────────────────────────────────────

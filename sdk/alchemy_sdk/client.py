@@ -44,10 +44,10 @@ class Alchemy:
 
     _THROTTLE_S = 10.0  # max 1 log() call per 10s
 
-    def __init__(self) -> None:
+    def __init__(self, server: Optional[str] = None) -> None:
         self._task_id: Optional[str] = os.environ.get("ALCHEMY_TASK_ID") or None
         stub_socket: Optional[str] = os.environ.get("ALCHEMY_STUB_SOCKET") or None
-        server: Optional[str] = os.environ.get("ALCHEMY_SERVER") or None
+        server = server or os.environ.get("ALCHEMY_SERVER") or None
 
         # Managed mode: alchemy is in control → strict, zero tolerance
         self._managed: bool = self._task_id is not None
@@ -139,9 +139,16 @@ class Alchemy:
 
         msg: dict[str, Any] = {"type": "progress", "step": step, "total": total}
         if loss is not None:
-            msg["loss"] = loss
+            msg["loss"] = float(loss)
         if metrics:
-            msg["metrics"] = metrics
+            clean_metrics: dict[str, float] = {}
+            for key, value in metrics.items():
+                if isinstance(value, bool):
+                    clean_metrics[key] = float(value)
+                elif isinstance(value, (int, float)):
+                    clean_metrics[key] = float(value)
+            if clean_metrics:
+                msg["metrics"] = clean_metrics
         self._transport.send(msg)
 
     def log_eval(self, metrics: dict[str, Any]) -> None:

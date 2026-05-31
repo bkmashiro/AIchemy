@@ -296,9 +296,9 @@ class TestAutoRetryOnLost:
 
 
 class TestStubNameStability:
-    """socket/stub.ts — computeStubId is a hash of hostname+CUDA_VISIBLE_DEVICES+gpu.
+    """socket/stub.ts — computeStubId is a hash of hostname+user+slurm_job_id.
     A stub reconnecting with the same identity should get the same stub_id,
-    not create a duplicate (even across SLURM job restarts)."""
+    not create a duplicate (even across reconnects)."""
 
     def test_reconnected_stub_keeps_same_id(self, api, test_server, tmp_path):
         """Start a stub, record its ID, stop it, start it again with

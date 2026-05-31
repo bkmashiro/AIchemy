@@ -1,8 +1,9 @@
 /**
  * store/index.ts — Drizzle ORM + SQLite state management.
  *
- * All writes go directly to SQLite (WAL mode) via Drizzle ORM.
- * In-memory caches are rebuilt from DB on startup.
+ * SQLite is the single source of truth for tasks.
+ * In-memory: stubs (with running tasks), tokens, grids, experiments.
+ * All task reads/writes for archive + globalQueue go through the DB.
  *
  * Tables: stubs, tokens, tasks, grids, experiments, meta
  */
@@ -12,7 +13,7 @@ import fsp from "fs/promises";
 import path from "path";
 import Database from "better-sqlite3";
 import { drizzle, BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, and, desc, asc, not, inArray } from "drizzle-orm";
 import * as schema from "./schema";
 import { Stub, Task, Grid, Token, Experiment, ServerState, TaskStatus } from "../types";
 import { writeLockTable } from "../dedup";
@@ -41,12 +42,10 @@ class Store {
   // In-memory caches
   private stubs: Map<string, Stub> = new Map();
   private tokens: Map<string, Token> = new Map();
-  private globalQueue: Task[] = [];
   private grids: Map<string, Grid> = new Map();
   private experiments: Map<string, Experiment> = new Map();
   private seqCounter: number = 0;
   private fingerprintIndex: FingerprintIndex = new Map();
-  private archive: Task[] = [];
   private _taskIndex = new Map<string, { stubId?: string; location: "global" | "stub" | "archive" }>();
 
   constructor() {
@@ -147,38 +146,36 @@ class Store {
         .get();
       this.seqCounter = seqRow ? parseInt(seqRow.value, 10) : 0;
 
-      // tasks
-      const taskRows = this.db.select({ location: schema.tasks.location, data: schema.tasks.data })
-        .from(schema.tasks).all();
-      for (const row of taskRows) {
+      // tasks with location='stub' — load onto stubs or move to archive
+      const stubTaskRows = this.db.select({ data: schema.tasks.data })
+        .from(schema.tasks)
+        .where(eq(schema.tasks.location, "stub"))
+        .all();
+      for (const row of stubTaskRows) {
         const task: Task = JSON.parse(row.data);
-        if (row.location === "stub") {
-          const stub = this.stubs.get(task.stub_id!);
-          if (stub) {
-            if (this._isActive(task.status)) {
-              stub.tasks.push(task);
-            } else {
-              this._truncateLogBuffer(task);
-              this.archive.push(task);
-              this._saveTask(task, "archive");
-            }
+        if (task.stub_id) {
+          const stub = this.stubs.get(task.stub_id);
+          if (stub && this._isActive(task.status)) {
+            stub.tasks.push(task);
           } else {
+            // Stub gone or task terminal — move to archive in DB
             this._truncateLogBuffer(task);
-            this.archive.push(task);
+            this._saveTask(task, "archive");
           }
-        } else if (row.location === "global") {
-          this.globalQueue.push(task);
         } else {
           this._truncateLogBuffer(task);
-          this.archive.push(task);
+          this._saveTask(task, "archive");
         }
       }
 
-      for (const t of this.archive) this._truncateLogBuffer(t);
-      this._pruneArchiveInMemory();
+      // Prune archive in DB
+      this._pruneArchive();
 
       this.rebuildFingerprintIndex();
       this._rebuildTaskIndex();
+
+      const archiveCount = this._getArchiveCount();
+      const queueCount = this._getGlobalQueueCount();
 
       logger.info("state.load", {
         stubs: this.stubs.size,
@@ -186,8 +183,8 @@ class Store {
         grids: this.grids.size,
         experiments: this.experiments.size,
         seq: this.seqCounter,
-        archive: this.archive.length,
-        queue: this.globalQueue.length,
+        archive: archiveCount,
+        queue: queueCount,
       });
     } catch (err) {
       logger.error("state.load_failed", { error: String(err) });
@@ -254,6 +251,66 @@ class Store {
     }
   }
 
+  // ─── DB query helpers ──────────────────────────────────────────────────
+
+  private _getArchiveCount(): number {
+    const row = this.db.select({ count: sql<number>`count(*)` })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.location, "archive"))
+      .get();
+    return row?.count ?? 0;
+  }
+
+  private _getGlobalQueueCount(): number {
+    const row = this.db.select({ count: sql<number>`count(*)` })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.location, "global"))
+      .get();
+    return row?.count ?? 0;
+  }
+
+  private _queryArchiveTasks(): Task[] {
+    const rows = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.location, "archive"))
+      .all();
+    const tasks: Task[] = [];
+    for (const row of rows) {
+      try { tasks.push(JSON.parse(row.data) as Task); } catch { /* skip corrupt */ }
+    }
+    return tasks;
+  }
+
+  private _queryGlobalQueueTasks(): Task[] {
+    const rows = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.location, "global"))
+      .all();
+    const tasks: Task[] = [];
+    for (const row of rows) {
+      try { tasks.push(JSON.parse(row.data) as Task); } catch { /* skip corrupt */ }
+    }
+    return tasks;
+  }
+
+  private _findTaskInDb(taskId: string): Task | undefined {
+    const row = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.id, taskId))
+      .get();
+    if (!row) return undefined;
+    try { return JSON.parse(row.data) as Task; } catch { return undefined; }
+  }
+
+  private _findGlobalQueueTaskInDb(taskId: string): Task | undefined {
+    const row = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(and(eq(schema.tasks.id, taskId), eq(schema.tasks.location, "global")))
+      .get();
+    if (!row) return undefined;
+    try { return JSON.parse(row.data) as Task; } catch { return undefined; }
+  }
+
   // ─── Seq Counter ────────────────────────────────────────────────────────
 
   nextSeq(): number {
@@ -317,9 +374,8 @@ class Store {
       this.db.transaction((tx) => {
         for (const task of stub.tasks) {
           this._truncateLogBuffer(task);
-          this.archive.push(task);
-          this._taskIndex.set(task.id, { location: "archive" });
           this._saveTask(task, "archive");
+          this._taskIndex.set(task.id, { location: "archive" });
         }
         this.stubs.delete(id);
         this._deleteStub(id);
@@ -375,38 +431,40 @@ class Store {
   // ─── Tasks ──────────────────────────────────────────────────────────────
 
   getAllTasks(): Task[] {
-    const tasks: Task[] = [...this.globalQueue];
-    for (const stub of this.stubs.values()) {
-      tasks.push(...stub.tasks);
-    }
-    const activeIds = new Set(tasks.map((t) => t.id));
+    const tasks: Task[] = [];
+    const seenIds = new Set<string>();
 
-    // Query all archived tasks from DB (includes evicted ones)
+    // Stub tasks (in-memory, transient)
+    for (const stub of this.stubs.values()) {
+      for (const t of stub.tasks) {
+        tasks.push(t);
+        seenIds.add(t.id);
+      }
+    }
+
+    // All DB tasks (global + archive)
     try {
       const dbRows = this.db.select({ data: schema.tasks.data })
         .from(schema.tasks)
-        .where(eq(schema.tasks.location, "archive"))
+        .where(not(eq(schema.tasks.location, "stub")))
         .all();
       for (const row of dbRows) {
         try {
           const task = JSON.parse(row.data) as Task;
-          if (!activeIds.has(task.id)) {
+          if (!seenIds.has(task.id)) {
             tasks.push(task);
+            seenIds.add(task.id);
           }
         } catch { /* skip corrupt rows */ }
       }
     } catch (err) {
       logger.error("db.get_all_tasks_failed", { error: String(err) });
-      // Fallback to in-memory archive
-      for (const t of this.archive) {
-        if (!activeIds.has(t.id)) tasks.push(t);
-      }
     }
     return tasks;
   }
 
   getActiveTasks(): Task[] {
-    const tasks: Task[] = [...this.globalQueue];
+    const tasks: Task[] = [...this._queryGlobalQueueTasks()];
     for (const stub of this.stubs.values()) {
       tasks.push(...stub.tasks);
     }
@@ -414,16 +472,14 @@ class Store {
   }
 
   getArchive(): Task[] {
-    return this.archive;
+    return this._queryArchiveTasks();
   }
 
   setArchive(tasks: Task[]): void {
     this.db.transaction((tx) => {
-      for (const t of this.archive) {
-        tx.delete(schema.tasks).where(eq(schema.tasks.id, t.id)).run();
-        this._taskIndex.delete(t.id);
-      }
-      this.archive = tasks;
+      // Delete all current archive tasks
+      tx.delete(schema.tasks).where(eq(schema.tasks.location, "archive")).run();
+      // Insert the new set
       for (const t of tasks) {
         tx.insert(schema.tasks)
           .values({
@@ -439,12 +495,23 @@ class Store {
         this._taskIndex.set(t.id, { location: "archive" });
       }
     });
+    // Remove from _taskIndex any archive tasks that were deleted
+    for (const [id, entry] of this._taskIndex) {
+      if (entry.location === "archive" && !tasks.some((t) => t.id === id)) {
+        this._taskIndex.delete(id);
+      }
+    }
   }
 
   removeFromArchive(taskId: string): Task | undefined {
-    const idx = this.archive.findIndex((t) => t.id === taskId);
-    if (idx === -1) return undefined;
-    const [task] = this.archive.splice(idx, 1);
+    const task = this._findTaskInDb(taskId);
+    if (!task) return undefined;
+    // Verify it's in archive
+    const row = this.db.select({ location: schema.tasks.location })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.id, taskId))
+      .get();
+    if (!row || row.location !== "archive") return undefined;
     this._taskIndex.delete(taskId);
     this._deleteTask(taskId);
     return task;
@@ -459,7 +526,6 @@ class Store {
         this._saveStub(stub);
       }
       this._truncateLogBuffer(task);
-      this.archive.push(task);
       this._saveTask(task, "archive");
       this._taskIndex.set(taskId, { location: "archive" });
     });
@@ -472,92 +538,42 @@ class Store {
     }
   }
 
-  private _pruneArchiveInMemory(): void {
-    if (this.archive.length <= ARCHIVE_MAX) return;
-    const sorted = [...this.archive].sort((a, b) => {
-      return (a.finished_at ?? a.created_at).localeCompare(b.finished_at ?? b.created_at);
-    });
-    const toRemove = sorted.length - ARCHIVE_MAX;
-    const evicted = sorted.slice(0, toRemove);
-    const kept = new Set(sorted.slice(toRemove).map((t) => t.id));
-
-    this.db.transaction((tx) => {
-      for (const task of evicted) {
-        const stripped = { ...task, log_buffer: [] };
-        tx.insert(schema.tasks)
-          .values({
-            id: task.id, status: task.status, stub_id: task.stub_id || null,
-            priority: task.priority, seq: task.seq, created_at: task.created_at,
-            location: "archive", data: JSON.stringify(stripped),
-          })
-          .onConflictDoUpdate({
-            target: schema.tasks.id,
-            set: { data: JSON.stringify(stripped) },
-          })
-          .run();
-        this._taskIndex.delete(task.id);
-      }
-    });
-
-    this.archive = this.archive.filter((t) => kept.has(t.id));
-    if (evicted.length > 0) {
-      logger.info("archive.prune_memory", { evicted: evicted.length, remaining: this.archive.length });
-    }
-  }
-
   private _pruneArchive(): void {
-    if (this.archive.length <= ARCHIVE_MAX) return;
-    const sorted = [...this.archive].sort((a, b) => {
-      return (a.finished_at ?? a.created_at).localeCompare(b.finished_at ?? b.created_at);
-    });
-    const toRemove = sorted.length - ARCHIVE_MAX;
-    const evicted = sorted.slice(0, toRemove);
-    const kept = new Set(sorted.slice(toRemove).map((t) => t.id));
+    const count = this._getArchiveCount();
+    if (count <= ARCHIVE_MAX) return;
 
-    this.db.transaction((tx) => {
-      for (const task of evicted) {
-        const stripped = { ...task, log_buffer: [] };
-        tx.insert(schema.tasks)
-          .values({
-            id: task.id, status: task.status, stub_id: task.stub_id || null,
-            priority: task.priority, seq: task.seq, created_at: task.created_at,
-            location: "archive", data: JSON.stringify(stripped),
-          })
-          .onConflictDoUpdate({
-            target: schema.tasks.id,
-            set: { data: JSON.stringify(stripped) },
-          })
-          .run();
-        this._taskIndex.delete(task.id);
+    // Preserve historical task rows. For archive entries beyond the hot window,
+    // strip log buffers only; API/query limits decide how much history to show.
+    const coldCount = count - ARCHIVE_MAX;
+    const coldRows = this.db.all(
+      sql`SELECT id, data FROM tasks WHERE location = 'archive' ORDER BY COALESCE(json_extract(data, '$.finished_at'), created_at) ASC LIMIT ${coldCount}`
+    ) as { id: string; data: string }[];
+
+    let trimmed = 0;
+    for (const row of coldRows) {
+      try {
+        const task = JSON.parse(row.data) as Task;
+        if (!task.log_buffer || task.log_buffer.length === 0) continue;
+        task.log_buffer = [];
+        this._saveTask(task, "archive");
+        trimmed++;
+      } catch {
+        // Keep corrupt rows for manual inspection rather than silently deleting them.
       }
-    });
-
-    this.archive = this.archive.filter((t) => kept.has(t.id));
-    logger.info("archive.prune_memory", { evicted: toRemove, remaining: this.archive.length });
+    }
+    if (trimmed > 0) logger.info("archive.prune_logs", { trimmed, archive_count: count });
   }
 
   unarchiveTask(stubId: string, taskId: string, update: Partial<Task>): Task | undefined {
     const stub = this.stubs.get(stubId);
     if (!stub) return undefined;
-    let task: Task;
-    const idx = this.archive.findIndex((t) => t.id === taskId);
-    if (idx !== -1) {
-      [task] = this.archive.splice(idx, 1);
-    } else {
-      // DB fallback: task may have been evicted from memory
-      try {
-        const row = this.db.select({ data: schema.tasks.data })
-          .from(schema.tasks)
-          .where(eq(schema.tasks.id, taskId))
-          .get();
-        if (!row) return undefined;
-        task = JSON.parse(row.data) as Task;
-        logger.info("unarchiveTask.db_fallback", { taskId, status: task.status });
-      } catch { return undefined; }
-    }
+
+    // Find task in DB (archive)
+    const task = this._findTaskInDb(taskId);
+    if (!task) return undefined;
+
     if (update.status && !canTransition(task.status, update.status)) {
       logger.warn("unarchiveTask.illegal_transition", { taskId, from: task.status, to: update.status });
-      if (idx !== -1) this.archive.push(task);
       return undefined;
     }
     const recovered = { ...task, ...update };
@@ -576,7 +592,7 @@ class Store {
   }
 
   getGlobalQueue(): Task[] {
-    return [...this.globalQueue].sort((a, b) => {
+    return this._queryGlobalQueueTasks().sort((a, b) => {
       if (b.priority !== a.priority) return b.priority - a.priority;
       return a.created_at.localeCompare(b.created_at);
     });
@@ -584,7 +600,6 @@ class Store {
 
   addToGlobalQueue(task: Task): void {
     task.stub_id = undefined;
-    this.globalQueue.push(task);
     this._taskIndex.set(task.id, { location: "global" });
     try {
       this._saveTask(task, "global");
@@ -597,37 +612,31 @@ class Store {
   }
 
   removeFromGlobalQueue(taskId: string): Task | undefined {
-    const idx = this.globalQueue.findIndex((t) => t.id === taskId);
-    if (idx === -1) return undefined;
-    const [task] = this.globalQueue.splice(idx, 1);
+    const task = this._findGlobalQueueTaskInDb(taskId);
+    if (!task) return undefined;
     this._taskIndex.delete(taskId);
     this._deleteTask(taskId);
     return task;
   }
 
   updateGlobalQueueTask(taskId: string, update: Partial<Task>): Task | undefined {
-    const idx = this.globalQueue.findIndex((t) => t.id === taskId);
-    if (idx === -1) return undefined;
-    const prev = this.globalQueue[idx];
+    const prev = this._findGlobalQueueTaskInDb(taskId);
+    if (!prev) return undefined;
+
     if (update.status && update.status !== prev.status) {
       if (!canTransition(prev.status, update.status)) {
         logger.error("state.illegal_transition", { task_id: taskId, from: prev.status, to: update.status });
         return undefined;
       }
     }
-    this.globalQueue[idx] = { ...prev, ...update };
-    const updated = this.globalQueue[idx];
+    const updated = { ...prev, ...update };
 
     if (this._isActive(prev.status) && !this._isActive(updated.status)) {
-      this.globalQueue.splice(idx, 1);
+      // Move to archive
       const archived = { ...updated };
       this._truncateLogBuffer(archived);
-
-      this.db.transaction((tx) => {
-        this.archive.push(archived);
-        this._saveTask(archived, "archive");
-        this._taskIndex.set(taskId, { location: "archive" });
-      });
+      this._saveTask(archived, "archive");
+      this._taskIndex.set(taskId, { location: "archive" });
       this._pruneArchive();
     } else {
       try {
@@ -655,14 +664,14 @@ class Store {
         const task = stub?.tasks.find((t) => t.id === taskId);
         if (task) return { task, stubId: entry.stubId };
       } else if (entry.location === "global") {
-        const task = this.globalQueue.find((t) => t.id === taskId);
+        const task = this._findGlobalQueueTaskInDb(taskId);
         if (task) return { task, stubId: null };
       } else if (entry.location === "archive") {
-        const task = this.archive.find((t) => t.id === taskId);
+        const task = this._findTaskInDb(taskId);
         if (task) return { task, stubId: task.stub_id || null, archived: true };
       }
     }
-    // Slow fallback
+    // Slow fallback: check stubs
     for (const stub of this.stubs.values()) {
       const task = stub.tasks.find((t) => t.id === taskId);
       if (task) {
@@ -670,25 +679,21 @@ class Store {
         return { task, stubId: stub.id };
       }
     }
-    const gq = this.globalQueue.find((t) => t.id === taskId);
-    if (gq) {
-      this._taskIndex.set(taskId, { location: "global" });
-      return { task: gq, stubId: null };
-    }
-    const arch = this.archive.find((t) => t.id === taskId);
-    if (arch) {
-      this._taskIndex.set(taskId, { location: "archive" });
-      return { task: arch, stubId: arch.stub_id || null, archived: true };
-    }
-    // DB fallback for evicted archive tasks
+    // DB fallback
     try {
-      const row = this.db.select({ data: schema.tasks.data })
+      const row = this.db.select({ data: schema.tasks.data, location: schema.tasks.location })
         .from(schema.tasks)
         .where(eq(schema.tasks.id, taskId))
         .get();
       if (row) {
         const task = JSON.parse(row.data) as Task;
-        return { task, stubId: task.stub_id || null, archived: true };
+        if (row.location === "global") {
+          this._taskIndex.set(taskId, { location: "global" });
+          return { task, stubId: null };
+        } else {
+          this._taskIndex.set(taskId, { location: "archive" });
+          return { task, stubId: task.stub_id || null, archived: true };
+        }
       }
     } catch { /* skip */ }
     return undefined;
@@ -752,7 +757,6 @@ class Store {
   requeueDispatchedTask(stub: Stub, recovered: Task): void {
     this.db.transaction((tx) => {
       recovered.stub_id = undefined;
-      this.globalQueue.push(recovered);
       this._saveTask(recovered, "global");
       this._taskIndex.set(recovered.id, { location: "global" });
       this._saveStub(stub);
@@ -774,7 +778,6 @@ class Store {
           const prev = { ...task };
           task.status = "pending";
           task.stub_id = undefined;
-          this.globalQueue.push(task);
           this._saveTask(task, "global");
           this._taskIndex.set(task.id, { location: "global" });
           this._reindexTask(prev, task);
@@ -845,15 +848,20 @@ class Store {
 
   private _rebuildTaskIndex(): void {
     this._taskIndex.clear();
-    for (const task of this.globalQueue) {
+    // Global queue from DB
+    const globalTasks = this._queryGlobalQueueTasks();
+    for (const task of globalTasks) {
       this._taskIndex.set(task.id, { location: "global" });
     }
+    // Stubs (in-memory)
     for (const stub of this.stubs.values()) {
       for (const task of stub.tasks) {
         this._taskIndex.set(task.id, { stubId: stub.id, location: "stub" });
       }
     }
-    for (const task of this.archive) {
+    // Archive from DB
+    const archiveTasks = this._queryArchiveTasks();
+    for (const task of archiveTasks) {
       this._taskIndex.set(task.id, { location: "archive" });
     }
   }
@@ -898,9 +906,23 @@ class Store {
 
   getGridTasks(gridId: string): Task[] {
     const active = this.getActiveTasks().filter((t) => t.grid_id === gridId);
-    const archived = this.archive.filter((t) => t.grid_id === gridId);
-    const seen = new Set(active.map((t) => t.id));
-    return [...active, ...archived.filter((t) => !seen.has(t.id))];
+    const seenIds = new Set(active.map((t) => t.id));
+
+    // Query archived tasks with this grid_id from DB
+    const archiveRows = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.location, "archive"))
+      .all();
+    const archived: Task[] = [];
+    for (const row of archiveRows) {
+      try {
+        const t = JSON.parse(row.data) as Task;
+        if (t.grid_id === gridId && !seenIds.has(t.id)) {
+          archived.push(t);
+        }
+      } catch { /* skip */ }
+    }
+    return [...active, ...archived];
   }
 
   updateGridStatus(gridId: string): void {
@@ -965,7 +987,9 @@ class Store {
   }
 
   getBlockedTasksDependingOn(taskId: string): Task[] {
-    return this.globalQueue.filter(
+    // Query global queue for blocked tasks depending on taskId
+    const globalTasks = this._queryGlobalQueueTasks();
+    return globalTasks.filter(
       (t) => t.status === "blocked" && t.depends_on?.includes(taskId)
     );
   }
@@ -1015,8 +1039,8 @@ class Store {
       grids: Array.from(this.grids.values()),
       experiments: Array.from(this.experiments.values()),
       seq_counter: this.seqCounter,
-      archive: this.archive,
-      global_queue: this.globalQueue,
+      archive: this._queryArchiveTasks(),
+      global_queue: this._queryGlobalQueueTasks(),
     };
   }
 
@@ -1059,12 +1083,10 @@ class Store {
   loadFromState(state: ServerState): void {
     this.stubs.clear();
     this.tokens.clear();
-    this.globalQueue = [];
     this.grids.clear();
     this.experiments.clear();
     this.fingerprintIndex.clear();
     this._taskIndex.clear();
-    this.archive = [];
     this.seqCounter = 0;
 
     // Clear DB
@@ -1113,12 +1135,13 @@ class Store {
       }
 
       if (state.archive) {
-        this.archive = state.archive;
-        for (const t of this.archive) this._saveTask(t, "archive");
+        for (const t of state.archive) {
+          this._truncateLogBuffer(t);
+          this._saveTask(t, "archive");
+        }
       }
       if (state.global_queue) {
-        this.globalQueue = state.global_queue;
-        for (const t of this.globalQueue) this._saveTask(t, "global");
+        for (const t of state.global_queue) this._saveTask(t, "global");
       }
       if (typeof state.seq_counter === "number") {
         this.seqCounter = state.seq_counter;
@@ -1134,7 +1157,6 @@ class Store {
           stub.tasks = stub.tasks.filter((t) => this._isActive(t.status));
           for (const t of terminal) {
             this._truncateLogBuffer(t);
-            this.archive.push(t);
             this._saveTask(t, "archive");
           }
           this._saveStub(stub);
@@ -1143,9 +1165,7 @@ class Store {
       }
     });
 
-    for (const t of this.archive) this._truncateLogBuffer(t);
     this._pruneArchive();
-
     this.rebuildFingerprintIndex();
     this._rebuildTaskIndex();
   }
@@ -1161,12 +1181,10 @@ class Store {
   reset(): void {
     this.stubs.clear();
     this.tokens.clear();
-    this.globalQueue = [];
     this.grids.clear();
     this.experiments.clear();
     this.fingerprintIndex.clear();
     this._taskIndex.clear();
-    this.archive = [];
     this.seqCounter = 0;
     writeLockTable.clear();
 

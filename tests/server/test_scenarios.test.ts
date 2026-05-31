@@ -95,6 +95,7 @@ function sendResume(socket: Socket, opts: {
   tags?: string[];
 }) {
   socket.emit("resume", {
+    stub_version: "2.1.0",
     hostname: opts.hostname,
     gpu: { name: opts.gpuName || "A40", vram_total_mb: 10240, count: 1 },
     max_concurrent: opts.maxConcurrent ?? 2,

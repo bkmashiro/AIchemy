@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from .context import TrainingContext
 
 
-def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
+def run_preflight(ctx: "TrainingContext", reads: list[str], writes: list[str] | None = None) -> None:
     """
     Perform pre-training sanity checks:
 
@@ -35,7 +35,26 @@ def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
                 f"Preflight: reads path is not readable: {rpath}"
             )
 
-    # 2. run_dir writable — check parent directory
+    # 2. Write paths check
+    for wpath in writes or []:
+        p = Path(wpath)
+        if p.exists():
+            if not os.access(p, os.W_OK):
+                raise PermissionError(
+                    f"Preflight: writes path exists but is not writable: {wpath}"
+                )
+        else:
+            parent = p.parent
+            if not parent.exists():
+                raise FileNotFoundError(
+                    f"Preflight: writes path parent does not exist: {parent}"
+                )
+            if not os.access(parent, os.W_OK):
+                raise PermissionError(
+                    f"Preflight: writes path parent is not writable: {parent}"
+                )
+
+    # 3. run_dir writable — check parent directory
     run_dir_parent = ctx.run_dir.parent
     if run_dir_parent.exists():
         if not os.access(run_dir_parent, os.W_OK):
@@ -51,11 +70,11 @@ def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
                 f"Preflight: cannot create run_dir parent {run_dir_parent}: {e}"
             ) from e
 
-    # 3. Auto-create run_dir and checkpoint_dir
+    # 4. Auto-create run_dir and checkpoint_dir
     _makedirs_002(ctx.run_dir)
     _makedirs_002(ctx.checkpoint_dir)
 
-    # 4. Disk space warning (< 1 GiB = 1_073_741_824 bytes)
+    # 5. Disk space warning (< 1 GiB = 1_073_741_824 bytes)
     try:
         usage = shutil.disk_usage(ctx.run_dir)
         if usage.free < 1_073_741_824:
@@ -68,7 +87,7 @@ def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
     except Exception:
         pass  # disk_usage may fail on exotic filesystems — not fatal
 
-    # 5. GPU check — raise if torch installed but no CUDA
+    # 6. GPU check — raise if torch installed but no CUDA
     try:
         import torch  # type: ignore
         if not torch.cuda.is_available():
@@ -79,7 +98,7 @@ def run_preflight(ctx: "TrainingContext", reads: list[str]) -> None:
     except ImportError:
         pass  # torch not installed — skip GPU check
 
-    # 6. Detect existing checkpoint → set is_resume
+    # 7. Detect existing checkpoint → set is_resume
     ckpt = ctx.latest_checkpoint()
     if ckpt is not None:
         ctx.is_resume = True

@@ -216,6 +216,7 @@ import { logger } from "../src/log";
 const BASE_HOSTNAME = "gpu32";
 const BASE_GPU = { name: "A40", count: 1 };
 const BASE_RESUME_PAYLOAD = {
+  stub_version: "2.1.0",
   hostname: BASE_HOSTNAME,
   gpu: BASE_GPU,
   max_concurrent: 5,
@@ -232,7 +233,8 @@ function computeExpectedStubId(
   user: string = "",
   slurmJobId: string = "",
 ): string {
-  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}|${user}|${slurmJobId}`;
+  const instanceId = slurmJobId || cudaVisibleDevices || gpu?.name || "";
+  const input = `${hostname}|${user}|${instanceId}|${slurmJobId}`;
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
@@ -667,6 +669,24 @@ describe("resume reconciliation", () => {
     socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, token: "wrong" });
     expect(mockSocket.emit).toHaveBeenCalledWith("error", expect.objectContaining({ message: "Invalid token" }));
     expect(mockSocket.disconnect).toHaveBeenCalled();
+  });
+
+  it("rejects mismatched stub version", () => {
+    const { socketHandlers, mockSocket } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, stub_version: "2.0.0" });
+    expect(mockSocket.emit).toHaveBeenCalledWith(
+      "resume_response",
+      expect.objectContaining({
+        error: expect.stringContaining("version mismatch"),
+        server_version: "2.1.0",
+        stub_version: "2.0.0",
+      }),
+    );
+    expect(mockSocket.disconnect).toHaveBeenCalledWith(true);
+    expect(logger.error).toHaveBeenCalledWith(
+      "stub.version_mismatch",
+      expect.objectContaining({ stub_version: "2.0.0", server_version: "2.1.0" }),
+    );
   });
 
   it("emits stub.online on successful first resume", () => {

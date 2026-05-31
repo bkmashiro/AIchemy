@@ -10,3 +10,7 @@ backups/
 *.log
 .DS_Store
 state-v2.json.bak
+state.db
+state.db-*
+/sdk/uv.lock
+/stub/uv.lock

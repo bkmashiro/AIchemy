@@ -11,6 +11,8 @@ Reliable messaging:
 """
 from __future__ import annotations
 
+from . import __version__
+
 import asyncio
 import json
 import logging
@@ -270,11 +272,8 @@ class StubDaemon:
         """Send unified resume event (spec §4)."""
         gpu_info = self.gpu_monitor.get_gpu_info()
 
-        # Compute server-compatible stub_id using actual GPU info
-        computed_stub_id = self.config.compute_stub_id(
-            gpu_name=gpu_info.get("name", "CPU-only"),
-            gpu_count=gpu_info.get("count", 0),
-        )
+        # Compute server-compatible stub_id (hostname + user + instance discriminator)
+        computed_stub_id = self.config.compute_stub_id()
 
         running_tasks = []
         for task_id, pid in self.process_mgr.get_task_pids().items():
@@ -290,9 +289,10 @@ class StubDaemon:
 
         payload: dict[str, Any] = {
             "stub_id": computed_stub_id,
+            "stub_version": __version__,
             "hostname": self.config.hostname,
             "gpu": gpu_info,
-            "cuda_visible_devices": cuda_visible_devices,  # part of stable identity hash
+            "cuda_visible_devices": cuda_visible_devices,  # informational, not used for identity
             "max_concurrent": self.config.max_concurrent,
             "token": self.config.token,
             "running_tasks": running_tasks,
@@ -387,6 +387,12 @@ class StubDaemon:
     # ------------------------------------------------------------------ #
 
     async def _handle_resume_response(self, data: dict) -> None:
+        if data.get("error"):
+            jlog("error", "resume_response.error", error=data.get("error"), server_version=data.get("server_version"), stub_version=data.get("stub_version"))
+            log.error("Server rejected stub resume: %s", data.get("error"))
+            await asyncio.sleep(0.2)
+            os._exit(2)
+
         self.stub_id = data.get("stub_id")
         self.stub_name = data.get("name")
         config_update = data.get("config") or {}
