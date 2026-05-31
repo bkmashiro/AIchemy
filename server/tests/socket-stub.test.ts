@@ -66,6 +66,7 @@ vi.mock("../src/store", () => ({
     rebuildWriteLocks: vi.fn(),
     unarchiveTask: vi.fn(),
     requeueStubTasks: vi.fn(() => []),
+    deleteStub: vi.fn((id: string) => { _stubs.delete(id); }),
   },
 }));
 
@@ -238,6 +239,17 @@ function computeExpectedStubId(
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
+function computeLegacyExpectedStubId(
+  hostname = BASE_HOSTNAME,
+  gpu = BASE_GPU,
+  cudaVisibleDevices: string = "",
+  user: string = "",
+  slurmJobId: string = "",
+): string {
+  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}|${user}|${slurmJobId}`;
+  return createHash("sha256").update(input).digest("hex").slice(0, 12);
+}
+
 const STUB_ID = computeExpectedStubId();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -367,6 +379,8 @@ beforeEach(() => {
   _stubs.clear();
   _queue.length = 0;
   _seqCounter = 0;
+  delete process.env.ALCHEMY_ENFORCE_VERSION;
+  delete process.env.ALCHEMY_ENABLE_ZOMBIE_CLEANUP;
   vi.clearAllMocks();
 });
 
@@ -671,7 +685,29 @@ describe("resume reconciliation", () => {
     expect(mockSocket.disconnect).toHaveBeenCalled();
   });
 
-  it("rejects mismatched stub version", () => {
+  it("allows mismatched stub version by default during rolling upgrades", () => {
+    const { socketHandlers, mockSocket } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, stub_version: "2.0.0" });
+    expect(mockSocket.disconnect).not.toHaveBeenCalledWith(true);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "stub.version_mismatch_allowed",
+      expect.objectContaining({ stub_version: "2.0.0", server_version: "2.1.0" }),
+    );
+  });
+
+  it("allows missing stub version for old stubs and warns", () => {
+    const { socketHandlers, mockSocket } = buildHarness({ skipResume: true });
+    const { stub_version, ...oldPayload } = BASE_RESUME_PAYLOAD;
+    socketHandlers["resume"]?.(oldPayload);
+    expect(mockSocket.disconnect).not.toHaveBeenCalledWith(true);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "stub.version_missing",
+      expect.objectContaining({ server_version: "2.1.0" }),
+    );
+  });
+
+  it("rejects mismatched stub version only when enforcement is enabled", () => {
+    process.env.ALCHEMY_ENFORCE_VERSION = "1";
     const { socketHandlers, mockSocket } = buildHarness({ skipResume: true });
     socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, stub_version: "2.0.0" });
     expect(mockSocket.emit).toHaveBeenCalledWith(
@@ -686,6 +722,26 @@ describe("resume reconciliation", () => {
     expect(logger.error).toHaveBeenCalledWith(
       "stub.version_mismatch",
       expect.objectContaining({ stub_version: "2.0.0", server_version: "2.1.0" }),
+    );
+  });
+
+  it("reuses existing legacy stub ID for old stubs without client-computed stub_id", () => {
+    const legacyId = computeLegacyExpectedStubId(BASE_HOSTNAME, BASE_GPU, "0", "ys25");
+    const legacyStub = makeStub({ id: legacyId, user: "ys25", tasks: [] });
+    _stubs.set(legacyId, legacyStub);
+
+    const { socketHandlers, webNs } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.({
+      ...BASE_RESUME_PAYLOAD,
+      stub_version: undefined,
+      user: "ys25",
+      cuda_visible_devices: "0",
+    });
+
+    expect(webNs.emit).toHaveBeenCalledWith("stub.online", expect.objectContaining({ id: legacyId }));
+    expect(logger.warn).toHaveBeenCalledWith(
+      "stub.legacy_identity_reused",
+      expect.objectContaining({ legacy_id: legacyId }),
     );
   });
 

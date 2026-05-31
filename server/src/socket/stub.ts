@@ -76,6 +76,20 @@ export function computeStubId(hostname: string, user: string = "", instanceId: s
   return createHash("sha256").update(input).digest("hex").slice(0, 12);
 }
 
+/** Legacy v2.0 identity formula. Keep during rolling upgrades so existing
+ * persisted stub rows are reused instead of creating zombie stubs.
+ */
+export function computeLegacyStubId(
+  hostname: string,
+  gpu: { name: string; count: number },
+  cudaVisibleDevices: string = "",
+  user: string = "",
+  slurmJobId: string = "",
+): string {
+  const input = `${hostname}|${cudaVisibleDevices}|${gpu.name}|${gpu.count}|${user}|${slurmJobId}`;
+  return createHash("sha256").update(input).digest("hex").slice(0, 12);
+}
+
 // ─── Semantic name generation ─────────────────────────────────────────────────
 
 function generateStubName(hostname: string, gpuName: string, slurmJobId?: string): string {
@@ -563,39 +577,48 @@ function handleResume(
     return;
   }
 
-  const stubVersion = payload.stub_version ?? "unknown";
-  if (stubVersion !== ALCHEMY_VERSION) {
-    const error = `Alchemy version mismatch: server=${ALCHEMY_VERSION} stub=${stubVersion}. Redeploy the stub package.`;
-    logger.error("stub.version_mismatch", { hostname, stub_version: stubVersion, server_version: ALCHEMY_VERSION });
-    socket.emit("resume_response", { error, server_version: ALCHEMY_VERSION, stub_version: stubVersion });
-    socket.disconnect(true);
-    return;
+  const stubVersion = payload.stub_version;
+  const enforceVersion = process.env.ALCHEMY_ENFORCE_VERSION === "1" || process.env.ALCHEMY_ENFORCE_VERSION === "true";
+  if (!stubVersion) {
+    logger.warn("stub.version_missing", { hostname, server_version: ALCHEMY_VERSION });
+  } else if (stubVersion !== ALCHEMY_VERSION) {
+    const details = { hostname, stub_version: stubVersion, server_version: ALCHEMY_VERSION };
+    if (enforceVersion) {
+      const error = `Alchemy version mismatch: server=${ALCHEMY_VERSION} stub=${stubVersion}. Redeploy the stub package.`;
+      logger.error("stub.version_mismatch", details);
+      socket.emit("resume_response", { error, server_version: ALCHEMY_VERSION, stub_version: stubVersion });
+      socket.disconnect(true);
+      return;
+    }
+    logger.warn("stub.version_mismatch_allowed", details);
   }
 
   // Compute stable stub ID from hostname + user + per-instance discriminator.
-  // If the stub sends a pre-computed stub_id (aligned formula), use it.
-  // Otherwise fall back to server-side computation for backward compat.
-  // New stubs send stub_id computed from SLURM/CUDA instance identity. For older
-  // stubs and tests that do not send stub_id/cuda_visible_devices, use gpu.name as
-  // a compatibility discriminator so same-host different-GPU workers do not collide.
+  // Prefer client-provided IDs from new stubs. For rolling upgrades, when an old
+  // stub does not send stub_id, reuse an existing legacy-ID row if present.
   const identityInstanceId = slurm_job_id || cuda_visible_devices || (payload.stub_id ? "" : gpu?.name) || "";
   const serverComputedId = computeStubId(hostname, user ?? "", identityInstanceId, slurm_job_id ?? "");
+  const legacyComputedId = computeLegacyStubId(hostname, gpu, cuda_visible_devices ?? "", user ?? "", slurm_job_id ?? "");
   let stubId: string;
   if (payload.stub_id) {
-    if (payload.stub_id !== serverComputedId) {
+    if (payload.stub_id !== serverComputedId && payload.stub_id !== legacyComputedId) {
       logger.warn("stub.id_mismatch", {
         client_id: payload.stub_id,
         server_id: serverComputedId,
+        legacy_id: legacyComputedId,
         hostname,
         user,
         slurm_job_id,
         identity_instance_id: identityInstanceId,
       });
     }
-    // Trust the client-provided ID — it was computed with the same formula.
+    // Trust the client-provided ID — it was computed with the stub's actual identity inputs.
     stubId = payload.stub_id;
   } else {
-    stubId = serverComputedId;
+    stubId = store.getStub(legacyComputedId) ? legacyComputedId : serverComputedId;
+    if (stubId === legacyComputedId && legacyComputedId !== serverComputedId) {
+      logger.warn("stub.legacy_identity_reused", { hostname, user, legacy_id: legacyComputedId, new_id: serverComputedId });
+    }
   }
 
   // Cancel disconnect fail timer if stub is reconnecting within heartbeat timeout
@@ -715,58 +738,40 @@ function handleResume(
     logger.info("stub.resume", { stub: stub.name, running: running_tasks.length, queued: local_queue.length, new: true });
   }
 
-  // ─── Zombie cleanup: migrate tasks from old stale offline stubs (same host+user) ──
-  // Do not fail another offline stub merely because a same-host/user stub resumed;
-  // respect the disconnect grace window before declaring those tasks dead.
-  for (const oldStub of store.getAllStubs()) {
-    if (oldStub.id === stubId) continue; // skip self
-    if (oldStub.hostname !== hostname) continue;
-    if ((oldStub.user ?? "") !== (user ?? "")) continue;
-    if (oldStub.status === "online") continue; // don't touch live stubs
-    const lastSeen = new Date(oldStub.last_seen || oldStub.last_heartbeat || oldStub.connected_at).getTime();
-    const stale = Number.isFinite(lastSeen) && Date.now() - lastSeen >= DISCONNECT_FAIL_MS;
-    if (!stale) continue;
+  // ─── Conservative stale-stub cleanup ───────────────────────────────────────
+  // Disabled by default. During rolling upgrades, identity formulas and versions
+  // can legitimately differ while old tasks are still running. Never fail running
+  // tasks from this path; the disconnect timeout/reconciliation path owns that.
+  if (process.env.ALCHEMY_ENABLE_ZOMBIE_CLEANUP === "1") {
+    for (const oldStub of store.getAllStubs()) {
+      if (oldStub.id === stubId) continue; // skip self
+      if (oldStub.hostname !== hostname) continue;
+      if ((oldStub.user ?? "") !== (user ?? "")) continue;
+      if (oldStub.status === "online") continue; // don't touch live stubs
+      const lastHeartbeat = oldStub.last_seen || oldStub.last_heartbeat;
+      if (!lastHeartbeat) continue;
+      const lastSeen = new Date(lastHeartbeat).getTime();
+      const stale = Number.isFinite(lastSeen) && Date.now() - lastSeen >= DISCONNECT_FAIL_MS;
+      if (!stale) continue;
 
-    const migratedCount = { lost: 0, requeued: 0 };
-    const oldTasks = [...oldStub.tasks];
-    for (const task of oldTasks) {
-      if (["running", "paused"].includes(task.status)) {
-        // Task was "running" on a now-dead stub — mark as failed (lost)
-        const updated = failTask(oldStub.id, task.id, undefined, { death_cause: "disappeared" });
-        if (updated) {
-          webNs.emit("task.update", updated);
-          logger.info("task.migrated_lost", { task_seq: updated.seq, old_stub: oldStub.name, new_stub: stub.name });
-          notifyFailed(updated).catch(() => {});
-          handleAutoRetry(updated, webNs);
-          migratedCount.lost++;
-        }
-      } else if (task.status === "assigned") {
-        // Re-queue assigned tasks so they can be dispatched to the new stub
-        const requeued = store.requeueStubTasks(oldStub.id);
-        for (const t of requeued) {
-          webNs.emit("task.update", t);
-          migratedCount.requeued++;
-        }
-        break; // requeueStubTasks handles all assigned tasks at once
+      const hasRunning = oldStub.tasks.some((t) => ["running", "paused"].includes(t.status));
+      if (hasRunning) {
+        logger.warn("stub.zombie_cleanup_skipped_running", { zombie_stub: oldStub.name, zombie_id: oldStub.id, new_stub: stub.name });
+        continue;
       }
-    }
 
-    if (migratedCount.lost > 0 || migratedCount.requeued > 0) {
-      logger.info("stub.zombie_cleanup", {
-        zombie_stub: oldStub.name,
-        zombie_id: oldStub.id,
-        new_stub: stub.name,
-        lost: migratedCount.lost,
-        requeued: migratedCount.requeued,
-      });
-    }
+      const requeued = store.requeueStubTasks(oldStub.id);
+      for (const t of requeued) webNs.emit("task.update", t);
+      if (requeued.length > 0) {
+        logger.info("stub.zombie_cleanup", { zombie_stub: oldStub.name, zombie_id: oldStub.id, new_stub: stub.name, requeued: requeued.length });
+      }
 
-    // Remove the zombie stub if it has no more active tasks
-    const hasActive = oldStub.tasks.some((t) => ["running", "paused", "assigned"].includes(t.status));
-    if (!hasActive) {
-      store.deleteStub(oldStub.id);
-      webNs.emit("stub.removed", { stub_id: oldStub.id });
-      logger.info("stub.zombie_removed", { stub: oldStub.name, stub_id: oldStub.id });
+      const hasActive = oldStub.tasks.some((t) => ["running", "paused", "assigned"].includes(t.status));
+      if (!hasActive) {
+        store.deleteStub(oldStub.id);
+        webNs.emit("stub.removed", { stub_id: oldStub.id });
+        logger.info("stub.zombie_removed", { stub: oldStub.name, stub_id: oldStub.id });
+      }
     }
   }
 
