@@ -13,7 +13,6 @@ type DemoExperiment = {
   family: string;
   parentId?: string;
   branch: "baseline" | "curiosity" | "batch" | "resume" | "ablation";
-  lane: number;
   hypothesis: string;
   expected: string;
   forkReason?: string;
@@ -41,9 +40,6 @@ type BranchStyle = {
   bg: string;
   text: string;
 };
-
-const MAX_MOBILE_DEPTH = 2;
-const MAX_DESKTOP_DEPTH = 5;
 
 const BRANCH: Record<DemoExperiment["branch"], BranchStyle> = {
   baseline: { label: "baseline", color: "#8b949e", glow: "rgba(139,148,158,0.28)", bg: "bg-slate-500/10", text: "text-slate-300" },
@@ -81,7 +77,6 @@ const demoExperiments: DemoExperiment[] = [
     description: "Baseline JEMA v2 run before curiosity objective changes.",
     family: "jema_v2/pretrain",
     branch: "baseline",
-    lane: 0,
     hypothesis: "Stable pretraining should hold zN above 0.82 without loss spikes.",
     expected: "zN >= 0.82, eval loss <= 1.9, no OOM on A30.",
     decision: "fork",
@@ -99,7 +94,6 @@ const demoExperiments: DemoExperiment[] = [
     family: "jema_v2/pretrain",
     parentId: "baseline",
     branch: "curiosity",
-    lane: 1,
     hypothesis: "Curiosity objective improves zN if LR is reduced enough to avoid collapse.",
     expected: "zN >= 0.86 and smoother loss curve than baseline.",
     forkReason: "Baseline showed usable zN but loss instability after 18k steps.",
@@ -118,7 +112,6 @@ const demoExperiments: DemoExperiment[] = [
     family: "jema_v2/pretrain",
     parentId: "curiosity-low-lr",
     branch: "resume",
-    lane: 2,
     hypothesis: "Same objective should stabilize once the memory pressure is removed.",
     expected: "zN >= 0.865, loss spike disappears after resume.",
     forkReason: "A30 run hit OOM; resume branch records environment change explicitly.",
@@ -137,7 +130,6 @@ const demoExperiments: DemoExperiment[] = [
     family: "jema_v2/pretrain",
     parentId: "curiosity-resume-t4",
     branch: "ablation",
-    lane: 3,
     hypothesis: "Removing dropout improves zN but may hurt eval loss stability.",
     expected: "zN +0.01 with eval_loss regression <= 0.03.",
     forkReason: "Resume branch became the best checkpoint; isolate regularization next.",
@@ -156,7 +148,6 @@ const demoExperiments: DemoExperiment[] = [
     family: "jema_v2/pretrain",
     parentId: "baseline",
     branch: "batch",
-    lane: 1,
     hypothesis: "Higher batch reduces variance without hurting zN.",
     expected: "Lower loss variance and no OOM.",
     forkReason: "Baseline variance looked optimizer-related.",
@@ -175,7 +166,6 @@ const demoExperiments: DemoExperiment[] = [
     family: "jema_v2/pretrain",
     parentId: "curiosity-higher-batch",
     branch: "batch",
-    lane: 2,
     hypothesis: "Batch 64 keeps the variance gain without OOM.",
     expected: "No OOM and zN recovers to baseline + curiosity levels.",
     forkReason: "High batch failed for memory, not necessarily for model quality.",
@@ -234,6 +224,188 @@ function MetricCard({ name, value }: { name: string; value: number }) {
   );
 }
 
+// Git-style commit-graph layout.
+// Why inline (no dependency): the existing graph libraries we evaluated either
+// render the whole graph as one global SVG (gitgraph.js, react-d3-tree) — which
+// re-creates the alignment-drift problem we are fixing — or are heavy node-edge
+// frameworks (reactflow, @xyflow/react) whose UX is canvas-style pan/zoom, not
+// the row-aligned clickable list this inspector needs. The algorithm below is
+// ~40 lines and fits both UX and bundle constraints.
+type GraphRow = {
+  exp: DemoExperiment;
+  index: number;
+  lane: number;
+  parentLane?: number;
+};
+
+function buildLanes(experiments: DemoExperiment[]): {
+  rows: GraphRow[];
+  laneCount: number;
+  laneColor: string[];
+} {
+  const expLane = new Map<string, number>();
+  const firstChildClaimed = new Set<string>();
+  const laneColor: string[] = [];
+  const rows: GraphRow[] = [];
+  let nextLane = 0;
+
+  experiments.forEach((exp, index) => {
+    let lane: number;
+    let parentLane: number | undefined;
+    if (exp.parentId && expLane.has(exp.parentId)) {
+      parentLane = expLane.get(exp.parentId);
+      if (!firstChildClaimed.has(exp.parentId)) {
+        lane = parentLane!;
+        firstChildClaimed.add(exp.parentId);
+      } else {
+        lane = nextLane++;
+        laneColor[lane] = BRANCH[exp.branch].color;
+      }
+    } else {
+      lane = nextLane++;
+      laneColor[lane] = BRANCH[exp.branch].color;
+    }
+    expLane.set(exp.id, lane);
+    rows.push({ exp, index, lane, parentLane });
+  });
+
+  return { rows, laneCount: nextLane, laneColor };
+}
+
+function computeLaneRanges(rows: GraphRow[], laneCount: number) {
+  const first = new Array<number>(laneCount).fill(Number.POSITIVE_INFINITY);
+  const lastUse = new Array<number>(laneCount).fill(Number.NEGATIVE_INFINITY);
+  for (const row of rows) {
+    first[row.lane] = Math.min(first[row.lane], row.index);
+    lastUse[row.lane] = Math.max(lastUse[row.lane], row.index);
+    if (row.parentLane !== undefined && row.parentLane !== row.lane) {
+      // The parent lane stays "in use" through the fork row so the connector
+      // curve at row R has a continuous vertical above it (drawn as the
+      // bottom-half of row R-1 etc.). The fork row itself skips the parent's
+      // top-half line because the curve replaces it.
+      lastUse[row.parentLane] = Math.max(lastUse[row.parentLane], row.index);
+    }
+  }
+  return { first, lastUse };
+}
+
+const LANE_W = 18;
+const NODE_R = 7;
+
+function laneCx(lane: number) {
+  return lane * LANE_W + LANE_W / 2;
+}
+
+function RowGraph({
+  row,
+  ranges,
+  laneCount,
+  laneColor,
+  isSelected,
+}: {
+  row: GraphRow;
+  ranges: { first: number[]; lastUse: number[] };
+  laneCount: number;
+  laneColor: string[];
+  isSelected: boolean;
+}) {
+  const width = laneCount * LANE_W;
+  const branchColor = BRANCH[row.exp.branch].color;
+  const branchGlow = BRANCH[row.exp.branch].glow;
+  const isFork = row.parentLane !== undefined && row.parentLane !== row.lane;
+  const cx = laneCx(row.lane);
+
+  // For each lane, decide whether to draw a top-half line (above the node row,
+  // y=0..50) and/or a bottom-half line (y=50..100). A lane is "alive above"
+  // this row if some earlier row owned it AND it is still in use at or below
+  // this row. "Alive below" mirrors that downward.
+  const segments: Array<{ lane: number; top: boolean; bottom: boolean; color: string; ownLane: boolean }> = [];
+  for (let L = 0; L < laneCount; L++) {
+    const aliveAbove = ranges.first[L] < row.index && ranges.lastUse[L] >= row.index;
+    const aliveBelow = ranges.first[L] <= row.index && ranges.lastUse[L] > row.index;
+    const ownLane = L === row.lane;
+    // Fork row: parent lane's top-half is replaced by the curve. Skip it.
+    const top = aliveAbove && !(isFork && L === row.parentLane);
+    const bottom = aliveBelow;
+    if (top || bottom) {
+      segments.push({ lane: L, top, bottom, color: ownLane ? branchColor : laneColor[L], ownLane });
+    }
+  }
+
+  // SVG draws lines and curves in viewBox y=[0,100]; preserveAspectRatio="none"
+  // is safe because we only draw vertical lines (no aspect distortion) plus
+  // one curve that remains visually acceptable under uniform y-scaling. The
+  // node circle is a positioned HTML element below to stay round at any row
+  // height.
+  return (
+    <div className="relative shrink-0" style={{ width }}>
+      <svg
+        width={width}
+        height="100%"
+        viewBox={`0 0 ${width} 100`}
+        preserveAspectRatio="none"
+        className="absolute inset-0 block"
+        aria-hidden
+      >
+        {segments.map((seg) => {
+          const sx = laneCx(seg.lane);
+          const strokeWidth = seg.ownLane ? 2 : 1.75;
+          return (
+            <g key={`seg-${seg.lane}`}>
+              {seg.top && (
+                <line
+                  x1={sx}
+                  y1={0}
+                  x2={sx}
+                  y2={50}
+                  stroke={seg.color}
+                  strokeWidth={strokeWidth}
+                  opacity={seg.ownLane ? 0.78 : 0.4}
+                />
+              )}
+              {seg.bottom && (
+                <line
+                  x1={sx}
+                  y1={50}
+                  x2={sx}
+                  y2={100}
+                  stroke={seg.color}
+                  strokeWidth={strokeWidth}
+                  opacity={seg.ownLane ? 0.55 : 0.4}
+                />
+              )}
+            </g>
+          );
+        })}
+        {isFork && (
+          <path
+            d={`M ${laneCx(row.parentLane!)} 0 C ${laneCx(row.parentLane!)} 30, ${cx} 22, ${cx} 50`}
+            stroke={branchColor}
+            strokeWidth={2}
+            fill="none"
+            opacity={0.85}
+          />
+        )}
+      </svg>
+      <span
+        className={cn(
+          "pointer-events-none absolute top-1/2 -translate-y-1/2 rounded-full border-2 bg-[#0f1011] transition",
+          isSelected ? "scale-110" : "",
+        )}
+        style={{
+          left: cx - NODE_R,
+          width: NODE_R * 2,
+          height: NODE_R * 2,
+          borderColor: branchColor,
+          boxShadow: isSelected
+            ? `0 0 0 4px ${branchGlow}, 0 0 18px ${branchGlow}`
+            : `0 0 0 2px ${branchGlow}, 0 0 10px ${branchGlow}`,
+        }}
+      />
+    </div>
+  );
+}
+
 export default function ExperimentLineageDemo() {
   const [experiments, setExperiments] = useState(demoExperiments);
   const [selectedId, setSelectedId] = useState("curiosity-resume-t4");
@@ -273,29 +445,8 @@ export default function ExperimentLineageDemo() {
 
   const timeline = events.filter((e) => e.experimentId === selected.id);
 
-  function lineageDepth(exp: DemoExperiment) {
-    let depth = 0;
-    let cursor = exp;
-    const seen = new Set<string>();
-    while (cursor.parentId && !seen.has(cursor.id)) {
-      seen.add(cursor.id);
-      const parentNode = experiments.find((candidate) => candidate.id === cursor.parentId);
-      if (!parentNode) break;
-      depth += 1;
-      cursor = parentNode;
-    }
-    return depth;
-  }
-
-  const visibleIds = new Set(visibleExperiments.map((exp) => exp.id));
-
-  const graphRows = visibleExperiments.map((exp, index) => ({
-    exp,
-    depth: lineageDepth(exp),
-    isFirst: index === 0,
-    isLast: index === visibleExperiments.length - 1,
-    parentVisible: Boolean(exp.parentId && visibleIds.has(exp.parentId)),
-  }));
+  const { rows, laneCount, laneColor } = useMemo(() => buildLanes(visibleExperiments), [visibleExperiments]);
+  const ranges = useMemo(() => computeLaneRanges(rows, laneCount), [rows, laneCount]);
 
   const diff = useMemo(() => {
     if (!parent) return [];
@@ -366,7 +517,7 @@ export default function ExperimentLineageDemo() {
         <div className="flex items-center gap-3">
           <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.04] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">⚖️</div>
           <span className="text-sm font-semibold tracking-tight">Alchemy</span>
-          <span className="rounded-full border border-white/[0.06] bg-white/[0.025] px-2 py-0.5 text-[11px] text-gray-400">GitLens-style lineage demo</span>
+          <span className="rounded-full border border-white/[0.06] bg-white/[0.025] px-2 py-0.5 text-[11px] text-gray-400">Experiment lineage demo</span>
         </div>
         <div className="flex items-center gap-2 text-[11px] text-emerald-300">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.8)]" />
@@ -380,7 +531,7 @@ export default function ExperimentLineageDemo() {
             <div className="mb-2 font-mono text-[11px] text-indigo-300">/demo/experiments-lineage</div>
             <h1 className="text-3xl font-medium tracking-[-0.04em] text-white md:text-4xl">Experiment lineage graph</h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-gray-400">
-              GitLens-style branch rail for research experiments. The graph shows where runs fork; the inspector only expands detail for the selected node.
+              Commit-graph-style rail for research experiments. Each lane is a live branch tip; forks split, first child inherits the parent lane.
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -398,7 +549,7 @@ export default function ExperimentLineageDemo() {
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
               <div>
                 <h2 className="text-sm font-medium text-gray-200">Branch graph</h2>
-                <p className="text-xs text-gray-500">Compact graph first. Details stay in the inspector.</p>
+                <p className="text-xs text-gray-500">{rows.length} runs · {laneCount} live lanes</p>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -414,6 +565,7 @@ export default function ExperimentLineageDemo() {
                   value={selectedId}
                   onChange={(e) => selectExperiment(e.target.value)}
                   className="rounded-md border border-white/[0.08] bg-[#191a1b] px-3 py-1.5 text-xs text-gray-200 outline-none"
+                  aria-label="Select experiment"
                 >
                   {experiments.map((exp) => (
                     <option key={exp.id} value={exp.id}>{exp.name}</option>
@@ -422,74 +574,71 @@ export default function ExperimentLineageDemo() {
               </div>
             </div>
 
-            <div className="p-2 sm:p-4">
-              <div className="divide-y divide-white/[0.04] overflow-hidden rounded-xl border border-white/[0.05] bg-black/10">
-                {graphRows.map(({ exp, depth, isFirst, isLast, parentVisible }) => {
+            <div className="p-2 sm:p-3">
+              <ul className="divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.05] bg-black/15">
+                {rows.map((row) => {
+                  const { exp } = row;
                   const branch = BRANCH[exp.branch];
                   const isSelected = exp.id === selected.id;
                   const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
                   const changedLabels = summarizeDiff(exp);
-                  const mobileDepth = Math.min(depth, MAX_MOBILE_DEPTH);
-                  const desktopDepth = Math.min(depth, MAX_DESKTOP_DEPTH);
                   const parentName = exp.parentId ? experiments.find((node) => node.id === exp.parentId)?.shortName : undefined;
 
                   return (
-                    <button
-                      key={exp.id}
-                      onClick={() => selectExperiment(exp.id)}
-                      className={cn(
-                        "group grid w-full grid-cols-[58px_minmax(0,1fr)] items-stretch gap-2 px-2 text-left transition duration-150 sm:grid-cols-[108px_minmax(0,1fr)_150px] sm:gap-3 sm:px-3",
-                        isSelected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.035]",
-                      )}
-                    >
-                      <div className="relative min-h-[72px] py-0">
-                        <div className="relative h-full sm:hidden" style={{ marginLeft: mobileDepth * 10 }}>
-                          {!isFirst && <span className="absolute left-[13px] top-0 h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: parentVisible ? 0.72 : 0.22 }} />}
-                          {!isLast && <span className="absolute bottom-0 left-[13px] h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: 0.42 }} />}
-                          <span
-                            className={cn("absolute left-[6px] top-1/2 h-4 w-4 -translate-y-1/2 rounded-full border-2 bg-[#0f1011] transition group-hover:scale-110", isSelected && "h-5 w-5 left-[5px]")}
-                            style={{ borderColor: branch.color, boxShadow: `0 0 0 4px ${branch.glow}, 0 0 16px ${branch.glow}` }}
-                          />
-                        </div>
-                        <div className="relative hidden h-full sm:block" style={{ marginLeft: desktopDepth * 15 }}>
-                          {!isFirst && <span className="absolute left-[16px] top-0 h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: parentVisible ? 0.72 : 0.22 }} />}
-                          {!isLast && <span className="absolute bottom-0 left-[16px] h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: 0.42 }} />}
-                          <span
-                            className={cn("absolute left-[8px] top-1/2 h-4 w-4 -translate-y-1/2 rounded-full border-2 bg-[#0f1011] transition group-hover:scale-110", isSelected && "h-5 w-5 left-[7px]")}
-                            style={{ borderColor: branch.color, boxShadow: `0 0 0 5px ${branch.glow}, 0 0 18px ${branch.glow}` }}
-                          />
-                          <span className="absolute left-8 top-1/2 -translate-y-1/2 font-mono text-[10px] text-gray-600">{branch.label}</span>
-                        </div>
-                      </div>
+                    <li key={exp.id}>
+                      <button
+                        onClick={() => selectExperiment(exp.id)}
+                        aria-pressed={isSelected}
+                        aria-label={`Open ${exp.name}`}
+                        className={cn(
+                          "group flex w-full items-stretch gap-2 px-2 text-left transition duration-150 sm:gap-3 sm:px-3",
+                          isSelected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.035]",
+                        )}
+                        style={{ minHeight: 78 }}
+                      >
+                        <RowGraph
+                          row={row}
+                          ranges={ranges}
+                          laneCount={laneCount}
+                          laneColor={laneColor}
+                          isSelected={isSelected}
+                        />
 
-                      <div className="min-w-0 py-3">
-                        <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
-                          <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
-                          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
-                          {branchForks > 0 && <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">{branchForks} forks</span>}
-                          {parentName && <span className="hidden rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-500 sm:inline">↳ {parentName}</span>}
+                        <div className="min-w-0 flex-1 py-3">
+                          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                            <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
+                            <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
+                            <span className={cn("rounded-full px-1.5 py-0.5 text-[10px]", branch.bg, branch.text)}>{branch.label}</span>
+                            {branchForks > 0 && (
+                              <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">
+                                {branchForks} fork{branchForks > 1 ? "s" : ""}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                            {parentName && (
+                              <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-500">↳ {parentName}</span>
+                            )}
+                            {changedLabels.map((label) => (
+                              <span key={label} className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-gray-400">
+                                {label}
+                              </span>
+                            ))}
+                            <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
+                          </div>
                         </div>
-                        <div className="mt-1 flex min-w-0 flex-wrap gap-1">
-                          {changedLabels.map((label) => (
-                            <span key={label} className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-gray-400">
-                              {label}
-                            </span>
-                          ))}
-                          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
-                          <span className="hidden truncate text-xs text-gray-500 md:inline">{exp.hypothesis}</span>
-                        </div>
-                      </div>
 
-                      <div className="hidden items-center justify-end gap-2 py-3 sm:flex">
-                        <div className="text-right">
-                          <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
-                          <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
+                        <div className="hidden shrink-0 items-center justify-end gap-2 py-3 pr-1 sm:flex">
+                          <div className="text-right">
+                            <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
+                            <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
+                          </div>
                         </div>
-                      </div>
-                    </button>
+                      </button>
+                    </li>
                   );
                 })}
-              </div>
+              </ul>
             </div>
             <div className="border-t border-white/[0.06] px-4 py-3">
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
