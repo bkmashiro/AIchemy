@@ -1196,6 +1196,17 @@ export default function ExperimentLineageDemo() {
     return total;
   }, [stages, runsByStage, visibleStageIds, showFoldedBranches]);
 
+  const stageStateCounts = useMemo(() => {
+    let active = 0;
+    let decided = 0;
+    for (const s of visibleStages) {
+      if (s.folded) continue;
+      if (s.state === "decided") decided++;
+      else active++;
+    }
+    return { active, decided };
+  }, [visibleStages]);
+
   const visibleRunsByStage = useMemo(() => {
     const map = new Map<string, DemoExperiment[]>();
     for (const stage of visibleStages) {
@@ -1325,12 +1336,24 @@ export default function ExperimentLineageDemo() {
         <section className="grid grid-cols-1 gap-5">
           <div className="overflow-hidden rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 shadow-[0_20px_80px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.035)]">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
-              <div>
+              <div className="min-w-0">
                 <h2 className="text-sm font-medium text-gray-200">Stage graph</h2>
-                <p className="text-xs text-gray-500">
-                  {visibleStages.length} stage{visibleStages.length === 1 ? "" : "s"} · {visibleRunsCount} run{visibleRunsCount === 1 ? "" : "s"}
-                  {foldedCount > 0 ? ` · ${foldedCount} folded` : ""}
-                </p>
+                <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                  <span className="rounded border border-blue-400/20 bg-blue-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-blue-300">
+                    {stageStateCounts.active} active
+                  </span>
+                  <span className="rounded border border-emerald-400/20 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-emerald-300">
+                    {stageStateCounts.decided} decided
+                  </span>
+                  <span className="rounded border border-white/[0.08] bg-white/[0.04] px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-300">
+                    {visibleRunsCount} run{visibleRunsCount === 1 ? "" : "s"}
+                  </span>
+                  {foldedCount > 0 && (
+                    <span className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-200">
+                      {foldedCount} folded
+                    </span>
+                  )}
+                </div>
               </div>
               <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
                 <div className="grid grid-cols-2 gap-2 sm:flex sm:items-center">
@@ -1374,6 +1397,34 @@ export default function ExperimentLineageDemo() {
               </div>
             </div>
 
+            <div className="flex items-center gap-x-4 gap-y-1.5 overflow-x-auto border-b border-white/[0.06] bg-white/[0.012] px-4 py-2 text-[10.5px] text-gray-500">
+              <span className="flex shrink-0 items-center gap-1.5">
+                <span
+                  className="inline-block h-2 w-2 rounded-full"
+                  style={{ backgroundColor: "#7c7cff", boxShadow: "0 0 8px rgba(124,124,255,0.6)" }}
+                  aria-hidden
+                />
+                <span><span className="text-gray-300">dot</span> = run</span>
+              </span>
+              <span className="flex shrink-0 items-center gap-1.5">
+                <span className="inline-block h-2.5 w-5 rounded-sm border border-white/15 bg-white/[0.04]" aria-hidden />
+                <span><span className="text-gray-300">band</span> = stage</span>
+              </span>
+              <span className="flex shrink-0 items-center gap-1.5">
+                <svg width="22" height="6" viewBox="0 0 22 6" aria-hidden>
+                  <line x1="0" y1="3" x2="22" y2="3" stroke="#7c7cff" strokeWidth="2" />
+                </svg>
+                <span><span className="text-indigo-300">solid</span> = promoted / continued</span>
+              </span>
+              <span className="flex shrink-0 items-center gap-1.5">
+                <svg width="22" height="6" viewBox="0 0 22 6" aria-hidden>
+                  <line x1="0" y1="3" x2="22" y2="3" stroke="#6b7280" strokeWidth="1.5" strokeDasharray="3 3" />
+                </svg>
+                <span><span className="text-gray-400">dashed</span> = folded / dropped</span>
+              </span>
+              <span className="ml-auto shrink-0 hidden text-gray-600 sm:inline">tap a dot to inspect</span>
+            </div>
+
             <div className="p-2 sm:p-3">
               <div className="rounded-xl border border-white/[0.05] bg-black/15">
                 <LineageFlow
@@ -1386,26 +1437,56 @@ export default function ExperimentLineageDemo() {
                 />
               </div>
             </div>
-            <div className="border-t border-white/[0.06] px-4 py-3">
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="truncate font-mono text-xs text-gray-200">{selected.shortName}</span>
-                    {selectedStage && (
-                      <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 text-[10px] text-gray-400">
-                        in {selectedStage.title}
-                      </span>
-                    )}
-                    <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[selected.decision ?? "note"])}>{selected.decision ?? "open"}</span>
-                    {diff.slice(0, 3).map((row) => (
-                      <span key={row.key} className="rounded border border-white/[0.06] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-400">{row.key}</span>
+            <div className="border-t border-white/[0.06] px-3 py-2 sm:px-4 sm:py-3">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2 font-mono text-[11px]">
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: BRANCH[selected.branch].color, boxShadow: `0 0 10px ${BRANCH[selected.branch].glow}` }}
+                    aria-hidden
+                  />
+                  <span className="truncate text-gray-100">{selected.shortName}</span>
+                </span>
+                {selectedStage && (
+                  <span className="hidden truncate text-[11px] text-gray-500 sm:inline">
+                    in <span className="text-gray-300">{selectedStage.title}</span>
+                  </span>
+                )}
+                <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase leading-none", BADGE[selected.status])}>{selected.status}</span>
+                <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase leading-none", BADGE[selected.decision ?? "note"])}>{selected.decision ?? "open"}</span>
+                {Object.entries(selected.metrics).slice(0, 2).map(([key, value]) => (
+                  <span key={key} className="flex items-center gap-1 text-gray-500">
+                    <span className="text-gray-500">{key}</span>
+                    <span className="text-gray-200">{value}</span>
+                  </span>
+                ))}
+                {parent && (
+                  <button
+                    type="button"
+                    onClick={() => selectExperiment(parent.id)}
+                    className="text-indigo-300 transition hover:text-indigo-200"
+                    title={`Parent: ${parent.name}`}
+                  >
+                    ↳ {parent.shortName}
+                  </button>
+                )}
+                {forks.length > 0 && (
+                  <span className="text-gray-500">
+                    <span className="text-gray-200">{forks.length}</span> fork{forks.length === 1 ? "" : "s"}
+                  </span>
+                )}
+                {diff.length > 0 && (
+                  <span className="flex items-center gap-1 text-gray-500">
+                    <span>changed</span>
+                    {diff.slice(0, 4).map((row) => (
+                      <span key={row.key} className="rounded border border-white/[0.06] bg-black/30 px-1 py-px text-[10px] text-gray-300">{row.key}</span>
                     ))}
-                  </div>
-                  <p className="mt-1 truncate text-xs text-gray-500">Tap a dot to inspect that run. The graph stays topology-only by default.</p>
-                </div>
+                    {diff.length > 4 && <span className="text-gray-600">+{diff.length - 4}</span>}
+                  </span>
+                )}
                 <button
                   onClick={() => setDetailsOpen((open) => !open)}
-                  className="rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 text-xs text-indigo-200 transition hover:bg-indigo-500/25"
+                  className="ml-auto shrink-0 rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 font-sans text-xs text-indigo-200 transition hover:bg-indigo-500/25"
                 >
                   {detailsOpen ? "Hide details" : "Open details"}
                 </button>
