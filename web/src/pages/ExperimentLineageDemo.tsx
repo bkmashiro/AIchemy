@@ -164,6 +164,24 @@ const demoExperiments: DemoExperiment[] = [
     metrics: { zN: 0.869, eval_loss: 1.78, step: 31000 },
   },
   {
+    id: "curiosity-long-run-t4",
+    name: "jema_v2_curiosity_long_run_t4",
+    shortName: "long_run_t4",
+    status: "running",
+    description: "Extended-horizon validation of the kept resume checkpoint to confirm zN stability past 60k steps.",
+    family: "jema_v2/pretrain",
+    parentId: "curiosity-resume-t4",
+    branch: "resume",
+    hypothesis: "If the kept checkpoint is real, zN should hold or improve under 2x training horizon without drift.",
+    expected: "zN holds within +/-0.003 of resume_t4 through step 80k.",
+    forkReason: "Need long-horizon evidence before promoting curiosity branch as the new default.",
+    decision: "rerun",
+    decisionReason: "Still extending the horizon; checkpoint stability is the gate.",
+    criteria: { zN: ">=0.870", eval_loss: "<=1.78" },
+    config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-06", max_steps: 80000 },
+    metrics: { zN: 0.871, eval_loss: 1.77, step: 58000 },
+  },
+  {
     id: "regularize-dropout-005",
     name: "jema_v2_regularize_dropout_005",
     shortName: "dropout_005",
@@ -283,6 +301,15 @@ const demoStages: DemoStage[] = [
     state: "active",
   },
   {
+    id: "long-run-validation-stage",
+    title: "Long-run validation",
+    purpose: "Confirm the kept resume checkpoint holds under a 2x training horizon before promoting it.",
+    parentStageId: "curiosity-stage",
+    parentRunId: "curiosity-resume-t4",
+    runIds: ["curiosity-long-run-t4"],
+    state: "active",
+  },
+  {
     id: "batch-stage",
     title: "Batch-size exploration",
     purpose: "Folded after OOM and the narrower retry under-performed the curiosity branch.",
@@ -325,13 +352,28 @@ function MetricCard({ name, value }: { name: string; value: number }) {
 }
 
 // Stage/cohort graph: vertical axis is research stages (purposes / decisions),
-// horizontal inside each stage is sibling runs competing for promotion. The
-// left gutter holds the stage rail; cards live to the right with a single
-// SVG overlay drawing dots+edges so connectors stay continuous across rows.
-const STAGE_H = 188;
+// horizontal inside each stage is sibling runs competing for promotion. Edges
+// are anchored to the specific source run chip (since a "branch" is from a
+// chosen run, not from a stage), curving left/down into the child stage rail
+// dot. The SVG overlay is full-width so chip anchors are addressable; chips
+// stay clickable because the overlay is pointer-events-none.
+const STAGE_H = 228;
 const GRAPH_W = 52;
 const STAGE_X = 22;
 const STAGE_NODE_R = 8;
+
+// Layout constants for deriving deterministic run-chip anchors. Match the
+// classes used on the <li>, the spacer, the StageCard, and RunChip. We use
+// the sm-breakpoint values; the demo card is rendered at sm width and up.
+const LIST_PADDING_X = 12; // sm:px-3 on the <li>
+const LIST_GAP = 12; // sm:gap-3 between rail spacer and StageCard
+const STAGE_CARD_PADDING_X = 12; // p-3 on StageCard
+const RUN_CHIP_W = 200;
+const RUN_CHIP_GAP = 8; // gap-2 between chips
+const CHIPS_START_X = LIST_PADDING_X + GRAPH_W + LIST_GAP + STAGE_CARD_PADDING_X;
+// Chip vertical center within its stage row (calibrated against STAGE_H=228).
+const RUN_ANCHOR_Y = 162;
+const RUN_ANCHOR_INSET_X = 18; // anchor a bit inside the chip's left edge
 
 function isFoldedRun(exp: DemoExperiment) {
   return exp.status === "failed" || exp.decision === "drop";
@@ -344,14 +386,26 @@ type StageNode = {
   cy: number;
 };
 
-type StageEdge = {
-  id: string;
-  fromRow: number;
-  toRow: number;
-  muted: boolean;
-};
+type StageEdge =
+  | { id: string; kind: "rail"; fromRow: number; toRow: number; muted: boolean }
+  | {
+      id: string;
+      kind: "run";
+      fromRunId: string;
+      fromStageId: string;
+      fromRow: number;
+      toRow: number;
+      fromChipIndex: number;
+      siblingIndex: number;
+      siblingCount: number;
+      muted: boolean;
+      emphasized?: boolean;
+    };
 
-function buildStageGraph(stages: DemoStage[]): { nodes: StageNode[]; edges: StageEdge[] } {
+function buildStageGraph(
+  stages: DemoStage[],
+  visibleRunsByStage: Map<string, DemoExperiment[]>,
+): { nodes: StageNode[]; edges: StageEdge[] } {
   const rowById = new Map<string, number>();
   stages.forEach((stage, idx) => rowById.set(stage.id, idx));
   const nodes: StageNode[] = stages.map((stage, row) => ({
@@ -360,65 +414,170 @@ function buildStageGraph(stages: DemoStage[]): { nodes: StageNode[]; edges: Stag
     row,
     cy: row * STAGE_H + STAGE_H / 2,
   }));
-  const edges: StageEdge[] = [];
+
+  type Pending = {
+    stage: DemoStage;
+    fromRow: number;
+    toRow: number;
+    parentStage: DemoStage;
+    runIndex: number | null;
+  };
+  const pending: Pending[] = [];
   for (const stage of stages) {
     if (!stage.parentStageId) continue;
     const fromRow = rowById.get(stage.parentStageId);
     const toRow = rowById.get(stage.id);
     if (fromRow === undefined || toRow === undefined) continue;
     const parentStage = stages.find((s) => s.id === stage.parentStageId);
-    edges.push({
-      id: `${stage.parentStageId}->${stage.id}`,
-      fromRow,
-      toRow,
-      muted: !!stage.folded || !!parentStage?.folded,
-    });
+    if (!parentStage) continue;
+    let runIndex: number | null = null;
+    if (stage.parentRunId) {
+      const runs = visibleRunsByStage.get(stage.parentStageId) ?? [];
+      const idx = runs.findIndex((r) => r.id === stage.parentRunId);
+      if (idx >= 0) runIndex = idx;
+    }
+    pending.push({ stage, fromRow, toRow, parentStage, runIndex });
+  }
+
+  // Group run-anchored edges by source run so we can space siblings apart.
+  const groupCounts = new Map<string, number>();
+  for (const p of pending) {
+    if (p.runIndex === null || !p.stage.parentRunId) continue;
+    const key = `${p.stage.parentStageId}::${p.stage.parentRunId}`;
+    groupCounts.set(key, (groupCounts.get(key) ?? 0) + 1);
+  }
+  const groupSeen = new Map<string, number>();
+
+  const edges: StageEdge[] = [];
+  for (const p of pending) {
+    const muted = !!p.stage.folded || !!p.parentStage.folded;
+    if (p.runIndex !== null && p.stage.parentRunId) {
+      const key = `${p.stage.parentStageId}::${p.stage.parentRunId}`;
+      const siblingIndex = groupSeen.get(key) ?? 0;
+      groupSeen.set(key, siblingIndex + 1);
+      const siblingCount = groupCounts.get(key) ?? 1;
+      const emphasized = p.parentStage.promotedRunId === p.stage.parentRunId;
+      edges.push({
+        id: `${p.stage.parentRunId}->${p.stage.id}`,
+        kind: "run",
+        fromRunId: p.stage.parentRunId,
+        fromStageId: p.stage.parentStageId!,
+        fromRow: p.fromRow,
+        toRow: p.toRow,
+        fromChipIndex: p.runIndex,
+        siblingIndex,
+        siblingCount,
+        muted,
+        emphasized,
+      });
+    } else {
+      // Fallback: source run is hidden (or no parentRunId) — draw a muted
+      // dashed rail edge so the lineage is still readable.
+      edges.push({
+        id: `${p.stage.parentStageId}->${p.stage.id}`,
+        kind: "rail",
+        fromRow: p.fromRow,
+        toRow: p.toRow,
+        muted: muted || !!p.stage.parentRunId,
+      });
+    }
   }
   return { nodes, edges };
 }
 
-function stageEdgePath(fromRow: number, toRow: number) {
+function railEdgePath(fromRow: number, toRow: number) {
   const fromY = fromRow * STAGE_H + STAGE_H / 2 + STAGE_NODE_R;
   const toY = toRow * STAGE_H + STAGE_H / 2 - STAGE_NODE_R;
   const skip = toRow - fromRow;
   if (skip <= 1) {
     return `M ${STAGE_X} ${fromY} L ${STAGE_X} ${toY}`;
   }
-  // Skipping edges bulge outward so a non-adjacent branch reads as a fork.
   const bulge = STAGE_X + 18;
   const midY = (fromY + toY) / 2;
   return `M ${STAGE_X} ${fromY} C ${bulge} ${fromY + (midY - fromY) * 0.55}, ${bulge} ${toY - (toY - midY) * 0.55}, ${STAGE_X} ${toY}`;
+}
+
+function runEdgePath(edge: Extract<StageEdge, { kind: "run" }>) {
+  const chipLeftX = CHIPS_START_X + edge.fromChipIndex * (RUN_CHIP_W + RUN_CHIP_GAP);
+  // Fan out sibling edges from the same chip so multiple outgoing branches
+  // don't overlap into one line.
+  const fanSpread = Math.max(0, edge.siblingCount - 1);
+  const fanOffset = fanSpread === 0 ? 0 : (edge.siblingIndex - fanSpread / 2) * 22;
+  const sx = chipLeftX + RUN_ANCHOR_INSET_X + fanOffset;
+  const sy = edge.fromRow * STAGE_H + RUN_ANCHOR_Y + 18; // bottom-ish of chip
+  const tx = STAGE_X;
+  const ty = edge.toRow * STAGE_H + STAGE_H / 2 - STAGE_NODE_R;
+  // Curve left first, then down into the child rail dot. Control points pull
+  // leftward early so the curve reads as "this run forks into that stage".
+  const c1x = sx - 60 - fanOffset * 0.3;
+  const c1y = sy + 24;
+  const c2x = tx;
+  const c2y = ty - 60;
+  return `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`;
 }
 
 function StageGraphOverlay({
   nodes,
   edges,
   selectedStageId,
+  selectedRunId,
 }: {
   nodes: StageNode[];
   edges: StageEdge[];
   selectedStageId: string | undefined;
+  selectedRunId: string;
 }) {
   const height = nodes.length * STAGE_H;
   return (
     <svg
-      width={GRAPH_W}
+      width="100%"
       height={height}
-      viewBox={`0 0 ${GRAPH_W} ${height}`}
-      className="pointer-events-none absolute left-0 top-0"
+      className="pointer-events-none absolute inset-0"
       aria-hidden
     >
-      {edges.map((edge) => (
-        <path
-          key={edge.id}
-          d={stageEdgePath(edge.fromRow, edge.toRow)}
-          stroke="#3f3f46"
-          strokeWidth={2}
-          fill="none"
-          opacity={edge.muted ? 0.3 : 0.85}
-          strokeLinecap="round"
+      {/* Faint vertical rail behind the dots so the spine still reads. */}
+      {nodes.length > 1 && (
+        <line
+          x1={STAGE_X}
+          y1={STAGE_NODE_R + 4}
+          x2={STAGE_X}
+          y2={(nodes.length - 1) * STAGE_H + STAGE_H / 2 - STAGE_NODE_R}
+          stroke="#1f1f23"
+          strokeWidth={1}
         />
-      ))}
+      )}
+      {edges.map((edge) => {
+        if (edge.kind === "rail") {
+          return (
+            <path
+              key={edge.id}
+              d={railEdgePath(edge.fromRow, edge.toRow)}
+              stroke="#3f3f46"
+              strokeWidth={2}
+              fill="none"
+              opacity={edge.muted ? 0.3 : 0.7}
+              strokeDasharray={edge.muted ? "4 3" : undefined}
+              strokeLinecap="round"
+            />
+          );
+        }
+        const isSelectedEdge = edge.fromRunId === selectedRunId;
+        const stroke = edge.emphasized ? "#7c7cff" : isSelectedEdge ? "#a5b4fc" : "#3f3f46";
+        const width = edge.emphasized ? 2.5 : isSelectedEdge ? 2.25 : 1.75;
+        const opacity = edge.muted ? 0.35 : edge.emphasized ? 0.92 : isSelectedEdge ? 0.95 : 0.75;
+        return (
+          <path
+            key={edge.id}
+            d={runEdgePath(edge)}
+            stroke={stroke}
+            strokeWidth={width}
+            fill="none"
+            opacity={opacity}
+            strokeDasharray={edge.muted ? "5 4" : undefined}
+            strokeLinecap="round"
+          />
+        );
+      })}
       {nodes.map((node) => {
         const state = node.stage.state ?? "active";
         const color = STAGE_DOT_COLOR[state];
@@ -655,7 +814,25 @@ export default function ExperimentLineageDemo() {
     return total;
   }, [stages, runsByStage, visibleStageIds, showFoldedBranches]);
 
-  const { nodes, edges } = useMemo(() => buildStageGraph(visibleStages), [visibleStages]);
+  const visibleRunsByStage = useMemo(() => {
+    const map = new Map<string, DemoExperiment[]>();
+    for (const stage of visibleStages) {
+      const buckets = runsByStage.get(stage.id) ?? { normal: [], folded: [] };
+      const selectedFoldedRun = buckets.folded.find((exp) => exp.id === selected.id);
+      const ordered = showFoldedBranches
+        ? [...buckets.normal, ...buckets.folded]
+        : selectedFoldedRun
+          ? [...buckets.normal, selectedFoldedRun]
+          : buckets.normal;
+      map.set(stage.id, ordered);
+    }
+    return map;
+  }, [visibleStages, runsByStage, showFoldedBranches, selected.id]);
+
+  const { nodes, edges } = useMemo(
+    () => buildStageGraph(visibleStages, visibleRunsByStage),
+    [visibleStages, visibleRunsByStage],
+  );
 
   const timeline = events.filter((e) => e.experimentId === selected.id);
 
@@ -813,7 +990,7 @@ export default function ExperimentLineageDemo() {
 
             <div className="p-2 sm:p-3">
               <div className="relative overflow-hidden rounded-xl border border-white/[0.05] bg-black/15">
-                <StageGraphOverlay nodes={nodes} edges={edges} selectedStageId={selectedStage?.id} />
+                <StageGraphOverlay nodes={nodes} edges={edges} selectedStageId={selectedStage?.id} selectedRunId={selected.id} />
                 <ul className="relative">
                   {visibleStages.map((stage) => {
                     const buckets = runsByStage.get(stage.id) ?? { normal: [], folded: [] };
