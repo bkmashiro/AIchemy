@@ -260,194 +260,175 @@ function MetricCard({ name, value }: { name: string; value: number }) {
   );
 }
 
-// Git-style commit-graph layout.
-// Why inline (no dependency): the existing graph libraries we evaluated either
-// render the whole graph as one global SVG (gitgraph.js, react-d3-tree) — which
-// re-creates the alignment-drift problem we are fixing — or are heavy node-edge
-// frameworks (reactflow, @xyflow/react) whose UX is canvas-style pan/zoom, not
-// the row-aligned clickable list this inspector needs. The algorithm below is
-// ~40 lines and fits both UX and bundle constraints.
-type GraphRow = {
+// GitLens-style commit graph rendered as a single SVG overlay above a fixed-
+// height row list. Rows reserve a gutter; all connectors and dots live in the
+// overlay so paths stay continuous across rows instead of being stitched from
+// per-row half-lines.
+const ROW_H = 78;
+const LANE_W = 20;
+const GRAPH_PAD_X = 14;
+const NODE_R = 7;
+
+type GraphNode = {
+  id: string;
   exp: DemoExperiment;
-  index: number;
+  row: number;
   lane: number;
-  parentLane?: number;
+  parentId?: string;
+  muted: boolean;
+};
+
+type GraphEdge = {
+  id: string;
+  fromId: string;
+  toId: string;
+  kind: "continue" | "fork";
+  fromLane: number;
+  toLane: number;
+  fromRow: number;
+  toRow: number;
+  muted: boolean;
+  color: string;
 };
 
 function isFoldedBranch(exp: DemoExperiment) {
   return exp.branch === "batch" || exp.status === "failed" || exp.decision === "drop";
 }
 
-function buildLanes(experiments: DemoExperiment[]): {
-  rows: GraphRow[];
+function buildGraph(experiments: DemoExperiment[]): {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
   laneCount: number;
-  laneColor: string[];
 } {
-  const expLane = new Map<string, number>();
-  const firstChildClaimed = new Set<string>();
-  const laneColor: string[] = [];
-  const rows: GraphRow[] = [];
+  const expById = new Map(experiments.map((exp) => [exp.id, exp]));
+  // Pick a lane-inheriting "primary child" per parent. Prefer non-folded so
+  // active work continues down the parent's lane while failed siblings fork.
+  const primaryChild = new Map<string, string>();
+  for (const exp of experiments) {
+    if (!exp.parentId || !expById.has(exp.parentId)) continue;
+    const current = primaryChild.get(exp.parentId);
+    if (current === undefined) {
+      primaryChild.set(exp.parentId, exp.id);
+      continue;
+    }
+    const currentExp = expById.get(current)!;
+    if (isFoldedBranch(currentExp) && !isFoldedBranch(exp)) {
+      primaryChild.set(exp.parentId, exp.id);
+    }
+  }
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+  const nodeById = new Map<string, GraphNode>();
   let nextLane = 0;
-
-  experiments.forEach((exp, index) => {
+  experiments.forEach((exp, row) => {
+    const muted = isFoldedBranch(exp);
+    const parentNode = exp.parentId ? nodeById.get(exp.parentId) : undefined;
     let lane: number;
-    let parentLane: number | undefined;
-    if (exp.parentId && expLane.has(exp.parentId)) {
-      parentLane = expLane.get(exp.parentId);
-      if (!firstChildClaimed.has(exp.parentId)) {
-        lane = parentLane!;
-        firstChildClaimed.add(exp.parentId);
-      } else {
-        lane = nextLane++;
-        laneColor[lane] = BRANCH[exp.branch].color;
-      }
+    let kind: "continue" | "fork" | undefined;
+    if (parentNode && primaryChild.get(parentNode.id) === exp.id) {
+      lane = parentNode.lane;
+      kind = "continue";
+    } else if (parentNode) {
+      lane = nextLane++;
+      kind = "fork";
     } else {
       lane = nextLane++;
-      laneColor[lane] = BRANCH[exp.branch].color;
     }
-    expLane.set(exp.id, lane);
-    rows.push({ exp, index, lane, parentLane });
+    const node: GraphNode = { id: exp.id, exp, row, lane, parentId: exp.parentId, muted };
+    nodes.push(node);
+    nodeById.set(node.id, node);
+    if (parentNode && kind) {
+      edges.push({
+        id: `${parentNode.id}->${node.id}`,
+        fromId: parentNode.id,
+        toId: node.id,
+        kind,
+        fromLane: parentNode.lane,
+        toLane: lane,
+        fromRow: parentNode.row,
+        toRow: row,
+        muted: muted || parentNode.muted,
+        color: BRANCH[exp.branch].color,
+      });
+    }
   });
-
-  return { rows, laneCount: nextLane, laneColor };
+  return { nodes, edges, laneCount: Math.max(nextLane, 1) };
 }
 
-function computeLaneRanges(rows: GraphRow[], laneCount: number) {
-  const first = new Array<number>(laneCount).fill(Number.POSITIVE_INFINITY);
-  const lastUse = new Array<number>(laneCount).fill(Number.NEGATIVE_INFINITY);
-  for (const row of rows) {
-    first[row.lane] = Math.min(first[row.lane], row.index);
-    lastUse[row.lane] = Math.max(lastUse[row.lane], row.index);
-    if (row.parentLane !== undefined && row.parentLane !== row.lane) {
-      // The parent lane stays "in use" through the fork row so the connector
-      // curve at row R has a continuous vertical above it (drawn as the
-      // bottom-half of row R-1 etc.). The fork row itself skips the parent's
-      // top-half line because the curve replaces it.
-      lastUse[row.parentLane] = Math.max(lastUse[row.parentLane], row.index);
-    }
-  }
-  return { first, lastUse };
+function nodeX(lane: number) {
+  return GRAPH_PAD_X + lane * LANE_W;
+}
+function nodeY(row: number) {
+  return row * ROW_H + ROW_H / 2;
+}
+function graphGutterWidth(laneCount: number) {
+  return GRAPH_PAD_X * 2 + Math.max(0, laneCount - 1) * LANE_W;
 }
 
-const LANE_W = 18;
-const NODE_R = 7;
-
-function laneCx(lane: number) {
-  return lane * LANE_W + LANE_W / 2;
+function edgePath(edge: GraphEdge) {
+  const px = nodeX(edge.fromLane);
+  const py = nodeY(edge.fromRow);
+  const cx = nodeX(edge.toLane);
+  const cy = nodeY(edge.toRow);
+  if (px === cx) return `M ${px} ${py} L ${cx} ${cy}`;
+  // Bend within the first row, then run straight down to the child if the
+  // child sits more than one row below.
+  const bendEndY = Math.min(py + ROW_H, cy);
+  const dy = (bendEndY - py) * 0.5;
+  let path = `M ${px} ${py} C ${px} ${py + dy}, ${cx} ${bendEndY - dy}, ${cx} ${bendEndY}`;
+  if (bendEndY < cy) path += ` L ${cx} ${cy}`;
+  return path;
 }
 
-function RowGraph({
-  row,
-  ranges,
+function GraphOverlay({
+  nodes,
+  edges,
   laneCount,
-  laneColor,
-  isSelected,
-  isMuted,
+  rowCount,
+  selectedId,
 }: {
-  row: GraphRow;
-  ranges: { first: number[]; lastUse: number[] };
+  nodes: GraphNode[];
+  edges: GraphEdge[];
   laneCount: number;
-  laneColor: string[];
-  isSelected: boolean;
-  isMuted?: boolean;
+  rowCount: number;
+  selectedId: string;
 }) {
-  const width = laneCount * LANE_W;
-  const branchColor = BRANCH[row.exp.branch].color;
-  const branchGlow = BRANCH[row.exp.branch].glow;
-  const isFork = row.parentLane !== undefined && row.parentLane !== row.lane;
-  const cx = laneCx(row.lane);
-
-  // For each lane, decide whether to draw a top-half line (above the node row,
-  // y=0..50) and/or a bottom-half line (y=50..100). A lane is "alive above"
-  // this row if some earlier row owned it AND it is still in use at or below
-  // this row. "Alive below" mirrors that downward.
-  const segments: Array<{ lane: number; top: boolean; bottom: boolean; color: string; ownLane: boolean }> = [];
-  for (let L = 0; L < laneCount; L++) {
-    const aliveAbove = ranges.first[L] < row.index && ranges.lastUse[L] >= row.index;
-    const aliveBelow = ranges.first[L] <= row.index && ranges.lastUse[L] > row.index;
-    const ownLane = L === row.lane;
-    // Fork row: parent lane's top-half is replaced by the curve. Skip it.
-    const top = aliveAbove && !(isFork && L === row.parentLane);
-    const bottom = aliveBelow;
-    if (top || bottom) {
-      segments.push({ lane: L, top, bottom, color: ownLane ? branchColor : laneColor[L], ownLane });
-    }
-  }
-
-  // SVG draws lines and curves in viewBox y=[0,100]; preserveAspectRatio="none"
-  // is safe because we only draw vertical lines (no aspect distortion) plus
-  // one curve that remains visually acceptable under uniform y-scaling. The
-  // node circle is a positioned HTML element below to stay round at any row
-  // height.
+  const width = graphGutterWidth(laneCount);
+  const height = rowCount * ROW_H;
   return (
-    <div className="relative shrink-0" style={{ width }}>
-      <svg
-        width={width}
-        height="100%"
-        viewBox={`0 0 ${width} 100`}
-        preserveAspectRatio="none"
-        className="absolute inset-0 block"
-        aria-hidden
-      >
-        {segments.map((seg) => {
-          const sx = laneCx(seg.lane);
-          const strokeWidth = seg.ownLane ? 2 : 1.75;
-          return (
-            <g key={`seg-${seg.lane}`}>
-              {seg.top && (
-                <line
-                  x1={sx}
-                  y1={0}
-                  x2={sx}
-                  y2={50}
-                  stroke={seg.color}
-                  strokeWidth={strokeWidth}
-                  opacity={isMuted ? 0.18 : seg.ownLane ? 0.78 : 0.4}
-                />
-              )}
-              {seg.bottom && (
-                <line
-                  x1={sx}
-                  y1={50}
-                  x2={sx}
-                  y2={100}
-                  stroke={seg.color}
-                  strokeWidth={strokeWidth}
-                  opacity={isMuted ? 0.14 : seg.ownLane ? 0.55 : 0.4}
-                />
-              )}
-            </g>
-          );
-        })}
-        {isFork && (
-          <path
-            d={`M ${laneCx(row.parentLane!)} 0 C ${laneCx(row.parentLane!)} 30, ${cx} 22, ${cx} 50`}
-            stroke={branchColor}
-            strokeWidth={2}
-            fill="none"
-            opacity={isMuted ? 0.22 : 0.85}
-          />
-        )}
-      </svg>
-      <span
-        className={cn(
-          "pointer-events-none absolute top-1/2 -translate-y-1/2 rounded-full border-2 bg-[#0f1011] transition",
-          isSelected ? "scale-110" : "",
-        )}
-        style={{
-          left: cx - NODE_R,
-          width: NODE_R * 2,
-          height: NODE_R * 2,
-          borderColor: branchColor,
-          opacity: isMuted ? 0.45 : 1,
-          boxShadow: isMuted
-            ? `0 0 0 1px ${branchGlow}`
-            : isSelected
-              ? `0 0 0 4px ${branchGlow}, 0 0 18px ${branchGlow}`
-              : `0 0 0 2px ${branchGlow}, 0 0 10px ${branchGlow}`,
-        }}
-      />
-    </div>
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className="pointer-events-none absolute left-0 top-0"
+      aria-hidden
+    >
+      {edges.map((edge) => (
+        <path
+          key={edge.id}
+          d={edgePath(edge)}
+          stroke={edge.color}
+          strokeWidth={2}
+          fill="none"
+          opacity={edge.muted ? 0.22 : 0.82}
+          strokeLinecap="round"
+        />
+      ))}
+      {nodes.map((node) => {
+        const branch = BRANCH[node.exp.branch];
+        const isSelected = node.id === selectedId;
+        const cx = nodeX(node.lane);
+        const cy = nodeY(node.row);
+        const r = isSelected ? NODE_R + 1 : NODE_R;
+        return (
+          <g key={node.id} opacity={node.muted && !isSelected ? 0.55 : 1}>
+            {isSelected && <circle cx={cx} cy={cy} r={r + 5} fill={branch.glow} opacity={0.55} />}
+            <circle cx={cx} cy={cy} r={r} fill="#0f1011" stroke={branch.color} strokeWidth={2} />
+            {isSelected && <circle cx={cx} cy={cy} r={r - 3} fill={branch.color} />}
+          </g>
+        );
+      })}
+    </svg>
   );
 }
 
@@ -493,15 +474,32 @@ export default function ExperimentLineageDemo() {
     return base.filter((exp) => !isFoldedBranch(exp));
   }, [childrenByParent, experiments, focusOnly, selected, showFoldedBranches]);
 
+  const visibleIds = useMemo(() => new Set(visibleExperiments.map((exp) => exp.id)), [visibleExperiments]);
+
   const foldedBranches = useMemo(
-    () => experiments.filter((exp) => isFoldedBranch(exp) && !visibleExperiments.some((visible) => visible.id === exp.id)),
-    [experiments, visibleExperiments],
+    () => experiments.filter((exp) => isFoldedBranch(exp) && !visibleIds.has(exp.id)),
+    [experiments, visibleIds],
   );
+
+  // Attribute each hidden experiment to its nearest visible ancestor so we can
+  // show a "+N folded" pill on the parent that absorbs the dropped subtree.
+  const foldedByParentCount = useMemo(() => {
+    const result = new Map<string, number>();
+    const expById = new Map(experiments.map((exp) => [exp.id, exp]));
+    for (const exp of experiments) {
+      if (visibleIds.has(exp.id)) continue;
+      let cursor: DemoExperiment | undefined = exp.parentId ? expById.get(exp.parentId) : undefined;
+      while (cursor && !visibleIds.has(cursor.id)) {
+        cursor = cursor.parentId ? expById.get(cursor.parentId) : undefined;
+      }
+      if (cursor) result.set(cursor.id, (result.get(cursor.id) ?? 0) + 1);
+    }
+    return result;
+  }, [experiments, visibleIds]);
 
   const timeline = events.filter((e) => e.experimentId === selected.id);
 
-  const { rows, laneCount, laneColor } = useMemo(() => buildLanes(visibleExperiments), [visibleExperiments]);
-  const ranges = useMemo(() => computeLaneRanges(rows, laneCount), [rows, laneCount]);
+  const { nodes, edges, laneCount } = useMemo(() => buildGraph(visibleExperiments), [visibleExperiments]);
 
   const diff = useMemo(() => {
     if (!parent) return [];
@@ -605,7 +603,7 @@ export default function ExperimentLineageDemo() {
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
               <div>
                 <h2 className="text-sm font-medium text-gray-200">Branch graph</h2>
-                <p className="text-xs text-gray-500">{rows.length} runs · {laneCount} live lanes</p>
+                <p className="text-xs text-gray-500">{nodes.length} runs · {laneCount} live lanes{foldedBranches.length > 0 ? ` · ${foldedBranches.length} folded` : ""}</p>
               </div>
               <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
                 <div className="grid grid-cols-2 gap-2 sm:flex sm:items-center">
@@ -642,76 +640,82 @@ export default function ExperimentLineageDemo() {
             </div>
 
             <div className="p-2 sm:p-3">
-              <ul className="divide-y divide-white/[0.05] overflow-hidden rounded-xl border border-white/[0.05] bg-black/15">
-                {rows.map((row) => {
-                  const { exp } = row;
-                  const branch = BRANCH[exp.branch];
-                  const isSelected = exp.id === selected.id;
-                  const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
-                  const changedLabels = summarizeDiff(exp);
-                  const parentName = exp.parentId ? experiments.find((node) => node.id === exp.parentId)?.shortName : undefined;
-                  const isMuted = isFoldedBranch(exp);
+              <div className="relative overflow-hidden rounded-xl border border-white/[0.05] bg-black/15">
+                <GraphOverlay
+                  nodes={nodes}
+                  edges={edges}
+                  laneCount={laneCount}
+                  rowCount={nodes.length}
+                  selectedId={selected.id}
+                />
+                <ul className="relative">
+                  {nodes.map((node) => {
+                    const { exp } = node;
+                    const branch = BRANCH[exp.branch];
+                    const isSelected = exp.id === selected.id;
+                    const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
+                    const changedLabels = summarizeDiff(exp);
+                    const parentName = exp.parentId ? experiments.find((p) => p.id === exp.parentId)?.shortName : undefined;
+                    const isMuted = node.muted;
+                    const hiddenFolded = foldedByParentCount.get(exp.id) ?? 0;
 
-                  return (
-                    <li key={exp.id}>
-                      <button
-                        onClick={() => selectExperiment(exp.id)}
-                        aria-pressed={isSelected}
-                        aria-label={`Open ${exp.name}`}
-                        className={cn(
-                          "group flex w-full items-stretch gap-2 px-2 text-left transition duration-150 sm:gap-3 sm:px-3",
-                          isSelected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.035]",
-                          isMuted && !isSelected && "opacity-45 hover:opacity-70",
-                        )}
-                        style={{ minHeight: 78 }}
-                      >
-                        <RowGraph
-                          row={row}
-                          ranges={ranges}
-                          laneCount={laneCount}
-                          laneColor={laneColor}
-                          isSelected={isSelected}
-                          isMuted={isMuted && !isSelected}
-                        />
-
-                        <div className="min-w-0 flex-1 py-3">
-                          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                            <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
-                            <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
-                            <span className={cn("rounded-full px-1.5 py-0.5 text-[10px]", branch.bg, branch.text)}>{branch.label}</span>
-                            {branchForks > 0 && (
-                              <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">
-                                {branchForks} fork{branchForks > 1 ? "s" : ""}
-                              </span>
-                            )}
-                            {isMuted && (
-                              <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 text-[10px] text-gray-500">folded end</span>
-                            )}
+                    return (
+                      <li key={exp.id}>
+                        <button
+                          onClick={() => selectExperiment(exp.id)}
+                          aria-pressed={isSelected}
+                          aria-label={`Open ${exp.name}`}
+                          className={cn(
+                            "group flex w-full items-stretch gap-2 text-left transition duration-150 sm:gap-3",
+                            isSelected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.035]",
+                            isMuted && !isSelected && "opacity-55 hover:opacity-85",
+                          )}
+                          style={{ height: ROW_H }}
+                        >
+                          <div className="shrink-0" style={{ width: graphGutterWidth(laneCount) }} aria-hidden />
+                          <div className="min-w-0 flex-1 self-center pr-1">
+                            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                              <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
+                              <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
+                              <span className={cn("rounded-full px-1.5 py-0.5 text-[10px]", branch.bg, branch.text)}>{branch.label}</span>
+                              {branchForks > 0 && (
+                                <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">
+                                  {branchForks} fork{branchForks > 1 ? "s" : ""}
+                                </span>
+                              )}
+                              {hiddenFolded > 0 && !showFoldedBranches && (
+                                <span className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-200">
+                                  +{hiddenFolded} folded
+                                </span>
+                              )}
+                              {isMuted && (
+                                <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 text-[10px] text-gray-500">folded</span>
+                              )}
+                            </div>
+                            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
+                              {parentName && (
+                                <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-500">↳ {parentName}</span>
+                              )}
+                              {changedLabels.map((label) => (
+                                <span key={label} className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-gray-400">
+                                  {label}
+                                </span>
+                              ))}
+                              <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
+                            </div>
                           </div>
-                          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
-                            {parentName && (
-                              <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-500">↳ {parentName}</span>
-                            )}
-                            {changedLabels.map((label) => (
-                              <span key={label} className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-gray-400">
-                                {label}
-                              </span>
-                            ))}
-                            <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
+                          <div className="hidden shrink-0 items-center justify-end self-center pr-3 sm:flex">
+                            <div className="text-right">
+                              <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
+                              <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
+                            </div>
                           </div>
-                        </div>
-
-                        <div className="hidden shrink-0 items-center justify-end gap-2 py-3 pr-1 sm:flex">
-                          <div className="text-right">
-                            <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
-                            <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
-                          </div>
-                        </div>
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
             </div>
             <div className="border-t border-white/[0.06] px-4 py-3">
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
