@@ -362,6 +362,29 @@ function isFoldedRun(exp: DemoExperiment) {
   return exp.status === "failed" || exp.decision === "drop";
 }
 
+function sortRunsForRail(
+  runs: DemoExperiment[],
+  stage: DemoStage,
+  directChildRuns: Map<string, number>,
+  childStages: Map<string, number>,
+) {
+  const originalIndex = new Map(stage.runIds.map((id, index) => [id, index]));
+  return [...runs].sort((a, b) => {
+    const score = (exp: DemoExperiment) => {
+      const childStageCount = childStages.get(exp.id) ?? 0;
+      const childRunCount = directChildRuns.get(exp.id) ?? 0;
+      const hasChildren = childStageCount + childRunCount > 0;
+      const noChildrenPenalty = hasChildren ? 0 : 100;
+      const promotedBonus = exp.id === stage.promotedRunId ? -100 : 0;
+      const childStageBonus = childStageCount * -18;
+      const childRunBonus = childRunCount * -8;
+      const statusPenalty = isFoldedRun(exp) ? 40 : 0;
+      return promotedBonus + childStageBonus + childRunBonus + noChildrenPenalty + statusPenalty;
+    };
+    return score(a) - score(b) || (originalIndex.get(a.id) ?? 0) - (originalIndex.get(b.id) ?? 0);
+  });
+}
+
 function getBandY(bandIndex: number) {
   return CANVAS_PAD_Y + bandIndex * (BAND_H + BAND_GAP);
 }
@@ -780,20 +803,33 @@ export default function ExperimentLineageDemo() {
   }, [selectedStage, selected.id, expById]);
 
   const runsByStage = useMemo(() => {
+    const directChildRuns = new Map<string, number>();
+    for (const exp of experiments) {
+      if (!exp.parentId) continue;
+      directChildRuns.set(exp.parentId, (directChildRuns.get(exp.parentId) ?? 0) + 1);
+    }
+    const childStages = new Map<string, number>();
+    for (const stage of stages) {
+      if (!stage.parentRunId) continue;
+      childStages.set(stage.parentRunId, (childStages.get(stage.parentRunId) ?? 0) + 1);
+    }
+
     const map = new Map<string, { normal: DemoExperiment[]; folded: DemoExperiment[] }>();
     for (const stage of stages) {
+      const stageRuns = stage.runIds
+        .map((id) => expById.get(id))
+        .filter((exp): exp is DemoExperiment => !!exp);
+      const orderedRuns = sortRunsForRail(stageRuns, stage, directChildRuns, childStages);
       const normal: DemoExperiment[] = [];
       const folded: DemoExperiment[] = [];
-      for (const id of stage.runIds) {
-        const exp = expById.get(id);
-        if (!exp) continue;
+      for (const exp of orderedRuns) {
         if (isFoldedRun(exp)) folded.push(exp);
         else normal.push(exp);
       }
       map.set(stage.id, { normal, folded });
     }
     return map;
-  }, [stages, expById]);
+  }, [stages, expById, experiments]);
 
   const visibleStages = useMemo(() => {
     const selectedStageId = selectedStage?.id;
