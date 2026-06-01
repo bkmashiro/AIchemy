@@ -1,52 +1,14 @@
 import { useEffect, useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
-import { api, Task } from "../lib/api";
+import {
+  Task,
+  Experiment,
+  ExperimentDetail,
+  ExperimentEvent,
+  ExperimentDecision,
+  experimentsApi,
+} from "../lib/api";
 import { formatRelTime } from "../lib/format";
-
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-interface CriterionResult {
-  value: number;
-  threshold: string;
-  ok: boolean;
-}
-
-interface TaskValidation {
-  passed: boolean;
-  checked_at: string;
-  details: Record<string, CriterionResult>;
-}
-
-interface Experiment {
-  id: string;
-  name: string;
-  description?: string;
-  criteria: Record<string, string>;
-  grid_id: string;
-  status: "running" | "passed" | "partial" | "failed";
-  results: Record<string, TaskValidation>;
-  created_at: string;
-}
-
-interface ExperimentDetail extends Experiment {
-  grid?: {
-    id: string;
-    display_name: string;
-    script: string;
-    param_space: Record<string, unknown[]>;
-    task_ids: string[];
-  };
-  tasks?: Task[];
-}
-
-// ─── API ────────────────────────────────────────────────────────────────────
-
-const experimentsApi = {
-  list: () => api.get<Experiment[]>("/experiments").then((r) => r.data),
-  get: (id: string) => api.get<ExperimentDetail>(`/experiments/${id}`).then((r) => r.data),
-  delete: (id: string) => api.delete(`/experiments/${id}`).then((r) => r.data),
-  retryFailed: (id: string) => api.post(`/experiments/${id}/retry-failed`).then((r) => r.data),
-};
 
 // ─── Status badges ──────────────────────────────────────────────────────────
 
@@ -172,12 +134,14 @@ function ExperimentsList() {
 
 // ─── Detail View ────────────────────────────────────────────────────────────
 
-function ExperimentDetail() {
+function ExperimentDetailView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [exp, setExp] = useState<ExperimentDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandedCell, setExpandedCell] = useState<string | null>(null);
+  const [events, setEvents] = useState<ExperimentEvent[]>([]);
+  const [allExperiments, setAllExperiments] = useState<Experiment[]>([]);
 
   const load = () => {
     if (!id) return;
@@ -185,12 +149,21 @@ function ExperimentDetail() {
       .then(setExp)
       .catch(() => {})
       .finally(() => setLoading(false));
+    experimentsApi.getTimeline(id)
+      .then((r) => setEvents(r.events))
+      .catch(() => {});
   };
 
   useEffect(() => {
     load();
     const t = setInterval(load, 10000);
     return () => clearInterval(t);
+  }, [id]);
+
+  useEffect(() => {
+    experimentsApi.list()
+      .then(setAllExperiments)
+      .catch(() => {});
   }, [id]);
 
   if (loading) {
@@ -317,8 +290,25 @@ function ExperimentDetail() {
               {metric} {expr}
             </span>
           ))}
+          {Object.keys(exp.criteria).length === 0 && (
+            <span className="text-xs text-gray-600">No criteria</span>
+          )}
         </div>
       </div>
+
+      {/* Intent + Decision + Lineage grid */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <IntentCard exp={exp} />
+        <DecisionCard exp={exp} onUpdated={(u) => { setExp({ ...exp, ...u }); load(); }} />
+        <LineageCard exp={exp} allExperiments={allExperiments} />
+      </div>
+
+      {/* Timeline */}
+      <TimelineCard
+        exp={exp}
+        events={events}
+        onNoteAdded={() => load()}
+      />
 
       {/* Matrix Heatmap */}
       {paramKeys.length > 0 && (
@@ -445,9 +435,367 @@ function ExperimentDetail() {
   );
 }
 
+// ─── Intent Card ────────────────────────────────────────────────────────────
+
+function IntentCard({ exp }: { exp: ExperimentDetail }) {
+  const hasIntent = exp.hypothesis || exp.expected_outcome || exp.family || exp.parent_name || exp.fork_reason;
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <h2 className="text-sm font-medium text-gray-400 mb-3">Intent</h2>
+      {!hasIntent && <p className="text-xs text-gray-600">No intent recorded</p>}
+      <div className="space-y-2 text-xs">
+        {exp.family && (
+          <Field label="Family">
+            <span className="font-mono text-gray-300">{exp.family}</span>
+          </Field>
+        )}
+        {exp.parent_name && (
+          <Field label="Parent">
+            {exp.parent_id ? (
+              <Link to={`/experiments/${exp.parent_id}`} className="text-blue-400 hover:text-blue-300 font-mono">
+                {exp.parent_name}
+              </Link>
+            ) : (
+              <span className="font-mono text-gray-300">{exp.parent_name}</span>
+            )}
+          </Field>
+        )}
+        {exp.hypothesis && (
+          <Field label="Hypothesis">
+            <p className="text-gray-300 whitespace-pre-wrap">{exp.hypothesis}</p>
+          </Field>
+        )}
+        {exp.expected_outcome && (
+          <Field label="Expected">
+            <p className="text-gray-300 whitespace-pre-wrap">{exp.expected_outcome}</p>
+          </Field>
+        )}
+        {exp.fork_reason && (
+          <Field label="Fork reason">
+            <p className="text-gray-300 whitespace-pre-wrap">{exp.fork_reason}</p>
+          </Field>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">{label}</div>
+      <div>{children}</div>
+    </div>
+  );
+}
+
+// ─── Decision Card ──────────────────────────────────────────────────────────
+
+const DECISION_OPTIONS: ExperimentDecision[] = ["keep", "drop", "rerun", "fork"];
+
+const DECISION_BADGE: Record<string, string> = {
+  keep:  "bg-green-900/30 text-green-400 border-green-700/40",
+  drop:  "bg-red-900/30 text-red-400 border-red-700/40",
+  rerun: "bg-blue-900/30 text-blue-400 border-blue-700/40",
+  fork:  "bg-purple-900/30 text-purple-400 border-purple-700/40",
+};
+
+function DecisionCard({
+  exp,
+  onUpdated,
+}: {
+  exp: ExperimentDetail;
+  onUpdated: (u: Partial<ExperimentDetail>) => void;
+}) {
+  const [decision, setDecision] = useState<ExperimentDecision>(exp.decision ?? "keep");
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!reason.trim()) {
+      setError("Reason required");
+      return;
+    }
+    setError(null);
+    setSubmitting(true);
+    try {
+      const updated = await experimentsApi.decide(exp.id, decision, reason.trim());
+      setReason("");
+      onUpdated(updated);
+    } catch (err: any) {
+      setError(err?.response?.data?.error ?? "Failed to set decision");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const currentBadge = exp.decision
+    ? DECISION_BADGE[exp.decision] || "bg-gray-800 text-gray-400 border-gray-700"
+    : "bg-gray-800 text-gray-500 border-gray-700";
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <h2 className="text-sm font-medium text-gray-400 mb-3">Decision</h2>
+      <div className="space-y-3 text-xs">
+        <div>
+          <span className={`inline-block text-xs px-2 py-0.5 rounded border ${currentBadge}`}>
+            {(exp.decision ?? "undecided").toUpperCase()}
+          </span>
+          {exp.decision_at && (
+            <span className="ml-2 text-gray-600">{formatRelTime(exp.decision_at)}</span>
+          )}
+        </div>
+        {exp.decision_reason && (
+          <p className="text-gray-300 whitespace-pre-wrap">{exp.decision_reason}</p>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-2 pt-2 border-t border-gray-800">
+          <div className="flex items-center gap-2">
+            <select
+              value={decision}
+              onChange={(e) => setDecision(e.target.value as ExperimentDecision)}
+              className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200"
+              disabled={submitting}
+            >
+              {DECISION_OPTIONS.map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-3 py-1 text-xs rounded bg-blue-600/20 text-blue-400 border border-blue-700/40 hover:bg-blue-600/30 disabled:opacity-50"
+            >
+              {submitting ? "Saving..." : "Set"}
+            </button>
+          </div>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Reason..."
+            rows={2}
+            className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600"
+            disabled={submitting}
+          />
+          {error && <p className="text-red-400 text-xs">{error}</p>}
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ─── Lineage Card ───────────────────────────────────────────────────────────
+
+function LineageCard({
+  exp,
+  allExperiments,
+}: {
+  exp: ExperimentDetail;
+  allExperiments: Experiment[];
+}) {
+  // Walk ancestors via parent_id
+  const ancestors: Experiment[] = [];
+  const byId = new Map(allExperiments.map((e) => [e.id, e]));
+  let cursor = exp.parent_id ? byId.get(exp.parent_id) : undefined;
+  const seen = new Set<string>([exp.id]);
+  while (cursor && !seen.has(cursor.id)) {
+    seen.add(cursor.id);
+    ancestors.unshift(cursor);
+    cursor = cursor.parent_id ? byId.get(cursor.parent_id) : undefined;
+  }
+  const descendants = allExperiments.filter((e) => e.parent_id === exp.id);
+
+  const hasAny = ancestors.length > 0 || descendants.length > 0;
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <h2 className="text-sm font-medium text-gray-400 mb-3">Lineage</h2>
+      {!hasAny && <p className="text-xs text-gray-600">No related experiments</p>}
+      {ancestors.length > 0 && (
+        <div className="mb-3">
+          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Ancestors</div>
+          <div className="flex flex-wrap items-center gap-1 text-xs">
+            {ancestors.map((a, i) => (
+              <span key={a.id} className="flex items-center gap-1">
+                <Link to={`/experiments/${a.id}`} className="text-blue-400 hover:text-blue-300 font-mono">
+                  {a.name}
+                </Link>
+                {i < ancestors.length - 1 && <span className="text-gray-700">/</span>}
+              </span>
+            ))}
+            <span className="text-gray-700">/</span>
+            <span className="text-gray-400 font-mono">{exp.name}</span>
+          </div>
+        </div>
+      )}
+      {descendants.length > 0 && (
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">
+            Forks ({descendants.length})
+          </div>
+          <ul className="space-y-1 text-xs">
+            {descendants.map((d) => (
+              <li key={d.id} className="flex items-center gap-2">
+                <Link to={`/experiments/${d.id}`} className="text-blue-400 hover:text-blue-300 font-mono truncate">
+                  {d.name}
+                </Link>
+                {d.fork_reason && (
+                  <span className="text-gray-600 truncate">— {d.fork_reason}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Timeline Card ──────────────────────────────────────────────────────────
+
+const EVENT_BADGE: Record<string, string> = {
+  created:        "bg-blue-900/30 text-blue-400 border-blue-700/40",
+  forked:         "bg-purple-900/30 text-purple-400 border-purple-700/40",
+  task_started:   "bg-blue-900/30 text-blue-400 border-blue-700/40",
+  task_completed: "bg-green-900/30 text-green-400 border-green-700/40",
+  task_failed:    "bg-red-900/30 text-red-400 border-red-700/40",
+  resumed:        "bg-amber-900/30 text-amber-400 border-amber-700/40",
+  moved_stub:     "bg-amber-900/30 text-amber-400 border-amber-700/40",
+  metric_best:    "bg-green-900/30 text-green-400 border-green-700/40",
+  note:           "bg-gray-800 text-gray-300 border-gray-700",
+  decision:       "bg-purple-900/30 text-purple-400 border-purple-700/40",
+};
+
+function formatEventData(data: Record<string, any> | undefined): string | null {
+  if (!data) return null;
+  try {
+    const s = JSON.stringify(data);
+    if (s === "{}") return null;
+    return s.length > 240 ? s.slice(0, 237) + "..." : s;
+  } catch {
+    return null;
+  }
+}
+
+function TimelineCard({
+  exp,
+  events,
+  onNoteAdded,
+}: {
+  exp: ExperimentDetail;
+  events: ExperimentEvent[];
+  onNoteAdded: () => void;
+}) {
+  const [message, setMessage] = useState("");
+  const [taskId, setTaskId] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!message.trim()) {
+      setError("Message required");
+      return;
+    }
+    setError(null);
+    setSubmitting(true);
+    try {
+      await experimentsApi.addNote(exp.id, message.trim(), {
+        task_id: taskId.trim() || undefined,
+      });
+      setMessage("");
+      setTaskId("");
+      onNoteAdded();
+    } catch (err: any) {
+      setError(err?.response?.data?.error ?? "Failed to add note");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const sorted = [...events].sort((a, b) => a.created_at.localeCompare(b.created_at));
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-medium text-gray-400">Timeline</h2>
+        <span className="text-xs text-gray-600">{sorted.length} event{sorted.length === 1 ? "" : "s"}</span>
+      </div>
+
+      {/* Note form */}
+      <form onSubmit={handleSubmit} className="mb-4 space-y-2 p-3 bg-gray-950/40 border border-gray-800 rounded-lg">
+        <textarea
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          placeholder="Add a note..."
+          rows={2}
+          className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600"
+          disabled={submitting}
+        />
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={taskId}
+            onChange={(e) => setTaskId(e.target.value)}
+            placeholder="Task ID (optional)"
+            className="flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600 font-mono"
+            disabled={submitting}
+          />
+          <button
+            type="submit"
+            disabled={submitting}
+            className="px-3 py-1 text-xs rounded bg-blue-600/20 text-blue-400 border border-blue-700/40 hover:bg-blue-600/30 disabled:opacity-50"
+          >
+            {submitting ? "Posting..." : "Add note"}
+          </button>
+        </div>
+        {error && <p className="text-red-400 text-xs">{error}</p>}
+      </form>
+
+      {/* Event list */}
+      {sorted.length === 0 ? (
+        <p className="text-xs text-gray-600 text-center py-6">No timeline events yet</p>
+      ) : (
+        <ul className="space-y-2">
+          {sorted.map((ev) => {
+            const badge = EVENT_BADGE[ev.kind] || "bg-gray-800 text-gray-400 border-gray-700";
+            const dataStr = formatEventData(ev.data);
+            return (
+              <li key={ev.id} className="text-xs border-l-2 border-gray-800 pl-3 py-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className={`px-1.5 py-0.5 rounded border text-[10px] ${badge}`}>
+                    {ev.kind}
+                  </span>
+                  <span className="text-gray-300">{ev.message}</span>
+                  <span className="text-gray-600 ml-auto">{formatRelTime(ev.created_at)}</span>
+                </div>
+                <div className="flex items-center gap-3 mt-0.5 text-gray-600 text-[11px]">
+                  {ev.actor && <span>by {ev.actor}</span>}
+                  {ev.task_id && (
+                    <Link to={`/tasks/${ev.task_id}`} className="text-blue-500 hover:text-blue-400 font-mono">
+                      task {ev.task_id.slice(0, 8)}
+                    </Link>
+                  )}
+                </div>
+                {dataStr && (
+                  <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/40 rounded px-2 py-1 overflow-x-auto font-mono">
+                    {dataStr}
+                  </pre>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 // ─── Router entry ───────────────────────────────────────────────────────────
 
 export default function ExperimentsPage() {
   const { id } = useParams<{ id: string }>();
-  return id ? <ExperimentDetail /> : <ExperimentsList />;
+  return id ? <ExperimentDetailView /> : <ExperimentsList />;
 }

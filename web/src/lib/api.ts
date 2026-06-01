@@ -290,6 +290,121 @@ export const metricsApi = {
   getTaskMetrics: (taskId: string) => api.get(`/tasks/${taskId}/metrics`).then((r) => r.data),
 };
 
+// ─── Experiments API ─────────────────────────────────────────────────────────
+
+export type ExperimentDecision = "keep" | "drop" | "rerun" | "fork";
+
+export type ExperimentEventKind =
+  | "created"
+  | "forked"
+  | "task_started"
+  | "task_completed"
+  | "task_failed"
+  | "resumed"
+  | "moved_stub"
+  | "metric_best"
+  | "note"
+  | "decision";
+
+export interface ExperimentEvent {
+  id: string;
+  experiment_id: string;
+  task_id?: string;
+  kind: ExperimentEventKind;
+  message: string;
+  created_at: string;
+  actor?: string;
+  data?: Record<string, any>;
+  deleted_at?: string;
+}
+
+export interface CriterionResult {
+  value: number;
+  threshold: string;
+  ok: boolean;
+}
+
+export interface TaskValidation {
+  passed: boolean;
+  checked_at: string;
+  details: Record<string, CriterionResult>;
+}
+
+export interface Experiment {
+  id: string;
+  name: string;
+  description?: string;
+  criteria: Record<string, string>;
+  grid_id: string;
+  status: "running" | "passed" | "partial" | "failed";
+  results: Record<string, TaskValidation>;
+  created_at: string;
+  // Lineage
+  config?: Record<string, any>;
+  config_diff?: Record<string, { old: any; new: any }>;
+  parent_name?: string;
+  parent_id?: string;
+  // Intent
+  family?: string;
+  hypothesis?: string;
+  expected_outcome?: string;
+  fork_reason?: string;
+  // Decision
+  decision?: ExperimentDecision;
+  decision_reason?: string;
+  decision_at?: string;
+  // Git tracking
+  git_tracking?: boolean;
+  git_repo_path?: string;
+}
+
+export interface ExperimentDetail extends Experiment {
+  grid?: {
+    id: string;
+    display_name: string;
+    script: string;
+    param_space: Record<string, unknown[]>;
+    task_ids: string[];
+  };
+  tasks?: Task[];
+}
+
+export interface ExperimentTimelineResponse {
+  experiment_id: string;
+  events: ExperimentEvent[];
+}
+
+export interface AddEventPayload {
+  kind: ExperimentEventKind;
+  message: string;
+  task_id?: string;
+  data?: Record<string, any>;
+}
+
+export const experimentsApi = {
+  list: () => api.get<Experiment[]>("/experiments").then((r) => r.data),
+  get: (id: string) => api.get<ExperimentDetail>(`/experiments/${id}`).then((r) => r.data),
+  delete: (id: string) => api.delete(`/experiments/${id}`).then((r) => r.data),
+  retryFailed: (id: string) => api.post(`/experiments/${id}/retry-failed`).then((r) => r.data),
+  getTimeline: (id: string) =>
+    api.get<ExperimentTimelineResponse>(`/experiments/${id}/timeline`).then((r) => r.data),
+  addEvent: (id: string, payload: AddEventPayload) =>
+    api.post<ExperimentEvent>(`/experiments/${id}/events`, payload).then((r) => r.data),
+  addNote: (id: string, message: string, opts?: { task_id?: string; data?: Record<string, any> }) =>
+    api
+      .post<ExperimentEvent>(`/experiments/${id}/events`, {
+        kind: "note" as ExperimentEventKind,
+        message,
+        task_id: opts?.task_id,
+        data: opts?.data,
+      })
+      .then((r) => r.data),
+  decide: (id: string, decision: ExperimentDecision, reason: string) =>
+    api
+      .patch<Experiment>(`/experiments/${id}/decision`, { decision, reason })
+      .then((r) => r.data),
+};
+
 // ─── Cost API ─────────────────────────────────────────────────────────────────
 
 export interface CostSummary {

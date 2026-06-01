@@ -159,7 +159,44 @@ interface Experiment {
 }
 ```
 
-Server 在收到 `parent_name` 时，尝试查找最近同名已完成的 experiment，填充 `parent_id`。找不到也不报错——lineage 是 best-effort。
+Server 在收到 `parent_name` 时，尝试查找最近同名已完成的 experiment，填充并冻结 `parent_id`。找不到也不报错——lineage 是 best-effort，但后续读取不再重新猜 parent。
+
+### 2.4 Intent / Decision / Timeline（已落地的 MVP）
+
+Experiment 现在还可以记录科研意图和后续决策：
+
+```python
+exp = Experiment(
+    "scale40_v2",
+    family="scale40",
+    hypothesis="降低 batch size 会改善不稳定训练",
+    expected_outcome="eval win-rate 提升且 loss variance 下降",
+)
+
+v3 = exp.fork(
+    "scale40_v3",
+    fork_reason="v2 loss variance 仍高，继续调 var_coef",
+)
+```
+
+CLI 查询和注释：
+
+```bash
+alch experiments ls
+alch experiments show scale40_v2
+alch experiments timeline scale40_v2
+alch experiments note scale40_v2 "seed 42 明显更稳" --data '{"eval_win_rate":0.91}'
+alch experiments decide scale40_v2 keep --reason "目前 best run，可作为下一轮 parent"
+```
+
+Web dashboard 的 experiment detail 页会显示：
+
+- Intent：hypothesis、expected outcome、family、parent/fork reason
+- Decision：keep/drop/rerun/fork 和 reason，可直接在页面更新
+- Lineage：ancestor breadcrumb 和直接 forks
+- Timeline：created/forked/note/decision 等 append-only events，可直接添加 note
+
+事件存储是 append-only；软删除 experiment 不删除 timeline/audit 历史。`actor` 由 server 端身份推导，CLI/Web 不传。
 
 ---
 
