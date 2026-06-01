@@ -348,14 +348,14 @@ function MetricCard({ name, value }: { name: string; value: number }) {
 // Graph canvas: stages are horizontal swimlane bands. Topology is the only
 // thing rendered in the graph: GitLens-style small dots and rail edges. Run
 // details live outside the graph and open on dot click.
-const CANVAS_W = 760;
+const CANVAS_W = 1180;
 const BAND_H = 116;
 const BAND_GAP = 28;
 const DOT_R = 6;
 const DOT_HIT = 30;
-const STAGE_LABEL_W = 192;
-const RAIL_START_X = 226;
-const RUN_GAP_X = 92;
+const STAGE_LABEL_W = 184;
+const RAIL_START_X = 50;
+const RUN_GAP_X = 58;
 const CANVAS_PAD_Y = 10;
 
 function isFoldedRun(exp: DemoExperiment) {
@@ -505,44 +505,28 @@ function buildCanvasGraph(
 }
 
 function edgePath(
-  edge: CanvasEdge,
+  _edge: CanvasEdge,
   source: CanvasRunNode,
   targetBand: CanvasStageBand,
   targetRun?: CanvasRunNode,
 ): string {
-  const fanSpread = Math.max(0, edge.siblingCount - 1);
-  const fanOffset = fanSpread === 0 ? 0 : (edge.siblingIndex - fanSpread / 2) * 18;
-  const sx = source.dotX + fanOffset;
+  const sx = source.dotX;
   const sy = source.dotY;
   const tx = targetRun ? targetRun.dotX : RAIL_START_X;
   const ty = targetRun ? targetRun.dotY : targetBand.y + BAND_H / 2;
   const bandSpan = targetBand.bandIndex - source.bandIndex;
-  const dy = ty - sy;
 
+  // Same-stage sibling runs are not Bezier branches. The row rail already
+  // provides the visual lane, so the explicit edge is a short straight join.
   if (bandSpan === 0) {
-    const midY = sy + (edge.siblingIndex % 2 === 0 ? -18 : 18);
-    return `M ${sx} ${sy} C ${sx + 34} ${midY}, ${tx - 34} ${midY}, ${tx} ${ty}`;
+    return `M ${sx} ${sy} L ${tx} ${ty}`;
   }
 
-  if (bandSpan <= 1) {
-    const c1x = sx + (tx - sx) * 0.12;
-    const c1y = sy + dy * 0.58;
-    const c2x = tx - (tx - sx) * 0.12;
-    const c2y = ty - dy * 0.42;
-    return `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`;
-  }
-
-  // Skip edge across multiple bands: bend through a rail corridor so the
-  // curve does not pass through detached label cards in intermediate bands.
-  const corridor =
-    sx <= (RAIL_START_X + (CANVAS_W - RAIL_START_X) / 2)
-      ? Math.max(STAGE_LABEL_W + 14, sx - 96)
-      : Math.min(CANVAS_W - 36, sx + 96);
-  const c1x = corridor;
-  const c1y = sy + dy * 0.32;
-  const c2x = corridor;
-  const c2y = ty - dy * 0.32;
-  return `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`;
+  // Cross-stage branches use a commit-graph elbow: vertical down the source
+  // lane, horizontal into the target lane, then vertical to the target dot.
+  // This avoids the strange spaghetti curves that cut through empty space.
+  const midY = sy + (ty - sy) * 0.5;
+  return `M ${sx} ${sy} L ${sx} ${midY} L ${tx} ${midY} L ${tx} ${ty}`;
 }
 
 function GraphRunNode({
@@ -617,7 +601,7 @@ function GraphStageBand({
     >
       <div
         className="absolute top-0 flex h-full flex-col gap-1.5 overflow-hidden px-3 py-3"
-        style={{ left: 0, width: STAGE_LABEL_W - 12 }}
+        style={{ left: STAGE_LABEL_W, width: CANVAS_W - STAGE_LABEL_W - 28 }}
       >
         <div className="flex flex-wrap items-center gap-1.5">
           <h3 className={cn("min-w-0 truncate text-xs font-semibold tracking-[-0.01em]", band.folded ? "text-gray-400" : "text-gray-100")}>{band.stage.title}</h3>
@@ -707,7 +691,7 @@ function GraphCanvas({
             return (
               <line
                 key={`${band.id}-rail`}
-                x1={Math.max(STAGE_LABEL_W + 10, x1 - 18)}
+                x1={x1 - 18}
                 y1={y}
                 x2={x2 + 18}
                 y2={y}
@@ -747,6 +731,7 @@ function GraphCanvas({
                 opacity={opacity}
                 strokeDasharray={edge.muted ? "5 4" : undefined}
                 strokeLinecap="round"
+                strokeLinejoin="round"
               />
             );
           })}
