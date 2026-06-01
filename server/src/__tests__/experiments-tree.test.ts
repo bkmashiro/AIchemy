@@ -133,6 +133,60 @@ describe("GET /experiments/tree", () => {
     expect(res.body).toHaveProperty("roots");
   });
 
+  it("orders same-created_at siblings by name then id", async () => {
+    const app = makeApp();
+    // Two roots with identical created_at — should fall back to name then id
+    const rootA = makeExperiment({
+      id: "z-id", name: "alpha", created_at: "2025-03-01T00:00:00.000Z",
+    });
+    const rootB = makeExperiment({
+      id: "a-id", name: "beta", created_at: "2025-03-01T00:00:00.000Z",
+    });
+    // Two roots with identical created_at AND identical name — fall back to id
+    const dupNameA = makeExperiment({
+      id: "id-2", name: "gamma", created_at: "2025-03-02T00:00:00.000Z",
+    });
+    const dupNameB = makeExperiment({
+      id: "id-1", name: "gamma", created_at: "2025-03-02T00:00:00.000Z",
+    });
+    // Two children with identical created_at — also fall back to name then id
+    const child1 = makeExperiment({
+      id: "c-zz", name: "ka", parent_id: "z-id",
+      created_at: "2025-03-10T00:00:00.000Z",
+    });
+    const child2 = makeExperiment({
+      id: "c-aa", name: "kb", parent_id: "z-id",
+      created_at: "2025-03-10T00:00:00.000Z",
+    });
+    // Two same-name same-created_at siblings — fall back to id
+    const child3 = makeExperiment({
+      id: "c-yy", name: "kc", parent_id: "z-id",
+      created_at: "2025-03-10T00:00:00.000Z",
+    });
+    const child4 = makeExperiment({
+      id: "c-bb", name: "kc", parent_id: "z-id",
+      created_at: "2025-03-10T00:00:00.000Z",
+    });
+
+    for (const e of [rootA, rootB, dupNameA, dupNameB, child1, child2, child3, child4]) {
+      store.setGrid(makeGrid(e.grid_id));
+      store.setExperiment(e);
+    }
+
+    const res = await request(app).get("/experiments/tree").expect(200);
+    // Roots first ordered by created_at; within the second created_at, by name then id
+    expect(res.body.roots.map((r: any) => r.id)).toEqual([
+      "z-id", "a-id", "id-1", "id-2",
+    ]);
+    const firstRootChildren = res.body.roots[0].children;
+    expect(firstRootChildren.map((c: any) => c.id)).toEqual([
+      "c-zz", // ka < kb < kc
+      "c-aa",
+      "c-bb", // same created_at + name → id ascending
+      "c-yy",
+    ]);
+  });
+
   it("includes fork_reason, goal_metric, goal_direction in brief nodes", async () => {
     const app = makeApp();
     const root = makeExperiment({
@@ -164,6 +218,52 @@ describe("GET /experiments/compare", () => {
     await request(app).get("/experiments/compare").expect(400);
     await request(app).get("/experiments/compare?ids=").expect(400);
     await request(app).get("/experiments/compare?ids=,,").expect(400);
+  });
+
+  it("400s when more than 6 unique ids are requested", async () => {
+    const app = makeApp();
+    const ids: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      const exp = makeExperiment({ id: `m${i}`, name: `m${i}` });
+      store.setGrid(makeGrid(exp.grid_id));
+      store.setExperiment(exp);
+      ids.push(exp.id);
+    }
+    // 6 unique → OK
+    await request(app).get(`/experiments/compare?ids=${ids.slice(0, 6).join(",")}`).expect(200);
+    // 7 unique → 400
+    await request(app).get(`/experiments/compare?ids=${ids.join(",")}`).expect(400);
+  });
+
+  it("deduplicates repeated ids in ids/found/experiments/metric_deltas", async () => {
+    const app = makeApp();
+    const expA = makeExperiment({
+      id: "A", name: "A", criteria: { loss: "< 1.0" },
+      results: {
+        t1: { passed: true, checked_at: "x", details: { loss: { value: 0.5, threshold: "< 1.0", ok: true } } },
+      },
+    });
+    const expB = makeExperiment({
+      id: "B", name: "B", criteria: { loss: "< 1.0" },
+      results: {
+        t1: { passed: true, checked_at: "x", details: { loss: { value: 0.3, threshold: "< 1.0", ok: true } } },
+      },
+    });
+    for (const e of [expA, expB]) {
+      store.setGrid(makeGrid(e.grid_id));
+      store.setExperiment(e);
+    }
+
+    // Duplicates and surrounding whitespace must collapse to first-seen order.
+    const res = await request(app)
+      .get("/experiments/compare?ids=A,B,A, B ,A")
+      .expect(200);
+    expect(res.body.ids).toEqual(["A", "B"]);
+    expect(res.body.found).toEqual(["A", "B"]);
+    expect(res.body.missing).toEqual([]);
+    expect(res.body.experiments.map((e: any) => e.id)).toEqual(["A", "B"]);
+    // metric_deltas rows must not duplicate either
+    expect(res.body.metric_deltas.loss.map((r: any) => r.id)).toEqual(["A", "B"]);
   });
 
   it("reports missing ids without dropping found experiments", async () => {
@@ -226,6 +326,68 @@ describe("GET /experiments/compare", () => {
     expect(res.body.metric_deltas.loss).toEqual([
       { id: "B", best: null, delta: null },
       { id: "A", best: 0.2, delta: 0 },
+    ]);
+  });
+
+  it("metric_deltas keys are sorted and per-metric rows follow requested id order with null for missing data", async () => {
+    const app = makeApp();
+    // X has loss + acc; Y has only loss; Z has only zeta.
+    const expX = makeExperiment({
+      id: "X", name: "X", criteria: { loss: "< 1.0", acc: "> 0.5" },
+      results: {
+        t1: { passed: true, checked_at: "x", details: {
+          loss: { value: 0.25, threshold: "< 1.0", ok: true },
+          acc: { value: 0.875, threshold: "> 0.5", ok: true },
+        }},
+      },
+    });
+    const expY = makeExperiment({
+      id: "Y", name: "Y", criteria: { loss: "< 1.0" },
+      results: {
+        t1: { passed: true, checked_at: "x", details: {
+          loss: { value: 0.5, threshold: "< 1.0", ok: true },
+        }},
+      },
+    });
+    const expZ = makeExperiment({
+      id: "Z", name: "Z", criteria: { zeta: "> 0.1" },
+      results: {
+        t1: { passed: true, checked_at: "x", details: {
+          zeta: { value: 0.9, threshold: "> 0.1", ok: true },
+        }},
+      },
+    });
+    for (const e of [expX, expY, expZ]) {
+      store.setGrid(makeGrid(e.grid_id));
+      store.setExperiment(e);
+    }
+
+    // Request in non-sorted order to verify ids ordering propagates to rows.
+    const res = await request(app).get("/experiments/compare?ids=Y,Z,X").expect(200);
+    expect(res.body.found).toEqual(["Y", "Z", "X"]);
+    // Keys deterministic and sorted alphabetically.
+    expect(Object.keys(res.body.metric_deltas)).toEqual(["acc", "loss", "zeta"]);
+    // Per-metric row ids follow requested order (which equals `found` here).
+    for (const metric of ["acc", "loss", "zeta"]) {
+      expect(res.body.metric_deltas[metric].map((r: any) => r.id)).toEqual(["Y", "Z", "X"]);
+    }
+    // acc: only X has it → reference is X's value, X's delta is 0.
+    expect(res.body.metric_deltas.acc).toEqual([
+      { id: "Y", best: null, delta: null },
+      { id: "Z", best: null, delta: null },
+      { id: "X", best: 0.875, delta: 0 },
+    ]);
+    // loss: Y (reference) then X. Z null. delta vs first found-with-metric.
+    expect(res.body.metric_deltas.loss).toEqual([
+      { id: "Y", best: 0.5, delta: 0 },
+      { id: "Z", best: null, delta: null },
+      { id: "X", best: 0.25, delta: -0.25 },
+    ]);
+    // zeta: only Z has it.
+    expect(res.body.metric_deltas.zeta).toEqual([
+      { id: "Y", best: null, delta: null },
+      { id: "Z", best: 0.9, delta: 0 },
+      { id: "X", best: null, delta: null },
     ]);
   });
 });
@@ -295,6 +457,93 @@ describe("GET /experiments/:id/summary", () => {
     expect(res.body.timeline_event_count).toBe(1);
     expect(res.body.config).toEqual({ lr: 0.01 });
     expect(res.body.config_diff).toEqual({ lr: { old: 0.02, new: 0.01 } });
+  });
+
+  it("primary_metric is null when goal_metric is set but goal_direction is missing", async () => {
+    const app = makeApp();
+    // goal_metric set, but no goal_direction. Also: criteria mentions "loss" with
+    // a "<" operator, and the metric name "loss" itself suggests minimization —
+    // neither should be used to infer direction.
+    const exp = makeExperiment({
+      id: "no-dir", name: "no-dir",
+      goal_metric: "loss",
+      criteria: { loss: "< 1.0" },
+      results: {
+        t1: { passed: true, checked_at: "x", details: {
+          loss: { value: 0.3, threshold: "< 1.0", ok: true },
+        }},
+      },
+    });
+    store.setGrid(makeGrid(exp.grid_id));
+    store.setExperiment(exp);
+
+    const res = await request(app).get(`/experiments/${exp.id}/summary`).expect(200);
+    expect(res.body.goal_metric).toBe("loss");
+    expect(res.body.goal_direction).toBeNull();
+    expect(res.body.primary_metric).toBeNull();
+    // Sanity: best_metrics still computed via criteria-derived best.
+    expect(res.body.best_metrics).toEqual({ loss: 0.3 });
+  });
+
+  it("parent and children briefs include lineage fields ordered deterministically", async () => {
+    const app = makeApp();
+    const parent = makeExperiment({
+      id: "P", name: "parent", family: "fam",
+      decision: "keep", decision_reason: "good", decision_at: "2025-04-01T00:00:00.000Z",
+      goal_metric: "loss", goal_direction: "min", fork_reason: "explore",
+      created_at: "2025-04-01T00:00:00.000Z",
+    });
+    const exp = makeExperiment({
+      id: "E", name: "exp", parent_id: "P", family: "fam",
+      created_at: "2025-04-02T00:00:00.000Z",
+    });
+    // Two children with same created_at and same name → must fall back to id.
+    const childA = makeExperiment({
+      id: "c-b", name: "kid", parent_id: "E",
+      decision: "drop", fork_reason: "diverged",
+      goal_metric: "acc", goal_direction: "max",
+      created_at: "2025-04-03T00:00:00.000Z",
+    });
+    const childB = makeExperiment({
+      id: "c-a", name: "kid", parent_id: "E",
+      decision: "fork", fork_reason: "branch",
+      goal_metric: "f1", goal_direction: "max",
+      created_at: "2025-04-03T00:00:00.000Z",
+    });
+    for (const e of [parent, exp, childA, childB]) {
+      store.setGrid(makeGrid(e.grid_id));
+      store.setExperiment(e);
+    }
+
+    const res = await request(app).get(`/experiments/${exp.id}/summary`).expect(200);
+    expect(res.body.parent).toMatchObject({
+      id: "P",
+      name: "parent",
+      family: "fam",
+      decision: "keep",
+      fork_reason: "explore",
+      goal_metric: "loss",
+      goal_direction: "min",
+      parent_id: null,
+    });
+    // Deterministic same-created_at + same-name fallback to id ascending.
+    expect(res.body.children.map((c: any) => c.id)).toEqual(["c-a", "c-b"]);
+    expect(res.body.children[0]).toMatchObject({
+      id: "c-a",
+      decision: "fork",
+      fork_reason: "branch",
+      goal_metric: "f1",
+      goal_direction: "max",
+      parent_id: "E",
+    });
+    expect(res.body.children[1]).toMatchObject({
+      id: "c-b",
+      decision: "drop",
+      fork_reason: "diverged",
+      goal_metric: "acc",
+      goal_direction: "max",
+      parent_id: "E",
+    });
   });
 
   it("returns null parent when experiment has no parent_id", async () => {
