@@ -345,19 +345,21 @@ function MetricCard({ name, value }: { name: string; value: number }) {
   );
 }
 
-// Graph canvas: stages are horizontal swimlane bands (background only). Runs
-// are first-class graph nodes placed in canvas coordinates. Edges are SVG
-// curves drawn in the same coordinate system, anchored from source run node
-// to target stage entry. Run nodes intentionally show only a compact summary
-// — full details live in the inspector below.
+// Graph canvas: stages are horizontal swimlane bands. Topology is drawn as
+// GitLens-style small dots and rail edges; run labels are detached cards so
+// edges never target large chips.
 const CANVAS_W = 1100;
 const BAND_H = 156;
 const BAND_GAP = 32;
-const NODE_W = 160;
-const NODE_H = 80;
+const DOT_R = 6;
+const DOT_HIT = 28;
+const CARD_W = 168;
+const CARD_H = 64;
 const STAGE_LABEL_W = 200;
-const NODE_START_X = 220;
-const NODE_GAP_X = 220;
+const RAIL_START_X = 232;
+const RUN_GAP_X = 218;
+const CARD_OFFSET_X = 18;
+const CARD_OFFSET_Y = -24;
 const CANVAS_PAD_Y = 10;
 
 function isFoldedRun(exp: DemoExperiment) {
@@ -367,11 +369,17 @@ function isFoldedRun(exp: DemoExperiment) {
 function getBandY(bandIndex: number) {
   return CANVAS_PAD_Y + bandIndex * (BAND_H + BAND_GAP);
 }
-function getNodeY(bandIndex: number) {
-  return getBandY(bandIndex) + (BAND_H - NODE_H) / 2;
+function getDotY(bandIndex: number) {
+  return getBandY(bandIndex) + BAND_H / 2;
 }
-function getNodeX(runIndex: number) {
-  return NODE_START_X + runIndex * NODE_GAP_X;
+function getDotX(runIndex: number) {
+  return RAIL_START_X + runIndex * RUN_GAP_X;
+}
+function getCardX(runIndex: number) {
+  return getDotX(runIndex) + CARD_OFFSET_X;
+}
+function getCardY(bandIndex: number) {
+  return getDotY(bandIndex) + CARD_OFFSET_Y;
 }
 
 type CanvasRunNode = {
@@ -380,10 +388,12 @@ type CanvasRunNode = {
   stageId: string;
   bandIndex: number;
   runIndex: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
+  dotX: number;
+  dotY: number;
+  cardX: number;
+  cardY: number;
+  cardWidth: number;
+  cardHeight: number;
   muted: boolean;
   selected: boolean;
 };
@@ -440,10 +450,12 @@ function buildCanvasGraph(
         stageId: band.id,
         bandIndex: band.bandIndex,
         runIndex,
-        x: getNodeX(runIndex),
-        y: getNodeY(band.bandIndex),
-        width: NODE_W,
-        height: NODE_H,
+        dotX: getDotX(runIndex),
+        dotY: getDotY(band.bandIndex),
+        cardX: getCardX(runIndex),
+        cardY: getCardY(band.bandIndex),
+        cardWidth: CARD_W,
+        cardHeight: CARD_H,
         muted: band.folded || isFoldedRun(exp),
         selected: exp.id === selectedRunId,
       });
@@ -453,7 +465,7 @@ function buildCanvasGraph(
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
   const bandById = new Map(bands.map((b) => [b.id, b]));
 
-  type Pending = { stage: DemoStage; parentStage: DemoStage; sourceRunId: string };
+  type Pending = { stage: DemoStage; parentStage: DemoStage; sourceRunId: string; targetRunId?: string };
   const pending: Pending[] = [];
   for (const band of bands) {
     const stage = band.stage;
@@ -465,6 +477,21 @@ function buildCanvasGraph(
       stage,
       parentStage: parentBand.stage,
       sourceRunId: stage.parentRunId,
+      targetRunId: band.visibleRunIds[0],
+    });
+  }
+
+  for (const node of nodes) {
+    if (!node.exp.parentId) continue;
+    const parentNode = nodeById.get(node.exp.parentId);
+    if (!parentNode || parentNode.stageId !== node.stageId) continue;
+    const band = bandById.get(node.stageId);
+    if (!band) continue;
+    pending.push({
+      stage: band.stage,
+      parentStage: band.stage,
+      sourceRunId: parentNode.id,
+      targetRunId: node.id,
     });
   }
 
@@ -479,11 +506,12 @@ function buildCanvasGraph(
     groupSeen.set(p.sourceRunId, siblingIndex + 1);
     const siblingCount = groupCounts.get(p.sourceRunId) ?? 1;
     const muted = !!p.stage.folded || !!p.parentStage.folded;
-    const emphasized = p.parentStage.promotedRunId === p.sourceRunId;
+    const emphasized = p.parentStage.promotedRunId === p.sourceRunId || p.stage.promotedRunId === p.targetRunId;
     return {
-      id: `${p.sourceRunId}->${p.stage.id}`,
+      id: `${p.sourceRunId}->${p.targetRunId ?? p.stage.id}`,
       fromRunId: p.sourceRunId,
       toStageId: p.stage.id,
+      toRunId: p.targetRunId,
       muted,
       emphasized,
       siblingIndex,
@@ -497,34 +525,37 @@ function buildCanvasGraph(
 function edgePath(
   edge: CanvasEdge,
   source: CanvasRunNode,
-  target: CanvasStageBand,
+  targetBand: CanvasStageBand,
+  targetRun?: CanvasRunNode,
 ): string {
   const fanSpread = Math.max(0, edge.siblingCount - 1);
-  const fanOffset =
-    fanSpread === 0 ? 0 : (edge.siblingIndex - fanSpread / 2) * 22;
-  const sx = source.x + source.width / 2 + fanOffset;
-  const sy = source.y + source.height - 4;
-  const tx = NODE_START_X + NODE_W / 2;
-  const ty = target.y + 4;
-  const bandSpan = target.bandIndex - source.bandIndex;
+  const fanOffset = fanSpread === 0 ? 0 : (edge.siblingIndex - fanSpread / 2) * 18;
+  const sx = source.dotX + fanOffset;
+  const sy = source.dotY;
+  const tx = targetRun ? targetRun.dotX : RAIL_START_X;
+  const ty = targetRun ? targetRun.dotY : targetBand.y + BAND_H / 2;
+  const bandSpan = targetBand.bandIndex - source.bandIndex;
   const dy = ty - sy;
 
+  if (bandSpan === 0) {
+    const midY = sy + (edge.siblingIndex % 2 === 0 ? -18 : 18);
+    return `M ${sx} ${sy} C ${sx + 34} ${midY}, ${tx - 34} ${midY}, ${tx} ${ty}`;
+  }
+
   if (bandSpan <= 1) {
-    const c1x = sx + (tx - sx) * 0.18;
-    const c1y = sy + dy * 0.55;
-    const c2x = tx - (tx - sx) * 0.18;
-    const c2y = ty - dy * 0.45;
+    const c1x = sx + (tx - sx) * 0.12;
+    const c1y = sy + dy * 0.58;
+    const c2x = tx - (tx - sx) * 0.12;
+    const c2y = ty - dy * 0.42;
     return `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`;
   }
 
-  // Skip edge across multiple bands: bend through a side corridor so the
-  // curve does not pass through node bodies in intermediate bands. Bias the
-  // corridor side based on where the source sits — left source bends left,
-  // right source bends right.
+  // Skip edge across multiple bands: bend through a rail corridor so the
+  // curve does not pass through detached label cards in intermediate bands.
   const corridor =
-    sx <= (NODE_START_X + (CANVAS_W - NODE_START_X) / 2)
-      ? Math.max(60, sx - 110)
-      : Math.min(CANVAS_W - 40, sx + 110);
+    sx <= (RAIL_START_X + (CANVAS_W - RAIL_START_X) / 2)
+      ? Math.max(STAGE_LABEL_W + 14, sx - 96)
+      : Math.min(CANVAS_W - 36, sx + 96);
   const c1x = corridor;
   const c1y = sy + dy * 0.32;
   const c2x = corridor;
@@ -543,45 +574,72 @@ function GraphRunNode({
 }) {
   const branch = BRANCH[node.exp.branch];
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={node.selected}
-      aria-label={`Open ${node.exp.name}`}
-      className={cn(
-        "absolute flex flex-col gap-1 rounded-xl border px-2.5 py-1.5 text-left transition",
-        node.selected
-          ? "border-indigo-400/55 bg-indigo-500/[0.12] shadow-[0_0_0_1px_rgba(124,124,255,0.45),0_12px_30px_-14px_rgba(124,124,255,0.6)]"
-          : "border-white/[0.08] bg-[#141517]/95 hover:border-white/[0.18] hover:bg-[#191a1c]/95",
-        node.muted && !node.selected && "opacity-55 hover:opacity-90",
-      )}
-      style={{
-        left: node.x,
-        top: node.y,
-        width: node.width,
-        height: node.height,
-      }}
-    >
-      <div className="flex items-center gap-1.5">
+    <>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-pressed={node.selected}
+        aria-label={`Open ${node.exp.name} graph dot`}
+        className={cn(
+          "absolute z-20 grid place-items-center rounded-full transition",
+          node.selected ? "bg-indigo-400/10" : "hover:bg-white/[0.05]",
+          node.muted && !node.selected && "opacity-55 hover:opacity-90",
+        )}
+        style={{
+          left: node.dotX - DOT_HIT / 2,
+          top: node.dotY - DOT_HIT / 2,
+          width: DOT_HIT,
+          height: DOT_HIT,
+        }}
+      >
         <span
-          className="h-2 w-2 shrink-0 rounded-full"
-          style={{ backgroundColor: branch.color, boxShadow: `0 0 10px ${branch.glow}` }}
+          className={cn(
+            "block rounded-full border",
+            node.selected ? "border-white/80" : "border-black/40",
+          )}
+          style={{
+            width: DOT_R * 2,
+            height: DOT_R * 2,
+            backgroundColor: branch.color,
+            boxShadow: node.selected ? `0 0 0 4px ${branch.glow}, 0 0 18px ${branch.color}` : `0 0 10px ${branch.glow}`,
+          }}
         />
-        <span className="truncate text-[11px] font-medium text-gray-100">{node.exp.shortName}</span>
-        <span className={cn("ml-auto rounded border px-1 py-px text-[9px] uppercase leading-none", BADGE[node.exp.status])}>{node.exp.status}</span>
-      </div>
-      <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
-        <span className="rounded border border-white/[0.06] bg-black/30 px-1.5 py-px text-gray-200">zN {node.exp.metrics.zN}</span>
-        {summary.slice(0, 1).map((label) => (
-          <span key={label} className="max-w-[80px] truncate rounded border border-white/[0.05] bg-white/[0.025] px-1.5 py-px text-gray-400">
-            {label}
-          </span>
-        ))}
-      </div>
-      {node.exp.decision && (
-        <span className={cn("self-start rounded border px-1.5 py-px text-[9px] uppercase leading-none", BADGE[node.exp.decision])}>{node.exp.decision}</span>
-      )}
-    </button>
+      </button>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label={`Open ${node.exp.name}`}
+        className={cn(
+          "absolute z-10 flex flex-col gap-1 rounded-lg border px-2 py-1.5 text-left transition",
+          node.selected
+            ? "border-indigo-400/45 bg-indigo-500/[0.10] shadow-[0_12px_28px_-18px_rgba(124,124,255,0.8)]"
+            : "border-white/[0.07] bg-[#141517]/85 hover:border-white/[0.16] hover:bg-[#191a1c]/90",
+          node.muted && !node.selected && "opacity-50 hover:opacity-85",
+        )}
+        style={{
+          left: node.cardX,
+          top: node.cardY,
+          width: node.cardWidth,
+          height: node.cardHeight,
+        }}
+      >
+        <div className="flex items-center gap-1.5">
+          <span className="truncate text-[11px] font-medium text-gray-100">{node.exp.shortName}</span>
+          <span className={cn("ml-auto rounded border px-1 py-px text-[9px] uppercase leading-none", BADGE[node.exp.status])}>{node.exp.status}</span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
+          <span className="rounded border border-white/[0.06] bg-black/30 px-1.5 py-px text-gray-200">zN {node.exp.metrics.zN}</span>
+          {summary.slice(0, 1).map((label) => (
+            <span key={label} className="max-w-[82px] truncate rounded border border-white/[0.05] bg-white/[0.025] px-1.5 py-px text-gray-400">
+              {label}
+            </span>
+          ))}
+        </div>
+        {node.exp.decision && (
+          <span className={cn("self-start rounded border px-1.5 py-px text-[9px] uppercase leading-none", BADGE[node.exp.decision])}>{node.exp.decision}</span>
+        )}
+      </button>
+    </>
   );
 }
 
@@ -673,7 +731,7 @@ function GraphCanvas({
     const scroller = scrollerRef.current;
     const selectedNode = nodeById.get(selectedRunId);
     if (!scroller || !selectedNode || scroller.clientWidth >= CANVAS_W) return;
-    scroller.scrollTo({ left: Math.max(0, selectedNode.x - 96), behavior: "auto" });
+    scroller.scrollTo({ left: Math.max(0, selectedNode.cardX - 96), behavior: "auto" });
   }, [nodeById, selectedRunId]);
 
   return (
@@ -696,11 +754,32 @@ function GraphCanvas({
           className="pointer-events-none absolute inset-0"
           aria-hidden
         >
+          {bands.map((band) => {
+            const bandNodes = nodes.filter((node) => node.stageId === band.id);
+            if (bandNodes.length === 0) return null;
+            const x1 = Math.min(...bandNodes.map((node) => node.dotX));
+            const x2 = Math.max(...bandNodes.map((node) => node.dotX));
+            const y = getDotY(band.bandIndex);
+            return (
+              <line
+                key={`${band.id}-rail`}
+                x1={Math.max(STAGE_LABEL_W + 10, x1 - 18)}
+                y1={y}
+                x2={x2 + 18}
+                y2={y}
+                stroke="#27272a"
+                strokeWidth={1.4}
+                strokeLinecap="round"
+                opacity={band.folded ? 0.35 : 0.62}
+              />
+            );
+          })}
           {edges.map((edge) => {
             const source = nodeById.get(edge.fromRunId);
             const target = bandById.get(edge.toStageId);
+            const targetRun = edge.toRunId ? nodeById.get(edge.toRunId) : undefined;
             if (!source || !target) return null;
-            const isSelectedEdge = edge.fromRunId === selectedRunId;
+            const isSelectedEdge = edge.fromRunId === selectedRunId || edge.toRunId === selectedRunId;
             const stroke = edge.emphasized
               ? "#7c7cff"
               : isSelectedEdge
@@ -717,7 +796,7 @@ function GraphCanvas({
             return (
               <path
                 key={edge.id}
-                d={edgePath(edge, source, target)}
+                d={edgePath(edge, source, target, targetRun)}
                 stroke={stroke}
                 strokeWidth={width}
                 fill="none"
