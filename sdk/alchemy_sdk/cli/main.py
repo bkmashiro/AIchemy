@@ -121,6 +121,10 @@ def short_experiment(exp: dict[str, Any]) -> dict[str, Any]:
 
 def find_experiment(client: ApiClient, ref: str) -> dict[str, Any]:
     experiments = client.get("/experiments")
+    return resolve_experiment(experiments, ref)
+
+
+def resolve_experiment(experiments: list[dict[str, Any]], ref: str) -> dict[str, Any]:
     matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref]
     if not matches:
         raise AlchError(f"experiment not found: {ref}")
@@ -334,6 +338,32 @@ def cmd_experiments_note(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.post(f"/experiments/{exp['id']}/events", body))
 
 
+def cmd_experiments_tree(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get("/experiments/tree"))
+
+
+def cmd_experiments_compare(args: argparse.Namespace, client: ApiClient) -> None:
+    experiments = client.get("/experiments")
+    resolved = [resolve_experiment(experiments, ref) for ref in args.experiments]
+    ids = ",".join(e["id"] for e in resolved)
+    print_json(client.get(f"/experiments/compare?{urlencode({'ids': ids})}"))
+
+
+def cmd_experiments_summary(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}/summary"))
+
+
+def cmd_experiments_diff(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}/diff"))
+
+
+def cmd_experiments_manifest(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}/manifest"))
+
+
 def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
     reason = args.reason_flag or args.reason
     if not reason:
@@ -382,6 +412,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = exps_sub.add_parser("timeline"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_timeline)
     p = exps_sub.add_parser("note"); p.add_argument("experiment"); p.add_argument("message"); p.add_argument("--task"); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_note)
     p = exps_sub.add_parser("decide"); p.add_argument("experiment"); p.add_argument("decision", choices=["keep", "drop", "rerun", "fork"]); p.add_argument("reason", nargs="?"); p.add_argument("--reason", dest="reason_flag"); p.set_defaults(func=cmd_experiments_decide)
+    p = exps_sub.add_parser("tree"); p.set_defaults(func=cmd_experiments_tree)
+    p = exps_sub.add_parser("compare"); p.add_argument("experiments", nargs="+"); p.set_defaults(func=cmd_experiments_compare)
+    p = exps_sub.add_parser("summary"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_summary)
+    p = exps_sub.add_parser("diff"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_diff)
+    p = exps_sub.add_parser("manifest"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_manifest)
 
     p = sub.add_parser("verify"); p.add_argument("--task"); p.add_argument("--stub"); p.add_argument("--expect-status", default="running"); p.set_defaults(func=cmd_verify)
     return parser

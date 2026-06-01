@@ -247,6 +247,97 @@ def test_experiments_show_ambiguous_name_fails(monkeypatch):
     assert code == 1
 
 
+def test_experiments_tree_fetches_tree_endpoint(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "tree"],
+        [{"roots": []}],
+    )
+
+    assert calls == [{
+        "method": "GET",
+        "url": "http://localhost:3002/api/experiments/tree",
+        "body": None,
+        "auth": "Bearer secret-token",
+        "timeout": 20.0,
+    }]
+
+
+def test_experiments_compare_resolves_names_and_preserves_order(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "compare", "beta", "alpha", "exp-3"],
+        [
+            [
+                {"id": "exp-1", "name": "alpha"},
+                {"id": "exp-2", "name": "beta"},
+                {"id": "exp-3", "name": "gamma"},
+            ],
+            {"experiments": []},
+        ],
+    )
+
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/compare?ids=exp-2%2Cexp-1%2Cexp-3"
+
+
+def test_experiments_compare_unknown_ref_fails(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    def fake_urlopen(req, timeout=20.0):
+        assert req.method == "GET"
+        return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "compare", "alpha", "ghost"])
+
+    assert code == 1
+
+
+def test_experiments_summary_resolves_name(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "summary", "alpha"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "exp-1", "metrics": {}},
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/summary"
+
+
+def test_experiments_diff_fetches_by_id(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "diff", "exp-1"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"changes": []},
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/diff"
+
+
+def test_experiments_manifest_fetches_by_id(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "manifest", "alpha"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"manifest_version": 1, "tasks": []},
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/manifest"
+
+
 def test_move_to_stub_cancels_then_posts_target_stub(monkeypatch):
     task = {
         "id": "task-1",
