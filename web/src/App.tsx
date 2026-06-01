@@ -11,6 +11,7 @@ import TaskDetailPage from "./pages/TaskDetailPage";
 import StubDetailPage from "./pages/StubDetail";
 import StubsPage from "./pages/StubsPage";
 import ExperimentsPage from "./pages/ExperimentsPage";
+import ExperimentLineageDemo from "./pages/ExperimentLineageDemo";
 import DeployPage from "./pages/DeployPage";
 import LoginPage from "./pages/LoginPage";
 
@@ -98,6 +99,7 @@ function AppInner(_props: { onLogout: () => void }) {
       <main className="flex-1 overflow-auto">
         <div className="p-5 max-w-screen-2xl mx-auto">
           <Routes>
+            <Route path="/demo/experiments-lineage" element={<ExperimentLineageDemo />} />
             <Route
               path="/"
               element={
@@ -138,6 +140,7 @@ function AppInner(_props: { onLogout: () => void }) {
 
 export default function App() {
   const [authed, setAuthed] = useState(hasToken());
+  const isDemoRoute = window.location.pathname.startsWith("/demo/");
 
   const logout = useCallback(() => {
     clearToken();
@@ -148,6 +151,16 @@ export default function App() {
   useEffect(() => {
     setOnAuthFail(logout);
   }, [logout]);
+
+  if (isDemoRoute) {
+    return (
+      <BrowserRouter>
+        <Routes>
+          <Route path="/demo/experiments-lineage" element={<ExperimentLineageDemo />} />
+        </Routes>
+      </BrowserRouter>
+    );
+  }
 
   if (!authed) {
     return <LoginPage onAuth={() => setAuthed(true)} />;
