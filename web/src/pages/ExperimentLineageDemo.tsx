@@ -1,15 +1,19 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 
 type DemoDecision = "keep" | "drop" | "rerun" | "fork";
-type DemoEventKind = "created" | "forked" | "note" | "decision" | "task_failed" | "resumed" | "metric_best";
+type DemoEventKind = "created" | "forked" | "note" | "decision" | "task_failed" | "resumed" | "metric_best" | "checkpoint";
+type DemoStatus = "running" | "passed" | "partial" | "failed";
 
 type DemoExperiment = {
   id: string;
   name: string;
-  status: "running" | "passed" | "partial" | "failed";
+  shortName: string;
+  status: DemoStatus;
   description: string;
   family: string;
   parentId?: string;
+  branch: "baseline" | "curiosity" | "batch" | "resume" | "ablation";
+  lane: number;
   hypothesis: string;
   expected: string;
   forkReason?: string;
@@ -30,89 +34,186 @@ type DemoEvent = {
   data?: Record<string, unknown>;
 };
 
+type BranchStyle = {
+  label: string;
+  color: string;
+  glow: string;
+  bg: string;
+  text: string;
+};
+
+const ROW_HEIGHT = 78;
+const LANE_WIDTH = 42;
+const GRAPH_LEFT = 28;
+const GRAPH_TOP = 34;
+
+const BRANCH: Record<DemoExperiment["branch"], BranchStyle> = {
+  baseline: { label: "baseline", color: "#8b949e", glow: "rgba(139,148,158,0.28)", bg: "bg-slate-500/10", text: "text-slate-300" },
+  curiosity: { label: "curiosity", color: "#7c7cff", glow: "rgba(124,124,255,0.36)", bg: "bg-indigo-500/10", text: "text-indigo-300" },
+  batch: { label: "batch", color: "#f59e0b", glow: "rgba(245,158,11,0.32)", bg: "bg-amber-500/10", text: "text-amber-300" },
+  resume: { label: "resume", color: "#10b981", glow: "rgba(16,185,129,0.32)", bg: "bg-emerald-500/10", text: "text-emerald-300" },
+  ablation: { label: "ablation", color: "#ec4899", glow: "rgba(236,72,153,0.32)", bg: "bg-pink-500/10", text: "text-pink-300" },
+};
+
 const BADGE: Record<string, string> = {
-  running: "bg-blue-900/30 text-blue-400 border-blue-700/40",
-  passed: "bg-green-900/30 text-green-400 border-green-700/40",
-  partial: "bg-orange-900/30 text-orange-400 border-orange-700/40",
-  failed: "bg-red-900/30 text-red-400 border-red-700/40",
-  keep: "bg-green-900/30 text-green-400 border-green-700/40",
-  drop: "bg-red-900/30 text-red-400 border-red-700/40",
-  rerun: "bg-blue-900/30 text-blue-400 border-blue-700/40",
-  fork: "bg-purple-900/30 text-purple-400 border-purple-700/40",
-  created: "bg-blue-900/30 text-blue-400 border-blue-700/40",
-  forked: "bg-purple-900/30 text-purple-400 border-purple-700/40",
-  note: "bg-gray-800 text-gray-300 border-gray-700",
-  decision: "bg-purple-900/30 text-purple-400 border-purple-700/40",
-  task_failed: "bg-red-900/30 text-red-400 border-red-700/40",
-  resumed: "bg-amber-900/30 text-amber-400 border-amber-700/40",
-  metric_best: "bg-green-900/30 text-green-400 border-green-700/40",
+  running: "bg-blue-500/10 text-blue-300 border-blue-400/20",
+  passed: "bg-emerald-500/10 text-emerald-300 border-emerald-400/20",
+  partial: "bg-amber-500/10 text-amber-300 border-amber-400/20",
+  failed: "bg-red-500/10 text-red-300 border-red-400/20",
+  keep: "bg-emerald-500/10 text-emerald-300 border-emerald-400/20",
+  drop: "bg-red-500/10 text-red-300 border-red-400/20",
+  rerun: "bg-blue-500/10 text-blue-300 border-blue-400/20",
+  fork: "bg-violet-500/10 text-violet-300 border-violet-400/20",
+  created: "bg-blue-500/10 text-blue-300 border-blue-400/20",
+  forked: "bg-violet-500/10 text-violet-300 border-violet-400/20",
+  note: "bg-white/[0.04] text-gray-300 border-white/[0.08]",
+  decision: "bg-violet-500/10 text-violet-300 border-violet-400/20",
+  task_failed: "bg-red-500/10 text-red-300 border-red-400/20",
+  resumed: "bg-amber-500/10 text-amber-300 border-amber-400/20",
+  metric_best: "bg-emerald-500/10 text-emerald-300 border-emerald-400/20",
+  checkpoint: "bg-cyan-500/10 text-cyan-300 border-cyan-400/20",
 };
 
 const demoExperiments: DemoExperiment[] = [
   {
     id: "baseline",
     name: "jema_v2_baseline_a30",
+    shortName: "baseline_a30",
     status: "partial",
     description: "Baseline JEMA v2 run before curiosity objective changes.",
     family: "jema_v2/pretrain",
+    branch: "baseline",
+    lane: 0,
     hypothesis: "Stable pretraining should hold zN above 0.82 without loss spikes.",
     expected: "zN >= 0.82, eval loss <= 1.9, no OOM on A30.",
     decision: "fork",
-    decisionReason: "Good enough signal, but A30 memory pressure needs a narrower fork.",
+    decisionReason: "Good enough signal, but A30 memory pressure needs narrower forks.",
     criteria: { zN: ">=0.82", eval_loss: "<=1.90" },
-    config: { lr: 0.0003, batch: 64, curiosity: false, stub: "a30-01" },
-    metrics: { zN: 0.821, eval_loss: 1.94 },
+    config: { lr: 0.0003, batch: 64, curiosity: false, dropout: 0.1, stub: "a30-01" },
+    metrics: { zN: 0.821, eval_loss: 1.94, step: 18000 },
   },
   {
     id: "curiosity-low-lr",
     name: "jema_v2_curiosity_low_lr",
+    shortName: "curiosity_low_lr",
     status: "running",
     description: "Fork with lower LR and curiosity objective enabled.",
     family: "jema_v2/pretrain",
     parentId: "baseline",
+    branch: "curiosity",
+    lane: 1,
     hypothesis: "Curiosity objective improves zN if LR is reduced enough to avoid collapse.",
     expected: "zN >= 0.86 and smoother loss curve than baseline.",
     forkReason: "Baseline showed usable zN but loss instability after 18k steps.",
     decision: "rerun",
     decisionReason: "Promising zN, but resume on T4 before keeping it.",
     criteria: { zN: ">=0.86", eval_loss: "<=1.80" },
-    config: { lr: 0.00018, batch: 48, curiosity: true, stub: "t4-02" },
-    metrics: { zN: 0.858, eval_loss: 1.81 },
+    config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-02" },
+    metrics: { zN: 0.858, eval_loss: 1.81, step: 24000 },
+  },
+  {
+    id: "curiosity-resume-t4",
+    name: "jema_v2_curiosity_resume_t4",
+    shortName: "resume_t4",
+    status: "passed",
+    description: "Continuation of the low-LR branch after moving off the A30 stub.",
+    family: "jema_v2/pretrain",
+    parentId: "curiosity-low-lr",
+    branch: "resume",
+    lane: 2,
+    hypothesis: "Same objective should stabilize once the memory pressure is removed.",
+    expected: "zN >= 0.865, loss spike disappears after resume.",
+    forkReason: "A30 run hit OOM; resume branch records environment change explicitly.",
+    decision: "keep",
+    decisionReason: "Best current result; use as parent for ablations.",
+    criteria: { zN: ">=0.865", eval_loss: "<=1.78" },
+    config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-02" },
+    metrics: { zN: 0.872, eval_loss: 1.76, step: 42000 },
+  },
+  {
+    id: "ablate-no-dropout",
+    name: "jema_v2_ablate_no_dropout",
+    shortName: "ablate_dropout",
+    status: "running",
+    description: "Ablation fork testing whether dropout is hiding useful representation capacity.",
+    family: "jema_v2/pretrain",
+    parentId: "curiosity-resume-t4",
+    branch: "ablation",
+    lane: 3,
+    hypothesis: "Removing dropout improves zN but may hurt eval loss stability.",
+    expected: "zN +0.01 with eval_loss regression <= 0.03.",
+    forkReason: "Resume branch became the best checkpoint; isolate regularization next.",
+    decision: "rerun",
+    decisionReason: "Early signal positive; needs another seed.",
+    criteria: { zN: ">=0.88", eval_loss: "<=1.79" },
+    config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.0, stub: "t4-03" },
+    metrics: { zN: 0.879, eval_loss: 1.8, step: 16000 },
   },
   {
     id: "curiosity-higher-batch",
     name: "jema_v2_curiosity_higher_batch",
+    shortName: "higher_batch",
     status: "failed",
     description: "Sibling fork testing whether higher batch fixes gradient noise.",
     family: "jema_v2/pretrain",
     parentId: "baseline",
+    branch: "batch",
+    lane: 1,
     hypothesis: "Higher batch reduces variance without hurting zN.",
     expected: "Lower loss variance and no OOM.",
     forkReason: "Baseline variance looked optimizer-related.",
     decision: "drop",
     decisionReason: "OOM twice; not worth more cluster time.",
     criteria: { zN: ">=0.84", eval_loss: "<=1.85" },
-    config: { lr: 0.0003, batch: 96, curiosity: true, stub: "a30-03" },
-    metrics: { zN: 0.0, eval_loss: 9.99 },
+    config: { lr: 0.0003, batch: 96, curiosity: true, dropout: 0.1, stub: "a30-03" },
+    metrics: { zN: 0.0, eval_loss: 9.99, step: 6200 },
+  },
+  {
+    id: "batch-64-retry",
+    name: "jema_v2_batch64_retry",
+    shortName: "batch64_retry",
+    status: "partial",
+    description: "Narrower retry of the failed high-batch branch.",
+    family: "jema_v2/pretrain",
+    parentId: "curiosity-higher-batch",
+    branch: "batch",
+    lane: 2,
+    hypothesis: "Batch 64 keeps the variance gain without OOM.",
+    expected: "No OOM and zN recovers to baseline + curiosity levels.",
+    forkReason: "High batch failed for memory, not necessarily for model quality.",
+    decision: "fork",
+    decisionReason: "Worth one narrower run, but not the mainline.",
+    criteria: { zN: ">=0.85", eval_loss: "<=1.83" },
+    config: { lr: 0.00024, batch: 64, curiosity: true, dropout: 0.1, stub: "a30-04" },
+    metrics: { zN: 0.847, eval_loss: 1.84, step: 19000 },
   },
 ];
 
 const seedEvents: DemoEvent[] = [
   { id: "e1", experimentId: "baseline", kind: "created", message: "Created baseline experiment", actor: "operator", age: "2d ago" },
   { id: "e2", experimentId: "baseline", kind: "metric_best", message: "Best zN reached 0.821 at step 18k", actor: "eval", age: "31h ago", data: { zN: 0.821, step: 18000 } },
-  { id: "e3", experimentId: "baseline", kind: "decision", message: "Marked fork: Good enough signal, but A30 memory pressure needs a narrower fork.", actor: "operator", age: "30h ago", data: { decision: "fork" } },
-  { id: "e4", experimentId: "curiosity-low-lr", kind: "forked", message: "Forked from jema_v2_baseline_a30", actor: "operator", age: "26h ago", data: { parent: "jema_v2_baseline_a30", lr: "0.0003 -> 0.00018", curiosity: "false -> true" } },
+  { id: "e3", experimentId: "baseline", kind: "decision", message: "Marked fork: usable signal, but memory pressure needs narrower branches", actor: "operator", age: "30h ago", data: { decision: "fork" } },
+  { id: "e4", experimentId: "curiosity-low-lr", kind: "forked", message: "Forked from baseline_a30", actor: "operator", age: "26h ago", data: { lr: "0.0003 -> 0.00018", curiosity: "false -> true" } },
   { id: "e5", experimentId: "curiosity-low-lr", kind: "task_failed", message: "A30 OOM at step 12k", actor: "scheduler", age: "18h ago", data: { stub: "a30-01", exit_code: 137 } },
   { id: "e6", experimentId: "curiosity-low-lr", kind: "resumed", message: "Resumed on t4-02 with batch 48", actor: "operator", age: "16h ago", data: { stub: "t4-02", batch: 48 } },
-  { id: "e7", experimentId: "curiosity-low-lr", kind: "decision", message: "Marked rerun: Promising zN, but resume on T4 before keeping it.", actor: "operator", age: "2h ago", data: { decision: "rerun" } },
-  { id: "e8", experimentId: "curiosity-higher-batch", kind: "forked", message: "Forked from jema_v2_baseline_a30", actor: "operator", age: "25h ago", data: { batch: "64 -> 96" } },
-  { id: "e9", experimentId: "curiosity-higher-batch", kind: "decision", message: "Marked drop: OOM twice; not worth more cluster time.", actor: "operator", age: "20h ago", data: { decision: "drop" } },
+  { id: "e7", experimentId: "curiosity-low-lr", kind: "decision", message: "Marked rerun: promising zN, but validate resume branch first", actor: "operator", age: "2h ago", data: { decision: "rerun" } },
+  { id: "e8", experimentId: "curiosity-resume-t4", kind: "checkpoint", message: "Checkpoint promoted from resumed run", actor: "eval", age: "90m ago", data: { checkpoint: "step-42000", zN: 0.872 } },
+  { id: "e9", experimentId: "curiosity-resume-t4", kind: "decision", message: "Marked keep: best current result", actor: "operator", age: "42m ago", data: { decision: "keep" } },
+  { id: "e10", experimentId: "ablate-no-dropout", kind: "forked", message: "Forked from resume_t4 to test dropout=0", actor: "operator", age: "38m ago", data: { dropout: "0.1 -> 0.0" } },
+  { id: "e11", experimentId: "ablate-no-dropout", kind: "metric_best", message: "Early zN reached 0.879", actor: "eval", age: "12m ago", data: { zN: 0.879, step: 16000 } },
+  { id: "e12", experimentId: "curiosity-higher-batch", kind: "forked", message: "Forked from baseline_a30", actor: "operator", age: "25h ago", data: { batch: "64 -> 96" } },
+  { id: "e13", experimentId: "curiosity-higher-batch", kind: "decision", message: "Marked drop: OOM twice; not worth more cluster time", actor: "operator", age: "20h ago", data: { decision: "drop" } },
+  { id: "e14", experimentId: "batch-64-retry", kind: "forked", message: "Forked from higher_batch with safer memory envelope", actor: "operator", age: "9h ago", data: { batch: "96 -> 64", lr: "0.0003 -> 0.00024" } },
 ];
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function cn(...parts: Array<string | false | null | undefined>) {
+  return parts.filter(Boolean).join(" ");
+}
+
+function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div>
-      <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">{label}</div>
+    <div className="space-y-1">
+      <div className="text-[10px] uppercase tracking-[0.2em] text-gray-500">{label}</div>
       <div>{children}</div>
     </div>
   );
@@ -120,23 +221,64 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function JsonPill({ data }: { data: Record<string, unknown> }) {
   return (
-    <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/50 rounded px-2 py-1 overflow-x-auto font-mono">
+    <pre className="mt-2 rounded-md border border-white/[0.06] bg-black/30 px-2 py-1.5 font-mono text-[10px] leading-relaxed text-gray-500 overflow-x-auto">
       {JSON.stringify(data)}
     </pre>
   );
 }
 
+function nodePoint(exp: DemoExperiment, index: number) {
+  return {
+    x: GRAPH_LEFT + exp.lane * LANE_WIDTH,
+    y: GRAPH_TOP + index * ROW_HEIGHT,
+  };
+}
+
+function MetricCard({ name, value }: { name: string; value: number }) {
+  return (
+    <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+      <div className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{name}</div>
+      <div className="mt-1 font-mono text-sm text-gray-100">{value}</div>
+    </div>
+  );
+}
+
 export default function ExperimentLineageDemo() {
   const [experiments, setExperiments] = useState(demoExperiments);
-  const [selectedId, setSelectedId] = useState("curiosity-low-lr");
+  const [selectedId, setSelectedId] = useState("curiosity-resume-t4");
   const [events, setEvents] = useState(seedEvents);
   const [note, setNote] = useState("");
-  const [decision, setDecision] = useState<DemoDecision>("rerun");
+  const [decision, setDecision] = useState<DemoDecision>("keep");
   const [reason, setReason] = useState("");
+  const [focusOnly, setFocusOnly] = useState(false);
 
   const selected = experiments.find((e) => e.id === selectedId) ?? experiments[0];
   const parent = selected.parentId ? experiments.find((e) => e.id === selected.parentId) : undefined;
   const forks = experiments.filter((e) => e.parentId === selected.id);
+  const childrenByParent = useMemo(() => {
+    const map = new Map<string, DemoExperiment[]>();
+    for (const exp of experiments) {
+      if (!exp.parentId) continue;
+      map.set(exp.parentId, [...(map.get(exp.parentId) ?? []), exp]);
+    }
+    return map;
+  }, [experiments]);
+
+  const visibleExperiments = useMemo(() => {
+    if (!focusOnly) return experiments;
+    const keep = new Set<string>([selected.id]);
+    let cursor: DemoExperiment | undefined = selected;
+    while (cursor?.parentId) {
+      keep.add(cursor.parentId);
+      cursor = experiments.find((exp) => exp.id === cursor?.parentId);
+    }
+    for (const child of childrenByParent.get(selected.id) ?? []) keep.add(child.id);
+    if (selected.parentId) {
+      for (const sibling of childrenByParent.get(selected.parentId) ?? []) keep.add(sibling.id);
+    }
+    return experiments.filter((exp) => keep.has(exp.id));
+  }, [childrenByParent, experiments, focusOnly, selected]);
+
   const timeline = events.filter((e) => e.experimentId === selected.id);
 
   const diff = useMemo(() => {
@@ -147,10 +289,14 @@ export default function ExperimentLineageDemo() {
       .filter((row) => JSON.stringify(row.before) !== JSON.stringify(row.after));
   }, [parent, selected]);
 
+  const graphHeight = Math.max(visibleExperiments.length * ROW_HEIGHT + 30, 420);
+  const visibleIds = new Set(visibleExperiments.map((exp) => exp.id));
+
   function selectExperiment(id: string) {
     const exp = experiments.find((x) => x.id === id);
     setSelectedId(id);
     setDecision(exp?.decision ?? "keep");
+    setReason("");
   }
 
   function addNote() {
@@ -172,11 +318,7 @@ export default function ExperimentLineageDemo() {
   function setDemoDecision() {
     if (!reason.trim()) return;
     setExperiments((prev) =>
-      prev.map((exp) =>
-        exp.id === selected.id
-          ? { ...exp, decision, decisionReason: reason.trim() }
-          : exp,
-      ),
+      prev.map((exp) => (exp.id === selected.id ? { ...exp, decision, decisionReason: reason.trim() } : exp)),
     );
     setEvents((prev) => [
       ...prev,
@@ -194,169 +336,278 @@ export default function ExperimentLineageDemo() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white">
-      <header className="bg-gray-900 border-b border-gray-800 px-5 h-12 flex items-center justify-between">
+    <div className="min-h-screen bg-[#08090a] text-[#f7f8f8] [font-feature-settings:'cv01','ss03']">
+      <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(113,112,255,0.16),transparent_34%),radial-gradient(circle_at_82%_18%,rgba(16,185,129,0.12),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.035),transparent_22%)]" />
+
+      <header className="relative z-10 flex h-14 items-center justify-between border-b border-white/[0.06] bg-[#0f1011]/85 px-5 backdrop-blur-xl">
         <div className="flex items-center gap-3">
-          <span className="text-lg">⚖️</span>
-          <span className="font-bold tracking-tight">Alchemy</span>
-          <span className="text-xs text-gray-600">mock lineage demo</span>
+          <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.04] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">⚖️</div>
+          <span className="text-sm font-semibold tracking-tight">Alchemy</span>
+          <span className="rounded-full border border-white/[0.06] bg-white/[0.025] px-2 py-0.5 text-[11px] text-gray-400">GitLens-style lineage demo</span>
         </div>
-        <div className="text-xs text-emerald-400">No server · no token · no state</div>
+        <div className="flex items-center gap-2 text-[11px] text-emerald-300">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.8)]" />
+          No server · no token · no mutable state
+        </div>
       </header>
 
-      <main className="p-5 max-w-screen-2xl mx-auto space-y-6">
-        <section className="flex items-start justify-between gap-4">
+      <main className="relative z-10 mx-auto max-w-[1560px] space-y-5 p-5">
+        <section className="flex flex-col gap-4 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <div className="text-xs text-blue-400 mb-2">/demo/experiments-lineage</div>
-            <h1 className="text-2xl font-bold">Research lineage demo</h1>
-            <p className="text-sm text-gray-500 mt-1 max-w-3xl">
-              Static mock data for reviewing the GitLens-style experiment workflow without spinning up Alchemy server, sockets, tokens, tasks, or real cluster state.
+            <div className="mb-2 font-mono text-[11px] text-indigo-300">/demo/experiments-lineage</div>
+            <h1 className="text-3xl font-medium tracking-[-0.04em] text-white md:text-4xl">Experiment lineage graph</h1>
+            <p className="mt-2 max-w-3xl text-sm leading-6 text-gray-400">
+              GitLens-style branch rail for research experiments. The graph shows where runs fork; the inspector only expands detail for the selected node.
             </p>
           </div>
-          <select
-            value={selectedId}
-            onChange={(e) => selectExperiment(e.target.value)}
-            className="bg-gray-900 border border-gray-700 rounded px-3 py-2 text-sm text-gray-200"
-          >
-            {experiments.map((exp) => (
-              <option key={exp.id} value={exp.id}>{exp.name}</option>
+          <div className="flex flex-wrap items-center gap-2">
+            {Object.entries(BRANCH).map(([key, style]) => (
+              <span key={key} className={cn("rounded-full border border-white/[0.06] px-2.5 py-1 text-[11px]", style.bg, style.text)}>
+                <span className="mr-1.5 inline-block h-2 w-2 rounded-full" style={{ backgroundColor: style.color, boxShadow: `0 0 10px ${style.glow}` }} />
+                {style.label}
+              </span>
             ))}
-          </select>
-        </section>
-
-        <section className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-3">
-                <h2 className="text-xl font-bold">{selected.name}</h2>
-                <span className={`text-xs px-2 py-0.5 rounded border ${BADGE[selected.status]}`}>{selected.status.toUpperCase()}</span>
-              </div>
-              <p className="text-sm text-gray-500 mt-1">{selected.description}</p>
-            </div>
-            <div className="flex gap-2">
-              {Object.entries(selected.metrics).map(([key, value]) => (
-                <div key={key} className="bg-gray-950/60 border border-gray-800 rounded-lg px-3 py-2 text-right">
-                  <div className="text-[10px] uppercase tracking-wide text-gray-600">{key}</div>
-                  <div className="font-mono text-sm text-gray-200">{value}</div>
-                </div>
-              ))}
-            </div>
           </div>
         </section>
 
-        <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-            <h2 className="text-sm font-medium text-gray-400 mb-3">Intent</h2>
-            <div className="space-y-3 text-xs">
-              <Field label="Family"><span className="font-mono text-gray-300">{selected.family}</span></Field>
-              {parent && <Field label="Parent"><button onClick={() => selectExperiment(parent.id)} className="text-blue-400 hover:text-blue-300 font-mono">{parent.name}</button></Field>}
-              <Field label="Hypothesis"><p className="text-gray-300">{selected.hypothesis}</p></Field>
-              <Field label="Expected"><p className="text-gray-300">{selected.expected}</p></Field>
-              {selected.forkReason && <Field label="Fork reason"><p className="text-gray-300">{selected.forkReason}</p></Field>}
-            </div>
-          </div>
-
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-            <h2 className="text-sm font-medium text-gray-400 mb-3">Decision</h2>
-            <div className="space-y-3 text-xs">
+        <section className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(680px,1fr)_460px]">
+          <div className="overflow-hidden rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 shadow-[0_20px_80px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.035)]">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
               <div>
-                <span className={`inline-block text-xs px-2 py-0.5 rounded border ${BADGE[selected.decision ?? "note"]}`}>
-                  {(selected.decision ?? "undecided").toUpperCase()}
-                </span>
+                <h2 className="text-sm font-medium text-gray-200">Branch graph</h2>
+                <p className="text-xs text-gray-500">Compact graph first. Details stay in the inspector.</p>
               </div>
-              {selected.decisionReason && <p className="text-gray-300">{selected.decisionReason}</p>}
-              <div className="space-y-2 pt-2 border-t border-gray-800">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setFocusOnly((value) => !value)}
+                  className={cn(
+                    "rounded-md border px-3 py-1.5 text-xs transition",
+                    focusOnly ? "border-indigo-400/30 bg-indigo-500/15 text-indigo-200" : "border-white/[0.08] bg-white/[0.03] text-gray-300 hover:bg-white/[0.06]",
+                  )}
+                >
+                  {focusOnly ? "Show full family" : "Focus neighborhood"}
+                </button>
+                <select
+                  value={selectedId}
+                  onChange={(e) => selectExperiment(e.target.value)}
+                  className="rounded-md border border-white/[0.08] bg-[#191a1b] px-3 py-1.5 text-xs text-gray-200 outline-none"
+                >
+                  {experiments.map((exp) => (
+                    <option key={exp.id} value={exp.id}>{exp.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="relative overflow-x-auto p-4">
+              <div className="relative min-w-[680px]" style={{ height: graphHeight }}>
+                <svg className="absolute inset-0 h-full w-full" aria-hidden="true">
+                  <defs>
+                    <filter id="soft-glow" x="-50%" y="-50%" width="200%" height="200%">
+                      <feGaussianBlur stdDeviation="2.6" result="coloredBlur" />
+                      <feMerge>
+                        <feMergeNode in="coloredBlur" />
+                        <feMergeNode in="SourceGraphic" />
+                      </feMerge>
+                    </filter>
+                  </defs>
+                  {visibleExperiments.map((exp, index) => {
+                    if (!exp.parentId || !visibleIds.has(exp.parentId)) return null;
+                    const parentIndex = visibleExperiments.findIndex((node) => node.id === exp.parentId);
+                    if (parentIndex < 0) return null;
+                    const from = nodePoint(visibleExperiments[parentIndex], parentIndex);
+                    const to = nodePoint(exp, index);
+                    const midY = from.y + 26;
+                    const color = BRANCH[exp.branch].color;
+                    const d = `M ${from.x} ${from.y + 9} V ${midY} C ${from.x} ${midY + 16}, ${to.x} ${midY + 10}, ${to.x} ${midY + 27} V ${to.y - 9}`;
+                    return <path key={`${exp.parentId}-${exp.id}`} d={d} fill="none" stroke={color} strokeWidth="2.2" strokeLinecap="round" filter="url(#soft-glow)" opacity="0.86" />;
+                  })}
+                </svg>
+
+                {visibleExperiments.map((exp, index) => {
+                  const point = nodePoint(exp, index);
+                  const branch = BRANCH[exp.branch];
+                  const isSelected = exp.id === selected.id;
+                  const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
+                  return (
+                    <button
+                      key={exp.id}
+                      onClick={() => selectExperiment(exp.id)}
+                      className={cn(
+                        "group absolute left-0 right-0 grid grid-cols-[190px_minmax(0,1fr)_150px] items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition duration-150",
+                        isSelected
+                          ? "border-indigo-400/30 bg-indigo-500/[0.09] shadow-[0_0_0_1px_rgba(113,112,255,0.15),0_18px_50px_rgba(0,0,0,0.35)]"
+                          : "border-transparent hover:border-white/[0.07] hover:bg-white/[0.035]",
+                      )}
+                      style={{ top: index * ROW_HEIGHT, minHeight: 64 }}
+                    >
+                      <div className="relative h-12">
+                        <span
+                          className={cn("absolute rounded-full border-2 bg-[#0f1011] transition group-hover:scale-110", isSelected ? "h-5 w-5" : "h-4 w-4")}
+                          style={{
+                            left: point.x - 8,
+                            top: 15,
+                            borderColor: branch.color,
+                            boxShadow: `0 0 0 5px ${branch.glow}, 0 0 18px ${branch.glow}`,
+                          }}
+                        />
+                        <span className="absolute top-[17px] font-mono text-[10px] text-gray-600" style={{ left: GRAPH_LEFT + 4 * LANE_WIDTH + 12 }}>
+                          {branch.label}
+                        </span>
+                      </div>
+
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
+                          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
+                          {branchForks > 0 && <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">{branchForks} forks</span>}
+                        </div>
+                        <div className="mt-1 truncate text-xs text-gray-500">{exp.hypothesis}</div>
+                      </div>
+
+                      <div className="flex items-center justify-end gap-2">
+                        <div className="text-right">
+                          <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
+                          <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
+                        </div>
+                        <span className={cn("rounded-md border px-2 py-1 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <aside className="space-y-5">
+            <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[0_20px_80px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.035)]">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="mb-2 flex items-center gap-2">
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: BRANCH[selected.branch].color, boxShadow: `0 0 14px ${BRANCH[selected.branch].glow}` }} />
+                    <span className={cn("text-[11px]", BRANCH[selected.branch].text)}>{BRANCH[selected.branch].label}</span>
+                  </div>
+                  <h2 className="truncate text-xl font-medium tracking-[-0.03em] text-white">{selected.name}</h2>
+                  <p className="mt-1 text-sm leading-6 text-gray-400">{selected.description}</p>
+                </div>
+                <span className={cn("rounded-md border px-2 py-1 text-[10px] uppercase", BADGE[selected.status])}>{selected.status}</span>
+              </div>
+
+              <div className="mt-4 grid grid-cols-3 gap-2">
+                {Object.entries(selected.metrics).map(([key, value]) => <MetricCard key={key} name={key} value={value} />)}
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+              <h3 className="mb-3 text-sm font-medium text-gray-200">Inspector</h3>
+              <div className="space-y-4 text-sm">
+                <Field label="Family"><span className="font-mono text-xs text-gray-300">{selected.family}</span></Field>
+                {parent && (
+                  <Field label="Parent">
+                    <button onClick={() => selectExperiment(parent.id)} className="font-mono text-xs text-indigo-300 hover:text-indigo-200">{parent.name}</button>
+                  </Field>
+                )}
+                <Field label="Hypothesis"><p className="text-gray-300">{selected.hypothesis}</p></Field>
+                <Field label="Expected"><p className="text-gray-300">{selected.expected}</p></Field>
+                {selected.forkReason && <Field label="Fork reason"><p className="text-gray-300">{selected.forkReason}</p></Field>}
+                {forks.length > 0 && (
+                  <Field label={`Forks (${forks.length})`}>
+                    <div className="flex flex-wrap gap-1.5">
+                      {forks.map((fork) => (
+                        <button
+                          key={fork.id}
+                          onClick={() => selectExperiment(fork.id)}
+                          className={cn("rounded-md border border-white/[0.06] px-2 py-1 font-mono text-[11px] hover:border-indigo-400/30", BRANCH[fork.branch].bg, BRANCH[fork.branch].text)}
+                        >
+                          {fork.shortName}
+                        </button>
+                      ))}
+                    </div>
+                  </Field>
+                )}
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+              <div className="mb-3 flex items-center justify-between">
+                <h3 className="text-sm font-medium text-gray-200">Decision</h3>
+                <span className={cn("rounded-md border px-2 py-1 text-[10px] uppercase", BADGE[selected.decision ?? "note"])}>{selected.decision ?? "undecided"}</span>
+              </div>
+              {selected.decisionReason && <p className="mb-4 text-sm leading-6 text-gray-300">{selected.decisionReason}</p>}
+              <div className="space-y-2 rounded-xl border border-white/[0.06] bg-black/20 p-3">
                 <div className="flex items-center gap-2">
-                  <select value={decision} onChange={(e) => setDecision(e.target.value as DemoDecision)} className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200">
+                  <select value={decision} onChange={(e) => setDecision(e.target.value as DemoDecision)} className="rounded-md border border-white/[0.08] bg-[#191a1b] px-2 py-1.5 text-xs text-gray-200 outline-none">
                     <option value="keep">keep</option>
                     <option value="drop">drop</option>
                     <option value="rerun">rerun</option>
                     <option value="fork">fork</option>
                   </select>
-                  <button onClick={setDemoDecision} className="px-3 py-1 text-xs rounded bg-blue-600/20 text-blue-400 border border-blue-700/40 hover:bg-blue-600/30">Set</button>
+                  <button onClick={setDemoDecision} className="rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 text-xs text-indigo-200 transition hover:bg-indigo-500/25">Set decision</button>
                 </div>
-                <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason..." rows={2} className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600" />
+                <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason..." rows={2} className="w-full resize-none rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1.5 text-xs text-gray-200 outline-none placeholder:text-gray-600" />
               </div>
-            </div>
-          </div>
-
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-            <h2 className="text-sm font-medium text-gray-400 mb-3">Lineage</h2>
-            <div className="space-y-4 text-xs">
-              <div>
-                <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Tree</div>
-                <div className="space-y-1 font-mono">
-                  {experiments.map((exp) => (
-                    <button
-                      key={exp.id}
-                      onClick={() => selectExperiment(exp.id)}
-                      className={`block text-left ${exp.id === selected.id ? "text-blue-300" : exp.parentId ? "text-gray-400 ml-5" : "text-gray-300"}`}
-                    >
-                      {exp.parentId ? "└─ " : "● "}{exp.name}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              {forks.length > 0 && (
-                <div>
-                  <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Forks ({forks.length})</div>
-                  {forks.map((fork) => <button key={fork.id} onClick={() => selectExperiment(fork.id)} className="block text-blue-400 hover:text-blue-300 font-mono">{fork.name}</button>)}
-                </div>
-              )}
-            </div>
-          </div>
+            </section>
+          </aside>
         </section>
 
-        <section className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-medium text-gray-400">Config diff</h2>
-              <span className="text-xs text-gray-600">vs parent</span>
+        <section className="grid grid-cols-1 gap-5 xl:grid-cols-2">
+          <div className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-medium text-gray-200">Config diff</h2>
+              <span className="text-xs text-gray-500">vs parent</span>
             </div>
             {!parent ? (
-              <p className="text-xs text-gray-600">Root experiment has no parent diff.</p>
+              <p className="text-xs text-gray-500">Root experiment has no parent diff.</p>
             ) : (
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-gray-800 text-gray-600">
-                    <th className="text-left py-2">Key</th>
-                    <th className="text-left py-2">Parent</th>
-                    <th className="text-left py-2">Current</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-800/50">
-                  {diff.map((row) => (
-                    <tr key={row.key}>
-                      <td className="py-2 font-mono text-gray-400">{row.key}</td>
-                      <td className="py-2 font-mono text-red-300">{String(row.before)}</td>
-                      <td className="py-2 font-mono text-green-300">{String(row.after)}</td>
+              <div className="overflow-hidden rounded-xl border border-white/[0.06]">
+                <table className="w-full text-xs">
+                  <thead className="bg-white/[0.03] text-gray-500">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-medium">Key</th>
+                      <th className="px-3 py-2 text-left font-medium">Parent</th>
+                      <th className="px-3 py-2 text-left font-medium">Current</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.06]">
+                    {diff.length === 0 ? (
+                      <tr className="bg-black/10">
+                        <td colSpan={3} className="px-3 py-4 text-center text-xs text-gray-500">
+                          No config changes from parent. This node records runtime / checkpoint lineage only.
+                        </td>
+                      </tr>
+                    ) : diff.map((row) => (
+                      <tr key={row.key} className="bg-black/10">
+                        <td className="px-3 py-2 font-mono text-gray-400">{row.key}</td>
+                        <td className="px-3 py-2 font-mono text-red-300/85">{String(row.before)}</td>
+                        <td className="px-3 py-2 font-mono text-emerald-300/85">{String(row.after)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
 
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-medium text-gray-400">Timeline</h2>
-              <span className="text-xs text-gray-600">{timeline.length} events</span>
+          <div className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-medium text-gray-200">Node timeline</h2>
+              <span className="text-xs text-gray-500">{timeline.length} events on selected experiment</span>
             </div>
-            <div className="mb-4 space-y-2 p-3 bg-gray-950/40 border border-gray-800 rounded-lg">
-              <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a mock note..." rows={2} className="w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-600" />
+            <div className="mb-4 space-y-2 rounded-xl border border-white/[0.06] bg-black/20 p-3">
+              <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a mock note to this node..." rows={2} className="w-full resize-none rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1.5 text-xs text-gray-200 outline-none placeholder:text-gray-600" />
               <div className="flex justify-end">
-                <button onClick={addNote} className="px-3 py-1 text-xs rounded bg-blue-600/20 text-blue-400 border border-blue-700/40 hover:bg-blue-600/30">Add note</button>
+                <button onClick={addNote} className="rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 text-xs text-indigo-200 transition hover:bg-indigo-500/25">Add note</button>
               </div>
             </div>
             <ul className="space-y-2">
               {timeline.map((ev) => (
-                <li key={ev.id} className="text-xs border-l-2 border-gray-800 pl-3 py-1">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className={`px-1.5 py-0.5 rounded border text-[10px] ${BADGE[ev.kind]}`}>{ev.kind}</span>
+                <li key={ev.id} className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cn("rounded border px-1.5 py-0.5 text-[10px]", BADGE[ev.kind])}>{ev.kind}</span>
                     <span className="text-gray-300">{ev.message}</span>
-                    <span className="text-gray-600 ml-auto">{ev.age}</span>
+                    <span className="ml-auto text-gray-600">{ev.age}</span>
                   </div>
-                  <div className="mt-0.5 text-gray-600 text-[11px]">by {ev.actor}</div>
+                  <div className="mt-1 text-[11px] text-gray-600">by {ev.actor}</div>
                   {ev.data && <JsonPill data={ev.data} />}
                 </li>
               ))}
