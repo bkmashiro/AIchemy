@@ -629,6 +629,56 @@ function MetricCard({ name, value }: { name: string; value: number }) {
   );
 }
 
+const METRIC_DIRECTION: Record<string, "higher" | "lower"> = {
+  zN: "higher",
+  eval_loss: "lower",
+};
+
+function metricDelta(child: DemoExperiment, parent: DemoExperiment | undefined, key: string) {
+  const a = child.metrics[key];
+  const b = parent?.metrics[key];
+  if (typeof a !== "number" || typeof b !== "number") return null;
+  const delta = a - b;
+  const direction = METRIC_DIRECTION[key] ?? "higher";
+  const improved = direction === "lower" ? delta < 0 : delta > 0;
+  return { current: a, parent: b, delta, improved };
+}
+
+function changedConfigKeys(child: DemoExperiment, parent: DemoExperiment | undefined): string[] {
+  if (!parent) return [];
+  const keys = new Set([...Object.keys(child.config), ...Object.keys(parent.config)]);
+  const changed: string[] = [];
+  for (const k of keys) {
+    if (JSON.stringify(parent.config[k]) !== JSON.stringify(child.config[k])) changed.push(k);
+  }
+  return changed;
+}
+
+type NextAction = { label: string; hint: string; tone: "emerald" | "violet" | "blue" | "amber" | "gray" };
+
+function nextActionForDecision(exp: DemoExperiment): NextAction {
+  switch (exp.decision) {
+    case "keep":
+      return { label: "Promote → fork next stage", hint: "Use this checkpoint as parent for the next sweep.", tone: "emerald" };
+    case "fork":
+      return { label: "Branch from this run", hint: "Open a narrower fork to test the variant.", tone: "violet" };
+    case "rerun":
+      return { label: "Re-run for more evidence", hint: "Keep collecting before deciding keep / drop.", tone: "blue" };
+    case "drop":
+      return { label: "Fold into background", hint: "Preserve as evidence; do not extend.", tone: "amber" };
+    default:
+      return { label: "Awaiting decision", hint: "Select keep / fork / rerun / drop to advance the stage.", tone: "gray" };
+  }
+}
+
+const ACTION_TONE: Record<NextAction["tone"], string> = {
+  emerald: "border-emerald-400/30 bg-emerald-500/10 text-emerald-200",
+  violet: "border-violet-400/30 bg-violet-500/10 text-violet-200",
+  blue: "border-blue-400/30 bg-blue-500/10 text-blue-200",
+  amber: "border-amber-400/30 bg-amber-500/10 text-amber-200",
+  gray: "border-white/[0.08] bg-white/[0.04] text-gray-300",
+};
+
 // Graph canvas: stages are horizontal swimlane bands. Topology is the only
 // thing rendered in the graph: GitLens-style small dots and rail edges. Run
 // details live outside the graph and open on dot click.
@@ -1563,6 +1613,69 @@ export default function ExperimentLineageDemo() {
               </div>
             </section>
 
+            {(() => {
+              const action = nextActionForDecision(selected);
+              const zNDelta = metricDelta(selected, parent, "zN");
+              const lossDelta = metricDelta(selected, parent, "eval_loss");
+              const changedKeys = changedConfigKeys(selected, parent);
+              const deltaCards = [
+                { key: "zN", label: "zN vs parent", delta: zNDelta },
+                { key: "eval_loss", label: "eval loss vs parent", delta: lossDelta },
+              ].filter((row) => row.delta);
+              return (
+                <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+                  <div className="mb-3 flex items-center justify-between gap-2">
+                    <h3 className="text-sm font-medium text-gray-200">Research call</h3>
+                    <span className={cn("rounded-md border px-2 py-1 text-[10px] uppercase", BADGE[selected.decision ?? "note"])}>{selected.decision ?? "undecided"}</span>
+                  </div>
+                  <div className={cn("rounded-xl border px-3 py-2.5", ACTION_TONE[action.tone])}>
+                    <div className="text-xs font-medium leading-5">{action.label}</div>
+                    <div className="mt-0.5 text-[11px] leading-5 opacity-80">{action.hint}</div>
+                  </div>
+                  {selected.decisionReason && (
+                    <p className="mt-3 border-l-2 border-white/[0.08] pl-3 text-xs italic leading-5 text-gray-400">
+                      “{selected.decisionReason}”
+                    </p>
+                  )}
+                  {deltaCards.length > 0 && (
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      {deltaCards.map(({ key, label, delta }) => {
+                        if (!delta) return null;
+                        const sign = delta.delta > 0 ? "+" : "";
+                        return (
+                          <div key={key} className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-2.5 py-2">
+                            <div className="text-[10px] uppercase tracking-[0.18em] text-gray-500">{label}</div>
+                            <div className="mt-1 flex items-baseline gap-2">
+                              <span className="font-mono text-sm text-gray-100">{delta.current}</span>
+                              <span className={cn("font-mono text-[11px]", delta.improved ? "text-emerald-300" : "text-red-300/80")}>
+                                {sign}{delta.delta.toFixed(3)}
+                              </span>
+                            </div>
+                            <div className="mt-0.5 font-mono text-[10px] text-gray-600">parent {delta.parent}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {!parent && (
+                    <p className="mt-3 text-xs text-gray-500">Root experiment — no parent to compare against.</p>
+                  )}
+                  {changedKeys.length > 0 && (
+                    <div className="mt-3">
+                      <div className="text-[10px] uppercase tracking-[0.18em] text-gray-500">Tradeoff levers</div>
+                      <div className="mt-1.5 flex flex-wrap gap-1">
+                        {changedKeys.map((k) => (
+                          <span key={k} className="rounded border border-white/[0.06] bg-black/30 px-1.5 py-0.5 font-mono text-[10px] text-gray-300">
+                            {k}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </section>
+              );
+            })()}
+
             <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
               <div className="mb-3 flex items-center justify-between">
                 <h3 className="text-sm font-medium text-gray-200">Decision</h3>
@@ -1582,6 +1695,115 @@ export default function ExperimentLineageDemo() {
                 <textarea value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Reason..." rows={2} className="w-full resize-none rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1.5 text-xs text-gray-200 outline-none placeholder:text-gray-600" />
               </div>
             </section>
+
+            {selectedStage && stageSiblings.length > 0 && (() => {
+              const promotedRun = selectedStage.promotedRunId ? expById.get(selectedStage.promotedRunId) : undefined;
+              const rows = [selected, ...stageSiblings];
+              return (
+                <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
+                  <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-medium text-gray-200">Stage comparison</h3>
+                      <p className="truncate text-[11px] text-gray-500">
+                        {selectedStage.title} · {rows.length} run{rows.length === 1 ? "" : "s"}
+                      </p>
+                    </div>
+                    {promotedRun && (
+                      <span className="shrink-0 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2 py-0.5 text-[10px] text-emerald-200">
+                        ↑ promoted {promotedRun.shortName}
+                      </span>
+                    )}
+                  </div>
+                  <div className="-mx-1 overflow-x-auto">
+                    <table className="min-w-full text-[11px]">
+                      <thead className="text-gray-500">
+                        <tr>
+                          <th className="px-2 py-1 text-left font-medium">Run</th>
+                          <th className="px-2 py-1 text-left font-medium">Status</th>
+                          <th className="px-2 py-1 text-left font-medium">Call</th>
+                          <th className="px-2 py-1 text-right font-medium">zN</th>
+                          <th className="px-2 py-1 text-right font-medium">eval loss</th>
+                          <th className="px-2 py-1 text-left font-medium">Changed</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/[0.05]">
+                        {rows.map((run) => {
+                          const isSelected = run.id === selected.id;
+                          const isPromoted = run.id === selectedStage.promotedRunId;
+                          const runParent = run.parentId ? expById.get(run.parentId) : undefined;
+                          const changed = changedConfigKeys(run, runParent);
+                          return (
+                            <tr
+                              key={run.id}
+                              onClick={() => selectExperiment(run.id)}
+                              className={cn(
+                                "cursor-pointer transition",
+                                isSelected
+                                  ? "bg-indigo-500/10 ring-1 ring-inset ring-indigo-400/25"
+                                  : "hover:bg-white/[0.03]",
+                              )}
+                            >
+                              <td className="px-2 py-1.5">
+                                <div className="flex items-center gap-1.5">
+                                  <span
+                                    className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                    style={{ backgroundColor: BRANCH[run.branch].color, boxShadow: `0 0 6px ${BRANCH[run.branch].glow}` }}
+                                  />
+                                  <span className={cn("truncate font-mono", isSelected ? "text-indigo-200" : "text-gray-200")}>
+                                    {run.shortName}
+                                  </span>
+                                  {isPromoted && (
+                                    <span className="shrink-0 rounded-full bg-emerald-500/15 px-1 text-[9px] text-emerald-200">↑</span>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-2 py-1.5">
+                                <span className={cn("rounded border px-1 py-px text-[9px] uppercase leading-none", BADGE[run.status])}>
+                                  {run.status}
+                                </span>
+                              </td>
+                              <td className="px-2 py-1.5">
+                                <span className={cn("rounded border px-1 py-px text-[9px] uppercase leading-none", BADGE[run.decision ?? "note"])}>
+                                  {run.decision ?? "—"}
+                                </span>
+                              </td>
+                              <td className="px-2 py-1.5 text-right font-mono text-gray-200">
+                                {typeof run.metrics.zN === "number" ? run.metrics.zN : "—"}
+                              </td>
+                              <td className="px-2 py-1.5 text-right font-mono text-gray-200">
+                                {typeof run.metrics.eval_loss === "number" ? run.metrics.eval_loss : "—"}
+                              </td>
+                              <td className="px-2 py-1.5">
+                                <div className="flex flex-wrap gap-0.5">
+                                  {changed.length === 0 ? (
+                                    <span className="text-gray-600">—</span>
+                                  ) : (
+                                    <>
+                                      {changed.slice(0, 3).map((k) => (
+                                        <span
+                                          key={k}
+                                          className="rounded border border-white/[0.06] bg-black/30 px-1 py-px font-mono text-[9px] text-gray-300"
+                                        >
+                                          {k}
+                                        </span>
+                                      ))}
+                                      {changed.length > 3 && (
+                                        <span className="text-[9px] text-gray-500">+{changed.length - 3}</span>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="mt-2 text-[10px] text-gray-600">Tap a row to inspect that sibling.</p>
+                </section>
+              );
+            })()}
           </aside>
         </section>
 
