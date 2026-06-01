@@ -107,6 +107,40 @@ def short_task(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def short_experiment(exp: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": exp.get("id"),
+        "name": exp.get("name"),
+        "status": exp.get("status"),
+        "family": exp.get("family"),
+        "decision": exp.get("decision"),
+        "parent_name": exp.get("parent_name"),
+        "created_at": exp.get("created_at"),
+    }
+
+
+def find_experiment(client: ApiClient, ref: str) -> dict[str, Any]:
+    experiments = client.get("/experiments")
+    matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref]
+    if not matches:
+        raise AlchError(f"experiment not found: {ref}")
+    if len(matches) > 1:
+        raise AlchError(f"ambiguous experiment ref {ref}: {[e.get('name') for e in matches]}")
+    return matches[0]
+
+
+def parse_data_object(raw: str | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AlchError(f"--data must be valid JSON: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise AlchError("--data must be a JSON object")
+    return parsed
+
+
 def find_stub(client: ApiClient, ref: str) -> dict[str, Any]:
     stubs = client.get("/stubs")
     matches = [s for s in stubs if s.get("id") == ref or s.get("name") == ref or s.get("hostname") == ref]
@@ -274,6 +308,41 @@ def cmd_verify(args: argparse.Namespace, client: ApiClient) -> None:
         raise SystemExit(2)
 
 
+def cmd_experiments_ls(args: argparse.Namespace, client: ApiClient) -> None:
+    experiments = client.get("/experiments")
+    print_json([short_experiment(e) for e in experiments])
+
+
+def cmd_experiments_show(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}"))
+
+
+def cmd_experiments_timeline(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}/timeline"))
+
+
+def cmd_experiments_note(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    body: dict[str, Any] = {"kind": "note", "message": args.message}
+    if args.task:
+        body["task_id"] = args.task
+    data = parse_data_object(args.data)
+    if data is not None:
+        body["data"] = data
+    print_json(client.post(f"/experiments/{exp['id']}/events", body))
+
+
+def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
+    reason = args.reason_flag or args.reason
+    if not reason:
+        raise AlchError("decision reason required: pass --reason <text>")
+    exp = find_experiment(client, args.experiment)
+    body = {"decision": args.decision, "reason": reason}
+    print_json(client.patch(f"/experiments/{exp['id']}/decision", body))
+
+
 def add_global(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server", help=f"Alchemy server URL (default {DEFAULT_SERVER})")
     parser.add_argument("--token", help=argparse.SUPPRESS)
@@ -305,6 +374,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = tasks_sub.add_parser("cancel"); p.add_argument("task"); p.add_argument("--yes", action="store_true"); p.set_defaults(func=cmd_tasks_cancel)
     p = tasks_sub.add_parser("move"); p.add_argument("task"); p.add_argument("--to-stub"); p.add_argument("--to-tags"); p.add_argument("--name"); p.add_argument("--yes", action="store_true"); p.set_defaults(func=cmd_tasks_move)
     p = tasks_sub.add_parser("resubmit"); p.add_argument("task"); p.add_argument("--resume", action="store_true"); p.add_argument("--to-stub"); p.add_argument("--to-tags"); p.add_argument("--name"); p.add_argument("--wait", action="store_true"); p.add_argument("--wait-timeout", type=int, default=15); p.set_defaults(func=cmd_tasks_resubmit)
+
+    exps = sub.add_parser("experiments")
+    exps_sub = exps.add_subparsers(dest="cmd", required=True)
+    p = exps_sub.add_parser("ls"); p.set_defaults(func=cmd_experiments_ls)
+    p = exps_sub.add_parser("show"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_show)
+    p = exps_sub.add_parser("timeline"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_timeline)
+    p = exps_sub.add_parser("note"); p.add_argument("experiment"); p.add_argument("message"); p.add_argument("--task"); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_note)
+    p = exps_sub.add_parser("decide"); p.add_argument("experiment"); p.add_argument("decision", choices=["keep", "drop", "rerun", "fork"]); p.add_argument("reason", nargs="?"); p.add_argument("--reason", dest="reason_flag"); p.set_defaults(func=cmd_experiments_decide)
 
     p = sub.add_parser("verify"); p.add_argument("--task"); p.add_argument("--stub"); p.add_argument("--expect-status", default="running"); p.set_defaults(func=cmd_verify)
     return parser

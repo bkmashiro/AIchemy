@@ -124,6 +124,129 @@ def test_slurm_submit_t4_posts_deploy_restart(monkeypatch):
     ]
 
 
+def test_experiments_ls_returns_short_summary(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "ls"],
+        [[
+            {"id": "exp-1", "name": "alpha", "status": "running", "family": "ablation"},
+            {"id": "exp-2", "name": "beta", "status": "passed"},
+        ]],
+    )
+
+    assert calls == [{
+        "method": "GET",
+        "url": "http://localhost:3002/api/experiments",
+        "body": None,
+        "auth": "Bearer secret-token",
+        "timeout": 20.0,
+    }]
+
+
+def test_experiments_show_resolves_name_then_fetches_detail(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "show", "alpha"],
+        [
+            [{"id": "exp-1", "name": "alpha"}, {"id": "exp-2", "name": "beta"}],
+            {"id": "exp-1", "name": "alpha", "status": "running", "tasks": []},
+        ],
+    )
+
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1"
+
+
+def test_experiments_timeline_fetches_by_id(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "timeline", "exp-1"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"experiment_id": "exp-1", "events": []},
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/timeline"
+
+
+def test_experiments_note_posts_event_without_actor(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "note", "exp-1", "looks good", "--data", '{"metric": 0.9}'],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "evt-1", "kind": "note"},
+        ],
+    )
+
+    assert calls[1]["method"] == "POST"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/events"
+    assert calls[1]["body"] == {"kind": "note", "message": "looks good", "data": {"metric": 0.9}}
+    assert "actor" not in calls[1]["body"]
+
+
+def test_experiments_note_rejects_non_object_data(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    def fake_urlopen(req, timeout=20.0):
+        assert req.method == "GET"
+        return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "note", "exp-1", "hi", "--data", "[1,2,3]"])
+
+    assert code == 1
+
+
+def test_experiments_decide_sends_patch(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "decide", "exp-1", "keep", "best run so far"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "exp-1", "decision": "keep", "decision_reason": "best run so far"},
+        ],
+    )
+
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/decision"
+    assert calls[1]["body"] == {"decision": "keep", "reason": "best run so far"}
+
+
+def test_experiments_decide_accepts_reason_flag(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "decide", "exp-1", "fork", "--reason", "needs ablation"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "exp-1", "decision": "fork", "decision_reason": "needs ablation"},
+        ],
+    )
+
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/decision"
+    assert calls[1]["body"] == {"decision": "fork", "reason": "needs ablation"}
+
+
+def test_experiments_show_ambiguous_name_fails(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    def fake_urlopen(req, timeout=20.0):
+        assert req.method == "GET"
+        return FakeResponse([
+            {"id": "exp-1", "name": "alpha"},
+            {"id": "exp-2", "name": "alpha"},
+        ])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "show", "alpha"])
+
+    assert code == 1
+
+
 def test_move_to_stub_cancels_then_posts_target_stub(monkeypatch):
     task = {
         "id": "task-1",
