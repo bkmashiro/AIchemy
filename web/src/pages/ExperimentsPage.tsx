@@ -6,6 +6,9 @@ import {
   ExperimentDetail,
   ExperimentEvent,
   ExperimentDecision,
+  ExperimentTreeNode,
+  ExperimentSummaryResponse,
+  ExperimentDiffResponse,
   experimentsApi,
 } from "../lib/api";
 import { formatRelTime } from "../lib/format";
@@ -142,6 +145,9 @@ function ExperimentDetailView() {
   const [expandedCell, setExpandedCell] = useState<string | null>(null);
   const [events, setEvents] = useState<ExperimentEvent[]>([]);
   const [allExperiments, setAllExperiments] = useState<Experiment[]>([]);
+  const [tree, setTree] = useState<ExperimentTreeNode[] | null>(null);
+  const [summary, setSummary] = useState<ExperimentSummaryResponse | null>(null);
+  const [diff, setDiff] = useState<ExperimentDiffResponse | null>(null);
 
   const load = () => {
     if (!id) return;
@@ -152,6 +158,12 @@ function ExperimentDetailView() {
     experimentsApi.getTimeline(id)
       .then((r) => setEvents(r.events))
       .catch(() => {});
+    experimentsApi.getSummary(id)
+      .then(setSummary)
+      .catch(() => setSummary(null));
+    experimentsApi.getDiff(id)
+      .then(setDiff)
+      .catch(() => setDiff(null));
   };
 
   useEffect(() => {
@@ -164,6 +176,9 @@ function ExperimentDetailView() {
     experimentsApi.list()
       .then(setAllExperiments)
       .catch(() => {});
+    experimentsApi.getTree()
+      .then(setTree)
+      .catch(() => setTree(null));
   }, [id]);
 
   if (loading) {
@@ -301,6 +316,13 @@ function ExperimentDetailView() {
         <IntentCard exp={exp} />
         <DecisionCard exp={exp} onUpdated={(u) => { setExp({ ...exp, ...u }); load(); }} />
         <LineageCard exp={exp} allExperiments={allExperiments} />
+      </div>
+
+      {/* Lineage graph + Research call + Config diff */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <LineageGraphCard tree={tree} currentId={exp.id} />
+        <ResearchCallCard exp={exp} summary={summary} />
+        <ConfigDiffCard diff={diff} summary={summary} />
       </div>
 
       {/* Timeline */}
@@ -788,6 +810,337 @@ function TimelineCard({
             );
           })}
         </ul>
+      )}
+    </div>
+  );
+}
+
+// ─── Lineage Graph Card ─────────────────────────────────────────────────────
+
+function findNodePath(
+  roots: ExperimentTreeNode[],
+  targetId: string,
+): { root: ExperimentTreeNode; path: ExperimentTreeNode[] } | null {
+  for (const root of roots) {
+    const path: ExperimentTreeNode[] = [];
+    const dfs = (node: ExperimentTreeNode): boolean => {
+      path.push(node);
+      if (node.id === targetId) return true;
+      for (const c of node.children) {
+        if (dfs(c)) return true;
+      }
+      path.pop();
+      return false;
+    };
+    if (dfs(root)) return { root, path };
+  }
+  return null;
+}
+
+function TreeNodeRow({
+  node,
+  depth,
+  currentId,
+  selectedPathIds,
+}: {
+  node: ExperimentTreeNode;
+  depth: number;
+  currentId: string;
+  selectedPathIds: Set<string>;
+}) {
+  const isCurrent = node.id === currentId;
+  const onPath = selectedPathIds.has(node.id);
+  const statusColor =
+    node.status === "passed" ? "text-green-400" :
+    node.status === "partial" ? "text-orange-400" :
+    node.status === "failed" ? "text-red-400" :
+    "text-blue-400";
+  const decisionBadge = node.decision
+    ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
+    : null;
+
+  return (
+    <>
+      <li
+        className={`flex items-center gap-2 py-1 px-2 rounded text-xs ${
+          isCurrent ? "bg-indigo-500/10 ring-1 ring-inset ring-indigo-400/30" :
+          onPath ? "bg-white/[0.02]" : ""
+        }`}
+        style={{ paddingLeft: `${depth * 14 + 8}px` }}
+      >
+        <span className={`shrink-0 text-[10px] ${statusColor}`}>●</span>
+        {isCurrent ? (
+          <span className="font-mono text-indigo-200 truncate">{node.name}</span>
+        ) : (
+          <Link
+            to={`/experiments/${node.id}`}
+            className="font-mono text-blue-400 hover:text-blue-300 truncate"
+          >
+            {node.name}
+          </Link>
+        )}
+        {decisionBadge && (
+          <span className={`shrink-0 text-[9px] px-1 py-px rounded border ${decisionBadge}`}>
+            {node.decision}
+          </span>
+        )}
+        {node.goal_metric && (
+          <span className="shrink-0 text-[10px] text-gray-500 font-mono">
+            {node.goal_direction === "min" ? "↓" : "↑"}{node.goal_metric}
+          </span>
+        )}
+        {node.fork_reason && (
+          <span className="text-[10px] text-gray-600 truncate ml-1" title={node.fork_reason}>
+            — {node.fork_reason}
+          </span>
+        )}
+      </li>
+      {node.children.map((child) => (
+        <TreeNodeRow
+          key={child.id}
+          node={child}
+          depth={depth + 1}
+          currentId={currentId}
+          selectedPathIds={selectedPathIds}
+        />
+      ))}
+    </>
+  );
+}
+
+function LineageGraphCard({
+  tree,
+  currentId,
+}: {
+  tree: ExperimentTreeNode[] | null;
+  currentId: string;
+}) {
+  if (tree === null) {
+    return (
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <h2 className="text-sm font-medium text-gray-400 mb-3">Lineage graph</h2>
+        <p className="text-xs text-gray-600">Loading...</p>
+      </div>
+    );
+  }
+
+  const found = findNodePath(tree, currentId);
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-medium text-gray-400">Lineage graph</h2>
+        <span className="text-xs text-gray-600">
+          {tree.length} root{tree.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      {!found ? (
+        <p className="text-xs text-gray-600">No lineage data for this experiment.</p>
+      ) : (
+        <ul className="space-y-0.5 max-h-72 overflow-y-auto">
+          <TreeNodeRow
+            node={found.root}
+            depth={0}
+            currentId={currentId}
+            selectedPathIds={new Set(found.path.map((n) => n.id))}
+          />
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ─── Research Call Card ─────────────────────────────────────────────────────
+
+const NEXT_ACTION: Record<string, { label: string; hint: string; tone: string }> = {
+  keep: {
+    label: "Promote → fork next stage",
+    hint: "Use this checkpoint as a parent for the next sweep.",
+    tone: "border-green-400/30 bg-green-500/10 text-green-200",
+  },
+  fork: {
+    label: "Branch from this run",
+    hint: "Open a narrower fork to test the variant.",
+    tone: "border-purple-400/30 bg-purple-500/10 text-purple-200",
+  },
+  rerun: {
+    label: "Re-run for more evidence",
+    hint: "Keep collecting before deciding keep / drop.",
+    tone: "border-blue-400/30 bg-blue-500/10 text-blue-200",
+  },
+  drop: {
+    label: "Fold into background",
+    hint: "Preserve as evidence; do not extend.",
+    tone: "border-amber-400/30 bg-amber-500/10 text-amber-200",
+  },
+};
+
+function ResearchCallCard({
+  exp,
+  summary,
+}: {
+  exp: ExperimentDetail;
+  summary: ExperimentSummaryResponse | null;
+}) {
+  const decision = summary?.decision ?? exp.decision ?? null;
+  const action = decision
+    ? NEXT_ACTION[decision]
+    : { label: "Awaiting decision", hint: "Choose keep / fork / rerun / drop to advance.", tone: "border-white/[0.08] bg-white/[0.04] text-gray-300" };
+
+  const validation = summary?.validation;
+  const primary = summary?.primary_metric ?? null;
+  const bestMetrics = summary?.best_metrics ?? {};
+  const bestEntries = Object.entries(bestMetrics).slice(0, 4);
+  const forkReason = summary?.fork_reason ?? exp.fork_reason ?? null;
+  const decisionReason = summary?.decision_reason ?? exp.decision_reason ?? null;
+
+  const decisionBadge = decision
+    ? DECISION_BADGE[decision] || "bg-gray-800 text-gray-400 border-gray-700"
+    : "bg-gray-800 text-gray-500 border-gray-700";
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-medium text-gray-400">Research call</h2>
+        <span className={`text-[10px] px-2 py-0.5 rounded border uppercase ${decisionBadge}`}>
+          {decision ?? "undecided"}
+        </span>
+      </div>
+
+      <div className={`rounded-lg border px-3 py-2 ${action.tone}`}>
+        <div className="text-xs font-medium">{action.label}</div>
+        <div className="mt-0.5 text-[11px] opacity-80">{action.hint}</div>
+      </div>
+
+      {decisionReason && (
+        <p className="mt-3 border-l-2 border-gray-800 pl-3 text-xs italic text-gray-400">
+          &ldquo;{decisionReason}&rdquo;
+        </p>
+      )}
+
+      <div className="mt-3 space-y-2 text-xs">
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">Goal metric</div>
+          {primary ? (
+            <span className="font-mono text-gray-300">
+              {primary.direction === "min" ? "↓" : "↑"} {primary.metric}
+              {primary.best !== null && (
+                <span className="ml-1 text-gray-500">best {primary.best.toFixed?.(4) ?? primary.best}</span>
+              )}
+            </span>
+          ) : (
+            <span className="text-gray-600">No explicit goal metric set.</span>
+          )}
+        </div>
+
+        {validation && (
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">Validation</div>
+            <div className="font-mono text-gray-300">
+              <span className="text-green-400">{validation.passed} passed</span>
+              {" / "}
+              <span className="text-red-400">{validation.failed} failed</span>
+              {" / "}
+              <span className="text-gray-500">{validation.total} total</span>
+            </div>
+          </div>
+        )}
+
+        {bestEntries.length > 0 && (
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Best metrics</div>
+            <div className="flex flex-wrap gap-1">
+              {bestEntries.map(([k, v]) => (
+                <span
+                  key={k}
+                  className="font-mono text-[10px] px-1.5 py-0.5 rounded border border-gray-700 bg-gray-800 text-gray-300"
+                >
+                  {k}={typeof v === "number" ? v.toFixed(4) : String(v)}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {forkReason && (
+          <div>
+            <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">Fork reason</div>
+            <p className="text-gray-300 whitespace-pre-wrap">{forkReason}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Config Diff Card ───────────────────────────────────────────────────────
+
+function ConfigDiffCard({
+  diff,
+  summary,
+}: {
+  diff: ExperimentDiffResponse | null;
+  summary: ExperimentSummaryResponse | null;
+}) {
+  const configDiff = diff?.config_diff ?? summary?.config_diff ?? null;
+  const parentId = diff?.parent_id ?? summary?.parent?.id ?? null;
+  const parentName = diff?.parent_name ?? summary?.parent?.name ?? null;
+
+  if (!diff && !summary) {
+    return (
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <h2 className="text-sm font-medium text-gray-400 mb-3">Config diff</h2>
+        <p className="text-xs text-gray-600">Loading...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-medium text-gray-400">Config diff</h2>
+        <span className="text-xs text-gray-600">
+          {parentName ? (
+            parentId ? (
+              <>vs <Link to={`/experiments/${parentId}`} className="text-blue-400 hover:text-blue-300 font-mono">{parentName}</Link></>
+            ) : (
+              <>vs <span className="font-mono text-gray-400">{parentName}</span></>
+            )
+          ) : "no parent"}
+        </span>
+      </div>
+
+      {!parentId && !parentName ? (
+        <p className="text-xs text-gray-600">Root experiment &mdash; no parent diff.</p>
+      ) : !configDiff || Object.keys(configDiff).length === 0 ? (
+        <p className="text-xs text-gray-600">
+          No config changes from parent. This node records runtime / checkpoint lineage only.
+        </p>
+      ) : (
+        <div className="overflow-hidden rounded-lg border border-gray-800">
+          <table className="w-full text-xs">
+            <thead className="bg-gray-800/40 text-gray-500">
+              <tr>
+                <th className="px-2 py-1.5 text-left font-medium">Key</th>
+                <th className="px-2 py-1.5 text-left font-medium">Parent</th>
+                <th className="px-2 py-1.5 text-left font-medium">Current</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-800/50">
+              {Object.entries(configDiff).map(([key, change]) => (
+                <tr key={key}>
+                  <td className="px-2 py-1.5 font-mono text-gray-400">{key}</td>
+                  <td className="px-2 py-1.5 font-mono text-red-300/85">
+                    {change.old === undefined ? <span className="text-gray-600">—</span> : String(change.old)}
+                  </td>
+                  <td className="px-2 py-1.5 font-mono text-green-300/85">
+                    {change.new === undefined ? <span className="text-gray-600">—</span> : String(change.new)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

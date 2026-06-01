@@ -449,6 +449,16 @@ export interface ExperimentCompareResponse {
   metric_deltas: Record<string, MetricDeltaEntry[]>;
 }
 
+export interface ExperimentDiffResponse {
+  experiment_id: string;
+  name: string;
+  config: Record<string, any> | null;
+  config_diff: Record<string, { old: any; new: any }> | null;
+  parent_name: string | null;
+  parent_id: string | null;
+  parent_config?: Record<string, any> | null;
+}
+
 export interface ExperimentSummaryResponse {
   id: string;
   name: string;
@@ -504,6 +514,8 @@ export const experimentsApi = {
       .then((r) => r.data),
   getSummary: (id: string) =>
     api.get<ExperimentSummaryResponse>(`/experiments/${id}/summary`).then((r) => r.data),
+  getDiff: (id: string) =>
+    api.get<ExperimentDiffResponse>(`/experiments/${id}/diff`).then((r) => r.data),
 };
 
 // ─── Cost API ─────────────────────────────────────────────────────────────────
