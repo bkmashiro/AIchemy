@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 type DemoDecision = "keep" | "drop" | "rerun" | "fork";
 type DemoEventKind = "created" | "forked" | "note" | "decision" | "task_failed" | "resumed" | "metric_best" | "checkpoint";
@@ -84,12 +84,6 @@ const STAGE_STATE_BADGE: Record<NonNullable<DemoStage["state"]>, string> = {
   active: "bg-blue-500/10 text-blue-300 border-blue-400/20",
   decided: "bg-emerald-500/10 text-emerald-300 border-emerald-400/20",
   folded: "bg-white/[0.05] text-gray-500 border-white/[0.08]",
-};
-
-const STAGE_DOT_COLOR: Record<NonNullable<DemoStage["state"]>, string> = {
-  active: "#7c7cff",
-  decided: "#10b981",
-  folded: "#52525b",
 };
 
 const demoExperiments: DemoExperiment[] = [
@@ -282,6 +276,16 @@ const demoStages: DemoStage[] = [
     state: "decided",
   },
   {
+    id: "batch-stage",
+    title: "Batch-size exploration",
+    purpose: "Folded after OOM and the narrower retry under-performed the curiosity branch.",
+    parentStageId: "baseline-stage",
+    parentRunId: "baseline",
+    runIds: ["curiosity-higher-batch", "batch-64-retry"],
+    folded: true,
+    state: "folded",
+  },
+  {
     id: "curiosity-stage",
     title: "Curiosity objective",
     purpose: "Find an LR + resume recipe where curiosity beats baseline without collapse.",
@@ -308,16 +312,6 @@ const demoStages: DemoStage[] = [
     parentRunId: "curiosity-resume-t4",
     runIds: ["curiosity-long-run-t4"],
     state: "active",
-  },
-  {
-    id: "batch-stage",
-    title: "Batch-size exploration",
-    purpose: "Folded after OOM and the narrower retry under-performed the curiosity branch.",
-    parentStageId: "baseline-stage",
-    parentRunId: "baseline",
-    runIds: ["curiosity-higher-batch", "batch-64-retry"],
-    folded: true,
-    state: "folded",
   },
 ];
 
@@ -351,372 +345,397 @@ function MetricCard({ name, value }: { name: string; value: number }) {
   );
 }
 
-// Stage/cohort graph: vertical axis is research stages (purposes / decisions),
-// horizontal inside each stage is sibling runs competing for promotion. Edges
-// are anchored to the specific source run chip (since a "branch" is from a
-// chosen run, not from a stage), curving left/down into the child stage rail
-// dot. The SVG overlay is full-width so chip anchors are addressable; chips
-// stay clickable because the overlay is pointer-events-none.
-const STAGE_H = 228;
-const GRAPH_W = 52;
-const STAGE_X = 22;
-const STAGE_NODE_R = 8;
-
-// Layout constants for deriving deterministic run-chip anchors. Match the
-// classes used on the <li>, the spacer, the StageCard, and RunChip. We use
-// the sm-breakpoint values; the demo card is rendered at sm width and up.
-const LIST_PADDING_X = 12; // sm:px-3 on the <li>
-const LIST_GAP = 12; // sm:gap-3 between rail spacer and StageCard
-const STAGE_CARD_PADDING_X = 12; // p-3 on StageCard
-const RUN_CHIP_W = 200;
-const RUN_CHIP_GAP = 8; // gap-2 between chips
-const CHIPS_START_X = LIST_PADDING_X + GRAPH_W + LIST_GAP + STAGE_CARD_PADDING_X;
-// Chip vertical center within its stage row (calibrated against STAGE_H=228).
-const RUN_ANCHOR_Y = 162;
-const RUN_ANCHOR_INSET_X = 18; // anchor a bit inside the chip's left edge
+// Graph canvas: stages are horizontal swimlane bands (background only). Runs
+// are first-class graph nodes placed in canvas coordinates. Edges are SVG
+// curves drawn in the same coordinate system, anchored from source run node
+// to target stage entry. Run nodes intentionally show only a compact summary
+// — full details live in the inspector below.
+const CANVAS_W = 1100;
+const BAND_H = 156;
+const BAND_GAP = 32;
+const NODE_W = 160;
+const NODE_H = 80;
+const STAGE_LABEL_W = 200;
+const NODE_START_X = 220;
+const NODE_GAP_X = 220;
+const CANVAS_PAD_Y = 10;
 
 function isFoldedRun(exp: DemoExperiment) {
   return exp.status === "failed" || exp.decision === "drop";
 }
 
-type StageNode = {
+function getBandY(bandIndex: number) {
+  return CANVAS_PAD_Y + bandIndex * (BAND_H + BAND_GAP);
+}
+function getNodeY(bandIndex: number) {
+  return getBandY(bandIndex) + (BAND_H - NODE_H) / 2;
+}
+function getNodeX(runIndex: number) {
+  return NODE_START_X + runIndex * NODE_GAP_X;
+}
+
+type CanvasRunNode = {
   id: string;
-  stage: DemoStage;
-  row: number;
-  cy: number;
+  exp: DemoExperiment;
+  stageId: string;
+  bandIndex: number;
+  runIndex: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  muted: boolean;
+  selected: boolean;
 };
 
-type StageEdge =
-  | { id: string; kind: "rail"; fromRow: number; toRow: number; muted: boolean }
-  | {
-      id: string;
-      kind: "run";
-      fromRunId: string;
-      fromStageId: string;
-      fromRow: number;
-      toRow: number;
-      fromChipIndex: number;
-      siblingIndex: number;
-      siblingCount: number;
-      muted: boolean;
-      emphasized?: boolean;
-    };
+type CanvasStageBand = {
+  id: string;
+  stage: DemoStage;
+  bandIndex: number;
+  y: number;
+  height: number;
+  folded: boolean;
+  selected: boolean;
+  visibleRunIds: string[];
+  hiddenFoldedCount: number;
+};
 
-function buildStageGraph(
-  stages: DemoStage[],
+type CanvasEdge = {
+  id: string;
+  fromRunId: string;
+  toStageId: string;
+  toRunId?: string;
+  muted: boolean;
+  emphasized: boolean;
+  siblingIndex: number;
+  siblingCount: number;
+};
+
+function buildCanvasGraph(
+  visibleStages: DemoStage[],
   visibleRunsByStage: Map<string, DemoExperiment[]>,
-): { nodes: StageNode[]; edges: StageEdge[] } {
-  const rowById = new Map<string, number>();
-  stages.forEach((stage, idx) => rowById.set(stage.id, idx));
-  const nodes: StageNode[] = stages.map((stage, row) => ({
+  selectedRunId: string,
+  selectedStageId: string | undefined,
+  hiddenFoldedCountByStage: Map<string, number>,
+): { bands: CanvasStageBand[]; nodes: CanvasRunNode[]; edges: CanvasEdge[] } {
+  const bands: CanvasStageBand[] = visibleStages.map((stage, idx) => ({
     id: stage.id,
     stage,
-    row,
-    cy: row * STAGE_H + STAGE_H / 2,
+    bandIndex: idx,
+    y: getBandY(idx),
+    height: BAND_H,
+    folded: !!stage.folded,
+    selected: stage.id === selectedStageId,
+    visibleRunIds: (visibleRunsByStage.get(stage.id) ?? []).map((r) => r.id),
+    hiddenFoldedCount: hiddenFoldedCountByStage.get(stage.id) ?? 0,
   }));
 
-  type Pending = {
-    stage: DemoStage;
-    fromRow: number;
-    toRow: number;
-    parentStage: DemoStage;
-    runIndex: number | null;
-  };
-  const pending: Pending[] = [];
-  for (const stage of stages) {
-    if (!stage.parentStageId) continue;
-    const fromRow = rowById.get(stage.parentStageId);
-    const toRow = rowById.get(stage.id);
-    if (fromRow === undefined || toRow === undefined) continue;
-    const parentStage = stages.find((s) => s.id === stage.parentStageId);
-    if (!parentStage) continue;
-    let runIndex: number | null = null;
-    if (stage.parentRunId) {
-      const runs = visibleRunsByStage.get(stage.parentStageId) ?? [];
-      const idx = runs.findIndex((r) => r.id === stage.parentRunId);
-      if (idx >= 0) runIndex = idx;
-    }
-    pending.push({ stage, fromRow, toRow, parentStage, runIndex });
+  const nodes: CanvasRunNode[] = [];
+  for (const band of bands) {
+    const runs = visibleRunsByStage.get(band.id) ?? [];
+    runs.forEach((exp, runIndex) => {
+      nodes.push({
+        id: exp.id,
+        exp,
+        stageId: band.id,
+        bandIndex: band.bandIndex,
+        runIndex,
+        x: getNodeX(runIndex),
+        y: getNodeY(band.bandIndex),
+        width: NODE_W,
+        height: NODE_H,
+        muted: band.folded || isFoldedRun(exp),
+        selected: exp.id === selectedRunId,
+      });
+    });
   }
 
-  // Group run-anchored edges by source run so we can space siblings apart.
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const bandById = new Map(bands.map((b) => [b.id, b]));
+
+  type Pending = { stage: DemoStage; parentStage: DemoStage; sourceRunId: string };
+  const pending: Pending[] = [];
+  for (const band of bands) {
+    const stage = band.stage;
+    if (!stage.parentStageId || !stage.parentRunId) continue;
+    const parentBand = bandById.get(stage.parentStageId);
+    if (!parentBand) continue;
+    if (!nodeById.has(stage.parentRunId)) continue;
+    pending.push({
+      stage,
+      parentStage: parentBand.stage,
+      sourceRunId: stage.parentRunId,
+    });
+  }
+
   const groupCounts = new Map<string, number>();
   for (const p of pending) {
-    if (p.runIndex === null || !p.stage.parentRunId) continue;
-    const key = `${p.stage.parentStageId}::${p.stage.parentRunId}`;
-    groupCounts.set(key, (groupCounts.get(key) ?? 0) + 1);
+    groupCounts.set(p.sourceRunId, (groupCounts.get(p.sourceRunId) ?? 0) + 1);
   }
   const groupSeen = new Map<string, number>();
 
-  const edges: StageEdge[] = [];
-  for (const p of pending) {
+  const edges: CanvasEdge[] = pending.map((p) => {
+    const siblingIndex = groupSeen.get(p.sourceRunId) ?? 0;
+    groupSeen.set(p.sourceRunId, siblingIndex + 1);
+    const siblingCount = groupCounts.get(p.sourceRunId) ?? 1;
     const muted = !!p.stage.folded || !!p.parentStage.folded;
-    if (p.runIndex !== null && p.stage.parentRunId) {
-      const key = `${p.stage.parentStageId}::${p.stage.parentRunId}`;
-      const siblingIndex = groupSeen.get(key) ?? 0;
-      groupSeen.set(key, siblingIndex + 1);
-      const siblingCount = groupCounts.get(key) ?? 1;
-      const emphasized = p.parentStage.promotedRunId === p.stage.parentRunId;
-      edges.push({
-        id: `${p.stage.parentRunId}->${p.stage.id}`,
-        kind: "run",
-        fromRunId: p.stage.parentRunId,
-        fromStageId: p.stage.parentStageId!,
-        fromRow: p.fromRow,
-        toRow: p.toRow,
-        fromChipIndex: p.runIndex,
-        siblingIndex,
-        siblingCount,
-        muted,
-        emphasized,
-      });
-    } else {
-      // Fallback: source run is hidden (or no parentRunId) — draw a muted
-      // dashed rail edge so the lineage is still readable.
-      edges.push({
-        id: `${p.stage.parentStageId}->${p.stage.id}`,
-        kind: "rail",
-        fromRow: p.fromRow,
-        toRow: p.toRow,
-        muted: muted || !!p.stage.parentRunId,
-      });
-    }
-  }
-  return { nodes, edges };
+    const emphasized = p.parentStage.promotedRunId === p.sourceRunId;
+    return {
+      id: `${p.sourceRunId}->${p.stage.id}`,
+      fromRunId: p.sourceRunId,
+      toStageId: p.stage.id,
+      muted,
+      emphasized,
+      siblingIndex,
+      siblingCount,
+    };
+  });
+
+  return { bands, nodes, edges };
 }
 
-function railEdgePath(fromRow: number, toRow: number) {
-  const fromY = fromRow * STAGE_H + STAGE_H / 2 + STAGE_NODE_R;
-  const toY = toRow * STAGE_H + STAGE_H / 2 - STAGE_NODE_R;
-  const skip = toRow - fromRow;
-  if (skip <= 1) {
-    return `M ${STAGE_X} ${fromY} L ${STAGE_X} ${toY}`;
-  }
-  const bulge = STAGE_X + 18;
-  const midY = (fromY + toY) / 2;
-  return `M ${STAGE_X} ${fromY} C ${bulge} ${fromY + (midY - fromY) * 0.55}, ${bulge} ${toY - (toY - midY) * 0.55}, ${STAGE_X} ${toY}`;
-}
-
-function runEdgePath(edge: Extract<StageEdge, { kind: "run" }>) {
-  const chipLeftX = CHIPS_START_X + edge.fromChipIndex * (RUN_CHIP_W + RUN_CHIP_GAP);
-  // Fan out sibling edges from the same chip so multiple outgoing branches
-  // don't overlap into one line.
+function edgePath(
+  edge: CanvasEdge,
+  source: CanvasRunNode,
+  target: CanvasStageBand,
+): string {
   const fanSpread = Math.max(0, edge.siblingCount - 1);
-  const fanOffset = fanSpread === 0 ? 0 : (edge.siblingIndex - fanSpread / 2) * 22;
-  const sx = chipLeftX + RUN_ANCHOR_INSET_X + fanOffset;
-  const sy = edge.fromRow * STAGE_H + RUN_ANCHOR_Y + 18; // bottom-ish of chip
-  const tx = STAGE_X;
-  const ty = edge.toRow * STAGE_H + STAGE_H / 2 - STAGE_NODE_R;
-  // Curve left first, then down into the child rail dot. Control points pull
-  // leftward early so the curve reads as "this run forks into that stage".
-  const c1x = sx - 60 - fanOffset * 0.3;
-  const c1y = sy + 24;
-  const c2x = tx;
-  const c2y = ty - 60;
+  const fanOffset =
+    fanSpread === 0 ? 0 : (edge.siblingIndex - fanSpread / 2) * 22;
+  const sx = source.x + source.width / 2 + fanOffset;
+  const sy = source.y + source.height - 4;
+  const tx = NODE_START_X + NODE_W / 2;
+  const ty = target.y + 4;
+  const bandSpan = target.bandIndex - source.bandIndex;
+  const dy = ty - sy;
+
+  if (bandSpan <= 1) {
+    const c1x = sx + (tx - sx) * 0.18;
+    const c1y = sy + dy * 0.55;
+    const c2x = tx - (tx - sx) * 0.18;
+    const c2y = ty - dy * 0.45;
+    return `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`;
+  }
+
+  // Skip edge across multiple bands: bend through a side corridor so the
+  // curve does not pass through node bodies in intermediate bands. Bias the
+  // corridor side based on where the source sits — left source bends left,
+  // right source bends right.
+  const corridor =
+    sx <= (NODE_START_X + (CANVAS_W - NODE_START_X) / 2)
+      ? Math.max(60, sx - 110)
+      : Math.min(CANVAS_W - 40, sx + 110);
+  const c1x = corridor;
+  const c1y = sy + dy * 0.32;
+  const c2x = corridor;
+  const c2y = ty - dy * 0.32;
   return `M ${sx} ${sy} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`;
 }
 
-function StageGraphOverlay({
-  nodes,
-  edges,
-  selectedStageId,
-  selectedRunId,
-}: {
-  nodes: StageNode[];
-  edges: StageEdge[];
-  selectedStageId: string | undefined;
-  selectedRunId: string;
-}) {
-  const height = nodes.length * STAGE_H;
-  return (
-    <svg
-      width="100%"
-      height={height}
-      className="pointer-events-none absolute inset-0"
-      aria-hidden
-    >
-      {/* Faint vertical rail behind the dots so the spine still reads. */}
-      {nodes.length > 1 && (
-        <line
-          x1={STAGE_X}
-          y1={STAGE_NODE_R + 4}
-          x2={STAGE_X}
-          y2={(nodes.length - 1) * STAGE_H + STAGE_H / 2 - STAGE_NODE_R}
-          stroke="#1f1f23"
-          strokeWidth={1}
-        />
-      )}
-      {edges.map((edge) => {
-        if (edge.kind === "rail") {
-          return (
-            <path
-              key={edge.id}
-              d={railEdgePath(edge.fromRow, edge.toRow)}
-              stroke="#3f3f46"
-              strokeWidth={2}
-              fill="none"
-              opacity={edge.muted ? 0.3 : 0.7}
-              strokeDasharray={edge.muted ? "4 3" : undefined}
-              strokeLinecap="round"
-            />
-          );
-        }
-        const isSelectedEdge = edge.fromRunId === selectedRunId;
-        const stroke = edge.emphasized ? "#7c7cff" : isSelectedEdge ? "#a5b4fc" : "#3f3f46";
-        const width = edge.emphasized ? 2.5 : isSelectedEdge ? 2.25 : 1.75;
-        const opacity = edge.muted ? 0.35 : edge.emphasized ? 0.92 : isSelectedEdge ? 0.95 : 0.75;
-        return (
-          <path
-            key={edge.id}
-            d={runEdgePath(edge)}
-            stroke={stroke}
-            strokeWidth={width}
-            fill="none"
-            opacity={opacity}
-            strokeDasharray={edge.muted ? "5 4" : undefined}
-            strokeLinecap="round"
-          />
-        );
-      })}
-      {nodes.map((node) => {
-        const state = node.stage.state ?? "active";
-        const color = STAGE_DOT_COLOR[state];
-        const isSelected = node.id === selectedStageId;
-        const muted = !!node.stage.folded;
-        const r = isSelected ? STAGE_NODE_R + 1 : STAGE_NODE_R;
-        return (
-          <g key={node.id} opacity={muted && !isSelected ? 0.55 : 1}>
-            {isSelected && <circle cx={STAGE_X} cy={node.cy} r={r + 7} fill={color} opacity={0.18} />}
-            <circle cx={STAGE_X} cy={node.cy} r={r} fill="#0f1011" stroke={color} strokeWidth={2} />
-            {isSelected && <circle cx={STAGE_X} cy={node.cy} r={r - 3} fill={color} />}
-          </g>
-        );
-      })}
-    </svg>
-  );
-}
-
-function RunChip({
-  exp,
-  selected,
-  onClick,
+function GraphRunNode({
+  node,
   summary,
-  muted,
+  onClick,
 }: {
-  exp: DemoExperiment;
-  selected: boolean;
-  onClick: () => void;
+  node: CanvasRunNode;
   summary: string[];
-  muted: boolean;
+  onClick: () => void;
 }) {
-  const branch = BRANCH[exp.branch];
+  const branch = BRANCH[node.exp.branch];
   return (
     <button
       type="button"
       onClick={onClick}
-      aria-pressed={selected}
-      aria-label={`Open ${exp.name}`}
+      aria-pressed={node.selected}
+      aria-label={`Open ${node.exp.name}`}
       className={cn(
-        "flex w-[200px] shrink-0 flex-col gap-1.5 rounded-xl border px-3 py-2 text-left transition",
-        selected
-          ? "border-indigo-400/45 bg-indigo-500/[0.10] shadow-[0_0_0_1px_rgba(124,124,255,0.4),0_10px_28px_-12px_rgba(124,124,255,0.5)]"
-          : "border-white/[0.06] bg-white/[0.025] hover:border-white/[0.12] hover:bg-white/[0.05]",
-        muted && !selected && "opacity-55 hover:opacity-90",
+        "absolute flex flex-col gap-1 rounded-xl border px-2.5 py-1.5 text-left transition",
+        node.selected
+          ? "border-indigo-400/55 bg-indigo-500/[0.12] shadow-[0_0_0_1px_rgba(124,124,255,0.45),0_12px_30px_-14px_rgba(124,124,255,0.6)]"
+          : "border-white/[0.08] bg-[#141517]/95 hover:border-white/[0.18] hover:bg-[#191a1c]/95",
+        node.muted && !node.selected && "opacity-55 hover:opacity-90",
       )}
+      style={{
+        left: node.x,
+        top: node.y,
+        width: node.width,
+        height: node.height,
+      }}
     >
       <div className="flex items-center gap-1.5">
         <span
           className="h-2 w-2 shrink-0 rounded-full"
           style={{ backgroundColor: branch.color, boxShadow: `0 0 10px ${branch.glow}` }}
         />
-        <span className="truncate text-xs font-medium text-gray-100">{exp.shortName}</span>
-        <span className={cn("ml-auto rounded border px-1.5 py-0.5 text-[9px] uppercase", BADGE[exp.status])}>{exp.status}</span>
+        <span className="truncate text-[11px] font-medium text-gray-100">{node.exp.shortName}</span>
+        <span className={cn("ml-auto rounded border px-1 py-px text-[9px] uppercase leading-none", BADGE[node.exp.status])}>{node.exp.status}</span>
       </div>
       <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
-        <span className="rounded border border-white/[0.06] bg-black/25 px-1.5 py-0.5 text-gray-200">zN {exp.metrics.zN}</span>
-        {summary.slice(0, 2).map((label) => (
-          <span key={label} className="rounded border border-white/[0.05] bg-white/[0.025] px-1.5 py-0.5 text-gray-400">
+        <span className="rounded border border-white/[0.06] bg-black/30 px-1.5 py-px text-gray-200">zN {node.exp.metrics.zN}</span>
+        {summary.slice(0, 1).map((label) => (
+          <span key={label} className="max-w-[80px] truncate rounded border border-white/[0.05] bg-white/[0.025] px-1.5 py-px text-gray-400">
             {label}
           </span>
         ))}
       </div>
-      {exp.decision && (
-        <div className="flex">
-          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.decision])}>{exp.decision}</span>
-        </div>
+      {node.exp.decision && (
+        <span className={cn("self-start rounded border px-1.5 py-px text-[9px] uppercase leading-none", BADGE[node.exp.decision])}>{node.exp.decision}</span>
       )}
     </button>
   );
 }
 
-function StageCard({
-  stage,
-  runs,
-  hiddenFoldedCount,
-  selectedRunId,
-  onSelectRun,
+function GraphStageBand({
+  band,
   promotedRun,
   parentRun,
-  summarizeDiff,
 }: {
-  stage: DemoStage;
-  runs: DemoExperiment[];
-  hiddenFoldedCount: number;
-  selectedRunId: string;
-  onSelectRun: (id: string) => void;
+  band: CanvasStageBand;
   promotedRun?: DemoExperiment;
   parentRun?: DemoExperiment;
-  summarizeDiff: (exp: DemoExperiment) => string[];
 }) {
-  const state = stage.state ?? "active";
-  const isFoldedStage = !!stage.folded;
+  const state = band.stage.state ?? "active";
   return (
     <div
       className={cn(
-        "flex h-full flex-col gap-2.5 rounded-2xl border bg-white/[0.025] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]",
-        isFoldedStage ? "border-white/[0.04] bg-white/[0.015]" : "border-white/[0.07]",
+        "absolute rounded-2xl border",
+        band.folded
+          ? "border-dashed border-white/[0.05] bg-white/[0.012]"
+          : "border-white/[0.06] bg-white/[0.02]",
+        band.selected && "ring-1 ring-indigo-400/25",
       )}
+      style={{
+        left: 8,
+        top: band.y,
+        width: CANVAS_W - 16,
+        height: band.height,
+      }}
     >
-      <div className="flex flex-wrap items-start gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <h3 className={cn("text-sm font-semibold tracking-[-0.01em]", isFoldedStage ? "text-gray-300" : "text-gray-100")}>
-              {stage.title}
-            </h3>
-            <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", STAGE_STATE_BADGE[state])}>{state}</span>
-            {promotedRun && (
-              <span className="rounded-full border border-emerald-400/25 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-200">
-                promoted · {promotedRun.shortName}
-              </span>
-            )}
-            {parentRun && (
-              <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-500">
-                ↳ {parentRun.shortName}
-              </span>
-            )}
-          </div>
-          <p className="mt-1 line-clamp-2 text-xs leading-5 text-gray-500">{stage.purpose}</p>
+      <div
+        className="absolute top-0 flex h-full flex-col gap-1.5 overflow-hidden px-3 py-3"
+        style={{ left: 0, width: STAGE_LABEL_W - 12 }}
+      >
+        <div className="flex flex-wrap items-center gap-1.5">
+          <h3 className={cn("min-w-0 truncate text-xs font-semibold tracking-[-0.01em]", band.folded ? "text-gray-400" : "text-gray-100")}>{band.stage.title}</h3>
+          <span className={cn("rounded border px-1 py-px text-[9px] uppercase leading-none", STAGE_STATE_BADGE[state])}>{state}</span>
         </div>
-        <div className="text-right text-[10px] uppercase tracking-[0.18em] text-gray-600">
-          {stage.runIds.length} run{stage.runIds.length > 1 ? "s" : ""}
+        <p className="line-clamp-3 text-[10px] leading-snug text-gray-500">{band.stage.purpose}</p>
+        <div className="mt-auto flex flex-wrap items-center gap-1 text-[10px] text-gray-500">
+          <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-px">
+            {band.stage.runIds.length} run{band.stage.runIds.length > 1 ? "s" : ""}
+          </span>
+          {promotedRun && (
+            <span className="max-w-[140px] truncate rounded-full border border-emerald-400/25 bg-emerald-500/10 px-1.5 py-px text-emerald-200">
+              ↑ {promotedRun.shortName}
+            </span>
+          )}
+          {parentRun && (
+            <span className="max-w-[140px] truncate rounded border border-white/[0.05] bg-black/20 px-1.5 py-px font-mono text-gray-500">
+              ↳ {parentRun.shortName}
+            </span>
+          )}
+          {band.hiddenFoldedCount > 0 && (
+            <span className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-px text-amber-200">
+              +{band.hiddenFoldedCount} folded
+            </span>
+          )}
         </div>
       </div>
-      <div className="-mx-1 flex items-stretch gap-2 overflow-x-auto px-1 pb-1">
-        {runs.map((exp) => (
-          <RunChip
-            key={exp.id}
-            exp={exp}
-            selected={exp.id === selectedRunId}
-            onClick={() => onSelectRun(exp.id)}
-            summary={summarizeDiff(exp)}
-            muted={isFoldedStage || isFoldedRun(exp)}
+    </div>
+  );
+}
+
+function GraphCanvas({
+  bands,
+  nodes,
+  edges,
+  selectedRunId,
+  expById,
+  summarizeDiff,
+  onSelectRun,
+}: {
+  bands: CanvasStageBand[];
+  nodes: CanvasRunNode[];
+  edges: CanvasEdge[];
+  selectedRunId: string;
+  expById: Map<string, DemoExperiment>;
+  summarizeDiff: (exp: DemoExperiment) => string[];
+  onSelectRun: (id: string) => void;
+}) {
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const nodeById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+  const bandById = useMemo(() => new Map(bands.map((b) => [b.id, b])), [bands]);
+  const totalH = bands.length === 0
+    ? 120
+    : bands[bands.length - 1].y + BAND_H + CANVAS_PAD_Y;
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    const selectedNode = nodeById.get(selectedRunId);
+    if (!scroller || !selectedNode || scroller.clientWidth >= CANVAS_W) return;
+    scroller.scrollTo({ left: Math.max(0, selectedNode.x - 96), behavior: "auto" });
+  }, [nodeById, selectedRunId]);
+
+  return (
+    <div ref={scrollerRef} className="overflow-x-auto overflow-y-hidden">
+      <div
+        className="relative"
+        style={{ width: CANVAS_W, minWidth: CANVAS_W, height: totalH }}
+      >
+        {bands.map((band) => (
+          <GraphStageBand
+            key={band.id}
+            band={band}
+            promotedRun={band.stage.promotedRunId ? expById.get(band.stage.promotedRunId) : undefined}
+            parentRun={band.stage.parentRunId ? expById.get(band.stage.parentRunId) : undefined}
           />
         ))}
-        {hiddenFoldedCount > 0 && (
-          <span className="flex shrink-0 items-center self-stretch rounded-xl border border-amber-400/25 bg-amber-500/10 px-3 text-[11px] text-amber-200">
-            +{hiddenFoldedCount} folded
-          </span>
-        )}
+        <svg
+          width={CANVAS_W}
+          height={totalH}
+          className="pointer-events-none absolute inset-0"
+          aria-hidden
+        >
+          {edges.map((edge) => {
+            const source = nodeById.get(edge.fromRunId);
+            const target = bandById.get(edge.toStageId);
+            if (!source || !target) return null;
+            const isSelectedEdge = edge.fromRunId === selectedRunId;
+            const stroke = edge.emphasized
+              ? "#7c7cff"
+              : isSelectedEdge
+                ? "#a5b4fc"
+                : "#3f3f46";
+            const width = edge.emphasized ? 2.5 : isSelectedEdge ? 2.25 : 1.75;
+            const opacity = edge.muted
+              ? 0.35
+              : edge.emphasized
+                ? 0.95
+                : isSelectedEdge
+                  ? 0.95
+                  : 0.72;
+            return (
+              <path
+                key={edge.id}
+                d={edgePath(edge, source, target)}
+                stroke={stroke}
+                strokeWidth={width}
+                fill="none"
+                opacity={opacity}
+                strokeDasharray={edge.muted ? "5 4" : undefined}
+                strokeLinecap="round"
+              />
+            );
+          })}
+        </svg>
+        {nodes.map((node) => (
+          <GraphRunNode
+            key={node.id}
+            node={node}
+            summary={summarizeDiff(node.exp)}
+            onClick={() => onSelectRun(node.id)}
+          />
+        ))}
       </div>
     </div>
   );
@@ -829,9 +848,22 @@ export default function ExperimentLineageDemo() {
     return map;
   }, [visibleStages, runsByStage, showFoldedBranches, selected.id]);
 
-  const { nodes, edges } = useMemo(
-    () => buildStageGraph(visibleStages, visibleRunsByStage),
-    [visibleStages, visibleRunsByStage],
+  const hiddenFoldedCountByStage = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const stage of visibleStages) {
+      const buckets = runsByStage.get(stage.id) ?? { normal: [], folded: [] };
+      const selectedFoldedRun = buckets.folded.find((exp) => exp.id === selected.id);
+      const hidden = showFoldedBranches
+        ? 0
+        : Math.max(0, buckets.folded.length - (selectedFoldedRun ? 1 : 0));
+      map.set(stage.id, hidden);
+    }
+    return map;
+  }, [visibleStages, runsByStage, showFoldedBranches, selected.id]);
+
+  const { bands, nodes, edges } = useMemo(
+    () => buildCanvasGraph(visibleStages, visibleRunsByStage, selected.id, selectedStage?.id, hiddenFoldedCountByStage),
+    [visibleStages, visibleRunsByStage, selected.id, selectedStage?.id, hiddenFoldedCountByStage],
   );
 
   const timeline = events.filter((e) => e.experimentId === selected.id);
@@ -989,41 +1021,16 @@ export default function ExperimentLineageDemo() {
             </div>
 
             <div className="p-2 sm:p-3">
-              <div className="relative overflow-hidden rounded-xl border border-white/[0.05] bg-black/15">
-                <StageGraphOverlay nodes={nodes} edges={edges} selectedStageId={selectedStage?.id} selectedRunId={selected.id} />
-                <ul className="relative">
-                  {visibleStages.map((stage) => {
-                    const buckets = runsByStage.get(stage.id) ?? { normal: [], folded: [] };
-                    const selectedFoldedRun = buckets.folded.find((exp) => exp.id === selected.id);
-                    const runs = showFoldedBranches
-                      ? [...buckets.normal, ...buckets.folded]
-                      : selectedFoldedRun
-                        ? [...buckets.normal, selectedFoldedRun]
-                        : buckets.normal;
-                    const hiddenFoldedCount = showFoldedBranches ? 0 : Math.max(0, buckets.folded.length - (selectedFoldedRun ? 1 : 0));
-                    const promotedRun = stage.promotedRunId ? expById.get(stage.promotedRunId) : undefined;
-                    const parentRun = stage.parentRunId ? expById.get(stage.parentRunId) : undefined;
-                    return (
-                      <li key={stage.id} className="relative" style={{ height: STAGE_H }}>
-                        <div className="flex h-full items-stretch gap-2 px-2 py-2 sm:gap-3 sm:px-3">
-                          <div className="shrink-0" style={{ width: GRAPH_W }} aria-hidden />
-                          <div className="min-w-0 flex-1">
-                            <StageCard
-                              stage={stage}
-                              runs={runs}
-                              hiddenFoldedCount={hiddenFoldedCount}
-                              selectedRunId={selected.id}
-                              onSelectRun={selectExperiment}
-                              promotedRun={promotedRun}
-                              parentRun={parentRun}
-                              summarizeDiff={summarizeDiff}
-                            />
-                          </div>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
+              <div className="rounded-xl border border-white/[0.05] bg-black/15">
+                <GraphCanvas
+                  bands={bands}
+                  nodes={nodes}
+                  edges={edges}
+                  selectedRunId={selected.id}
+                  expById={expById}
+                  summarizeDiff={summarizeDiff}
+                  onSelectRun={selectExperiment}
+                />
               </div>
             </div>
             <div className="border-t border-white/[0.06] px-4 py-3">
