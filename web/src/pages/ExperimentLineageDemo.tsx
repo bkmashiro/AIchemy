@@ -251,6 +251,7 @@ export default function ExperimentLineageDemo() {
   const [decision, setDecision] = useState<DemoDecision>("keep");
   const [reason, setReason] = useState("");
   const [focusOnly, setFocusOnly] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   const selected = experiments.find((e) => e.id === selectedId) ?? experiments[0];
   const parent = selected.parentId ? experiments.find((e) => e.id === selected.parentId) : undefined;
@@ -297,6 +298,16 @@ export default function ExperimentLineageDemo() {
     setSelectedId(id);
     setDecision(exp?.decision ?? "keep");
     setReason("");
+    setDetailsOpen(true);
+  }
+
+  function summarizeDiff(exp: DemoExperiment) {
+    if (!exp.parentId) return ["root"];
+    const base = experiments.find((candidate) => candidate.id === exp.parentId);
+    if (!base) return ["fork"];
+    const keys = Array.from(new Set([...Object.keys(base.config), ...Object.keys(exp.config)]));
+    const changed = keys.filter((key) => JSON.stringify(base.config[key]) !== JSON.stringify(exp.config[key]));
+    return changed.length > 0 ? changed.slice(0, 3) : ["runtime"];
   }
 
   function addNote() {
@@ -339,7 +350,7 @@ export default function ExperimentLineageDemo() {
     <div className="min-h-screen bg-[#08090a] text-[#f7f8f8] [font-feature-settings:'cv01','ss03']">
       <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(113,112,255,0.16),transparent_34%),radial-gradient(circle_at_82%_18%,rgba(16,185,129,0.12),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.035),transparent_22%)]" />
 
-      <header className="relative z-10 flex h-14 items-center justify-between border-b border-white/[0.06] bg-[#0f1011]/85 px-5 backdrop-blur-xl">
+      <header className="relative z-10 flex min-h-14 flex-wrap items-center justify-between gap-2 border-b border-white/[0.06] bg-[#0f1011]/85 px-4 py-3 backdrop-blur-xl sm:px-5">
         <div className="flex items-center gap-3">
           <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.04] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">⚖️</div>
           <span className="text-sm font-semibold tracking-tight">Alchemy</span>
@@ -351,7 +362,7 @@ export default function ExperimentLineageDemo() {
         </div>
       </header>
 
-      <main className="relative z-10 mx-auto max-w-[1560px] space-y-5 p-5">
+      <main className="relative z-10 mx-auto max-w-[1560px] space-y-4 p-3 sm:space-y-5 sm:p-5">
         <section className="flex flex-col gap-4 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] lg:flex-row lg:items-end lg:justify-between">
           <div>
             <div className="mb-2 font-mono text-[11px] text-indigo-300">/demo/experiments-lineage</div>
@@ -370,7 +381,7 @@ export default function ExperimentLineageDemo() {
           </div>
         </section>
 
-        <section className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(680px,1fr)_460px]">
+        <section className="grid grid-cols-1 gap-5">
           <div className="overflow-hidden rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 shadow-[0_20px_80px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.035)]">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[0.06] px-4 py-3">
               <div>
@@ -399,8 +410,8 @@ export default function ExperimentLineageDemo() {
               </div>
             </div>
 
-            <div className="relative overflow-x-auto p-4">
-              <div className="relative min-w-[680px]" style={{ height: graphHeight }}>
+            <div className="relative overflow-hidden p-2 sm:p-4">
+              <div className="relative min-w-0" style={{ height: graphHeight }}>
                 <svg className="absolute inset-0 h-full w-full" aria-hidden="true">
                   <defs>
                     <filter id="soft-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -429,12 +440,13 @@ export default function ExperimentLineageDemo() {
                   const branch = BRANCH[exp.branch];
                   const isSelected = exp.id === selected.id;
                   const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
+                  const changedLabels = summarizeDiff(exp);
                   return (
                     <button
                       key={exp.id}
                       onClick={() => selectExperiment(exp.id)}
                       className={cn(
-                        "group absolute left-0 right-0 grid grid-cols-[190px_minmax(0,1fr)_150px] items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition duration-150",
+                        "group absolute left-0 right-0 grid grid-cols-[128px_minmax(0,1fr)] items-center gap-2 rounded-xl border px-2 py-2.5 text-left transition duration-150 sm:grid-cols-[190px_minmax(0,1fr)_150px] sm:gap-3 sm:px-3",
                         isSelected
                           ? "border-indigo-400/30 bg-indigo-500/[0.09] shadow-[0_0_0_1px_rgba(113,112,255,0.15),0_18px_50px_rgba(0,0,0,0.35)]"
                           : "border-transparent hover:border-white/[0.07] hover:bg-white/[0.035]",
@@ -451,21 +463,28 @@ export default function ExperimentLineageDemo() {
                             boxShadow: `0 0 0 5px ${branch.glow}, 0 0 18px ${branch.glow}`,
                           }}
                         />
-                        <span className="absolute top-[17px] font-mono text-[10px] text-gray-600" style={{ left: GRAPH_LEFT + 4 * LANE_WIDTH + 12 }}>
+                        <span className="absolute top-[17px] hidden font-mono text-[10px] text-gray-600 sm:block" style={{ left: GRAPH_LEFT + 4 * LANE_WIDTH + 12 }}>
                           {branch.label}
                         </span>
                       </div>
 
                       <div className="min-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
                           <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
                           <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
                           {branchForks > 0 && <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">{branchForks} forks</span>}
                         </div>
-                        <div className="mt-1 truncate text-xs text-gray-500">{exp.hypothesis}</div>
+                        <div className="mt-1 flex min-w-0 flex-wrap gap-1">
+                          {changedLabels.map((label) => (
+                            <span key={label} className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 font-mono text-[10px] text-gray-400">
+                              {label}
+                            </span>
+                          ))}
+                          <span className="hidden truncate text-xs text-gray-500 md:inline">{exp.hypothesis}</span>
+                        </div>
                       </div>
 
-                      <div className="flex items-center justify-end gap-2">
+                      <div className="hidden items-center justify-end gap-2 sm:flex">
                         <div className="text-right">
                           <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
                           <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
@@ -477,9 +496,29 @@ export default function ExperimentLineageDemo() {
                 })}
               </div>
             </div>
+            <div className="border-t border-white/[0.06] px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="truncate font-mono text-xs text-gray-200">{selected.shortName}</span>
+                    <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[selected.decision ?? "note"])}>{selected.decision ?? "open"}</span>
+                    {diff.slice(0, 3).map((row) => (
+                      <span key={row.key} className="rounded border border-white/[0.06] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-400">{row.key}</span>
+                    ))}
+                  </div>
+                  <p className="mt-1 truncate text-xs text-gray-500">Tap a node to open details. Compact labels stay on the rail.</p>
+                </div>
+                <button
+                  onClick={() => setDetailsOpen((open) => !open)}
+                  className="rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 text-xs text-indigo-200 transition hover:bg-indigo-500/25"
+                >
+                  {detailsOpen ? "Hide details" : "Open details"}
+                </button>
+              </div>
+            </div>
           </div>
 
-          <aside className="space-y-5">
+          <aside className={cn("space-y-5", !detailsOpen && "hidden")}>
             <section className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[0_20px_80px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.035)]">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
@@ -550,7 +589,7 @@ export default function ExperimentLineageDemo() {
           </aside>
         </section>
 
-        <section className="grid grid-cols-1 gap-5 xl:grid-cols-2">
+        <section className={cn("grid grid-cols-1 gap-5 xl:grid-cols-2", !detailsOpen && "hidden")}>
           <div className="rounded-2xl border border-white/[0.06] bg-[#0f1011]/90 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)]">
             <div className="mb-3 flex items-center justify-between">
               <h2 className="text-sm font-medium text-gray-200">Config diff</h2>
