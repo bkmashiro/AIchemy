@@ -122,6 +122,42 @@ const demoExperiments: DemoExperiment[] = [
     metrics: { zN: 0.872, eval_loss: 1.76, step: 42000 },
   },
   {
+    id: "curiosity-seed-b",
+    name: "jema_v2_curiosity_seed_b",
+    shortName: "seed_b",
+    status: "running",
+    description: "Parallel seed on the kept curiosity branch; still extending while ablations run.",
+    family: "jema_v2/pretrain",
+    parentId: "curiosity-resume-t4",
+    branch: "curiosity",
+    hypothesis: "A second seed should keep the zN gain without the checkpoint-specific spike.",
+    expected: "zN within 0.005 of resume_t4 and smoother eval loss.",
+    forkReason: "Validate the kept branch before promoting it as the new default.",
+    decision: "rerun",
+    decisionReason: "Still running; keep as a live sibling branch.",
+    criteria: { zN: ">=0.867", eval_loss: "<=1.79" },
+    config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-04", seed: 2 },
+    metrics: { zN: 0.869, eval_loss: 1.78, step: 31000 },
+  },
+  {
+    id: "regularize-dropout-005",
+    name: "jema_v2_regularize_dropout_005",
+    shortName: "dropout_005",
+    status: "partial",
+    description: "Middle-ground ablation that keeps some regularization while testing capacity.",
+    family: "jema_v2/pretrain",
+    parentId: "curiosity-resume-t4",
+    branch: "ablation",
+    hypothesis: "Lower dropout improves representation quality without the full instability of dropout=0.",
+    expected: "zN +0.006, eval loss regression <= 0.015.",
+    forkReason: "Ablation ladder from the kept resume checkpoint.",
+    decision: "fork",
+    decisionReason: "Promising but behind the live seed branch.",
+    criteria: { zN: ">=0.878", eval_loss: "<=1.78" },
+    config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, stub: "t4-05" },
+    metrics: { zN: 0.876, eval_loss: 1.775, step: 22000 },
+  },
+  {
     id: "ablate-no-dropout",
     name: "jema_v2_ablate_no_dropout",
     shortName: "ablate_dropout",
@@ -238,6 +274,10 @@ type GraphRow = {
   parentLane?: number;
 };
 
+function isFoldedBranch(exp: DemoExperiment) {
+  return exp.branch === "batch" || exp.status === "failed" || exp.decision === "drop";
+}
+
 function buildLanes(experiments: DemoExperiment[]): {
   rows: GraphRow[];
   laneCount: number;
@@ -302,12 +342,14 @@ function RowGraph({
   laneCount,
   laneColor,
   isSelected,
+  isMuted,
 }: {
   row: GraphRow;
   ranges: { first: number[]; lastUse: number[] };
   laneCount: number;
   laneColor: string[];
   isSelected: boolean;
+  isMuted?: boolean;
 }) {
   const width = laneCount * LANE_W;
   const branchColor = BRANCH[row.exp.branch].color;
@@ -360,7 +402,7 @@ function RowGraph({
                   y2={50}
                   stroke={seg.color}
                   strokeWidth={strokeWidth}
-                  opacity={seg.ownLane ? 0.78 : 0.4}
+                  opacity={isMuted ? 0.18 : seg.ownLane ? 0.78 : 0.4}
                 />
               )}
               {seg.bottom && (
@@ -371,7 +413,7 @@ function RowGraph({
                   y2={100}
                   stroke={seg.color}
                   strokeWidth={strokeWidth}
-                  opacity={seg.ownLane ? 0.55 : 0.4}
+                  opacity={isMuted ? 0.14 : seg.ownLane ? 0.55 : 0.4}
                 />
               )}
             </g>
@@ -383,7 +425,7 @@ function RowGraph({
             stroke={branchColor}
             strokeWidth={2}
             fill="none"
-            opacity={0.85}
+            opacity={isMuted ? 0.22 : 0.85}
           />
         )}
       </svg>
@@ -397,9 +439,12 @@ function RowGraph({
           width: NODE_R * 2,
           height: NODE_R * 2,
           borderColor: branchColor,
-          boxShadow: isSelected
-            ? `0 0 0 4px ${branchGlow}, 0 0 18px ${branchGlow}`
-            : `0 0 0 2px ${branchGlow}, 0 0 10px ${branchGlow}`,
+          opacity: isMuted ? 0.45 : 1,
+          boxShadow: isMuted
+            ? `0 0 0 1px ${branchGlow}`
+            : isSelected
+              ? `0 0 0 4px ${branchGlow}, 0 0 18px ${branchGlow}`
+              : `0 0 0 2px ${branchGlow}, 0 0 10px ${branchGlow}`,
         }}
       />
     </div>
@@ -414,6 +459,7 @@ export default function ExperimentLineageDemo() {
   const [decision, setDecision] = useState<DemoDecision>("keep");
   const [reason, setReason] = useState("");
   const [focusOnly, setFocusOnly] = useState(false);
+  const [showFoldedBranches, setShowFoldedBranches] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
 
   const selected = experiments.find((e) => e.id === selectedId) ?? experiments[0];
@@ -429,19 +475,28 @@ export default function ExperimentLineageDemo() {
   }, [experiments]);
 
   const visibleExperiments = useMemo(() => {
-    if (!focusOnly) return experiments;
-    const keep = new Set<string>([selected.id]);
-    let cursor: DemoExperiment | undefined = selected;
-    while (cursor?.parentId) {
-      keep.add(cursor.parentId);
-      cursor = experiments.find((exp) => exp.id === cursor?.parentId);
-    }
-    for (const child of childrenByParent.get(selected.id) ?? []) keep.add(child.id);
-    if (selected.parentId) {
-      for (const sibling of childrenByParent.get(selected.parentId) ?? []) keep.add(sibling.id);
-    }
-    return experiments.filter((exp) => keep.has(exp.id));
-  }, [childrenByParent, experiments, focusOnly, selected]);
+    const base = (() => {
+      if (!focusOnly) return experiments;
+      const keep = new Set<string>([selected.id]);
+      let cursor: DemoExperiment | undefined = selected;
+      while (cursor?.parentId) {
+        keep.add(cursor.parentId);
+        cursor = experiments.find((exp) => exp.id === cursor?.parentId);
+      }
+      for (const child of childrenByParent.get(selected.id) ?? []) keep.add(child.id);
+      if (selected.parentId) {
+        for (const sibling of childrenByParent.get(selected.parentId) ?? []) keep.add(sibling.id);
+      }
+      return experiments.filter((exp) => keep.has(exp.id));
+    })();
+    if (showFoldedBranches || isFoldedBranch(selected)) return base;
+    return base.filter((exp) => !isFoldedBranch(exp));
+  }, [childrenByParent, experiments, focusOnly, selected, showFoldedBranches]);
+
+  const foldedBranches = useMemo(
+    () => experiments.filter((exp) => isFoldedBranch(exp) && !visibleExperiments.some((visible) => visible.id === exp.id)),
+    [experiments, visibleExperiments],
+  );
 
   const timeline = events.filter((e) => e.experimentId === selected.id);
 
@@ -462,6 +517,7 @@ export default function ExperimentLineageDemo() {
     setDecision(exp?.decision ?? "keep");
     setReason("");
     setDetailsOpen(true);
+    if (exp && isFoldedBranch(exp)) setShowFoldedBranches(true);
   }
 
   function summarizeDiff(exp: DemoExperiment) {
@@ -551,20 +607,31 @@ export default function ExperimentLineageDemo() {
                 <h2 className="text-sm font-medium text-gray-200">Branch graph</h2>
                 <p className="text-xs text-gray-500">{rows.length} runs · {laneCount} live lanes</p>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => setFocusOnly((value) => !value)}
-                  className={cn(
-                    "rounded-md border px-3 py-1.5 text-xs transition",
-                    focusOnly ? "border-indigo-400/30 bg-indigo-500/15 text-indigo-200" : "border-white/[0.08] bg-white/[0.03] text-gray-300 hover:bg-white/[0.06]",
-                  )}
-                >
-                  {focusOnly ? "Show full family" : "Focus neighborhood"}
-                </button>
+              <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+                <div className="grid grid-cols-2 gap-2 sm:flex sm:items-center">
+                  <button
+                    onClick={() => setFocusOnly((value) => !value)}
+                    className={cn(
+                      "rounded-md border px-3 py-1.5 text-xs transition",
+                      focusOnly ? "border-indigo-400/30 bg-indigo-500/15 text-indigo-200" : "border-white/[0.08] bg-white/[0.03] text-gray-300 hover:bg-white/[0.06]",
+                    )}
+                  >
+                    {focusOnly ? "Show full family" : "Focus neighborhood"}
+                  </button>
+                  <button
+                    onClick={() => setShowFoldedBranches((value) => !value)}
+                    className={cn(
+                      "rounded-md border px-3 py-1.5 text-xs transition",
+                      showFoldedBranches ? "border-amber-400/25 bg-amber-500/10 text-amber-200" : "border-white/[0.08] bg-white/[0.03] text-gray-400 hover:bg-white/[0.06]",
+                    )}
+                  >
+                    {showFoldedBranches ? "Hide folded" : `${foldedBranches.length} folded`}
+                  </button>
+                </div>
                 <select
                   value={selectedId}
                   onChange={(e) => selectExperiment(e.target.value)}
-                  className="rounded-md border border-white/[0.08] bg-[#191a1b] px-3 py-1.5 text-xs text-gray-200 outline-none"
+                  className="w-full min-w-0 max-w-full truncate rounded-md border border-white/[0.08] bg-[#191a1b] px-3 py-1.5 text-xs text-gray-200 outline-none sm:w-60"
                   aria-label="Select experiment"
                 >
                   {experiments.map((exp) => (
@@ -583,6 +650,7 @@ export default function ExperimentLineageDemo() {
                   const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
                   const changedLabels = summarizeDiff(exp);
                   const parentName = exp.parentId ? experiments.find((node) => node.id === exp.parentId)?.shortName : undefined;
+                  const isMuted = isFoldedBranch(exp);
 
                   return (
                     <li key={exp.id}>
@@ -593,6 +661,7 @@ export default function ExperimentLineageDemo() {
                         className={cn(
                           "group flex w-full items-stretch gap-2 px-2 text-left transition duration-150 sm:gap-3 sm:px-3",
                           isSelected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.035]",
+                          isMuted && !isSelected && "opacity-45 hover:opacity-70",
                         )}
                         style={{ minHeight: 78 }}
                       >
@@ -602,6 +671,7 @@ export default function ExperimentLineageDemo() {
                           laneCount={laneCount}
                           laneColor={laneColor}
                           isSelected={isSelected}
+                          isMuted={isMuted && !isSelected}
                         />
 
                         <div className="min-w-0 flex-1 py-3">
@@ -613,6 +683,9 @@ export default function ExperimentLineageDemo() {
                               <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">
                                 {branchForks} fork{branchForks > 1 ? "s" : ""}
                               </span>
+                            )}
+                            {isMuted && (
+                              <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 text-[10px] text-gray-500">folded end</span>
                             )}
                           </div>
                           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-1">
