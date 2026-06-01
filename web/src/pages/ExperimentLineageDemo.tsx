@@ -345,21 +345,17 @@ function MetricCard({ name, value }: { name: string; value: number }) {
   );
 }
 
-// Graph canvas: stages are horizontal swimlane bands. Topology is drawn as
-// GitLens-style small dots and rail edges; run labels are detached cards so
-// edges never target large chips.
-const CANVAS_W = 1100;
-const BAND_H = 156;
-const BAND_GAP = 32;
+// Graph canvas: stages are horizontal swimlane bands. Topology is the only
+// thing rendered in the graph: GitLens-style small dots and rail edges. Run
+// details live outside the graph and open on dot click.
+const CANVAS_W = 760;
+const BAND_H = 116;
+const BAND_GAP = 28;
 const DOT_R = 6;
-const DOT_HIT = 28;
-const CARD_W = 168;
-const CARD_H = 64;
-const STAGE_LABEL_W = 200;
-const RAIL_START_X = 232;
-const RUN_GAP_X = 218;
-const CARD_OFFSET_X = 18;
-const CARD_OFFSET_Y = -24;
+const DOT_HIT = 30;
+const STAGE_LABEL_W = 192;
+const RAIL_START_X = 226;
+const RUN_GAP_X = 92;
 const CANVAS_PAD_Y = 10;
 
 function isFoldedRun(exp: DemoExperiment) {
@@ -375,12 +371,6 @@ function getDotY(bandIndex: number) {
 function getDotX(runIndex: number) {
   return RAIL_START_X + runIndex * RUN_GAP_X;
 }
-function getCardX(runIndex: number) {
-  return getDotX(runIndex) + CARD_OFFSET_X;
-}
-function getCardY(bandIndex: number) {
-  return getDotY(bandIndex) + CARD_OFFSET_Y;
-}
 
 type CanvasRunNode = {
   id: string;
@@ -390,10 +380,6 @@ type CanvasRunNode = {
   runIndex: number;
   dotX: number;
   dotY: number;
-  cardX: number;
-  cardY: number;
-  cardWidth: number;
-  cardHeight: number;
   muted: boolean;
   selected: boolean;
 };
@@ -452,10 +438,6 @@ function buildCanvasGraph(
         runIndex,
         dotX: getDotX(runIndex),
         dotY: getDotY(band.bandIndex),
-        cardX: getCardX(runIndex),
-        cardY: getCardY(band.bandIndex),
-        cardWidth: CARD_W,
-        cardHeight: CARD_H,
         muted: band.folded || isFoldedRun(exp),
         selected: exp.id === selectedRunId,
       });
@@ -565,81 +547,45 @@ function edgePath(
 
 function GraphRunNode({
   node,
-  summary,
   onClick,
 }: {
   node: CanvasRunNode;
-  summary: string[];
   onClick: () => void;
 }) {
   const branch = BRANCH[node.exp.branch];
+  const ringColor = node.selected ? branch.glow : "transparent";
   return (
-    <>
-      <button
-        type="button"
-        onClick={onClick}
-        aria-pressed={node.selected}
-        aria-label={`Open ${node.exp.name} graph dot`}
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={node.selected}
+      aria-label={`Open ${node.exp.name} graph dot`}
+      title={`${node.exp.shortName} · zN ${node.exp.metrics.zN} · ${node.exp.status}`}
+      className={cn(
+        "absolute z-20 grid place-items-center rounded-full transition",
+        node.selected ? "bg-white/[0.06]" : "hover:bg-white/[0.045]",
+        node.muted && !node.selected && "opacity-45 hover:opacity-80",
+      )}
+      style={{
+        left: node.dotX - DOT_HIT / 2,
+        top: node.dotY - DOT_HIT / 2,
+        width: DOT_HIT,
+        height: DOT_HIT,
+      }}
+    >
+      <span
         className={cn(
-          "absolute z-20 grid place-items-center rounded-full transition",
-          node.selected ? "bg-indigo-400/10" : "hover:bg-white/[0.05]",
-          node.muted && !node.selected && "opacity-55 hover:opacity-90",
+          "block rounded-full border",
+          node.selected ? "border-white/85" : "border-black/40",
         )}
         style={{
-          left: node.dotX - DOT_HIT / 2,
-          top: node.dotY - DOT_HIT / 2,
-          width: DOT_HIT,
-          height: DOT_HIT,
+          width: DOT_R * 2,
+          height: DOT_R * 2,
+          backgroundColor: branch.color,
+          boxShadow: node.selected ? `0 0 0 5px ${ringColor}, 0 0 18px ${branch.color}` : `0 0 10px ${branch.glow}`,
         }}
-      >
-        <span
-          className={cn(
-            "block rounded-full border",
-            node.selected ? "border-white/80" : "border-black/40",
-          )}
-          style={{
-            width: DOT_R * 2,
-            height: DOT_R * 2,
-            backgroundColor: branch.color,
-            boxShadow: node.selected ? `0 0 0 4px ${branch.glow}, 0 0 18px ${branch.color}` : `0 0 10px ${branch.glow}`,
-          }}
-        />
-      </button>
-      <button
-        type="button"
-        onClick={onClick}
-        aria-label={`Open ${node.exp.name}`}
-        className={cn(
-          "absolute z-10 flex flex-col gap-1 rounded-lg border px-2 py-1.5 text-left transition",
-          node.selected
-            ? "border-indigo-400/45 bg-indigo-500/[0.10] shadow-[0_12px_28px_-18px_rgba(124,124,255,0.8)]"
-            : "border-white/[0.07] bg-[#141517]/85 hover:border-white/[0.16] hover:bg-[#191a1c]/90",
-          node.muted && !node.selected && "opacity-50 hover:opacity-85",
-        )}
-        style={{
-          left: node.cardX,
-          top: node.cardY,
-          width: node.cardWidth,
-          height: node.cardHeight,
-        }}
-      >
-        <div className="flex items-center gap-1.5">
-          <span className="truncate text-[11px] font-medium text-gray-100">{node.exp.shortName}</span>
-          <span className={cn("ml-auto rounded border px-1 py-px text-[9px] uppercase leading-none", BADGE[node.exp.status])}>{node.exp.status}</span>
-        </div>
-        <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
-          <span className="rounded border border-white/[0.06] bg-black/30 px-1.5 py-px text-gray-200">zN {node.exp.metrics.zN}</span>
-          {summary.slice(0, 1).map((label) => (
-            <span key={label} className="max-w-[82px] truncate rounded border border-white/[0.05] bg-white/[0.025] px-1.5 py-px text-gray-400">
-              {label}
-            </span>
-          ))}
-        </div>
-        {node.exp.decision && (
-          <span className={cn("self-start rounded border px-1.5 py-px text-[9px] uppercase leading-none", BADGE[node.exp.decision])}>{node.exp.decision}</span>
-        )}
-      </button>
-    </>
+      />
+    </button>
   );
 }
 
@@ -709,7 +655,6 @@ function GraphCanvas({
   edges,
   selectedRunId,
   expById,
-  summarizeDiff,
   onSelectRun,
 }: {
   bands: CanvasStageBand[];
@@ -717,7 +662,6 @@ function GraphCanvas({
   edges: CanvasEdge[];
   selectedRunId: string;
   expById: Map<string, DemoExperiment>;
-  summarizeDiff: (exp: DemoExperiment) => string[];
   onSelectRun: (id: string) => void;
 }) {
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -731,7 +675,7 @@ function GraphCanvas({
     const scroller = scrollerRef.current;
     const selectedNode = nodeById.get(selectedRunId);
     if (!scroller || !selectedNode || scroller.clientWidth >= CANVAS_W) return;
-    scroller.scrollTo({ left: Math.max(0, selectedNode.cardX - 96), behavior: "auto" });
+    scroller.scrollTo({ left: Math.max(0, selectedNode.dotX - 120), behavior: "auto" });
   }, [nodeById, selectedRunId]);
 
   return (
@@ -811,7 +755,6 @@ function GraphCanvas({
           <GraphRunNode
             key={node.id}
             node={node}
-            summary={summarizeDiff(node.exp)}
             onClick={() => onSelectRun(node.id)}
           />
         ))}
@@ -967,15 +910,6 @@ export default function ExperimentLineageDemo() {
     }
   }
 
-  function summarizeDiff(exp: DemoExperiment) {
-    if (!exp.parentId) return ["root"];
-    const base = experiments.find((candidate) => candidate.id === exp.parentId);
-    if (!base) return ["fork"];
-    const keys = Array.from(new Set([...Object.keys(base.config), ...Object.keys(exp.config)]));
-    const changed = keys.filter((key) => JSON.stringify(base.config[key]) !== JSON.stringify(exp.config[key]));
-    return changed.length > 0 ? changed.slice(0, 3) : ["runtime"];
-  }
-
   function addNote() {
     if (!note.trim()) return;
     setEvents((prev) => [
@@ -1107,7 +1041,6 @@ export default function ExperimentLineageDemo() {
                   edges={edges}
                   selectedRunId={selected.id}
                   expById={expById}
-                  summarizeDiff={summarizeDiff}
                   onSelectRun={selectExperiment}
                 />
               </div>
@@ -1127,7 +1060,7 @@ export default function ExperimentLineageDemo() {
                       <span key={row.key} className="rounded border border-white/[0.06] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-400">{row.key}</span>
                     ))}
                   </div>
-                  <p className="mt-1 truncate text-xs text-gray-500">Tap a run chip to drill in. Folded stages stay collapsed by default.</p>
+                  <p className="mt-1 truncate text-xs text-gray-500">Tap a dot to inspect that run. The graph stays topology-only by default.</p>
                 </div>
                 <button
                   onClick={() => setDetailsOpen((open) => !open)}
