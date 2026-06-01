@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, lazy, Suspense } from "react";
 import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
 import { useSocket } from "./hooks/useSocket";
 import { hasToken, setOnAuthFail, clearToken } from "./lib/api";
@@ -11,9 +11,18 @@ import TaskDetailPage from "./pages/TaskDetailPage";
 import StubDetailPage from "./pages/StubDetail";
 import StubsPage from "./pages/StubsPage";
 import ExperimentsPage from "./pages/ExperimentsPage";
-import ExperimentLineageDemo from "./pages/ExperimentLineageDemo";
 import DeployPage from "./pages/DeployPage";
 import LoginPage from "./pages/LoginPage";
+
+const ExperimentLineageDemo = lazy(() => import("./pages/ExperimentLineageDemo"));
+
+function DemoFallback() {
+  return (
+    <div className="min-h-screen bg-gray-950 text-gray-500 flex items-center justify-center text-sm">
+      Loading lineage demo…
+    </div>
+  );
+}
 
 function NavItem({ to, label, badge, end }: { to: string; label: string; badge?: number; end?: boolean }) {
   return (
@@ -99,7 +108,14 @@ function AppInner(_props: { onLogout: () => void }) {
       <main className="flex-1 overflow-auto">
         <div className="p-5 max-w-screen-2xl mx-auto">
           <Routes>
-            <Route path="/demo/experiments-lineage" element={<ExperimentLineageDemo />} />
+            <Route
+              path="/demo/experiments-lineage"
+              element={
+                <Suspense fallback={<DemoFallback />}>
+                  <ExperimentLineageDemo />
+                </Suspense>
+              }
+            />
             <Route
               path="/"
               element={
@@ -155,9 +171,11 @@ export default function App() {
   if (isDemoRoute) {
     return (
       <BrowserRouter>
-        <Routes>
-          <Route path="/demo/experiments-lineage" element={<ExperimentLineageDemo />} />
-        </Routes>
+        <Suspense fallback={<DemoFallback />}>
+          <Routes>
+            <Route path="/demo/experiments-lineage" element={<ExperimentLineageDemo />} />
+          </Routes>
+        </Suspense>
       </BrowserRouter>
     );
   }

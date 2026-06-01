@@ -1059,7 +1059,7 @@ function LineageFlow({
     <ReactFlowProvider>
       <div
         className="relative w-full bg-[radial-gradient(circle_at_1px_1px,rgba(255,255,255,0.045)_1px,transparent_0)] [background-size:20px_20px]"
-        style={{ height: Math.max(totalH + FLOW_PAD * 2, 360) }}
+        style={{ width: "100%", height: Math.max(totalH + FLOW_PAD * 2, 360) }}
       >
         <BandsLayer bands={bands} expById={expById} totalH={totalH} />
         <ReactFlow
