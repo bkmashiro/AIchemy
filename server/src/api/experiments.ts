@@ -134,6 +134,9 @@ export interface ExperimentBrief {
   family: string | null;
   parent_id: string | null;
   decision: ExperimentDecision | null;
+  fork_reason: string | null;
+  goal_metric: string | null;
+  goal_direction: "min" | "max" | null;
   created_at: string;
 }
 
@@ -162,6 +165,9 @@ export function experimentBrief(exp: Experiment): ExperimentBrief {
     family: exp.family ?? null,
     parent_id: exp.parent_id ?? null,
     decision: exp.decision ?? null,
+    fork_reason: exp.fork_reason ?? null,
+    goal_metric: exp.goal_metric ?? null,
+    goal_direction: exp.goal_direction ?? null,
     created_at: exp.created_at,
   };
 }
@@ -231,6 +237,91 @@ function bestMetricValues(exp: Experiment): Record<string, number> {
     out[metric] = info.best;
   }
   return out;
+}
+
+export interface PrimaryMetric {
+  metric: string;
+  direction: "min" | "max";
+  best: number | null;
+}
+
+// Surface a primary metric only when both `goal_metric` and explicit
+// `goal_direction` exist. Do not infer winners from metric names or criteria.
+export function primaryMetricFor(exp: Experiment): PrimaryMetric | null {
+  const metric = exp.goal_metric;
+  const direction = exp.goal_direction;
+  if (!metric || !direction) return null;
+  const agg = aggregateMetrics(exp)[metric];
+  const best = agg ? (direction === "min" ? agg.min : agg.max) : null;
+  return { metric, direction, best };
+}
+
+// Shared keys across a set of configs: intersection of keys. Treats null/
+// undefined configs as having no keys (so any experiment without config makes
+// the intersection empty). Result is sorted for determinism.
+function sharedConfigKeys(configs: Array<Record<string, any> | null | undefined>): string[] {
+  if (configs.length === 0) return [];
+  let shared: Set<string> | null = null;
+  for (const cfg of configs) {
+    if (!cfg || typeof cfg !== "object") return [];
+    const keys = new Set<string>(Object.keys(cfg));
+    if (shared === null) {
+      shared = keys;
+    } else {
+      const next = new Set<string>();
+      for (const k of shared) if (keys.has(k)) next.add(k);
+      shared = next;
+    }
+  }
+  return Array.from(shared ?? []).sort();
+}
+
+// Of the shared keys, the subset where values differ across experiments.
+// JSON-based equality is used to handle nested objects/arrays consistently.
+function differingConfigKeys(
+  configs: Array<Record<string, any> | null | undefined>,
+  shared: string[],
+): string[] {
+  const out: string[] = [];
+  for (const key of shared) {
+    const first = JSON.stringify(configs[0]?.[key]);
+    if (configs.some((cfg) => JSON.stringify(cfg?.[key]) !== first)) out.push(key);
+  }
+  return out;
+}
+
+export interface MetricDeltaEntry {
+  id: string;
+  best: number | null;
+  delta: number | null;
+}
+
+// For each metric appearing in any experiment, list per-experiment best value
+// and delta vs the first experiment that has the metric (the "reference").
+// Null entries mean the experiment has no data for that metric.
+function metricDeltas(
+  ids: string[],
+  bestByExp: Map<string, Record<string, number>>,
+): Record<string, MetricDeltaEntry[]> {
+  const metrics = new Set<string>();
+  for (const id of ids) {
+    const best = bestByExp.get(id);
+    if (best) for (const m of Object.keys(best)) metrics.add(m);
+  }
+  const result: Record<string, MetricDeltaEntry[]> = {};
+  for (const metric of Array.from(metrics).sort()) {
+    let reference: number | null = null;
+    const entries: MetricDeltaEntry[] = [];
+    for (const id of ids) {
+      const value = bestByExp.get(id)?.[metric];
+      const best = typeof value === "number" ? value : null;
+      if (reference === null && best !== null) reference = best;
+      const delta = best !== null && reference !== null ? best - reference : null;
+      entries.push({ id, best, delta });
+    }
+    result[metric] = entries;
+  }
+  return result;
 }
 
 function taskCountsByStatus(exp: Experiment): Record<string, number> {
@@ -545,32 +636,64 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
   router.get("/compare", (req: Request, res: Response) => {
     const raw = req.query.ids;
     const idsParam = Array.isArray(raw) ? raw.join(",") : typeof raw === "string" ? raw : "";
-    const ids = idsParam.split(",").map((s) => s.trim()).filter(Boolean);
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const part of idsParam.split(",")) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+      if (seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      ids.push(trimmed);
+    }
     if (ids.length === 0) {
       res.status(400).json({ error: "ids query parameter required (comma-separated experiment IDs)" });
       return;
     }
+    if (ids.length > 6) {
+      res.status(400).json({ error: "compare supports at most 6 ids" });
+      return;
+    }
 
     const missing: string[] = [];
+    const found: string[] = [];
     const experiments: Experiment[] = [];
     for (const id of ids) {
       const exp = store.getExperiment(id);
       if (!exp) missing.push(id);
-      else experiments.push(exp);
-    }
-    if (missing.length > 0) {
-      res.status(404).json({ error: "Experiment(s) not found", missing });
-      return;
+      else {
+        experiments.push(exp);
+        found.push(id);
+      }
     }
 
-    const items = experiments.map((exp) => ({
-      ...experimentBrief(exp),
-      config: exp.config ?? null,
-      metrics: aggregateMetrics(exp),
-      criteria: exp.criteria ?? {},
-      pass_fail: passFailSummary(exp),
-    }));
-    res.json({ ids, experiments: items });
+    const bestByExp = new Map<string, Record<string, number>>();
+    const items = experiments.map((exp) => {
+      const best = bestMetricValues(exp);
+      bestByExp.set(exp.id, best);
+      return {
+        ...experimentBrief(exp),
+        config: exp.config ?? null,
+        criteria: exp.criteria ?? {},
+        metrics: aggregateMetrics(exp),
+        best_metrics: best,
+        primary_metric: primaryMetricFor(exp),
+        pass_fail: passFailSummary(exp),
+      };
+    });
+
+    const configs = experiments.map((e) => e.config ?? null);
+    const shared = sharedConfigKeys(configs);
+    const differing = differingConfigKeys(configs, shared);
+
+    res.json({
+      ids,
+      found,
+      missing,
+      experiments: items,
+      shared_config_keys: shared,
+      differing_config_keys: differing,
+      metric_deltas: metricDeltas(found, bestByExp),
+    });
   });
 
   // GET /experiments/:id/summary — detailed summary including lineage
@@ -593,6 +716,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       hypothesis: exp.hypothesis ?? null,
       expected_outcome: exp.expected_outcome ?? null,
       fork_reason: exp.fork_reason ?? null,
+      goal_metric: exp.goal_metric ?? null,
+      goal_direction: exp.goal_direction ?? null,
       decision: exp.decision ?? null,
       decision_reason: exp.decision_reason ?? null,
       decision_at: exp.decision_at ?? null,
@@ -602,6 +727,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       task_counts: taskCountsByStatus(exp),
       validation: passFailSummary(exp),
       best_metrics: bestMetricValues(exp),
+      primary_metric: primaryMetricFor(exp),
       timeline_event_count: eventCount,
       config: exp.config ?? null,
       config_diff: exp.config_diff ?? null,

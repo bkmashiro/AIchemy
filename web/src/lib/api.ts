@@ -353,6 +353,9 @@ export interface Experiment {
   decision?: ExperimentDecision;
   decision_reason?: string;
   decision_at?: string;
+  // Goal metric (lineage phase 2)
+  goal_metric?: string;
+  goal_direction?: "min" | "max";
   // Git tracking
   git_tracking?: boolean;
   git_repo_path?: string;
@@ -388,7 +391,22 @@ export interface ExperimentBrief {
   family: string | null;
   parent_id: string | null;
   decision: ExperimentDecision | null;
+  fork_reason: string | null;
+  goal_metric: string | null;
+  goal_direction: "min" | "max" | null;
   created_at: string;
+}
+
+export interface PrimaryMetric {
+  metric: string;
+  direction: "min" | "max";
+  best: number | null;
+}
+
+export interface MetricDeltaEntry {
+  id: string;
+  best: number | null;
+  delta: number | null;
 }
 
 export interface ExperimentTreeNode extends ExperimentBrief {
@@ -414,14 +432,21 @@ export interface ExperimentPassFailSummary {
 
 export interface ExperimentCompareItem extends ExperimentBrief {
   config: Record<string, any> | null;
-  metrics: Record<string, ExperimentMetricAggregate>;
   criteria: Record<string, string>;
+  metrics: Record<string, ExperimentMetricAggregate>;
+  best_metrics: Record<string, number>;
+  primary_metric: PrimaryMetric | null;
   pass_fail: ExperimentPassFailSummary;
 }
 
 export interface ExperimentCompareResponse {
   ids: string[];
+  found: string[];
+  missing: string[];
   experiments: ExperimentCompareItem[];
+  shared_config_keys: string[];
+  differing_config_keys: string[];
+  metric_deltas: Record<string, MetricDeltaEntry[]>;
 }
 
 export interface ExperimentSummaryResponse {
@@ -432,6 +457,8 @@ export interface ExperimentSummaryResponse {
   hypothesis: string | null;
   expected_outcome: string | null;
   fork_reason: string | null;
+  goal_metric: string | null;
+  goal_direction: "min" | "max" | null;
   decision: ExperimentDecision | null;
   decision_reason: string | null;
   decision_at: string | null;
@@ -441,6 +468,7 @@ export interface ExperimentSummaryResponse {
   task_counts: Record<string, number>;
   validation: ExperimentPassFailSummary;
   best_metrics: Record<string, number>;
+  primary_metric: PrimaryMetric | null;
   timeline_event_count: number;
   config: Record<string, any> | null;
   config_diff: Record<string, { old: any; new: any }> | null;

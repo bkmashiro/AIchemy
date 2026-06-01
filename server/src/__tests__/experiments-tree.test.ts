@@ -117,13 +117,44 @@ describe("GET /experiments/tree", () => {
     expect(first.children.map((c: any) => c.id)).toEqual(["c1", "c2"]);
     expect(first.children[0].children.map((c: any) => c.id)).toEqual(["g1"]);
     expect(first.status).toBe("running");
-    expect(first).toMatchObject({ family: null, decision: null, parent_id: null });
+    expect(first).toMatchObject({
+      family: null,
+      decision: null,
+      parent_id: null,
+      fork_reason: null,
+      goal_metric: null,
+      goal_direction: null,
+    });
   });
 
   it("does not match /:id when path is 'tree'", async () => {
     const app = makeApp();
     const res = await request(app).get("/experiments/tree").expect(200);
     expect(res.body).toHaveProperty("roots");
+  });
+
+  it("includes fork_reason, goal_metric, goal_direction in brief nodes", async () => {
+    const app = makeApp();
+    const root = makeExperiment({
+      id: "r", name: "root", goal_metric: "zn", goal_direction: "max",
+      created_at: "2025-02-01T00:00:00.000Z",
+    });
+    const child = makeExperiment({
+      id: "c", name: "child", parent_id: "r", fork_reason: "baseline plateaued",
+      created_at: "2025-02-02T00:00:00.000Z",
+    });
+    for (const e of [root, child]) {
+      store.setGrid(makeGrid(e.grid_id));
+      store.setExperiment(e);
+    }
+
+    const res = await request(app).get("/experiments/tree").expect(200);
+    expect(res.body.roots[0]).toMatchObject({
+      id: "r", goal_metric: "zn", goal_direction: "max", fork_reason: null,
+    });
+    expect(res.body.roots[0].children[0]).toMatchObject({
+      id: "c", fork_reason: "baseline plateaued", goal_metric: null, goal_direction: null,
+    });
   });
 });
 
@@ -135,14 +166,17 @@ describe("GET /experiments/compare", () => {
     await request(app).get("/experiments/compare?ids=,,").expect(400);
   });
 
-  it("404s when any id is missing and reports them", async () => {
+  it("reports missing ids without dropping found experiments", async () => {
     const app = makeApp();
-    const exp = makeExperiment({ id: "e1", name: "e1" });
+    const exp = makeExperiment({ id: "e1", name: "e1", config: { lr: 0.01 } });
     store.setGrid(makeGrid(exp.grid_id));
     store.setExperiment(exp);
 
-    const res = await request(app).get("/experiments/compare?ids=e1,e2,e3").expect(404);
+    const res = await request(app).get("/experiments/compare?ids=e1,e2,e3").expect(200);
+    expect(res.body.ids).toEqual(["e1", "e2", "e3"]);
+    expect(res.body.found).toEqual(["e1"]);
     expect(res.body.missing).toEqual(["e2", "e3"]);
+    expect(res.body.experiments.map((e: any) => e.id)).toEqual(["e1"]);
   });
 
   it("returns experiments in requested order with metrics + criteria + pass_fail", async () => {
@@ -179,6 +213,20 @@ describe("GET /experiments/compare", () => {
     expect(a.criteria).toEqual({ loss: "< 1.0" });
     expect(a.pass_fail).toEqual({ total: 2, passed: 1, failed: 1 });
     expect(b.pass_fail).toEqual({ total: 1, passed: 1, failed: 0 });
+    expect(a.primary_metric).toBeNull();
+    expect(b.primary_metric).toBeNull();
+    expect(res.body.found).toEqual(["B", "A"]);
+    expect(res.body.missing).toEqual([]);
+    expect(res.body.shared_config_keys).toEqual(["lr"]);
+    expect(res.body.differing_config_keys).toEqual(["lr"]);
+    expect(res.body.metric_deltas.acc).toEqual([
+      { id: "B", best: 0.95, delta: 0 },
+      { id: "A", best: null, delta: null },
+    ]);
+    expect(res.body.metric_deltas.loss).toEqual([
+      { id: "B", best: null, delta: null },
+      { id: "A", best: 0.2, delta: 0 },
+    ]);
   });
 });
 
@@ -197,7 +245,7 @@ describe("GET /experiments/:id/summary", () => {
     const exp = makeExperiment({
       id: "e", name: "exp", parent_id: "p", family: "fam-1",
       hypothesis: "hyp", expected_outcome: "good", fork_reason: "trying",
-      criteria: { loss: "< 1.0" },
+      criteria: { loss: "< 1.0" }, goal_metric: "loss", goal_direction: "min",
       config: { lr: 0.01 }, config_diff: { lr: { old: 0.02, new: 0.01 } },
       results: {
         t1: { passed: true, checked_at: "x", details: { loss: { value: 0.3, threshold: "< 1.0", ok: true } } },
@@ -241,6 +289,9 @@ describe("GET /experiments/:id/summary", () => {
     expect(res.body.task_counts).toEqual({ completed: 1, failed: 1 });
     expect(res.body.validation).toEqual({ total: 2, passed: 1, failed: 1 });
     expect(res.body.best_metrics).toEqual({ loss: 0.3 });
+    expect(res.body.goal_metric).toBe("loss");
+    expect(res.body.goal_direction).toBe("min");
+    expect(res.body.primary_metric).toEqual({ metric: "loss", direction: "min", best: 0.3 });
     expect(res.body.timeline_event_count).toBe(1);
     expect(res.body.config).toEqual({ lr: 0.01 });
     expect(res.body.config_diff).toEqual({ lr: { old: 0.02, new: 0.01 } });

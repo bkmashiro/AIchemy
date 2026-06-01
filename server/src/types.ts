@@ -300,6 +300,9 @@ export interface Experiment {
   hypothesis?: string;
   expected_outcome?: string;
   fork_reason?: string;
+  // Goal metric (Phase 2 lineage): when set, drives "best/primary" reporting.
+  goal_metric?: string;
+  goal_direction?: "min" | "max";
   // Decision metadata (undefined = never decided)
   decision?: ExperimentDecision;
   decision_reason?: string;
