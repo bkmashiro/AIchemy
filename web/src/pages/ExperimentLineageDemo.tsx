@@ -42,10 +42,8 @@ type BranchStyle = {
   text: string;
 };
 
-const ROW_HEIGHT = 78;
-const LANE_WIDTH = 42;
-const GRAPH_LEFT = 28;
-const GRAPH_TOP = 34;
+const MAX_MOBILE_DEPTH = 2;
+const MAX_DESKTOP_DEPTH = 5;
 
 const BRANCH: Record<DemoExperiment["branch"], BranchStyle> = {
   baseline: { label: "baseline", color: "#8b949e", glow: "rgba(139,148,158,0.28)", bg: "bg-slate-500/10", text: "text-slate-300" },
@@ -227,13 +225,6 @@ function JsonPill({ data }: { data: Record<string, unknown> }) {
   );
 }
 
-function nodePoint(exp: DemoExperiment, index: number) {
-  return {
-    x: GRAPH_LEFT + exp.lane * LANE_WIDTH,
-    y: GRAPH_TOP + index * ROW_HEIGHT,
-  };
-}
-
 function MetricCard({ name, value }: { name: string; value: number }) {
   return (
     <div className="rounded-lg border border-white/[0.06] bg-white/[0.025] px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
@@ -282,6 +273,30 @@ export default function ExperimentLineageDemo() {
 
   const timeline = events.filter((e) => e.experimentId === selected.id);
 
+  function lineageDepth(exp: DemoExperiment) {
+    let depth = 0;
+    let cursor = exp;
+    const seen = new Set<string>();
+    while (cursor.parentId && !seen.has(cursor.id)) {
+      seen.add(cursor.id);
+      const parentNode = experiments.find((candidate) => candidate.id === cursor.parentId);
+      if (!parentNode) break;
+      depth += 1;
+      cursor = parentNode;
+    }
+    return depth;
+  }
+
+  const visibleIds = new Set(visibleExperiments.map((exp) => exp.id));
+
+  const graphRows = visibleExperiments.map((exp, index) => ({
+    exp,
+    depth: lineageDepth(exp),
+    isFirst: index === 0,
+    isLast: index === visibleExperiments.length - 1,
+    parentVisible: Boolean(exp.parentId && visibleIds.has(exp.parentId)),
+  }));
+
   const diff = useMemo(() => {
     if (!parent) return [];
     const keys = Array.from(new Set([...Object.keys(parent.config), ...Object.keys(selected.config)]));
@@ -289,9 +304,6 @@ export default function ExperimentLineageDemo() {
       .map((key) => ({ key, before: parent.config[key], after: selected.config[key] }))
       .filter((row) => JSON.stringify(row.before) !== JSON.stringify(row.after));
   }, [parent, selected]);
-
-  const graphHeight = Math.max(visibleExperiments.length * ROW_HEIGHT + 30, 420);
-  const visibleIds = new Set(visibleExperiments.map((exp) => exp.id));
 
   function selectExperiment(id: string) {
     const exp = experiments.find((x) => x.id === id);
@@ -410,69 +422,52 @@ export default function ExperimentLineageDemo() {
               </div>
             </div>
 
-            <div className="relative overflow-hidden p-2 sm:p-4">
-              <div className="relative min-w-0" style={{ height: graphHeight }}>
-                <svg className="absolute inset-0 h-full w-full" aria-hidden="true">
-                  <defs>
-                    <filter id="soft-glow" x="-50%" y="-50%" width="200%" height="200%">
-                      <feGaussianBlur stdDeviation="2.6" result="coloredBlur" />
-                      <feMerge>
-                        <feMergeNode in="coloredBlur" />
-                        <feMergeNode in="SourceGraphic" />
-                      </feMerge>
-                    </filter>
-                  </defs>
-                  {visibleExperiments.map((exp, index) => {
-                    if (!exp.parentId || !visibleIds.has(exp.parentId)) return null;
-                    const parentIndex = visibleExperiments.findIndex((node) => node.id === exp.parentId);
-                    if (parentIndex < 0) return null;
-                    const from = nodePoint(visibleExperiments[parentIndex], parentIndex);
-                    const to = nodePoint(exp, index);
-                    const midY = from.y + 26;
-                    const color = BRANCH[exp.branch].color;
-                    const d = `M ${from.x} ${from.y + 9} V ${midY} C ${from.x} ${midY + 16}, ${to.x} ${midY + 10}, ${to.x} ${midY + 27} V ${to.y - 9}`;
-                    return <path key={`${exp.parentId}-${exp.id}`} d={d} fill="none" stroke={color} strokeWidth="2.2" strokeLinecap="round" filter="url(#soft-glow)" opacity="0.86" />;
-                  })}
-                </svg>
-
-                {visibleExperiments.map((exp, index) => {
-                  const point = nodePoint(exp, index);
+            <div className="p-2 sm:p-4">
+              <div className="divide-y divide-white/[0.04] overflow-hidden rounded-xl border border-white/[0.05] bg-black/10">
+                {graphRows.map(({ exp, depth, isFirst, isLast, parentVisible }) => {
                   const branch = BRANCH[exp.branch];
                   const isSelected = exp.id === selected.id;
                   const branchForks = childrenByParent.get(exp.id)?.length ?? 0;
                   const changedLabels = summarizeDiff(exp);
+                  const mobileDepth = Math.min(depth, MAX_MOBILE_DEPTH);
+                  const desktopDepth = Math.min(depth, MAX_DESKTOP_DEPTH);
+                  const parentName = exp.parentId ? experiments.find((node) => node.id === exp.parentId)?.shortName : undefined;
+
                   return (
                     <button
                       key={exp.id}
                       onClick={() => selectExperiment(exp.id)}
                       className={cn(
-                        "group absolute left-0 right-0 grid grid-cols-[128px_minmax(0,1fr)] items-center gap-2 rounded-xl border px-2 py-2.5 text-left transition duration-150 sm:grid-cols-[190px_minmax(0,1fr)_150px] sm:gap-3 sm:px-3",
-                        isSelected
-                          ? "border-indigo-400/30 bg-indigo-500/[0.09] shadow-[0_0_0_1px_rgba(113,112,255,0.15),0_18px_50px_rgba(0,0,0,0.35)]"
-                          : "border-transparent hover:border-white/[0.07] hover:bg-white/[0.035]",
+                        "group grid w-full grid-cols-[58px_minmax(0,1fr)] items-stretch gap-2 px-2 text-left transition duration-150 sm:grid-cols-[108px_minmax(0,1fr)_150px] sm:gap-3 sm:px-3",
+                        isSelected ? "bg-indigo-500/[0.09]" : "hover:bg-white/[0.035]",
                       )}
-                      style={{ top: index * ROW_HEIGHT, minHeight: 64 }}
                     >
-                      <div className="relative h-12">
-                        <span
-                          className={cn("absolute rounded-full border-2 bg-[#0f1011] transition group-hover:scale-110", isSelected ? "h-5 w-5" : "h-4 w-4")}
-                          style={{
-                            left: point.x - 8,
-                            top: 15,
-                            borderColor: branch.color,
-                            boxShadow: `0 0 0 5px ${branch.glow}, 0 0 18px ${branch.glow}`,
-                          }}
-                        />
-                        <span className="absolute top-[17px] hidden font-mono text-[10px] text-gray-600 sm:block" style={{ left: GRAPH_LEFT + 4 * LANE_WIDTH + 12 }}>
-                          {branch.label}
-                        </span>
+                      <div className="relative min-h-[72px] py-0">
+                        <div className="relative h-full sm:hidden" style={{ marginLeft: mobileDepth * 10 }}>
+                          {!isFirst && <span className="absolute left-[13px] top-0 h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: parentVisible ? 0.72 : 0.22 }} />}
+                          {!isLast && <span className="absolute bottom-0 left-[13px] h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: 0.42 }} />}
+                          <span
+                            className={cn("absolute left-[6px] top-1/2 h-4 w-4 -translate-y-1/2 rounded-full border-2 bg-[#0f1011] transition group-hover:scale-110", isSelected && "h-5 w-5 left-[5px]")}
+                            style={{ borderColor: branch.color, boxShadow: `0 0 0 4px ${branch.glow}, 0 0 16px ${branch.glow}` }}
+                          />
+                        </div>
+                        <div className="relative hidden h-full sm:block" style={{ marginLeft: desktopDepth * 15 }}>
+                          {!isFirst && <span className="absolute left-[16px] top-0 h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: parentVisible ? 0.72 : 0.22 }} />}
+                          {!isLast && <span className="absolute bottom-0 left-[16px] h-1/2 w-px" style={{ backgroundColor: branch.color, opacity: 0.42 }} />}
+                          <span
+                            className={cn("absolute left-[8px] top-1/2 h-4 w-4 -translate-y-1/2 rounded-full border-2 bg-[#0f1011] transition group-hover:scale-110", isSelected && "h-5 w-5 left-[7px]")}
+                            style={{ borderColor: branch.color, boxShadow: `0 0 0 5px ${branch.glow}, 0 0 18px ${branch.glow}` }}
+                          />
+                          <span className="absolute left-8 top-1/2 -translate-y-1/2 font-mono text-[10px] text-gray-600">{branch.label}</span>
+                        </div>
                       </div>
 
-                      <div className="min-w-0">
+                      <div className="min-w-0 py-3">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
                           <span className="truncate text-sm font-medium tracking-[-0.01em] text-gray-100">{exp.shortName}</span>
                           <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.status])}>{exp.status}</span>
                           {branchForks > 0 && <span className="rounded border border-white/[0.06] bg-white/[0.03] px-1.5 py-0.5 text-[10px] text-gray-400">{branchForks} forks</span>}
+                          {parentName && <span className="hidden rounded border border-white/[0.05] bg-black/20 px-1.5 py-0.5 font-mono text-[10px] text-gray-500 sm:inline">↳ {parentName}</span>}
                         </div>
                         <div className="mt-1 flex min-w-0 flex-wrap gap-1">
                           {changedLabels.map((label) => (
@@ -480,16 +475,16 @@ export default function ExperimentLineageDemo() {
                               {label}
                             </span>
                           ))}
+                          <span className={cn("rounded border px-1.5 py-0.5 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
                           <span className="hidden truncate text-xs text-gray-500 md:inline">{exp.hypothesis}</span>
                         </div>
                       </div>
 
-                      <div className="hidden items-center justify-end gap-2 sm:flex">
+                      <div className="hidden items-center justify-end gap-2 py-3 sm:flex">
                         <div className="text-right">
                           <div className="font-mono text-xs text-gray-200">zN {exp.metrics.zN}</div>
                           <div className="font-mono text-[10px] text-gray-500">loss {exp.metrics.eval_loss}</div>
                         </div>
-                        <span className={cn("rounded-md border px-2 py-1 text-[10px] uppercase", BADGE[exp.decision ?? "note"])}>{exp.decision ?? "open"}</span>
                       </div>
                     </button>
                   );
