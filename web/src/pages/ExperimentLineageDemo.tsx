@@ -1,4 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import {
+  Controls,
+  Handle,
+  Position,
+  ReactFlow,
+  ReactFlowProvider,
+  useViewport,
+  type Edge as FlowEdge,
+  type Node as FlowNode,
+  type NodeProps,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 
 type DemoDecision = "keep" | "drop" | "rerun" | "fork";
 type DemoEventKind = "created" | "forked" | "note" | "decision" | "task_failed" | "resumed" | "metric_best" | "checkpoint";
@@ -624,7 +636,6 @@ const CANVAS_W = 1180;
 const BAND_H = 116;
 const BAND_GAP = 28;
 const DOT_R = 6;
-const DOT_HIT = 30;
 const STAGE_LABEL_W = 184;
 const RAIL_START_X = 50;
 const RUN_GAP_X = 58;
@@ -799,136 +810,228 @@ function buildCanvasGraph(
   return { bands, nodes, edges };
 }
 
-function edgePath(
-  _edge: CanvasEdge,
-  source: CanvasRunNode,
-  targetBand: CanvasStageBand,
-  targetRun?: CanvasRunNode,
-): string {
-  const sx = source.dotX;
-  const sy = source.dotY;
-  const tx = targetRun ? targetRun.dotX : RAIL_START_X;
-  const ty = targetRun ? targetRun.dotY : targetBand.y + BAND_H / 2;
-  const bandSpan = targetBand.bandIndex - source.bandIndex;
+const DOT_NODE_SIZE = 24;
+const BAND_NODE_W = CANVAS_W - 16;
+const FLOW_PAD = 32;
 
-  // Same-stage sibling runs are not Bezier branches. The row rail already
-  // provides the visual lane, so the explicit edge is a short straight join.
-  if (bandSpan === 0) {
-    return `M ${sx} ${sy} L ${tx} ${ty}`;
-  }
+const HANDLE_STYLE: CSSProperties = {
+  width: 1,
+  height: 1,
+  minWidth: 1,
+  minHeight: 1,
+  opacity: 0,
+  background: "transparent",
+  border: "none",
+  pointerEvents: "none",
+};
 
-  // Cross-stage branches use a commit-graph elbow: vertical down the source
-  // lane, horizontal into the target lane, then vertical to the target dot.
-  // This avoids the strange spaghetti curves that cut through empty space.
-  const midY = sy + (ty - sy) * 0.5;
-  return `M ${sx} ${sy} L ${sx} ${midY} L ${tx} ${midY} L ${tx} ${ty}`;
-}
-
-function GraphRunNode({
-  node,
-  onClick,
-}: {
+type DotNodeData = {
   node: CanvasRunNode;
-  onClick: () => void;
-}) {
-  const branch = BRANCH[node.exp.branch];
-  const ringColor = node.selected ? branch.glow : "transparent";
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={node.selected}
-      aria-label={`Open ${node.exp.name} graph dot`}
-      title={`${node.exp.shortName} · zN ${node.exp.metrics.zN} · ${node.exp.status}`}
-      className={cn(
-        "absolute z-20 grid place-items-center rounded-full transition",
-        node.selected ? "bg-white/[0.06]" : "hover:bg-white/[0.045]",
-        node.muted && !node.selected && "opacity-45 hover:opacity-80",
-      )}
-      style={{
-        left: node.dotX - DOT_HIT / 2,
-        top: node.dotY - DOT_HIT / 2,
-        width: DOT_HIT,
-        height: DOT_HIT,
-      }}
-    >
-      <span
-        className={cn(
-          "block rounded-full border",
-          node.selected ? "border-white/85" : "border-black/40",
-        )}
-        style={{
-          width: DOT_R * 2,
-          height: DOT_R * 2,
-          backgroundColor: branch.color,
-          boxShadow: node.selected ? `0 0 0 5px ${ringColor}, 0 0 18px ${branch.color}` : `0 0 10px ${branch.glow}`,
-        }}
-      />
-    </button>
-  );
-}
+  selected: boolean;
+  onSelect: (id: string) => void;
+};
 
-function GraphStageBand({
-  band,
-  promotedRun,
-  parentRun,
-}: {
-  band: CanvasStageBand;
-  promotedRun?: DemoExperiment;
-  parentRun?: DemoExperiment;
-}) {
-  const state = band.stage.state ?? "active";
+type DotFlowNode = FlowNode<DotNodeData, "dot">;
+
+function DotNode({ data }: NodeProps<DotFlowNode>) {
+  const { node, selected, onSelect } = data;
+  const branch = BRANCH[node.exp.branch];
   return (
     <div
       className={cn(
-        "absolute rounded-2xl border",
-        band.folded
-          ? "border-dashed border-white/[0.05] bg-white/[0.012]"
-          : "border-white/[0.06] bg-white/[0.02]",
-        band.selected && "ring-1 ring-indigo-400/25",
+        "grid h-full w-full place-items-center rounded-full transition",
+        selected ? "bg-white/[0.06]" : "hover:bg-white/[0.045]",
+        node.muted && !selected && "opacity-45 hover:opacity-80",
       )}
-      style={{
-        left: 8,
-        top: band.y,
-        width: CANVAS_W - 16,
-        height: band.height,
-      }}
     >
-      <div
-        className="absolute top-0 flex h-full flex-col gap-1.5 overflow-hidden px-3 py-3"
-        style={{ left: STAGE_LABEL_W, width: CANVAS_W - STAGE_LABEL_W - 28 }}
+      <Handle id="top" type="target" position={Position.Top} style={HANDLE_STYLE} isConnectable={false} />
+      <Handle id="left" type="target" position={Position.Left} style={HANDLE_STYLE} isConnectable={false} />
+      <Handle id="bottom" type="source" position={Position.Bottom} style={HANDLE_STYLE} isConnectable={false} />
+      <Handle id="right" type="source" position={Position.Right} style={HANDLE_STYLE} isConnectable={false} />
+      <button
+        type="button"
+        onClick={() => onSelect(node.id)}
+        aria-pressed={selected}
+        aria-label={`Open ${node.exp.name} graph dot`}
+        title={`${node.exp.shortName} · zN ${node.exp.metrics.zN} · ${node.exp.status}`}
+        className="grid h-full w-full cursor-pointer place-items-center rounded-full bg-transparent"
       >
-        <div className="flex flex-wrap items-center gap-1.5">
-          <h3 className={cn("min-w-0 truncate text-xs font-semibold tracking-[-0.01em]", band.folded ? "text-gray-400" : "text-gray-100")}>{band.stage.title}</h3>
-          <span className={cn("rounded border px-1 py-px text-[9px] uppercase leading-none", STAGE_STATE_BADGE[state])}>{state}</span>
-        </div>
-        <p className="line-clamp-3 text-[10px] leading-snug text-gray-500">{band.stage.purpose}</p>
-        <div className="mt-auto flex flex-wrap items-center gap-1 text-[10px] text-gray-500">
-          <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-px">
-            {band.stage.runIds.length} run{band.stage.runIds.length > 1 ? "s" : ""}
-          </span>
-          {promotedRun && (
-            <span className="max-w-[140px] truncate rounded-full border border-emerald-400/25 bg-emerald-500/10 px-1.5 py-px text-emerald-200">
-              ↑ {promotedRun.shortName}
-            </span>
+        <span
+          className={cn(
+            "block rounded-full border",
+            selected ? "border-white/85" : "border-black/40",
           )}
-          {parentRun && (
-            <span className="max-w-[140px] truncate rounded border border-white/[0.05] bg-black/20 px-1.5 py-px font-mono text-gray-500">
-              ↳ {parentRun.shortName}
-            </span>
-          )}
-          {band.hiddenFoldedCount > 0 && (
-            <span className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-px text-amber-200">
-              +{band.hiddenFoldedCount} folded
-            </span>
-          )}
-        </div>
+          style={{
+            width: DOT_R * 2,
+            height: DOT_R * 2,
+            backgroundColor: branch.color,
+            boxShadow: selected
+              ? `0 0 0 5px ${branch.glow}, 0 0 18px ${branch.color}`
+              : `0 0 10px ${branch.glow}`,
+          }}
+        />
+      </button>
+    </div>
+  );
+}
+
+const nodeTypes = { dot: DotNode };
+
+function BandsLayer({
+  bands,
+  expById,
+  totalH,
+}: {
+  bands: CanvasStageBand[];
+  expById: Map<string, DemoExperiment>;
+  totalH: number;
+}) {
+  const { x, y, zoom } = useViewport();
+  return (
+    <div className="pointer-events-none absolute inset-0 overflow-hidden">
+      <div
+        style={{
+          transform: `translate(${x}px, ${y}px) scale(${zoom})`,
+          transformOrigin: "0 0",
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: CANVAS_W,
+          height: totalH,
+        }}
+      >
+        {bands.map((band) => {
+          const promotedRun = band.stage.promotedRunId ? expById.get(band.stage.promotedRunId) : undefined;
+          const parentRun = band.stage.parentRunId ? expById.get(band.stage.parentRunId) : undefined;
+          const state = band.stage.state ?? "active";
+          const visibleCount = band.visibleRunIds.length;
+          const railY = BAND_H / 2;
+          const railX1 = visibleCount > 0 ? getDotX(0) - 18 - 8 : 0;
+          const railX2 = visibleCount > 0 ? getDotX(visibleCount - 1) + 18 - 8 : 0;
+          return (
+            <div
+              key={band.id}
+              className={cn(
+                "absolute rounded-2xl border",
+                band.folded ? "border-dashed border-white/[0.05] bg-white/[0.012]" : "border-white/[0.06] bg-white/[0.02]",
+                band.selected && "ring-1 ring-indigo-400/25",
+              )}
+              style={{ left: 8, top: band.y, width: BAND_NODE_W, height: band.height }}
+            >
+              <div
+                className="absolute top-0 flex h-full flex-col gap-1.5 overflow-hidden px-3 py-3"
+                style={{ left: STAGE_LABEL_W, width: BAND_NODE_W - STAGE_LABEL_W - 12 }}
+              >
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <h3 className={cn("min-w-0 truncate text-xs font-semibold tracking-[-0.01em]", band.folded ? "text-gray-400" : "text-gray-100")}>{band.stage.title}</h3>
+                  <span className={cn("rounded border px-1 py-px text-[9px] uppercase leading-none", STAGE_STATE_BADGE[state])}>{state}</span>
+                </div>
+                <p className="line-clamp-3 text-[10px] leading-snug text-gray-500">{band.stage.purpose}</p>
+                <div className="mt-auto flex flex-wrap items-center gap-1 text-[10px] text-gray-500">
+                  <span className="rounded border border-white/[0.05] bg-black/20 px-1.5 py-px">
+                    {band.stage.runIds.length} run{band.stage.runIds.length > 1 ? "s" : ""}
+                  </span>
+                  {promotedRun && (
+                    <span className="max-w-[140px] truncate rounded-full border border-emerald-400/25 bg-emerald-500/10 px-1.5 py-px text-emerald-200">
+                      ↑ {promotedRun.shortName}
+                    </span>
+                  )}
+                  {parentRun && (
+                    <span className="max-w-[140px] truncate rounded border border-white/[0.05] bg-black/20 px-1.5 py-px font-mono text-gray-500">
+                      ↳ {parentRun.shortName}
+                    </span>
+                  )}
+                  {band.hiddenFoldedCount > 0 && (
+                    <span className="rounded border border-amber-400/25 bg-amber-500/10 px-1.5 py-px text-amber-200">
+                      +{band.hiddenFoldedCount} folded
+                    </span>
+                  )}
+                </div>
+              </div>
+              {visibleCount > 0 && (
+                <svg
+                  className="pointer-events-none absolute inset-0"
+                  width={BAND_NODE_W}
+                  height={band.height}
+                  aria-hidden
+                >
+                  <line
+                    x1={railX1}
+                    y1={railY}
+                    x2={railX2}
+                    y2={railY}
+                    stroke="#27272a"
+                    strokeWidth={1.4}
+                    strokeLinecap="round"
+                    opacity={band.folded ? 0.35 : 0.62}
+                  />
+                </svg>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
 }
 
-function GraphCanvas({
+function buildFlow(
+  bands: CanvasStageBand[],
+  nodes: CanvasRunNode[],
+  edges: CanvasEdge[],
+  selectedRunId: string,
+  onSelectRun: (id: string) => void,
+): { flowNodes: DotFlowNode[]; flowEdges: FlowEdge[] } {
+  const bandById = new Map(bands.map((b) => [b.id, b]));
+  const flowNodes: DotFlowNode[] = nodes.map((n) => ({
+    id: n.id,
+    type: "dot",
+    position: { x: n.dotX - DOT_NODE_SIZE / 2, y: n.dotY - DOT_NODE_SIZE / 2 },
+    data: { node: n, selected: n.id === selectedRunId, onSelect: onSelectRun },
+    width: DOT_NODE_SIZE,
+    height: DOT_NODE_SIZE,
+    draggable: false,
+    selectable: false,
+    connectable: false,
+    deletable: false,
+  }));
+
+  const nodeById = new Map(nodes.map((n) => [n.id, n]));
+  const flowEdges: FlowEdge[] = edges.flatMap((edge) => {
+    const source = nodeById.get(edge.fromRunId);
+    if (!source) return [];
+    const targetBand = bandById.get(edge.toStageId);
+    if (!targetBand) return [];
+    const targetRun = edge.toRunId ? nodeById.get(edge.toRunId) : undefined;
+    if (!targetRun) return [];
+    const sameBand = source.stageId === targetRun.stageId;
+    const isSelectedEdge = edge.fromRunId === selectedRunId || edge.toRunId === selectedRunId;
+    const stroke = edge.emphasized ? "#7c7cff" : isSelectedEdge ? "#a5b4fc" : "#3f3f46";
+    const strokeWidth = edge.emphasized ? 2.5 : isSelectedEdge ? 2.25 : 1.75;
+    const opacity = edge.muted ? 0.35 : edge.emphasized ? 0.95 : isSelectedEdge ? 0.95 : 0.72;
+    return [
+      {
+        id: edge.id,
+        source: edge.fromRunId,
+        target: targetRun.id,
+        sourceHandle: sameBand ? "right" : "bottom",
+        targetHandle: sameBand ? "left" : "top",
+        type: sameBand ? "straight" : "smoothstep",
+        pathOptions: sameBand ? undefined : { borderRadius: 6 },
+        style: {
+          stroke,
+          strokeWidth,
+          opacity,
+          strokeDasharray: edge.muted ? "5 4" : undefined,
+        },
+      } as FlowEdge,
+    ];
+  });
+
+  return { flowNodes, flowEdges };
+}
+
+function LineageFlow({
   bands,
   nodes,
   edges,
@@ -943,103 +1046,48 @@ function GraphCanvas({
   expById: Map<string, DemoExperiment>;
   onSelectRun: (id: string) => void;
 }) {
-  const scrollerRef = useRef<HTMLDivElement>(null);
-  const nodeById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
-  const bandById = useMemo(() => new Map(bands.map((b) => [b.id, b])), [bands]);
   const totalH = bands.length === 0
-    ? 120
+    ? 200
     : bands[bands.length - 1].y + BAND_H + CANVAS_PAD_Y;
 
-  useEffect(() => {
-    const scroller = scrollerRef.current;
-    const selectedNode = nodeById.get(selectedRunId);
-    if (!scroller || !selectedNode || scroller.clientWidth >= CANVAS_W) return;
-    scroller.scrollTo({ left: Math.max(0, selectedNode.dotX - 120), behavior: "auto" });
-  }, [nodeById, selectedRunId]);
+  const { flowNodes, flowEdges } = useMemo(
+    () => buildFlow(bands, nodes, edges, selectedRunId, onSelectRun),
+    [bands, nodes, edges, selectedRunId, onSelectRun],
+  );
 
   return (
-    <div ref={scrollerRef} className="overflow-x-auto overflow-y-hidden">
+    <ReactFlowProvider>
       <div
-        className="relative"
-        style={{ width: CANVAS_W, minWidth: CANVAS_W, height: totalH }}
+        className="relative w-full bg-[radial-gradient(circle_at_1px_1px,rgba(255,255,255,0.045)_1px,transparent_0)] [background-size:20px_20px]"
+        style={{ height: Math.max(totalH + FLOW_PAD * 2, 360) }}
       >
-        {bands.map((band) => (
-          <GraphStageBand
-            key={band.id}
-            band={band}
-            promotedRun={band.stage.promotedRunId ? expById.get(band.stage.promotedRunId) : undefined}
-            parentRun={band.stage.parentRunId ? expById.get(band.stage.parentRunId) : undefined}
-          />
-        ))}
-        <svg
-          width={CANVAS_W}
-          height={totalH}
-          className="pointer-events-none absolute inset-0"
-          aria-hidden
+        <BandsLayer bands={bands} expById={expById} totalH={totalH} />
+        <ReactFlow
+          nodes={flowNodes}
+          edges={flowEdges}
+          nodeTypes={nodeTypes}
+          colorMode="dark"
+          style={{ background: "transparent" }}
+          defaultViewport={{ x: -24, y: FLOW_PAD, zoom: 1 }}
+          minZoom={0.25}
+          maxZoom={2}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          edgesFocusable={false}
+          panOnScroll
+          zoomOnPinch
+          panOnDrag
+          selectNodesOnDrag={false}
+          translateExtent={[
+            [-CANVAS_W * 0.5, -totalH * 0.5],
+            [CANVAS_W * 1.5, totalH * 1.5],
+          ]}
         >
-          {bands.map((band) => {
-            const bandNodes = nodes.filter((node) => node.stageId === band.id);
-            if (bandNodes.length === 0) return null;
-            const x1 = Math.min(...bandNodes.map((node) => node.dotX));
-            const x2 = Math.max(...bandNodes.map((node) => node.dotX));
-            const y = getDotY(band.bandIndex);
-            return (
-              <line
-                key={`${band.id}-rail`}
-                x1={x1 - 18}
-                y1={y}
-                x2={x2 + 18}
-                y2={y}
-                stroke="#27272a"
-                strokeWidth={1.4}
-                strokeLinecap="round"
-                opacity={band.folded ? 0.35 : 0.62}
-              />
-            );
-          })}
-          {edges.map((edge) => {
-            const source = nodeById.get(edge.fromRunId);
-            const target = bandById.get(edge.toStageId);
-            const targetRun = edge.toRunId ? nodeById.get(edge.toRunId) : undefined;
-            if (!source || !target) return null;
-            const isSelectedEdge = edge.fromRunId === selectedRunId || edge.toRunId === selectedRunId;
-            const stroke = edge.emphasized
-              ? "#7c7cff"
-              : isSelectedEdge
-                ? "#a5b4fc"
-                : "#3f3f46";
-            const width = edge.emphasized ? 2.5 : isSelectedEdge ? 2.25 : 1.75;
-            const opacity = edge.muted
-              ? 0.35
-              : edge.emphasized
-                ? 0.95
-                : isSelectedEdge
-                  ? 0.95
-                  : 0.72;
-            return (
-              <path
-                key={edge.id}
-                d={edgePath(edge, source, target, targetRun)}
-                stroke={stroke}
-                strokeWidth={width}
-                fill="none"
-                opacity={opacity}
-                strokeDasharray={edge.muted ? "5 4" : undefined}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            );
-          })}
-        </svg>
-        {nodes.map((node) => (
-          <GraphRunNode
-            key={node.id}
-            node={node}
-            onClick={() => onSelectRun(node.id)}
-          />
-        ))}
+          <Controls showInteractive={false} />
+        </ReactFlow>
       </div>
-    </div>
+    </ReactFlowProvider>
   );
 }
 
@@ -1328,7 +1376,7 @@ export default function ExperimentLineageDemo() {
 
             <div className="p-2 sm:p-3">
               <div className="rounded-xl border border-white/[0.05] bg-black/15">
-                <GraphCanvas
+                <LineageFlow
                   bands={bands}
                   nodes={nodes}
                   edges={edges}
