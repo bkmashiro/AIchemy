@@ -125,6 +125,125 @@ function timelineFor(exp: Experiment): ExperimentEvent[] {
   return [...stored, ...synthesized].sort((a, b) => a.created_at.localeCompare(b.created_at));
 }
 
+// ─── Lineage helpers (tree / compare / summary) ─────────────────────────────
+
+export interface ExperimentBrief {
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  family: string | null;
+  parent_id: string | null;
+  decision: ExperimentDecision | null;
+  created_at: string;
+}
+
+export interface MetricAggregate {
+  count: number;
+  values: number[];
+  min: number;
+  max: number;
+  mean: number;
+  best: number;
+  passed: number;
+  failed: number;
+}
+
+export interface PassFailSummary {
+  total: number;
+  passed: number;
+  failed: number;
+}
+
+export function experimentBrief(exp: Experiment): ExperimentBrief {
+  return {
+    id: exp.id,
+    name: exp.name,
+    status: deriveExperimentStatus(exp),
+    family: exp.family ?? null,
+    parent_id: exp.parent_id ?? null,
+    decision: exp.decision ?? null,
+    created_at: exp.created_at,
+  };
+}
+
+function compareExperiments(a: Experiment, b: Experiment): number {
+  if (a.created_at !== b.created_at) return a.created_at.localeCompare(b.created_at);
+  if (a.name !== b.name) return a.name.localeCompare(b.name);
+  return a.id.localeCompare(b.id);
+}
+
+export function aggregateMetrics(exp: Experiment): Record<string, MetricAggregate> {
+  const out: Record<string, MetricAggregate> = {};
+  const buckets = new Map<string, { values: number[]; passed: number; failed: number }>();
+  for (const validation of Object.values(exp.results)) {
+    for (const [metric, detail] of Object.entries(validation.details)) {
+      let bucket = buckets.get(metric);
+      if (!bucket) {
+        bucket = { values: [], passed: 0, failed: 0 };
+        buckets.set(metric, bucket);
+      }
+      bucket.values.push(detail.value);
+      if (detail.ok) bucket.passed += 1;
+      else bucket.failed += 1;
+    }
+  }
+  for (const [metric, bucket] of buckets.entries()) {
+    const values = bucket.values;
+    const count = values.length;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const mean = values.reduce((s, v) => s + v, 0) / count;
+    const expr = exp.criteria?.[metric];
+    let best = max;
+    if (expr) {
+      const trimmed = expr.trim();
+      if (trimmed.startsWith("<")) best = min;
+      else if (trimmed.startsWith(">")) best = max;
+    }
+    out[metric] = {
+      count,
+      values,
+      min,
+      max,
+      mean,
+      best,
+      passed: bucket.passed,
+      failed: bucket.failed,
+    };
+  }
+  return out;
+}
+
+export function passFailSummary(exp: Experiment): PassFailSummary {
+  const results = Object.values(exp.results);
+  const passed = results.filter((r) => r.passed).length;
+  return {
+    total: results.length,
+    passed,
+    failed: results.length - passed,
+  };
+}
+
+function bestMetricValues(exp: Experiment): Record<string, number> {
+  const agg = aggregateMetrics(exp);
+  const out: Record<string, number> = {};
+  for (const [metric, info] of Object.entries(agg)) {
+    out[metric] = info.best;
+  }
+  return out;
+}
+
+function taskCountsByStatus(exp: Experiment): Record<string, number> {
+  const grid = store.getGrid(exp.grid_id);
+  if (!grid) return {};
+  const tasks = store.getGridTasks(exp.grid_id);
+  const counts: Record<string, number> = {};
+  for (const task of tasks) {
+    counts[task.status] = (counts[task.status] ?? 0) + 1;
+  }
+  return counts;
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Router {
@@ -389,6 +508,104 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       status: deriveExperimentStatus(exp),
     }));
     res.json(experiments);
+  });
+
+  // GET /experiments/tree — parent_id forest of experiments
+  // NOTE: must be registered before /:id so Express does not capture "tree" as an id.
+  router.get("/tree", (_req: Request, res: Response) => {
+    const all = store.getAllExperiments();
+    const knownIds = new Set(all.map((e) => e.id));
+    const childrenByParent = new Map<string, Experiment[]>();
+    const roots: Experiment[] = [];
+
+    for (const exp of all) {
+      if (exp.parent_id && knownIds.has(exp.parent_id)) {
+        const bucket = childrenByParent.get(exp.parent_id) ?? [];
+        bucket.push(exp);
+        childrenByParent.set(exp.parent_id, bucket);
+      } else {
+        roots.push(exp);
+      }
+    }
+
+    const build = (exp: Experiment): any => {
+      const kids = (childrenByParent.get(exp.id) ?? []).slice().sort(compareExperiments);
+      return {
+        ...experimentBrief(exp),
+        children: kids.map(build),
+      };
+    };
+
+    const tree = roots.slice().sort(compareExperiments).map(build);
+    res.json({ roots: tree });
+  });
+
+  // GET /experiments/compare?ids=a,b,c — side-by-side comparison
+  // NOTE: must be registered before /:id.
+  router.get("/compare", (req: Request, res: Response) => {
+    const raw = req.query.ids;
+    const idsParam = Array.isArray(raw) ? raw.join(",") : typeof raw === "string" ? raw : "";
+    const ids = idsParam.split(",").map((s) => s.trim()).filter(Boolean);
+    if (ids.length === 0) {
+      res.status(400).json({ error: "ids query parameter required (comma-separated experiment IDs)" });
+      return;
+    }
+
+    const missing: string[] = [];
+    const experiments: Experiment[] = [];
+    for (const id of ids) {
+      const exp = store.getExperiment(id);
+      if (!exp) missing.push(id);
+      else experiments.push(exp);
+    }
+    if (missing.length > 0) {
+      res.status(404).json({ error: "Experiment(s) not found", missing });
+      return;
+    }
+
+    const items = experiments.map((exp) => ({
+      ...experimentBrief(exp),
+      config: exp.config ?? null,
+      metrics: aggregateMetrics(exp),
+      criteria: exp.criteria ?? {},
+      pass_fail: passFailSummary(exp),
+    }));
+    res.json({ ids, experiments: items });
+  });
+
+  // GET /experiments/:id/summary — detailed summary including lineage
+  // Registered before /:id-with-no-suffix is fine because path segments differ.
+  router.get("/:id/summary", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+
+    const parent = exp.parent_id ? store.getExperiment(exp.parent_id) : undefined;
+    const children = store.getAllExperiments()
+      .filter((e) => e.parent_id === exp.id)
+      .sort(compareExperiments);
+    const eventCount = store.getExperimentEvents(exp.id).filter((e) => !e.deleted_at).length;
+
+    res.json({
+      id: exp.id,
+      name: exp.name,
+      status: deriveExperimentStatus(exp),
+      family: exp.family ?? null,
+      hypothesis: exp.hypothesis ?? null,
+      expected_outcome: exp.expected_outcome ?? null,
+      fork_reason: exp.fork_reason ?? null,
+      decision: exp.decision ?? null,
+      decision_reason: exp.decision_reason ?? null,
+      decision_at: exp.decision_at ?? null,
+      created_at: exp.created_at,
+      parent: parent ? experimentBrief(parent) : null,
+      children: children.map(experimentBrief),
+      task_counts: taskCountsByStatus(exp),
+      validation: passFailSummary(exp),
+      best_metrics: bestMetricValues(exp),
+      timeline_event_count: eventCount,
+      config: exp.config ?? null,
+      config_diff: exp.config_diff ?? null,
+    });
   });
 
   // GET /experiments/:id

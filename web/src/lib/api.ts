@@ -381,6 +381,71 @@ export interface AddEventPayload {
   data?: Record<string, any>;
 }
 
+export interface ExperimentBrief {
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  family: string | null;
+  parent_id: string | null;
+  decision: ExperimentDecision | null;
+  created_at: string;
+}
+
+export interface ExperimentTreeNode extends ExperimentBrief {
+  children: ExperimentTreeNode[];
+}
+
+export interface ExperimentMetricAggregate {
+  count: number;
+  values: number[];
+  min: number;
+  max: number;
+  mean: number;
+  best: number;
+  passed: number;
+  failed: number;
+}
+
+export interface ExperimentPassFailSummary {
+  total: number;
+  passed: number;
+  failed: number;
+}
+
+export interface ExperimentCompareItem extends ExperimentBrief {
+  config: Record<string, any> | null;
+  metrics: Record<string, ExperimentMetricAggregate>;
+  criteria: Record<string, string>;
+  pass_fail: ExperimentPassFailSummary;
+}
+
+export interface ExperimentCompareResponse {
+  ids: string[];
+  experiments: ExperimentCompareItem[];
+}
+
+export interface ExperimentSummaryResponse {
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  family: string | null;
+  hypothesis: string | null;
+  expected_outcome: string | null;
+  fork_reason: string | null;
+  decision: ExperimentDecision | null;
+  decision_reason: string | null;
+  decision_at: string | null;
+  created_at: string;
+  parent: ExperimentBrief | null;
+  children: ExperimentBrief[];
+  task_counts: Record<string, number>;
+  validation: ExperimentPassFailSummary;
+  best_metrics: Record<string, number>;
+  timeline_event_count: number;
+  config: Record<string, any> | null;
+  config_diff: Record<string, { old: any; new: any }> | null;
+}
+
 export const experimentsApi = {
   list: () => api.get<Experiment[]>("/experiments").then((r) => r.data),
   get: (id: string) => api.get<ExperimentDetail>(`/experiments/${id}`).then((r) => r.data),
@@ -403,6 +468,14 @@ export const experimentsApi = {
     api
       .patch<Experiment>(`/experiments/${id}/decision`, { decision, reason })
       .then((r) => r.data),
+  getTree: () =>
+    api.get<{ roots: ExperimentTreeNode[] }>("/experiments/tree").then((r) => r.data.roots),
+  compare: (ids: string[]) =>
+    api
+      .get<ExperimentCompareResponse>("/experiments/compare", { params: { ids: ids.join(",") } })
+      .then((r) => r.data),
+  getSummary: (id: string) =>
+    api.get<ExperimentSummaryResponse>(`/experiments/${id}/summary`).then((r) => r.data),
 };
 
 // ─── Cost API ─────────────────────────────────────────────────────────────────
