@@ -92,6 +92,10 @@ class Experiment:
         *,
         description: str = "",
         server: Optional[str] = None,
+        family: Optional[str] = None,
+        hypothesis: Optional[str] = None,
+        expected_outcome: Optional[str] = None,
+        fork_reason: Optional[str] = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -102,6 +106,10 @@ class Experiment:
 
         # Config + lineage
         self.config: dict[str, Any] = {}
+        self.family = family
+        self.hypothesis = hypothesis
+        self.expected_outcome = expected_outcome
+        self.fork_reason = fork_reason
         self._parent_name: Optional[str] = None
         self._parent_config: Optional[dict[str, Any]] = None  # snapshot for diff
 
@@ -151,9 +159,15 @@ class Experiment:
         self._tasks.append(node)
         return node
 
-    def fork(self, name: str, *, description: str = "") -> "Experiment":
+    def fork(self, name: str, *, description: str = "", reason: str = "") -> "Experiment":
         """Create a child experiment by deep-copying config and task structure."""
-        child = Experiment(name, description=description, server=self._server)
+        child = Experiment(
+            name,
+            description=description,
+            server=self._server,
+            family=self.family,
+            fork_reason=reason or None,
+        )
         child.config = copy.deepcopy(self.config)
         child._parent_name = self.name
         child._parent_config = copy.deepcopy(self.config)
@@ -196,6 +210,10 @@ class Experiment:
             config=self.config if self.config else None,
             config_diff=self._compute_config_diff(),
             parent_name=self._parent_name,
+            family=self.family,
+            hypothesis=self.hypothesis,
+            expected_outcome=self.expected_outcome,
+            fork_reason=self.fork_reason,
         )
 
         # Backfill task_ids

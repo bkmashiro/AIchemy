@@ -44,3 +44,17 @@ export const meta = sqliteTable("meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
 });
+
+export const experimentEvents = sqliteTable("experiment_events", {
+  id: text("id").primaryKey(),
+  experiment_id: text("experiment_id").notNull(),
+  task_id: text("task_id"),
+  kind: text("kind").notNull(),
+  message: text("message").notNull(),
+  actor: text("actor"),
+  data_json: text("data_json"),
+  created_at: text("created_at").notNull(),
+  deleted_at: text("deleted_at"),
+}, (table) => [
+  index("idx_experiment_events_experiment_time").on(table.experiment_id, table.created_at),
+]);

@@ -253,6 +253,32 @@ export interface TaskValidation {
   details: Record<string, CriterionResult>;
 }
 
+export type ExperimentDecision = "keep" | "drop" | "rerun" | "fork";
+
+export type ExperimentEventKind =
+  | "created"
+  | "forked"
+  | "task_started"
+  | "task_completed"
+  | "task_failed"
+  | "resumed"
+  | "moved_stub"
+  | "metric_best"
+  | "note"
+  | "decision";
+
+export interface ExperimentEvent {
+  id: string;
+  experiment_id: string;
+  task_id?: string;
+  kind: ExperimentEventKind;
+  message: string;
+  created_at: string;
+  actor?: string;
+  data?: Record<string, any>;
+  deleted_at?: string;
+}
+
 export interface Experiment {
   id: string;
   name: string;
@@ -268,7 +294,16 @@ export interface Experiment {
   config?: Record<string, any>;                           // Full config snapshot
   config_diff?: Record<string, { old: any; new: any }>;   // Diff against parent
   parent_name?: string;                                    // Fork source experiment name
-  parent_id?: string;                                      // Fork source experiment ID (best-effort)
+  parent_id?: string;                                      // Fork source experiment ID (write-time frozen)
+  // Research intent
+  family?: string;
+  hypothesis?: string;
+  expected_outcome?: string;
+  fork_reason?: string;
+  // Decision metadata (undefined = never decided)
+  decision?: ExperimentDecision;
+  decision_reason?: string;
+  decision_at?: string;
   // Git tracking
   git_tracking?: boolean;                                  // Enable git manifest tracking
   git_repo_path?: string;                                  // Absolute path to git repo on stub

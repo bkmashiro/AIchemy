@@ -18,6 +18,10 @@ def submit_experiment(
     config: Optional[dict[str, Any]] = None,
     config_diff: Optional[dict[str, Any]] = None,
     parent_name: Optional[str] = None,
+    family: Optional[str] = None,
+    hypothesis: Optional[str] = None,
+    expected_outcome: Optional[str] = None,
+    fork_reason: Optional[str] = None,
 ) -> ExperimentResult:
     url = f"{server.rstrip('/')}/api/experiments"
     payload: dict[str, Any] = {
@@ -34,6 +38,14 @@ def submit_experiment(
         payload["config_diff"] = config_diff
     if parent_name is not None:
         payload["parent_name"] = parent_name
+    if family is not None:
+        payload["family"] = family
+    if hypothesis is not None:
+        payload["hypothesis"] = hypothesis
+    if expected_outcome is not None:
+        payload["expected_outcome"] = expected_outcome
+    if fork_reason is not None:
+        payload["fork_reason"] = fork_reason
 
     body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})

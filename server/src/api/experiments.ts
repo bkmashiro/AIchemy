@@ -12,7 +12,7 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { store } from "../store";
-import { Experiment, Grid, Task, TaskSpec } from "../types";
+import { Experiment, ExperimentDecision, ExperimentEvent, ExperimentEventKind, Grid, Task, TaskSpec } from "../types";
 import { Namespace } from "socket.io";
 import { createTask } from "./tasks";
 import { triggerSchedule } from "../scheduler";
@@ -62,6 +62,69 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
   return "running";
 }
 
+const DECISIONS = new Set<ExperimentDecision>(["keep", "drop", "rerun", "fork"]);
+const EVENT_KINDS = new Set<ExperimentEventKind>([
+  "created", "forked", "task_started", "task_completed", "task_failed",
+  "resumed", "moved_stub", "metric_best", "note", "decision",
+]);
+
+function operatorActor(_req: Request): string {
+  // Auth currently validates tokens but does not expose identity on Request.
+  // Never trust actor from the body; use a stable server-side fallback.
+  return "operator";
+}
+
+function validateMessage(message: unknown, field = "message"): string | undefined {
+  if (typeof message !== "string" || message.trim().length === 0) return `${field} required`;
+  if (message.length > 4096) return `${field} too long`;
+  return undefined;
+}
+
+function validateEventData(data: unknown): string | undefined {
+  if (data === undefined) return undefined;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return "data must be an object";
+  if (Buffer.byteLength(JSON.stringify(data), "utf8") > 8192) return "data too large";
+  return undefined;
+}
+
+function synthesizeTaskEvents(exp: Experiment, tasks: Task[]): ExperimentEvent[] {
+  const events: ExperimentEvent[] = [];
+  for (const task of tasks) {
+    const taskName = task.display_name || task.ref || `task ${task.id}`;
+    if (task.started_at) {
+      events.push({
+        id: `synth:${task.id}:started`, experiment_id: exp.id, task_id: task.id,
+        kind: "task_started", message: `${taskName} started`, created_at: task.started_at,
+        data: { status: task.status, stub_id: task.stub_id ?? null },
+      });
+    }
+    if (task.finished_at && task.status === "completed") {
+      events.push({
+        id: `synth:${task.id}:completed`, experiment_id: exp.id, task_id: task.id,
+        kind: "task_completed", message: `${taskName} completed`, created_at: task.finished_at,
+        data: { exit_code: task.exit_code ?? null, stub_id: task.stub_id ?? null },
+      });
+    }
+    if (task.finished_at && ["failed", "cancelled", "killed", "lost"].includes(task.status)) {
+      events.push({
+        id: `synth:${task.id}:failed`, experiment_id: exp.id, task_id: task.id,
+        kind: "task_failed", message: `${taskName} failed`, created_at: task.finished_at,
+        data: { status: task.status, exit_code: task.exit_code ?? null, stub_id: task.stub_id ?? null },
+      });
+    }
+  }
+  return events;
+}
+
+function timelineFor(exp: Experiment): ExperimentEvent[] {
+  const grid = store.getGrid(exp.grid_id);
+  const tasks = grid ? store.getGridTasks(exp.grid_id) : [];
+  const stored = store.getExperimentEvents(exp.id).filter((e) => !e.deleted_at);
+  const storedKeys = new Set(stored.filter((e) => e.task_id).map((e) => `${e.kind}:${e.task_id}`));
+  const synthesized = synthesizeTaskEvents(exp, tasks).filter((e) => !storedKeys.has(`${e.kind}:${e.task_id}`));
+  return [...stored, ...synthesized].sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Router {
@@ -75,6 +138,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       requirements, target_tags, task_specs,
       python_env, cwd,
       config, config_diff, parent_name,
+      family, hypothesis, expected_outcome, fork_reason,
       git_tracking, git_repo_path,
     } = req.body;
 
@@ -173,11 +237,24 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         config_diff: config_diff || undefined,
         parent_name: parent_name || undefined,
         parent_id: parentId,
+        family: family || undefined,
+        hypothesis: hypothesis || undefined,
+        expected_outcome: expected_outcome || undefined,
+        fork_reason: fork_reason || undefined,
         git_tracking: git_tracking === true ? true : undefined,
         git_repo_path: git_repo_path || undefined,
       };
 
       store.setExperiment(experiment);
+      store.addExperimentEvent({
+        id: uuidv4(),
+        experiment_id: experiment.id,
+        kind: parentId || parent_name ? "forked" : "created",
+        message: parent_name ? `Forked from ${parent_name}` : "Created experiment",
+        actor: operatorActor(req),
+        created_at: experiment.created_at,
+        data: parent_name ? { parent_name, parent_id: parentId ?? null } : undefined,
+      });
       triggerSchedule();
 
       webNs.emit("grid.update", grid);
@@ -271,11 +348,23 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       status: "running",
       results: {},
       created_at: new Date().toISOString(),
+      family: family || undefined,
+      hypothesis: hypothesis || undefined,
+      expected_outcome: expected_outcome || undefined,
+      fork_reason: fork_reason || undefined,
       git_tracking: git_tracking === true ? true : undefined,
       git_repo_path: git_repo_path || undefined,
     };
 
     store.setExperiment(experiment);
+    store.addExperimentEvent({
+      id: uuidv4(),
+      experiment_id: experiment.id,
+      kind: "created",
+      message: "Created experiment",
+      actor: operatorActor(req),
+      created_at: experiment.created_at,
+    });
     triggerSchedule();
 
     webNs.emit("grid.update", grid);
@@ -337,6 +426,68 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     }
 
     res.json(result);
+  });
+
+  // GET /experiments/:id/timeline — stored events plus synthesized task lifecycle
+  router.get("/:id/timeline", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    res.json({ experiment_id: exp.id, events: timelineFor(exp) });
+  });
+
+  // POST /experiments/:id/events — append note or operational event
+  router.post("/:id/events", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    const { kind, message, task_id, data } = req.body;
+    if (!EVENT_KINDS.has(kind)) { res.status(400).json({ error: "invalid event kind" }); return; }
+    const messageError = validateMessage(message);
+    if (messageError) { res.status(400).json({ error: messageError }); return; }
+    const dataError = validateEventData(data);
+    if (dataError) { res.status(400).json({ error: dataError }); return; }
+
+    const event: ExperimentEvent = {
+      id: uuidv4(),
+      experiment_id: exp.id,
+      task_id: typeof task_id === "string" && task_id ? task_id : undefined,
+      kind,
+      message,
+      actor: operatorActor(req),
+      data,
+      created_at: new Date().toISOString(),
+    };
+    store.addExperimentEvent(event);
+    res.status(201).json(event);
+  });
+
+  // PATCH /experiments/:id/decision — set decision metadata and append event
+  router.patch("/:id/decision", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    const { decision, reason } = req.body;
+    if (!DECISIONS.has(decision)) { res.status(400).json({ error: "invalid decision" }); return; }
+    const reasonError = validateMessage(reason, "reason");
+    if (reasonError) { res.status(400).json({ error: reasonError }); return; }
+
+    const decisionAt = new Date().toISOString();
+    const updated: Experiment = {
+      ...exp,
+      decision,
+      decision_reason: reason,
+      decision_at: decisionAt,
+    };
+    store.setExperiment(updated);
+    store.addExperimentEvent({
+      id: uuidv4(),
+      experiment_id: exp.id,
+      kind: "decision",
+      message: `Marked ${decision}: ${reason}`,
+      actor: operatorActor(req),
+      data: { decision },
+      created_at: decisionAt,
+    });
+    webNs.emit("experiment.update", updated);
+    res.json(updated);
   });
 
   // GET /experiments/:id/manifest
