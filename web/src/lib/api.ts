@@ -304,7 +304,9 @@ export type ExperimentEventKind =
   | "moved_stub"
   | "metric_best"
   | "note"
-  | "decision";
+  | "decision"
+  | "artifact"
+  | "checkpoint";
 
 export interface ExperimentEvent {
   id: string;

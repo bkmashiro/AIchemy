@@ -314,7 +314,17 @@ def cmd_verify(args: argparse.Namespace, client: ApiClient) -> None:
 
 
 def cmd_experiments_ls(args: argparse.Namespace, client: ApiClient) -> None:
-    experiments = client.get("/experiments")
+    params: dict[str, Any] = {}
+    if args.family:
+        params["family"] = args.family
+    if args.decision:
+        params["decision"] = args.decision
+    if args.status:
+        params["status"] = args.status
+    path = "/experiments"
+    if params:
+        path += f"?{urlencode(params)}"
+    experiments = client.get(path)
     print_json([short_experiment(e) for e in experiments])
 
 
@@ -337,6 +347,125 @@ def cmd_experiments_note(args: argparse.Namespace, client: ApiClient) -> None:
     if data is not None:
         body["data"] = data
     print_json(client.post(f"/experiments/{exp['id']}/events", body))
+
+
+ARTIFACT_TYPES = {"checkpoint", "tensorboard", "log", "file", "metrics"}
+
+
+def build_artifact_body(kind: str, locator: str, *, artifact_type: str | None,
+                       name: str | None, task: str | None, step: float | None,
+                       raw_data: str | None, default_message: str) -> dict[str, Any]:
+    if not locator or not locator.strip():
+        raise AlchError(f"{kind} requires a non-empty path or URI")
+    data: dict[str, Any] = {}
+    extra = parse_data_object(raw_data)
+    if extra is not None:
+        data.update(extra)
+    is_uri = "://" in locator
+    data["uri" if is_uri else "path"] = locator
+    if artifact_type:
+        if artifact_type not in ARTIFACT_TYPES:
+            raise AlchError(f"--type must be one of {sorted(ARTIFACT_TYPES)}")
+        data["artifact_type"] = artifact_type
+    elif kind == "checkpoint":
+        data.setdefault("artifact_type", "checkpoint")
+    if name:
+        data["name"] = name
+    if step is not None:
+        data["step"] = step
+    body: dict[str, Any] = {"kind": kind, "message": default_message, "data": data}
+    if task:
+        body["task_id"] = task
+    return body
+
+
+def cmd_experiments_artifact(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    label = args.name or args.location
+    body = build_artifact_body(
+        "artifact", args.location,
+        artifact_type=args.type, name=args.name, task=args.task, step=args.step,
+        raw_data=args.data, default_message=f"Artifact: {label}",
+    )
+    print_json(client.post(f"/experiments/{exp['id']}/events", body))
+
+
+def cmd_experiments_checkpoint(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    label = args.name or args.location
+    body = build_artifact_body(
+        "checkpoint", args.location,
+        artifact_type=None, name=args.name, task=args.task, step=args.step,
+        raw_data=args.data, default_message=f"Checkpoint: {label}",
+    )
+    print_json(client.post(f"/experiments/{exp['id']}/events", body))
+
+
+def parse_set_pair(raw: str) -> tuple[str, Any]:
+    if "=" not in raw:
+        raise AlchError(f"--set expects key=value (json-encoded value), got {raw!r}")
+    key, _, value = raw.partition("=")
+    key = key.strip()
+    if not key:
+        raise AlchError("--set key must be non-empty")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = value  # fall back to literal string
+    return key, parsed
+
+
+def apply_overrides(config: Any, sets: list[str], unsets: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Returns (proposed_config, diff). Operates on top-level keys only.
+
+    Nested keys are not supported here — the existing SDK fork helper deep-copies
+    configs but exposes no dotted-path setter, so we keep the surface flat.
+    """
+    base: dict[str, Any] = dict(config) if isinstance(config, dict) else {}
+    proposed: dict[str, Any] = dict(base)
+    diff: dict[str, Any] = {}
+    for raw in sets:
+        key, value = parse_set_pair(raw)
+        if "." in key:
+            raise AlchError(f"--set does not support nested keys; got {key!r}")
+        before = base.get(key, None) if key in base else "__unset__"
+        proposed[key] = value
+        diff[key] = {
+            "before": None if before == "__unset__" else before,
+            "after": value,
+            "op": "set" if key in base else "add",
+        }
+    for key in unsets:
+        if "." in key:
+            raise AlchError(f"--unset does not support nested keys; got {key!r}")
+        if key in proposed:
+            diff[key] = {"before": base.get(key), "after": None, "op": "unset"}
+            proposed.pop(key, None)
+    return proposed, diff
+
+
+def cmd_experiments_fork_plan(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    detail = client.get(f"/experiments/{exp['id']}")
+    base_config = detail.get("config") if isinstance(detail, dict) else None
+    proposed, diff = apply_overrides(base_config or {}, args.set or [], args.unset or [])
+    parent_name = detail.get("name") or exp.get("name")
+    suggested_name = args.name or f"{parent_name}-fork"
+    manifest = {
+        "kind": "fork-plan",
+        "dry_run": True,
+        "parent": {
+            "id": detail.get("id") or exp.get("id"),
+            "name": parent_name,
+            "family": detail.get("family"),
+        },
+        "suggested_name": suggested_name,
+        "reason": args.reason,
+        "parent_config": base_config or {},
+        "proposed_config": proposed,
+        "config_diff": diff,
+    }
+    print_json(manifest)
 
 
 def cmd_experiments_tree(args: argparse.Namespace, client: ApiClient) -> None:
@@ -431,10 +560,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     exps = sub.add_parser("experiments")
     exps_sub = exps.add_subparsers(dest="cmd", required=True)
-    p = exps_sub.add_parser("ls"); p.set_defaults(func=cmd_experiments_ls)
+    p = exps_sub.add_parser("ls"); p.add_argument("--family"); p.add_argument("--decision", choices=["keep", "drop", "rerun", "fork", "none"]); p.add_argument("--status", choices=["running", "passed", "partial", "failed"]); p.set_defaults(func=cmd_experiments_ls)
     p = exps_sub.add_parser("show"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_show)
     p = exps_sub.add_parser("timeline"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_timeline)
     p = exps_sub.add_parser("note"); p.add_argument("experiment"); p.add_argument("message"); p.add_argument("--task"); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_note)
+    p = exps_sub.add_parser("artifact"); p.add_argument("experiment"); p.add_argument("location"); p.add_argument("--type", choices=sorted(ARTIFACT_TYPES)); p.add_argument("--name"); p.add_argument("--task"); p.add_argument("--step", type=float); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_artifact)
+    p = exps_sub.add_parser("checkpoint"); p.add_argument("experiment"); p.add_argument("location"); p.add_argument("--name"); p.add_argument("--task"); p.add_argument("--step", type=float); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_checkpoint)
+    p = exps_sub.add_parser("fork-plan"); p.add_argument("experiment"); p.add_argument("--set", action="append", default=[], help="key=value (json), repeatable"); p.add_argument("--unset", action="append", default=[]); p.add_argument("--name"); p.add_argument("--reason", default=""); p.set_defaults(func=cmd_experiments_fork_plan)
     p = exps_sub.add_parser("decide"); p.add_argument("experiment"); p.add_argument("decision", choices=["keep", "drop", "rerun", "fork"]); p.add_argument("reason", nargs="?"); p.add_argument("--reason", dest="reason_flag"); p.set_defaults(func=cmd_experiments_decide)
     p = exps_sub.add_parser("tree"); p.set_defaults(func=cmd_experiments_tree)
     p = exps_sub.add_parser("compare"); p.add_argument("experiments", nargs="+"); p.set_defaults(func=cmd_experiments_compare)

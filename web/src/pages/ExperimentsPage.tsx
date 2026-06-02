@@ -29,6 +29,9 @@ import {
 function ExperimentsList() {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [loading, setLoading] = useState(true);
+  const [familyFilter, setFamilyFilter] = useState<string>("");
+  const [decisionFilter, setDecisionFilter] = useState<string>("");
+  const [statusFilter, setStatusFilter] = useState<string>("");
 
   useEffect(() => {
     const load = () => {
@@ -43,6 +46,20 @@ function ExperimentsList() {
     return () => clearInterval(t);
   }, []);
 
+  const families = Array.from(
+    new Set(experiments.map((e) => e.family).filter((f): f is string => !!f)),
+  ).sort();
+
+  const filtered = experiments.filter((e) => {
+    if (familyFilter && (e.family ?? "") !== familyFilter) return false;
+    if (decisionFilter) {
+      if (decisionFilter === "none" && e.decision) return false;
+      if (decisionFilter !== "none" && e.decision !== decisionFilter) return false;
+    }
+    if (statusFilter && e.status !== statusFilter) return false;
+    return true;
+  });
+
   if (loading && experiments.length === 0) {
     return (
       <div className="flex items-center justify-center py-24 text-gray-500">
@@ -55,9 +72,59 @@ function ExperimentsList() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-white">Experiments</h1>
-        <span className="text-xs text-gray-500">{experiments.length} total</span>
+        <span className="text-xs text-gray-500">
+          {filtered.length} of {experiments.length}
+        </span>
       </div>
-      <ExperimentListTable experiments={experiments} />
+      <div className="flex flex-wrap gap-2 items-center text-xs">
+        <select
+          value={familyFilter}
+          onChange={(e) => setFamilyFilter(e.target.value)}
+          className="bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-300"
+        >
+          <option value="">All families</option>
+          {families.map((f) => (
+            <option key={f} value={f}>{f}</option>
+          ))}
+        </select>
+        <select
+          value={decisionFilter}
+          onChange={(e) => setDecisionFilter(e.target.value)}
+          className="bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-300"
+        >
+          <option value="">All decisions</option>
+          <option value="keep">keep</option>
+          <option value="drop">drop</option>
+          <option value="rerun">rerun</option>
+          <option value="fork">fork</option>
+          <option value="none">undecided</option>
+        </select>
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-300"
+        >
+          <option value="">All statuses</option>
+          <option value="running">running</option>
+          <option value="passed">passed</option>
+          <option value="partial">partial</option>
+          <option value="failed">failed</option>
+        </select>
+        {(familyFilter || decisionFilter || statusFilter) && (
+          <button
+            type="button"
+            onClick={() => {
+              setFamilyFilter("");
+              setDecisionFilter("");
+              setStatusFilter("");
+            }}
+            className="text-gray-500 hover:text-gray-300"
+          >
+            clear
+          </button>
+        )}
+      </div>
+      <ExperimentListTable experiments={filtered} />
     </div>
   );
 }

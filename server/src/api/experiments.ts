@@ -66,7 +66,41 @@ const DECISIONS = new Set<ExperimentDecision>(["keep", "drop", "rerun", "fork"])
 const EVENT_KINDS = new Set<ExperimentEventKind>([
   "created", "forked", "task_started", "task_completed", "task_failed",
   "resumed", "moved_stub", "metric_best", "note", "decision",
+  "artifact", "checkpoint",
 ]);
+
+// Artifact/checkpoint events must carry a non-empty path or uri so consumers
+// can answer "产物在哪？". Other event kinds keep the looser shape.
+const ARTIFACT_KINDS = new Set<ExperimentEventKind>(["artifact", "checkpoint"]);
+const ARTIFACT_TYPES = new Set<string>(["checkpoint", "tensorboard", "log", "file", "metrics"]);
+
+function validateArtifactData(kind: ExperimentEventKind, data: unknown): string | undefined {
+  if (!ARTIFACT_KINDS.has(kind)) return undefined;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return "artifact data must be an object";
+  const obj = data as Record<string, unknown>;
+  const path = typeof obj.path === "string" ? obj.path.trim() : "";
+  const uri = typeof obj.uri === "string" ? obj.uri.trim() : "";
+  if (!path && !uri) {
+    return "artifact/checkpoint requires non-empty data.path or data.uri";
+  }
+  for (const locator of [path, uri]) {
+    if (locator.length > 2048) return "artifact path/uri too long";
+  }
+  if (obj.artifact_type !== undefined && obj.artifact_type !== null) {
+    if (typeof obj.artifact_type !== "string" || !ARTIFACT_TYPES.has(obj.artifact_type)) {
+      return `artifact_type must be one of ${[...ARTIFACT_TYPES].join(", ")}`;
+    }
+  }
+  if (obj.name !== undefined && obj.name !== null && typeof obj.name !== "string") {
+    return "artifact name must be a string";
+  }
+  if (obj.step !== undefined && obj.step !== null) {
+    if (typeof obj.step !== "number" || !Number.isFinite(obj.step)) {
+      return "artifact step must be a finite number";
+    }
+  }
+  return undefined;
+}
 
 function operatorActor(_req: Request): string {
   // Auth currently validates tokens but does not expose identity on Request.
@@ -592,12 +626,21 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     res.status(201).json(experiment);
   });
 
-  // GET /experiments
-  router.get("/", (_req: Request, res: Response) => {
-    const experiments = store.getAllExperiments().map((exp) => ({
+  // GET /experiments — optional ?family=&decision=&status= filters
+  router.get("/", (req: Request, res: Response) => {
+    const familyFilter = typeof req.query.family === "string" ? req.query.family : undefined;
+    const decisionFilter = typeof req.query.decision === "string" ? req.query.decision : undefined;
+    const statusFilter = typeof req.query.status === "string" ? req.query.status : undefined;
+    let experiments = store.getAllExperiments().map((exp) => ({
       ...exp,
       status: deriveExperimentStatus(exp),
     }));
+    if (familyFilter) experiments = experiments.filter((e) => (e.family ?? "") === familyFilter);
+    if (decisionFilter) {
+      if (decisionFilter === "none") experiments = experiments.filter((e) => !e.decision);
+      else experiments = experiments.filter((e) => e.decision === decisionFilter);
+    }
+    if (statusFilter) experiments = experiments.filter((e) => e.status === statusFilter);
     res.json(experiments);
   });
 
@@ -788,6 +831,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     if (messageError) { res.status(400).json({ error: messageError }); return; }
     const dataError = validateEventData(data);
     if (dataError) { res.status(400).json({ error: dataError }); return; }
+    const artifactError = validateArtifactData(kind, data);
+    if (artifactError) { res.status(400).json({ error: artifactError }); return; }
 
     const event: ExperimentEvent = {
       id: uuidv4(),

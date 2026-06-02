@@ -108,6 +108,92 @@ describe("experiment lineage API", () => {
     );
   });
 
+  it("accepts artifact/checkpoint events with a path and rejects empty locators", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({ name: "lineage-artifact", task_specs: [{ ref: "train", script: "train.py" }] })
+      .expect(201);
+
+    // Reject without path/uri.
+    await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({ kind: "checkpoint", message: "ckpt 100", data: { step: 100 } })
+      .expect(400);
+
+    // Reject with empty string path.
+    await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({ kind: "artifact", message: "x", data: { path: "  " } })
+      .expect(400);
+
+    // Reject invalid artifact_type.
+    await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({ kind: "artifact", message: "x", data: { path: "/p", artifact_type: "spaceship" } })
+      .expect(400);
+
+    const ok = await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({
+        kind: "checkpoint",
+        message: "ckpt step 1000",
+        data: { path: "/runs/abc/ckpt-1000.pt", artifact_type: "checkpoint", step: 1000, name: "best" },
+        actor: "mallory",
+      })
+      .expect(201);
+
+    expect(ok.body.actor).toBe("operator");
+    expect(ok.body.data.path).toBe("/runs/abc/ckpt-1000.pt");
+    expect(ok.body.data.step).toBe(1000);
+
+    const tb = await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({
+        kind: "artifact",
+        message: "tb",
+        data: { uri: "s3://bucket/tb", artifact_type: "tensorboard" },
+      })
+      .expect(201);
+    expect(tb.body.data.uri).toBe("s3://bucket/tb");
+
+    const fallbackUri = await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({
+        kind: "artifact",
+        message: "tb fallback",
+        data: { path: "  ", uri: "s3://bucket/tb-fallback", artifact_type: "tensorboard" },
+      })
+      .expect(201);
+    expect(fallbackUri.body.data.uri).toBe("s3://bucket/tb-fallback");
+  });
+
+  it("filters list by family, decision, and status", async () => {
+    const app = makeApp();
+    await request(app)
+      .post("/experiments")
+      .send({ name: "fam-a-1", family: "alpha", task_specs: [{ ref: "t", script: "t.py" }] })
+      .expect(201);
+    const beta = await request(app)
+      .post("/experiments")
+      .send({ name: "fam-b-1", family: "beta", task_specs: [{ ref: "t", script: "t.py" }] })
+      .expect(201);
+    await request(app)
+      .patch(`/experiments/${beta.body.id}/decision`)
+      .send({ decision: "keep", reason: "looks good" })
+      .expect(200);
+
+    const familyAlpha = await request(app).get("/experiments?family=alpha").expect(200);
+    expect(familyAlpha.body.map((e: any) => e.name)).toEqual(["fam-a-1"]);
+
+    const decisionKeep = await request(app).get("/experiments?decision=keep").expect(200);
+    expect(decisionKeep.body.map((e: any) => e.name)).toEqual(["fam-b-1"]);
+
+    const undecided = await request(app).get("/experiments?decision=none").expect(200);
+    expect(undecided.body.map((e: any) => e.name)).toContain("fam-a-1");
+    expect(undecided.body.map((e: any) => e.name)).not.toContain("fam-b-1");
+  });
+
   it("preserves events when experiment record is deleted", async () => {
     const app = makeApp();
     const created = await request(app)

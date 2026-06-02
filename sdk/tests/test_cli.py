@@ -188,6 +188,161 @@ def test_experiments_note_posts_event_without_actor(monkeypatch):
     assert "actor" not in calls[1]["body"]
 
 
+def test_experiments_artifact_posts_event_with_path(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "experiments", "artifact", "alpha", "/runs/abc/ckpt-100.pt",
+            "--type", "checkpoint", "--name", "best", "--task", "task-9", "--step", "100",
+        ],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "evt-1", "kind": "artifact"},
+        ],
+    )
+    assert calls[1]["method"] == "POST"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/events"
+    body = calls[1]["body"]
+    assert body["kind"] == "artifact"
+    assert body["task_id"] == "task-9"
+    assert body["data"]["path"] == "/runs/abc/ckpt-100.pt"
+    assert body["data"]["artifact_type"] == "checkpoint"
+    assert body["data"]["name"] == "best"
+    assert body["data"]["step"] == 100.0
+    assert "actor" not in body
+
+
+def test_experiments_artifact_detects_uri_and_merges_data(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "experiments", "artifact", "alpha", "s3://bucket/run/tb",
+            "--type", "tensorboard", "--data", '{"region": "us-west-2"}',
+        ],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "evt-1", "kind": "artifact"},
+        ],
+    )
+    body = calls[1]["body"]
+    assert body["data"]["uri"] == "s3://bucket/run/tb"
+    assert body["data"]["artifact_type"] == "tensorboard"
+    assert body["data"]["region"] == "us-west-2"
+    assert "path" not in body["data"]
+
+
+def test_experiments_checkpoint_defaults_type_and_message(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "checkpoint", "alpha", "/runs/abc/last.pt", "--name", "ep10"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "evt-1", "kind": "checkpoint"},
+        ],
+    )
+    body = calls[1]["body"]
+    assert body["kind"] == "checkpoint"
+    assert body["message"] == "Checkpoint: ep10"
+    assert body["data"]["path"] == "/runs/abc/last.pt"
+    assert body["data"]["artifact_type"] == "checkpoint"
+
+
+def test_experiments_artifact_rejects_empty_location(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    def fake_urlopen(req, timeout=20.0):
+        return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "artifact", "alpha", "   "])
+    assert code == 1
+    assert "non-empty path" in capsys.readouterr().err
+
+
+def test_experiments_artifact_rejects_non_object_data(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    def fake_urlopen(req, timeout=20.0):
+        return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "artifact", "alpha", "/p", "--data", "[1,2]"])
+    assert code == 1
+
+
+def test_experiments_fork_plan_returns_manifest_without_posting(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "experiments", "fork-plan", "alpha",
+            "--set", "lr=0.0003",
+            "--set", "use_curiosity=true",
+            "--unset", "warmup",
+            "--name", "alpha-curiosity",
+            "--reason", "test curiosity contribution",
+        ],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {
+                "id": "exp-1",
+                "name": "alpha",
+                "family": "pretrain",
+                "config": {"lr": 0.001, "warmup": 100, "seed": 7},
+            },
+        ],
+    )
+
+    # Two GETs only — must not POST/PATCH.
+    assert [c["method"] for c in calls] == ["GET", "GET"]
+    out = capsys.readouterr().out
+    manifest = json.loads(out)
+    assert manifest["kind"] == "fork-plan"
+    assert manifest["dry_run"] is True
+    assert manifest["parent"]["name"] == "alpha"
+    assert manifest["suggested_name"] == "alpha-curiosity"
+    assert manifest["reason"] == "test curiosity contribution"
+    assert manifest["parent_config"] == {"lr": 0.001, "warmup": 100, "seed": 7}
+    assert manifest["proposed_config"] == {"lr": 0.0003, "seed": 7, "use_curiosity": True}
+    assert manifest["config_diff"]["lr"] == {"before": 0.001, "after": 0.0003, "op": "set"}
+    assert manifest["config_diff"]["use_curiosity"] == {"before": None, "after": True, "op": "add"}
+    assert manifest["config_diff"]["warmup"] == {"before": 100, "after": None, "op": "unset"}
+
+
+def test_experiments_fork_plan_rejects_dotted_keys(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    responses = [
+        [{"id": "exp-1", "name": "alpha"}],
+        {"id": "exp-1", "name": "alpha", "config": {}},
+    ]
+
+    def fake_urlopen(req, timeout=20.0):
+        return FakeResponse(responses.pop(0))
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main([
+            "experiments", "fork-plan", "alpha",
+            "--set", "model.lr=0.1",
+        ])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "nested keys" in err
+
+
+def test_experiments_ls_passes_filters_as_query(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "ls", "--family", "alpha", "--decision", "keep", "--status", "passed"],
+        [[{"id": "exp-1", "name": "alpha", "status": "passed", "family": "alpha", "decision": "keep"}]],
+    )
+    assert calls[0]["method"] == "GET"
+    # urlencoded params, order from dict insertion.
+    assert calls[0]["url"].startswith("http://localhost:3002/api/experiments?")
+    assert "family=alpha" in calls[0]["url"]
+    assert "decision=keep" in calls[0]["url"]
+    assert "status=passed" in calls[0]["url"]
+
+
 def test_experiments_note_rejects_non_object_data(monkeypatch):
     monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
 

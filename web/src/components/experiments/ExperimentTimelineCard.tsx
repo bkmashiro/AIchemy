@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ExperimentEvent, experimentsApi } from "../../lib/api";
 import { formatRelTime } from "../../lib/format";
-import { EVENT_BADGE, formatEventData } from "./experimentDetailUtils";
+import { EVENT_BADGE, formatEventData, artifactLocator } from "./experimentDetailUtils";
 
 export function ExperimentTimelineCard({
   experimentId,
@@ -95,7 +95,9 @@ export function ExperimentTimelineCard({
           {sorted.map((ev) => {
             const badge =
               EVENT_BADGE[ev.kind] || "bg-gray-800 text-gray-400 border-gray-700";
-            const dataStr = formatEventData(ev.data);
+            const isArtifactKind = ev.kind === "artifact" || ev.kind === "checkpoint";
+            const artifact = isArtifactKind ? artifactLocator(ev.data) : null;
+            const dataStr = !artifact ? formatEventData(ev.data) : null;
             return (
               <li
                 key={ev.id}
@@ -123,6 +125,20 @@ export function ExperimentTimelineCard({
                     </Link>
                   )}
                 </div>
+                {artifact && (
+                  <div className="mt-1 text-[11px] flex items-center gap-2 flex-wrap">
+                    {artifact.type && (
+                      <span className="px-1 py-0.5 rounded border text-[10px] bg-gray-800 text-gray-400 border-gray-700">
+                        {artifact.type}
+                      </span>
+                    )}
+                    {artifact.name && <span className="text-gray-400">{artifact.name}</span>}
+                    {typeof artifact.step === "number" && (
+                      <span className="text-gray-500">step {artifact.step}</span>
+                    )}
+                    <code className="font-mono text-gray-300 break-all">{artifact.locator}</code>
+                  </div>
+                )}
                 {dataStr && (
                   <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/40 rounded px-2 py-1 overflow-x-auto font-mono">
                     {dataStr}

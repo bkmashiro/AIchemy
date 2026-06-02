@@ -133,7 +133,26 @@ export const EVENT_BADGE: Record<string, string> = {
   metric_best:    "bg-green-900/30 text-green-400 border-green-700/40",
   note:           "bg-gray-800 text-gray-300 border-gray-700",
   decision:       "bg-purple-900/30 text-purple-400 border-purple-700/40",
+  artifact:       "bg-cyan-900/30 text-cyan-400 border-cyan-700/40",
+  checkpoint:     "bg-teal-900/30 text-teal-400 border-teal-700/40",
 };
+
+// Pull a path/uri out of an artifact/checkpoint event payload. Returns the
+// raw locator (path or uri) plus the artifact_type label when present so the
+// timeline can render a compact "[type] locator" link.
+export function artifactLocator(
+  data: Record<string, unknown> | undefined,
+): { locator: string; type?: string; name?: string; step?: number } | null {
+  if (!data) return null;
+  const uri = typeof data.uri === "string" ? data.uri.trim() : "";
+  const path = typeof data.path === "string" ? data.path.trim() : "";
+  const loc = uri || path;
+  if (!loc) return null;
+  const type = typeof data.artifact_type === "string" ? data.artifact_type : undefined;
+  const name = typeof data.name === "string" ? data.name : undefined;
+  const step = typeof data.step === "number" ? data.step : undefined;
+  return { locator: loc, type, name, step };
+}
 
 export function formatEventData(
   data: Record<string, unknown> | undefined,
