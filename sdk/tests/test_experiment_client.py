@@ -5,7 +5,10 @@ from unittest.mock import patch
 
 import pytest
 
-from alchemy_sdk.experiments import ExperimentClient
+from alchemy_sdk.experiments import (
+    ExperimentClient,
+    render_research_report_markdown,
+)
 
 
 class FakeResponse:
@@ -589,6 +592,192 @@ def test_fork_plan_default_suggested_name(monkeypatch):
     assert plan["suggested_name"] == "alpha-fork"
     assert plan["proposed_config"] == {"lr": 0.001}
     assert plan["config_diff"] == {}
+
+
+def _sample_report() -> dict:
+    return {
+        "filters": {"family": "alpha", "decision": "none", "status": None, "limit": 25},
+        "generated_at": "2026-06-02T00:00:00.000Z",
+        "counts": {
+            "total": 3,
+            "by_status": {"running": 2, "failed": 1},
+            "by_decision": {"keep": 1, "none": 2},
+        },
+        "metric": {"name": "loss", "direction": "min"},
+        "leaderboard": [
+            {
+                "rank": 1,
+                "id": "exp-b",
+                "name": "rep-alpha-b",
+                "status": "running",
+                "decision": "keep",
+                "value": 0.1,
+                "metric": "loss",
+            },
+            {
+                "rank": 2,
+                "id": "exp-a",
+                "name": "rep-alpha-a",
+                "status": "running",
+                "decision": None,
+                "value": 0.42,
+                "metric": "loss",
+            },
+        ],
+        "experiments": [
+            {
+                "id": "exp-b",
+                "name": "rep-alpha-b",
+                "family": "alpha",
+                "status": "running",
+                "decision": "keep",
+                "task_counts": {"running": 1, "completed": 1},
+                "primary_metric": {"name": "loss", "value": 0.1},
+                "artifact_count": 2,
+                "checkpoint_count": 1,
+                "recent_events": [
+                    {"kind": "artifact", "created_at": "2026-06-01T12:00:00.000Z"},
+                    {"kind": "decision", "created_at": "2026-06-02T00:00:00.000Z"},
+                ],
+            },
+            {
+                "id": "exp-a",
+                "name": "rep-alpha-a",
+                "family": "alpha",
+                "status": "running",
+                "decision": None,
+                "task_counts": {"running": 1},
+                "primary_metric": None,
+                "artifact_count": 0,
+                "checkpoint_count": 0,
+                "recent_events": [],
+            },
+        ],
+    }
+
+
+def test_render_research_report_markdown_contains_all_sections():
+    md = render_research_report_markdown(_sample_report())
+    assert md.startswith("# Experiment Research Report\n")
+    assert md.endswith("\n")
+    # Filters
+    assert "## Filters" in md
+    assert "- family: alpha" in md
+    assert "- decision: none" in md
+    assert "- status: *all*" in md
+    assert "- limit: 25" in md
+    assert "- generated_at: 2026-06-02T00:00:00.000Z" in md
+    # Counts
+    assert "## Counts" in md
+    assert "- total: 3" in md
+    assert "- by_status: failed=1, running=2" in md
+    assert "- by_decision: keep=1, none=2" in md
+    # Metric
+    assert "## Metric" in md
+    assert "- name: loss" in md
+    assert "- direction: min" in md
+    # Leaderboard
+    assert "## Leaderboard" in md
+    assert "| Rank | Experiment | Status | Decision | Metric | Value |" in md
+    assert "| 1 | rep-alpha-b | running | keep | loss | 0.1 |" in md
+    assert "| 2 | rep-alpha-a | running | - | loss | 0.42 |" in md
+    # Experiments
+    assert "## Experiments" in md
+    assert "rep-alpha-b" in md
+    assert "running=1, completed=1" not in md  # sorted alphabetically below
+    assert "completed=1, running=1" in md
+    assert "loss=0.1" in md
+    assert "artifact@2026-06-01T12:00:00.000Z" in md
+    assert "decision@2026-06-02T00:00:00.000Z" in md
+
+
+def test_render_research_report_markdown_is_deterministic():
+    report = _sample_report()
+    a = render_research_report_markdown(report)
+    b = render_research_report_markdown(report)
+    assert a == b
+
+
+def test_render_research_report_markdown_empty_report():
+    empty = {
+        "filters": {"family": None, "decision": None, "status": None, "limit": 50},
+        "generated_at": "2026-06-02T00:00:00.000Z",
+        "counts": {"total": 0, "by_status": {}, "by_decision": {}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [],
+    }
+    md = render_research_report_markdown(empty)
+    assert "- family: *all*" in md
+    assert "- by_status: _(none)_" in md
+    assert "- by_decision: _(none)_" in md
+    assert "_No goal metric declared" in md
+    assert "_Empty — no experiment" in md
+    assert "_No experiments match" in md
+
+
+def test_render_research_report_markdown_handles_missing_fields():
+    md = render_research_report_markdown({})
+    assert "# Experiment Research Report" in md
+    assert "- total: 0" in md
+    assert "_No experiments match" in md
+
+
+def test_render_research_report_markdown_escapes_pipes_in_names():
+    report = {
+        "filters": {"family": None, "decision": None, "status": None, "limit": 50},
+        "counts": {"total": 1, "by_status": {"running": 1}, "by_decision": {"none": 1}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [
+            {
+                "id": "x",
+                "name": "weird|name",
+                "family": "fam",
+                "status": "running",
+                "decision": None,
+                "task_counts": {"running": 1},
+                "primary_metric": None,
+                "artifact_count": 0,
+                "checkpoint_count": 0,
+                "recent_events": [],
+            }
+        ],
+    }
+    md = render_research_report_markdown(report)
+    assert "weird\\|name" in md
+    assert "weird|name |" not in md  # raw pipe would break the table
+
+
+def test_render_research_report_markdown_rejects_non_mapping():
+    with pytest.raises(TypeError):
+        render_research_report_markdown([])  # type: ignore[arg-type]
+
+
+def test_research_report_markdown_method_issues_one_get(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    payload = _sample_report()
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.research_report_markdown(family="alpha", decision="none", limit=25),
+        [payload],
+    )
+    assert isinstance(result, str)
+    assert result.startswith("# Experiment Research Report\n")
+    assert len(calls) == 1
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == (
+        "http://server/api/experiments/research-report"
+        "?family=alpha&decision=none&limit=25"
+    )
+
+
+def test_research_report_markdown_method_rejects_non_object_response(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen([["not", "an", "object"]], [])):
+        with pytest.raises(RuntimeError, match="unexpected research-report response"):
+            client.research_report_markdown()
 
 
 def test_fork_plan_does_not_mutate_parent_config(monkeypatch):

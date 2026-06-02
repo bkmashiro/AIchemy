@@ -540,7 +540,31 @@ def cmd_experiments_report(args: argparse.Namespace, client: ApiClient) -> None:
     path = "/experiments/research-report"
     if params:
         path += f"?{urlencode(params)}"
-    print_json(client.get(path))
+    payload = client.get(path)
+
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "markdown":
+        # Import locally to keep the CLI's top-level import surface unchanged.
+        from alchemy_sdk.experiments import render_research_report_markdown
+
+        if not isinstance(payload, dict):
+            raise AlchError(
+                "unexpected research-report response: expected a JSON object, "
+                f"got {type(payload).__name__}"
+            )
+        rendered = render_research_report_markdown(payload)
+    else:
+        rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+    output = getattr(args, "output", None)
+    if output:
+        with open(output, "w", encoding="utf-8") as fh:
+            fh.write(rendered)
+            if not rendered.endswith("\n"):
+                fh.write("\n")
+        print(f"wrote {fmt} report to {output}", file=sys.stderr)
+    else:
+        print(rendered)
 
 
 def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
@@ -732,6 +756,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="filter by rollup status",
     )
     p.add_argument("--limit", type=int, default=None, help="cap experiments returned (default 50, max 200)")
+    p.add_argument(
+        "--format",
+        choices=["json", "markdown"],
+        default="json",
+        help="output format (default: json). Use 'markdown' for a human handoff.",
+    )
+    p.add_argument(
+        "--output",
+        help="optional local file path to write the rendered report to (stdout otherwise)",
+    )
     p.set_defaults(func=cmd_experiments_report)
 
     p = sub.add_parser("verify", help="poll task/stub state and assert expectations")

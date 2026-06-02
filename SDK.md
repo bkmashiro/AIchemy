@@ -147,6 +147,8 @@ ec.research_bundle("my-experiment")    # GET /api/experiments/<id>/research-bund
 ec.research_report(family="pretrain",  # GET /api/experiments/research-report
                    decision="none")    # family/decision/status rollup: counts,
                                        # leaderboard, per-experiment briefs
+ec.research_report_markdown(           # same GET, rendered as Markdown locally
+    family="pretrain")                 # — handy for pasting into Discord / notes
 
 # Local dry-run: build a fork manifest without submitting anything. Only the
 # two GET requests below run; nothing is written to the server.
@@ -218,6 +220,11 @@ alch experiments bundle <name-or-id>       # one-shot research export
 alch experiments report --family pretrain \
     --decision none --limit 25             # filtered family/decision/status rollup:
                                            # counts, leaderboard, per-exp briefs
+alch experiments report --family pretrain \
+    --format markdown                      # render the same report as Markdown
+                                           # (default --format json is unchanged)
+alch experiments report --family pretrain \
+    --format markdown --output report.md   # write rendered output to a local file
 alch experiments fork-plan <name-or-id> \
     --set lr=0.0002 --unset warmup \
     --reason "ablation"                    # local dry-run: prints proposed config + diff
@@ -239,6 +246,14 @@ writes events. Use it to answer "which runs in this family are
 keep/drop/rerun/fork/undecided, and which is currently winning the goal
 metric?" without paging through every detail page. `--limit` defaults to 50
 and is capped at 200 server-side.
+
+`--format markdown` is a **local-only** formatter applied on top of the same
+read-only GET — no extra requests, no server-side rendering. It produces a
+deterministic Markdown table layout (filters, counts, metric, leaderboard,
+per-experiment briefs) suitable for pasting into Discord / PRs / notes. The
+JSON shape is unchanged and remains the default. `--output PATH` writes the
+selected format to a local file (parent dir must exist) and prints a short
+confirmation to stderr instead of dumping to stdout.
 
 These are safe to run during live training: they only issue `GET` requests
 against the Alchemy server. `fork-plan` in particular does **not** submit a

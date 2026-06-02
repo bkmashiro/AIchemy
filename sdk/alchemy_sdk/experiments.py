@@ -187,6 +187,30 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/timeline")
 
+    def research_report_markdown(
+        self,
+        *,
+        family: Optional[str] = None,
+        decision: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> str:
+        """Fetch the research report and render it as Markdown.
+
+        Convenience wrapper around :meth:`research_report` plus
+        :func:`render_research_report_markdown`. One GET request total —
+        the rendering is local and side-effect-free.
+        """
+        report = self.research_report(
+            family=family, decision=decision, status=status, limit=limit
+        )
+        if not isinstance(report, Mapping):
+            raise RuntimeError(
+                "unexpected research-report response shape: expected object, "
+                f"got {type(report).__name__}"
+            )
+        return render_research_report_markdown(report)
+
     def research_report(
         self,
         *,
@@ -287,6 +311,189 @@ class ExperimentClient:
         resolved_ids = [self._resolve_one(experiments, ref)["id"] for ref in refs_list]
         query = urlencode({"ids": ",".join(resolved_ids)})
         return self._get(f"/experiments/compare?{query}")
+
+
+def _md_escape_cell(value: Any) -> str:
+    """Format a value safely for inclusion in a Markdown table cell."""
+    if value is None:
+        return "-"
+    text = str(value)
+    # Pipes break table layout; newlines collapse rows. Escape both.
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def _md_format_number(value: Any) -> str:
+    """Format a metric value compactly without losing precision unexpectedly."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return "NaN"
+        if value in (float("inf"), float("-inf")):
+            return "inf" if value > 0 else "-inf"
+        # 6 significant digits, trim trailing zeros.
+        text = f"{value:.6g}"
+        return text
+    return str(value)
+
+
+def _md_format_counts(counts: Mapping[str, Any]) -> str:
+    if not counts:
+        return "_(none)_"
+    return ", ".join(f"{k}={counts[k]}" for k in sorted(counts.keys()))
+
+
+def _md_format_task_counts(task_counts: Any) -> str:
+    if not isinstance(task_counts, Mapping) or not task_counts:
+        return "-"
+    return ", ".join(f"{k}={task_counts[k]}" for k in sorted(task_counts.keys()))
+
+
+def _md_format_primary_metric(primary_metric: Any) -> str:
+    if not isinstance(primary_metric, Mapping):
+        return "-"
+    name = primary_metric.get("name")
+    value = primary_metric.get("value")
+    if name is None and value is None:
+        return "-"
+    if name is None:
+        return _md_format_number(value)
+    return f"{name}={_md_format_number(value)}"
+
+
+def _md_format_recent_events(events: Any) -> str:
+    if not isinstance(events, list) or not events:
+        return "-"
+    parts: list[str] = []
+    for evt in events:
+        if not isinstance(evt, Mapping):
+            continue
+        kind = evt.get("kind") or evt.get("type") or "event"
+        ts = evt.get("created_at") or evt.get("at") or evt.get("ts")
+        if ts:
+            parts.append(f"{kind}@{ts}")
+        else:
+            parts.append(str(kind))
+    if not parts:
+        return "-"
+    return "; ".join(parts)
+
+
+def _md_filter_value(value: Any) -> str:
+    if value is None or value == "":
+        return "*all*"
+    return str(value)
+
+
+def render_research_report_markdown(report: Mapping[str, Any]) -> str:
+    """Render a research-report JSON payload as Markdown.
+
+    Pure formatter — no I/O, no network. The output is deterministic given
+    the input (no clock reads, no random ordering). Designed for handing
+    family-level experiment status off into Discord, notes, or PR
+    descriptions without paging through the live dashboard.
+    """
+    if not isinstance(report, Mapping):
+        raise TypeError(
+            f"render_research_report_markdown expects a mapping, got {type(report).__name__}"
+        )
+
+    lines: list[str] = ["# Experiment Research Report", ""]
+
+    filters = report.get("filters") if isinstance(report.get("filters"), Mapping) else {}
+    lines.append("## Filters")
+    lines.append("")
+    lines.append(f"- family: {_md_filter_value(filters.get('family'))}")
+    lines.append(f"- decision: {_md_filter_value(filters.get('decision'))}")
+    lines.append(f"- status: {_md_filter_value(filters.get('status'))}")
+    limit = filters.get("limit")
+    lines.append(f"- limit: {limit if limit is not None else '*default*'}")
+    generated_at = report.get("generated_at")
+    if generated_at:
+        lines.append(f"- generated_at: {generated_at}")
+    lines.append("")
+
+    counts = report.get("counts") if isinstance(report.get("counts"), Mapping) else {}
+    by_status = counts.get("by_status") if isinstance(counts.get("by_status"), Mapping) else {}
+    by_decision = counts.get("by_decision") if isinstance(counts.get("by_decision"), Mapping) else {}
+    lines.append("## Counts")
+    lines.append("")
+    lines.append(f"- total: {counts.get('total', 0)}")
+    lines.append(f"- by_status: {_md_format_counts(by_status)}")
+    lines.append(f"- by_decision: {_md_format_counts(by_decision)}")
+    lines.append("")
+
+    lines.append("## Metric")
+    lines.append("")
+    metric = report.get("metric")
+    if isinstance(metric, Mapping) and metric.get("name"):
+        lines.append(f"- name: {metric.get('name')}")
+        lines.append(f"- direction: {metric.get('direction') or '-'}")
+    else:
+        lines.append("_No goal metric declared by any experiment in this slice._")
+    lines.append("")
+
+    lines.append("## Leaderboard")
+    lines.append("")
+    leaderboard = report.get("leaderboard") if isinstance(report.get("leaderboard"), list) else []
+    if leaderboard:
+        lines.append("| Rank | Experiment | Status | Decision | Metric | Value |")
+        lines.append("|------|------------|--------|----------|--------|-------|")
+        for row in leaderboard:
+            if not isinstance(row, Mapping):
+                continue
+            lines.append(
+                "| {rank} | {name} | {status} | {decision} | {metric} | {value} |".format(
+                    rank=_md_escape_cell(row.get("rank")),
+                    name=_md_escape_cell(row.get("name") or row.get("id")),
+                    status=_md_escape_cell(row.get("status")),
+                    decision=_md_escape_cell(row.get("decision")),
+                    metric=_md_escape_cell(row.get("metric")),
+                    value=_md_escape_cell(_md_format_number(row.get("value"))),
+                )
+            )
+    else:
+        lines.append("_Empty — no experiment in this slice has a numeric goal-metric value yet._")
+    lines.append("")
+
+    lines.append("## Experiments")
+    lines.append("")
+    experiments = report.get("experiments") if isinstance(report.get("experiments"), list) else []
+    if experiments:
+        lines.append(
+            "| Name | Family | Status | Decision | Task counts | Primary metric "
+            "| Artifacts | Checkpoints | Recent events |"
+        )
+        lines.append(
+            "|------|--------|--------|----------|-------------|----------------"
+            "|-----------|-------------|---------------|"
+        )
+        for exp in experiments:
+            if not isinstance(exp, Mapping):
+                continue
+            lines.append(
+                "| {name} | {family} | {status} | {decision} | {tasks} | {metric} "
+                "| {artifacts} | {checkpoints} | {events} |".format(
+                    name=_md_escape_cell(exp.get("name") or exp.get("id")),
+                    family=_md_escape_cell(exp.get("family")),
+                    status=_md_escape_cell(exp.get("status")),
+                    decision=_md_escape_cell(exp.get("decision")),
+                    tasks=_md_escape_cell(_md_format_task_counts(exp.get("task_counts"))),
+                    metric=_md_escape_cell(_md_format_primary_metric(exp.get("primary_metric"))),
+                    artifacts=_md_escape_cell(exp.get("artifact_count", 0)),
+                    checkpoints=_md_escape_cell(exp.get("checkpoint_count", 0)),
+                    events=_md_escape_cell(_md_format_recent_events(exp.get("recent_events"))),
+                )
+            )
+    else:
+        lines.append("_No experiments match the current filters._")
+    lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _apply_flat_overrides(

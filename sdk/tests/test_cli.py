@@ -614,6 +614,135 @@ def test_experiments_report_with_no_filters_hits_bare_endpoint(monkeypatch):
     assert calls[0]["url"] == "http://localhost:3002/api/experiments/research-report"
 
 
+def test_experiments_report_markdown_format_prints_markdown(monkeypatch, capsys):
+    payload = {
+        "filters": {"family": "alpha", "decision": None, "status": None, "limit": 50},
+        "generated_at": "2026-06-02T00:00:00.000Z",
+        "counts": {
+            "total": 1,
+            "by_status": {"running": 1},
+            "by_decision": {"keep": 1},
+        },
+        "metric": {"name": "loss", "direction": "min"},
+        "leaderboard": [
+            {
+                "rank": 1,
+                "id": "exp-1",
+                "name": "rep-alpha-1",
+                "status": "running",
+                "decision": "keep",
+                "value": 0.123,
+                "metric": "loss",
+            }
+        ],
+        "experiments": [
+            {
+                "id": "exp-1",
+                "name": "rep-alpha-1",
+                "family": "alpha",
+                "status": "running",
+                "decision": "keep",
+                "task_counts": {"running": 1},
+                "primary_metric": {"name": "loss", "value": 0.123},
+                "artifact_count": 0,
+                "checkpoint_count": 0,
+                "recent_events": [],
+            }
+        ],
+    }
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "report", "--family", "alpha", "--format", "markdown"],
+        [payload],
+    )
+    assert len(calls) == 1
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == (
+        "http://localhost:3002/api/experiments/research-report?family=alpha"
+    )
+    out = capsys.readouterr().out
+    # Markdown, not JSON.
+    assert out.startswith("# Experiment Research Report")
+    assert '"filters"' not in out
+    assert "## Leaderboard" in out
+    assert "rep-alpha-1" in out
+    assert "loss" in out
+
+
+def test_experiments_report_default_format_remains_json(monkeypatch, capsys):
+    payload = {
+        "filters": {"family": None, "decision": None, "status": None, "limit": 50},
+        "counts": {"total": 0, "by_status": {}, "by_decision": {}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [],
+        "generated_at": "2026-06-02T00:00:00.000Z",
+    }
+    run_cli(monkeypatch, ["experiments", "report"], [payload])
+    out = capsys.readouterr().out
+    # JSON output starts with `{` and is sorted/indented.
+    assert out.lstrip().startswith("{")
+    parsed = json.loads(out)
+    assert parsed == payload
+    assert "# Experiment Research Report" not in out
+
+
+def test_experiments_report_invalid_format_rejected(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    try:
+        cli.main(["experiments", "report", "--format", "yaml"])
+    except SystemExit as exc:
+        assert exc.code != 0
+    else:
+        raise AssertionError("argparse should have rejected --format yaml")
+    err = capsys.readouterr().err
+    assert "--format" in err or "invalid choice" in err
+
+
+def test_experiments_report_output_writes_markdown_to_file(monkeypatch, tmp_path, capsys):
+    payload = {
+        "filters": {"family": None, "decision": None, "status": None, "limit": 50},
+        "counts": {"total": 0, "by_status": {}, "by_decision": {}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [],
+        "generated_at": "2026-06-02T00:00:00.000Z",
+    }
+    out_path = tmp_path / "report.md"
+    run_cli(
+        monkeypatch,
+        ["experiments", "report", "--format", "markdown", "--output", str(out_path)],
+        [payload],
+    )
+    captured = capsys.readouterr()
+    # Markdown is written to the file, not stdout. Stdout stays empty;
+    # confirmation goes to stderr.
+    assert captured.out == ""
+    assert str(out_path) in captured.err
+    contents = out_path.read_text(encoding="utf-8")
+    assert contents.startswith("# Experiment Research Report")
+    assert contents.endswith("\n")
+
+
+def test_experiments_report_output_writes_json_when_default_format(monkeypatch, tmp_path):
+    payload = {
+        "filters": {"family": None, "decision": None, "status": None, "limit": 50},
+        "counts": {"total": 0, "by_status": {}, "by_decision": {}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [],
+        "generated_at": "2026-06-02T00:00:00.000Z",
+    }
+    out_path = tmp_path / "report.json"
+    run_cli(
+        monkeypatch,
+        ["experiments", "report", "--output", str(out_path)],
+        [payload],
+    )
+    parsed = json.loads(out_path.read_text(encoding="utf-8"))
+    assert parsed == payload
+
+
 def test_experiments_report_help_documents_read_only_contract(capsys):
     out = _help_text(["experiments", "report", "--help"], capsys)
     assert "read-only" in out.lower()
