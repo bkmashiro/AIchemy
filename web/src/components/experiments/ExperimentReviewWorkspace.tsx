@@ -82,9 +82,164 @@ function downloadJson(filename: string, payload: unknown) {
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function filenameSuffix(value: string): string {
+export function filenameSuffix(value: string): string {
   const safe = value.trim().replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "");
   return safe || "family";
+}
+
+function mdText(value: string | number | null | undefined, empty = "—"): string {
+  if (value == null || value === "") return empty;
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/\r?\n/g, " ")
+    .replace(/([`*_{}\[\]()#+.!|>\-<>])/g, "\\$1");
+}
+
+function mdCell(value: string | number | null | undefined): string {
+  if (value == null || value === "") return "—";
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/</g, "\\<")
+    .replace(/>/g, "\\>")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ");
+}
+
+function mdCounts(counts: Record<string, number>): string {
+  const entries = Object.entries(counts).sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0) return "_(none)_";
+  return entries.map(([k, v]) => `${mdText(k)}=${v}`).join(", ");
+}
+
+function formatTaskCounts(counts: Record<string, number>): string {
+  const entries = Object.entries(counts).sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0) return "—";
+  return entries.map(([k, v]) => `${k}=${v}`).join(", ");
+}
+
+function formatPrimaryMetric(
+  primary: ExperimentResearchReportBlock["primary_metric"],
+): string {
+  if (!primary) return "—";
+  return `${primary.metric}=${formatMetricValue(primary.best)}`;
+}
+
+function formatRecentEvents(events: ExperimentResearchReportBlock["recent_events"]): string {
+  if (!events.length) return "—";
+  return events
+    .map((evt) => (evt.created_at ? `${evt.kind}@${evt.created_at}` : evt.kind))
+    .join("; ");
+}
+
+export function renderResearchReportMarkdown(
+  report: ExperimentResearchReportResponse,
+): string {
+  const lines: string[] = [];
+  lines.push("# Experiment Research Report");
+  lines.push("");
+  lines.push("## Filters");
+  lines.push("");
+  lines.push(`- family: ${report.filters.family ? mdText(report.filters.family) : "*all*"}`);
+  lines.push(
+    `- decision: ${report.filters.decision ? mdText(report.filters.decision) : "*all*"}`,
+  );
+  lines.push(`- status: ${report.filters.status ? mdText(report.filters.status) : "*all*"}`);
+  lines.push(`- limit: ${report.filters.limit ?? "*default*"}`);
+  if (report.generated_at) {
+    lines.push(`- generated_at: ${mdText(report.generated_at)}`);
+  }
+  lines.push("");
+  lines.push("## Counts");
+  lines.push("");
+  lines.push(`- total: ${report.counts.total}`);
+  lines.push(`- by_status: ${mdCounts(report.counts.by_status)}`);
+  lines.push(`- by_decision: ${mdCounts(report.counts.by_decision)}`);
+  lines.push("");
+
+  lines.push("## Metric");
+  lines.push("");
+  if (report.metric?.name) {
+    lines.push(`- name: ${mdText(report.metric.name)}`);
+    lines.push(`- direction: ${mdText(report.metric.direction)}`);
+  } else {
+    lines.push("_No goal metric declared by any experiment in this slice._");
+  }
+  lines.push("");
+
+  lines.push("## Leaderboard");
+  lines.push("");
+  if (report.leaderboard.length === 0) {
+    lines.push("_Empty — no experiment in this slice has a numeric goal-metric value yet._");
+  } else {
+    lines.push("| Rank | Experiment | Status | Decision | Metric | Value |");
+    lines.push("| ---: | --- | --- | --- | --- | ---: |");
+    for (const row of report.leaderboard) {
+      lines.push(
+        `| ${row.rank} | ${mdCell(row.name)} | ${mdCell(row.status)} | ${mdCell(
+          row.decision,
+        )} | ${mdCell(row.metric)} | ${formatMetricValue(row.value)} |`,
+      );
+    }
+  }
+  lines.push("");
+
+  const undecided = pickUndecided(report);
+  lines.push("## Undecided");
+  lines.push("");
+  if (report.experiments.length === 0) {
+    lines.push("_No experiments in this slice._");
+  } else if (undecided.length === 0) {
+    lines.push("_All experiments in this slice have a decision._");
+  } else {
+    lines.push(`_${undecided.length} of ${report.counts.total} undecided._`);
+    lines.push("");
+    lines.push("| Experiment | Status | Primary metric | Artifacts | Checkpoints |");
+    lines.push("| --- | --- | --- | ---: | ---: |");
+    for (const exp of undecided) {
+      lines.push(
+        `| ${mdCell(exp.name)} | ${mdCell(exp.status)} | ${mdCell(
+          formatPrimaryMetric(exp.primary_metric),
+        )} | ${exp.artifact_count} | ${exp.checkpoint_count} |`,
+      );
+    }
+  }
+  lines.push("");
+
+  lines.push("## Experiments");
+  lines.push("");
+  if (report.experiments.length === 0) {
+    lines.push("_No experiments match the current filters._");
+  } else {
+    lines.push(
+      "| Name | Family | Status | Decision | Task counts | Primary metric | Artifacts | Checkpoints | Recent events |",
+    );
+    lines.push("| --- | --- | --- | --- | --- | --- | ---: | ---: | --- |");
+    for (const exp of report.experiments) {
+      lines.push(
+        `| ${mdCell(exp.name || exp.id)} | ${mdCell(exp.family)} | ${mdCell(
+          exp.status,
+        )} | ${mdCell(exp.decision)} | ${mdCell(formatTaskCounts(exp.task_counts))} | ${mdCell(
+          formatPrimaryMetric(exp.primary_metric),
+        )} | ${exp.artifact_count} | ${exp.checkpoint_count} | ${mdCell(
+          formatRecentEvents(exp.recent_events),
+        )} |`,
+      );
+    }
+  }
+  lines.push("");
+  return lines.join("\n").replace(/\n+$/, "\n");
+}
+
+function downloadMarkdown(filename: string, body: string) {
+  const blob = new Blob([body], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function CopyButton({ value, label }: { value: string; label: string }) {
@@ -227,6 +382,10 @@ export function ExperimentReviewWorkspace({
     const suffix = familyFilter ? `-${filenameSuffix(familyFilter)}` : "-all";
     downloadJson(`experiment-research-report${suffix}.json`, report);
   };
+  const onDownloadMarkdown = () => {
+    const suffix = familyFilter ? filenameSuffix(familyFilter) : "all";
+    downloadMarkdown(`report-${suffix}.md`, renderResearchReportMarkdown(report));
+  };
 
   const hasFamily = !!familyFilter;
   const hasReport = report.counts.total > 0;
@@ -253,6 +412,15 @@ export function ExperimentReviewWorkspace({
               ))}
             </select>
           )}
+          <button
+            type="button"
+            onClick={onDownloadMarkdown}
+            disabled={!hasReport && !hasFamily}
+            className="text-[11px] text-gray-400 hover:text-gray-200 disabled:text-gray-700 disabled:cursor-not-allowed"
+            title="Download the research report as Markdown"
+          >
+            download Markdown
+          </button>
           <button
             type="button"
             onClick={onDownloadJson}

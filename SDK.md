@@ -297,8 +297,11 @@ Once a family is in flight, the recommended loop for triaging it is:
    The selected experiment block shows task counts, primary-metric best,
    artifact / checkpoint counts, and the last few timeline events — just
    enough to decide whether to keep, drop, rerun, or fork.
-3. **Export the family report** as JSON (workspace "download JSON"
-   button) or render it locally as Markdown:
+3. **Export the family report** straight from the dashboard — the
+   workspace has both a "download JSON" and a "download Markdown"
+   button (Markdown is rendered locally from the already-fetched
+   report, so it works offline against the same payload the panel
+   shows). For a CLI-driven copy:
 
    ```bash
    alch experiments report --family <family> --format markdown --output report.md
