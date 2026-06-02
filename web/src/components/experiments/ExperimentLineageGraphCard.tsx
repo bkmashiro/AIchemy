@@ -20,6 +20,9 @@ type RailRow = {
   // rails[d] = true iff column d should show a vertical line passing through
   // this row (i.e. ancestor at depth d has a later sibling). Length === depth.
   rails: boolean[];
+  // railOnPath[d] = true iff the ancestor at depth d is on the selected path,
+  // so the rail at that column should render with the path-highlight color.
+  railOnPath: boolean[];
 };
 
 const FOLD_DEPTH_LIMIT = 2;
@@ -32,6 +35,8 @@ function flattenLineage(
   const rows: RailRow[] = [];
   // ancestorIsLast[d] = "ancestor of current walk at depth d is last sibling"
   const ancestorIsLast: boolean[] = [];
+  // ancestorOnPath[d] = "ancestor at depth d lies on the selected spine"
+  const ancestorOnPath: boolean[] = [];
 
   const walk = (node: ExperimentTreeNode, depth: number, isLast: boolean) => {
     const onPath = pathIds.has(node.id);
@@ -52,7 +57,11 @@ function flattenLineage(
     }
 
     const rails: boolean[] = [];
-    for (let d = 0; d < depth; d++) rails.push(!ancestorIsLast[d]);
+    const railOnPath: boolean[] = [];
+    for (let d = 0; d < depth; d++) {
+      rails.push(!ancestorIsLast[d]);
+      railOnPath.push(!!ancestorOnPath[d]);
+    }
 
     rows.push({
       node,
@@ -64,14 +73,17 @@ function flattenLineage(
       hasVisibleChildren: renderChildren,
       foldedCount,
       rails,
+      railOnPath,
     });
 
     if (renderChildren) {
       ancestorIsLast[depth] = isLast;
+      ancestorOnPath[depth] = onPath || isCurrent;
       sortedChildren.forEach((child, i) =>
         walk(child, depth + 1, i === sortedChildren.length - 1),
       );
       ancestorIsLast.pop();
+      ancestorOnPath.pop();
     }
   };
 
@@ -98,12 +110,13 @@ const RAIL_LINE_PATH = "bg-indigo-400/40";
 
 const COL_W = 18; // px per gutter column
 
-function RailCell({ through }: { through: boolean }) {
+function RailCell({ through, onPath }: { through: boolean; onPath: boolean }) {
+  const color = onPath ? RAIL_LINE_PATH : RAIL_LINE;
   return (
     <div className="relative shrink-0" style={{ width: COL_W }}>
       {through && (
         <div
-          className={`absolute top-0 bottom-0 w-px ${RAIL_LINE}`}
+          className={`absolute top-0 bottom-0 w-px ${color}`}
           style={{ left: COL_W / 2 - 0.5 }}
         />
       )}
@@ -177,7 +190,7 @@ function RailRowView({
   row: RailRow;
   onSelectExperiment: (id: string) => void;
 }) {
-  const { node, depth, rails, isCurrent, onPath, tone, isLast, hasVisibleChildren, foldedCount } = row;
+  const { node, depth, rails, railOnPath, isCurrent, onPath, tone, isLast, hasVisibleChildren, foldedCount } = row;
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
@@ -193,7 +206,7 @@ function RailRowView({
   return (
     <div className={`flex items-stretch min-h-[24px] ${rowBg}`}>
       {rails.map((through, d) => (
-        <RailCell key={d} through={through} />
+        <RailCell key={d} through={through} onPath={railOnPath[d] ?? false} />
       ))}
       {depth > 0 && (
         <ConnectorCell drawBelow={drawBelowAtConnector} onPath={onPath} />
@@ -225,8 +238,11 @@ function RailRowView({
           </span>
         )}
         {foldedCount !== undefined && foldedCount > 0 && (
-          <span className="shrink-0 text-[10px] text-gray-500 italic">
-            +{foldedCount} folded
+          <span
+            className="shrink-0 text-[10px] text-gray-500 italic"
+            title={`${foldedCount} descendant run${foldedCount === 1 ? "" : "s"} hidden — select this run to expand the branch`}
+          >
+            +{foldedCount} hidden
           </span>
         )}
         {node.fork_reason && (

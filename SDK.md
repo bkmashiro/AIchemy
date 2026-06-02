@@ -113,3 +113,57 @@ lr = al.param("lr")           # crashes if missing (managed mode)
 lr = al.param("lr", 1e-3)     # default allowed in standalone mode
 params = al.params()           # full dict
 ```
+
+## Read-only Experiment Lineage
+
+The SDK also ships a thin, **read-only** HTTP client for inspecting
+experiment lineage from notebooks and scripts. It hits the same `/api/...`
+endpoints as the web dashboard and the `alch` CLI, and it never mutates
+scheduler / runtime / stub state — no decisions, no notes, no submissions.
+
+```python
+from alchemy_sdk import ExperimentClient
+
+# Auth is resolved in this order:
+#   1. token=... constructor arg (explicit wins)
+#   2. ALCHEMY_TOKEN env var
+# Server URL: server=... → ALCHEMY_SERVER → ALCHEMY_SERVER_URL → http://localhost:3002
+ec = ExperimentClient(server="https://alchemy.example.com", token="...")
+
+ec.list()                          # GET /api/experiments → list[dict]
+ec.tree()                          # GET /api/experiments/tree → forest
+ec.resolve("my-experiment")        # name-or-id → single experiment dict
+ec.summary("my-experiment")        # GET /api/experiments/<id>/summary
+ec.diff("my-experiment")           # GET /api/experiments/<id>/diff
+ec.manifest("my-experiment")       # GET /api/experiments/<id>/manifest
+ec.compare(["alpha", "beta-2"])    # GET /api/experiments/compare?ids=...
+```
+
+Notes:
+
+- All methods return raw decoded JSON (`dict` / `list`) — no dataclass wrapping.
+- `list()` raises if the server returns a non-list body (typically an error
+  envelope from an auth or middleware failure) instead of silently degrading.
+- `resolve()` and `compare()` accept either UUIDs or experiment names. Names
+  must be unambiguous; duplicates raise `RuntimeError`.
+- HTTP errors raise `RuntimeError` with the status code and response body
+  included so you can see exactly what the server said.
+- The companion CLI (`alch experiments tree|summary|diff|manifest|compare`)
+  uses the same endpoints and is also read-only by design.
+
+### Operator CLI: read-only experiment commands
+
+```bash
+alch experiments ls                        # list all experiments
+alch experiments show <name-or-id>         # full detail dict
+alch experiments tree                      # whole forest as JSON
+alch experiments summary <name-or-id>      # rollups, best metrics
+alch experiments diff <name-or-id>         # parameter / config diff vs parent
+alch experiments manifest <name-or-id>     # reproducibility manifest
+alch experiments compare <ref> <ref> ...   # multi-experiment compare
+alch experiments timeline <name-or-id>     # event timeline
+```
+
+These are safe to run during live training: they only issue `GET` requests
+against the Alchemy server. The mutating siblings (`note`, `decide`) require
+explicit arguments and are intentionally separate.

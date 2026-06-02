@@ -38,6 +38,16 @@ export type MatrixKeys = {
   colValues: unknown[];
 };
 
+// Pick a row/column axis pair for the experiment matrix grid.
+//
+// Edge cases worth knowing:
+//   - 0 params  → rowKey/colKey are "" and the grid degenerates to one cell.
+//   - 1 param   → only rowKey is set; colValues defaults to [""] so the grid
+//                 renders as a single column.
+//   - seed bias → when "seed" is one of the params, it is forced into colKey
+//                 (humans read seeds as repetitions, so they belong on cols).
+//   - non-array param values fall through to `[]`, which is what the grid
+//                 already expects (renders an empty row/col instead of NaN).
 export function pickMatrixKeys(
   paramSpace: Record<string, unknown>,
 ): MatrixKeys {
@@ -50,8 +60,18 @@ export function pickMatrixKeys(
     rowKey = paramKeys.find((k) => k !== "seed") ?? paramKeys[0];
   }
 
-  const rowValues = rowKey ? ((paramSpace[rowKey] as unknown[]) ?? []) : [""];
-  const colValues = colKey ? ((paramSpace[colKey] as unknown[]) ?? []) : [""];
+  // Preserve the historical empty-array fallback for non-array param values.
+  // Callers downstream iterate rowValues/colValues directly with .map().
+  const rowValues = rowKey
+    ? Array.isArray(paramSpace[rowKey])
+      ? (paramSpace[rowKey] as unknown[])
+      : []
+    : [""];
+  const colValues = colKey
+    ? Array.isArray(paramSpace[colKey])
+      ? (paramSpace[colKey] as unknown[])
+      : []
+    : [""];
   const extraKeys = paramKeys.filter((k) => k !== rowKey && k !== colKey);
 
   return { rowKey, colKey, extraKeys, rowValues, colValues };
@@ -150,6 +170,9 @@ export function findNodePath(
   return null;
 }
 
+// Count descendants of `node` (the node itself is NOT included). The lineage
+// rail uses this to label folded branches as "+N hidden" where N covers every
+// hidden descendant — including grandchildren — not just direct children.
 export function countSubtreeNodes(node: ExperimentTreeNode): number {
   let n = 0;
   for (const c of node.children) {
@@ -158,27 +181,50 @@ export function countSubtreeNodes(node: ExperimentTreeNode): number {
   return n;
 }
 
+// Priority buckets used by sortLineageChildren. Lower number = earlier.
+// Keep these as a named record so the sort order is self-documenting.
+const LINEAGE_SORT_PRIORITY = {
+  onPath: { yes: 0, no: 1 },
+  // child-bearing siblings rank before leaves so the rail keeps growing
+  hasKids: { yes: 0, no: 1 },
+  // promoted decisions read as "this branch continues" — surface them first
+  decision: { promoted: 0, other: 1 },
+  // failed/drop leaves sink to the bottom of any tied bucket
+  leafTone: { active: 0, dead: 1 },
+} as const;
+
 // Sort siblings for selected-path continuity without mutating input.
+//
+// Order (most → least significant):
 //  1. selected-path / current nodes first so the focused spine stays visible
 //  2. child-bearing nodes before leaves within the remaining siblings
 //  3. keep/fork decisions before drop/rerun/undecided
 //  4. failed/drop leaf branches after active/passed/partial/running leaves
-//  5. otherwise preserve API order via stable sort
+//  5. otherwise preserve API order (stable sort via decorated index)
+//
+// Note: this is a pure function — callers (e.g. ExperimentLineageGraphCard)
+// recurse into the returned array, so the sort cascades down the tree.
 export function sortLineageChildren(
   children: ExperimentTreeNode[],
   pathIds: Set<string>,
   currentId: string,
 ): ExperimentTreeNode[] {
+  const P = LINEAGE_SORT_PRIORITY;
   type Key = readonly [number, number, number, number];
   const key = (n: ExperimentTreeNode): Key => {
-    const onPath = pathIds.has(n.id) || n.id === currentId ? 0 : 1;
-    const hasKids = n.children.length > 0 ? 0 : 1;
-    const decisionBucket = n.decision === "keep" || n.decision === "fork" ? 0 : 1;
-    const failedLeaf =
-      n.children.length === 0 && (n.status === "failed" || n.decision === "drop")
-        ? 1
-        : 0;
-    return [onPath, hasKids, decisionBucket, failedLeaf];
+    const onPath =
+      pathIds.has(n.id) || n.id === currentId ? P.onPath.yes : P.onPath.no;
+    const hasKids = n.children.length > 0 ? P.hasKids.yes : P.hasKids.no;
+    const decisionBucket =
+      n.decision === "keep" || n.decision === "fork"
+        ? P.decision.promoted
+        : P.decision.other;
+    const leafTone =
+      n.children.length === 0 &&
+      (n.status === "failed" || n.decision === "drop")
+        ? P.leafTone.dead
+        : P.leafTone.active;
+    return [onPath, hasKids, decisionBucket, leafTone];
   };
   const decorated = children.map((node, idx) => ({ node, idx, k: key(node) }));
   decorated.sort((a, b) => {
@@ -192,6 +238,14 @@ export function sortLineageChildren(
 
 export type LineageTone = "current" | "path" | "active" | "muted";
 
+// Decide the visual tone for a lineage node. The order matters:
+//   1. current  — the focused experiment always wins.
+//   2. path     — ancestors on the selected spine stay highlighted.
+//   3. muted    — failed runs, dropped decisions, and undecided leaf branches
+//                 fold into the background so live work pops visually. A leaf
+//                 with status "running" is intentionally NOT muted so an
+//                 in-flight run keeps drawing attention until it terminates.
+//   4. active   — everything else (passed, partial, running with kids, etc.).
 export function lineageNodeTone(
   node: ExperimentTreeNode,
   isCurrent: boolean,

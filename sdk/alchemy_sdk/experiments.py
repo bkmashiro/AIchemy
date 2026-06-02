@@ -72,20 +72,36 @@ class ExperimentClient:
 
     def list(self) -> list[dict[str, Any]]:
         data = self._get("/experiments")
-        return list(data or [])
+        # GET /experiments must return a JSON array. Fail loudly if the server
+        # returns something else (e.g. an error envelope, a dict) rather than
+        # silently coercing to `list(dict.keys())`, which used to mask bad
+        # tokens and middleware that returns `{"error": ...}`.
+        if data is None:
+            return []
+        if not isinstance(data, list):
+            raise RuntimeError(
+                f"unexpected /experiments response shape: expected list, got {type(data).__name__}"
+            )
+        return data
 
     def tree(self) -> Any:
         return self._get("/experiments/tree")
 
-    def resolve(self, ref: str) -> dict[str, Any]:
-        experiments = self.list()
-        matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref]
+    def _resolve_one(
+        self, experiments: list[dict[str, Any]], ref: str
+    ) -> dict[str, Any]:
+        matches = [
+            e for e in experiments if e.get("id") == ref or e.get("name") == ref
+        ]
         if not matches:
             raise RuntimeError(f"experiment not found: {ref}")
         if len(matches) > 1:
             names = [e.get("name") for e in matches]
             raise RuntimeError(f"ambiguous experiment ref {ref!r}: {names}")
         return matches[0]
+
+    def resolve(self, ref: str) -> dict[str, Any]:
+        return self._resolve_one(self.list(), ref)
 
     def summary(self, ref: str) -> Any:
         exp = self.resolve(ref)
@@ -104,14 +120,6 @@ class ExperimentClient:
         if not refs_list:
             raise RuntimeError("compare requires at least one experiment ref")
         experiments = self.list()
-        resolved_ids: list[str] = []
-        for ref in refs_list:
-            matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref]
-            if not matches:
-                raise RuntimeError(f"experiment not found: {ref}")
-            if len(matches) > 1:
-                names = [e.get("name") for e in matches]
-                raise RuntimeError(f"ambiguous experiment ref {ref!r}: {names}")
-            resolved_ids.append(matches[0]["id"])
+        resolved_ids = [self._resolve_one(experiments, ref)["id"] for ref in refs_list]
         query = urlencode({"ids": ",".join(resolved_ids)})
         return self._get(f"/experiments/compare?{query}")

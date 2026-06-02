@@ -228,3 +228,58 @@ def test_server_defaults_from_env(monkeypatch):
 def test_exported_from_package():
     from alchemy_sdk import ExperimentClient as Exported
     assert Exported is ExperimentClient
+
+
+def test_explicit_token_arg_beats_env(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "env-token")
+    client = ExperimentClient(server="http://server", token="ctor-token")
+    queue = [[{"id": "exp-1", "name": "alpha"}]]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()
+    assert calls[0]["auth"] == "Bearer ctor-token"
+
+
+def test_constructor_token_used_when_env_unset(monkeypatch):
+    monkeypatch.delenv("ALCHEMY_TOKEN", raising=False)
+    client = ExperimentClient(server="http://server", token="ctor-only")
+    queue = [[]]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()
+    assert calls[0]["auth"] == "Bearer ctor-only"
+
+
+def test_trailing_slash_in_server_is_normalized(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    client = ExperimentClient(server="http://server:9000//")
+    # Both leading-slash normalizations should apply: server has no trailing
+    # slash, and the path joins cleanly without `//`.
+    assert client.server == "http://server:9000"
+    queue = [[]]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()
+    assert calls[0]["url"] == "http://server:9000/api/experiments"
+
+
+def test_list_raises_on_non_list_response(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    client = ExperimentClient(server="http://server")
+    # Server returned an error envelope (dict) instead of a list — we used to
+    # silently turn that into `list({"error": "..."}.keys())`. Now it must
+    # raise so the operator can see the real failure mode.
+    queue = [{"error": "db down"}]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        with pytest.raises(RuntimeError, match="unexpected /experiments response shape"):
+            client.list()
+
+
+def test_list_returns_empty_for_null_body(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    client = ExperimentClient(server="http://server")
+    queue = [None]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        assert client.list() == []
