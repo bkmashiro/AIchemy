@@ -50,8 +50,8 @@ export function pickMatrixKeys(
     rowKey = paramKeys.find((k) => k !== "seed") ?? paramKeys[0];
   }
 
-  const rowValues = rowKey ? ((paramSpace[rowKey] as unknown[]) ?? [""]) : [""];
-  const colValues = colKey ? ((paramSpace[colKey] as unknown[]) ?? [""]) : [""];
+  const rowValues = rowKey ? ((paramSpace[rowKey] as unknown[]) ?? []) : [""];
+  const colValues = colKey ? ((paramSpace[colKey] as unknown[]) ?? []) : [""];
   const extraKeys = paramKeys.filter((k) => k !== rowKey && k !== colKey);
 
   return { rowKey, colKey, extraKeys, rowValues, colValues };
@@ -158,9 +158,9 @@ export function countSubtreeNodes(node: ExperimentTreeNode): number {
   return n;
 }
 
-// Sort siblings for visual continuity (does NOT mutate input).
-//  1. child-bearing nodes first
-//  2. selected-path / current nodes before non-path
+// Sort siblings for selected-path continuity without mutating input.
+//  1. selected-path / current nodes first so the focused spine stays visible
+//  2. child-bearing nodes before leaves within the remaining siblings
 //  3. keep/fork decisions before drop/rerun/undecided
 //  4. failed/drop leaf branches after active/passed/partial/running leaves
 //  5. otherwise preserve API order via stable sort
@@ -171,14 +171,14 @@ export function sortLineageChildren(
 ): ExperimentTreeNode[] {
   type Key = readonly [number, number, number, number];
   const key = (n: ExperimentTreeNode): Key => {
-    const hasKids = n.children.length > 0 ? 0 : 1;
     const onPath = pathIds.has(n.id) || n.id === currentId ? 0 : 1;
+    const hasKids = n.children.length > 0 ? 0 : 1;
     const decisionBucket = n.decision === "keep" || n.decision === "fork" ? 0 : 1;
     const failedLeaf =
       n.children.length === 0 && (n.status === "failed" || n.decision === "drop")
         ? 1
         : 0;
-    return [hasKids, onPath, decisionBucket, failedLeaf];
+    return [onPath, hasKids, decisionBucket, failedLeaf];
   };
   const decorated = children.map((node, idx) => ({ node, idx, k: key(node) }));
   decorated.sort((a, b) => {
