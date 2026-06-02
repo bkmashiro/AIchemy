@@ -558,6 +558,41 @@ def test_experiments_manifest_fetches_by_id(monkeypatch):
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/manifest"
 
 
+def test_experiments_bundle_fetches_research_bundle_endpoint(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "bundle", "alpha"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {
+                "experiment": {"id": "exp-1", "name": "alpha"},
+                "summary": {"id": "exp-1"},
+                "diff": {"experiment_id": "exp-1"},
+                "manifest": {"enabled": False, "content": None, "status": "not_enabled", "error": None},
+                "timeline": {"experiment_id": "exp-1", "events": []},
+                "decision": {"decision": None, "reason": None, "decided_at": None},
+                "artifacts": [],
+                "generated_at": "2026-06-02T00:00:00.000Z",
+            },
+        ],
+    )
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/research-bundle"
+
+
+def test_experiments_bundle_help_documents_read_only_contract(capsys):
+    out = _help_text(["experiments", "bundle", "--help"], capsys)
+    assert "read-only" in out.lower() or "Only GET" in out or "only GET" in out
+    assert "research-bundle" in out
+
+
+def test_experiments_help_lists_bundle(capsys):
+    out = _help_text(["experiments", "--help"], capsys)
+    assert "bundle" in out
+
+
 def test_move_to_stub_cancels_then_posts_target_stub(monkeypatch):
     task = {
         "id": "task-1",

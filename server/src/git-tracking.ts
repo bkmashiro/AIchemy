@@ -13,6 +13,15 @@ import { logger } from "./log";
 
 // ─── Core exec helper ─────────────────────────────────────────────────────────
 
+export function shellQuote(value: string): string {
+  if (value.length === 0) return "''";
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildReadManifestCommand(repoPath: string, experimentName: string): string {
+  return `cd ${shellQuote(repoPath)} && cat ${shellQuote(`experiments/${experimentName}.yaml`)}`;
+}
+
 /**
  * Run a shell command on a stub via WebSocket exec.request.
  * Returns the response payload. Throws on timeout or socket error.
@@ -248,8 +257,7 @@ export async function readExperimentManifest(
   const repoPath = exp.git_repo_path;
   if (!repoPath) throw new Error("no git_repo_path on experiment");
 
-  const manifestPath = `experiments/${exp.name}.yaml`;
-  const command = `cd ${repoPath} && cat ${manifestPath}`;
+  const command = buildReadManifestCommand(repoPath, exp.name);
 
   const result = await execOnStub(stubId, command, 10_000, stubNs);
   if (result.exit_code !== 0) {

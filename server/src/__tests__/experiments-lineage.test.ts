@@ -302,6 +302,113 @@ describe("experiment lineage API", () => {
       .expect(400);
   });
 
+  it("returns a composite research-bundle that aligns with /summary, /diff, /timeline", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "bundle-export",
+        family: "pretrain",
+        hypothesis: "curiosity helps",
+        task_specs: [{ ref: "train", script: "train.py" }],
+      })
+      .expect(201);
+
+    const expId = created.body.id;
+
+    await request(app)
+      .post(`/experiments/${expId}/events`)
+      .send({ kind: "note", message: "first observation" })
+      .expect(201);
+
+    await request(app)
+      .post(`/experiments/${expId}/events`)
+      .send({
+        kind: "checkpoint",
+        message: "ckpt step 1000",
+        data: { path: "/runs/abc/ckpt-1000.pt", artifact_type: "checkpoint", step: 1000 },
+      })
+      .expect(201);
+
+    await request(app)
+      .post(`/experiments/${expId}/events`)
+      .send({
+        kind: "artifact",
+        message: "tb logs",
+        data: { uri: "s3://bucket/tb", artifact_type: "tensorboard" },
+      })
+      .expect(201);
+
+    await request(app)
+      .patch(`/experiments/${expId}/decision`)
+      .send({ decision: "keep", reason: "best zn so far" })
+      .expect(200);
+
+    const bundle = await request(app)
+      .get(`/experiments/${expId}/research-bundle`)
+      .expect(200);
+
+    expect(bundle.body.experiment.id).toBe(expId);
+    expect(bundle.body.experiment.status).toBeDefined();
+    expect(bundle.body.experiment.tasks).toBeDefined();
+
+    // Summary should align with /summary endpoint output.
+    const summary = await request(app).get(`/experiments/${expId}/summary`).expect(200);
+    expect(bundle.body.summary).toEqual(summary.body);
+
+    // Diff should align with /diff endpoint output.
+    const diff = await request(app).get(`/experiments/${expId}/diff`).expect(200);
+    expect(bundle.body.diff).toEqual(diff.body);
+
+    // Timeline events should match /timeline ordering (same helper).
+    const timeline = await request(app).get(`/experiments/${expId}/timeline`).expect(200);
+    expect(bundle.body.timeline).toEqual(timeline.body);
+
+    // Decision block.
+    expect(bundle.body.decision).toEqual({
+      decision: "keep",
+      reason: "best zn so far",
+      decided_at: expect.any(String),
+    });
+
+    // Artifacts: only artifact/checkpoint kinds, preserving locator.
+    const kinds = bundle.body.artifacts.map((e: any) => e.kind).sort();
+    expect(kinds).toEqual(["artifact", "checkpoint"]);
+    const ckpt = bundle.body.artifacts.find((e: any) => e.kind === "checkpoint");
+    expect(ckpt.data.path).toBe("/runs/abc/ckpt-1000.pt");
+    const tb = bundle.body.artifacts.find((e: any) => e.kind === "artifact");
+    expect(tb.data.uri).toBe("s3://bucket/tb");
+
+    // Manifest defaults to not_enabled when git_tracking is off.
+    expect(bundle.body.manifest).toEqual({
+      enabled: false,
+      content: null,
+      status: "not_enabled",
+      error: null,
+    });
+
+    expect(typeof bundle.body.generated_at).toBe("string");
+  });
+
+  it("research-bundle returns 404 when the experiment is missing", async () => {
+    const app = makeApp();
+    await request(app).get("/experiments/ghost/research-bundle").expect(404);
+  });
+
+  it("research-bundle is read-only and does not append events", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({ name: "bundle-readonly", task_specs: [{ ref: "t", script: "t.py" }] })
+      .expect(201);
+
+    const before = store.getExperimentEvents(created.body.id).length;
+    await request(app).get(`/experiments/${created.body.id}/research-bundle`).expect(200);
+    await request(app).get(`/experiments/${created.body.id}/research-bundle`).expect(200);
+    const after = store.getExperimentEvents(created.body.id).length;
+    expect(after).toBe(before);
+  });
+
   it("preserves events when experiment record is deleted", async () => {
     const app = makeApp();
     const created = await request(app)

@@ -520,6 +520,11 @@ def cmd_experiments_manifest(args: argparse.Namespace, client: ApiClient) -> Non
     print_json(client.get(f"/experiments/{exp['id']}/manifest"))
 
 
+def cmd_experiments_bundle(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}/research-bundle"))
+
+
 def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
     reason = args.reason_flag or args.reason
     if not reason:
@@ -539,11 +544,11 @@ def add_global(parser: argparse.ArgumentParser) -> None:
 
 EXPERIMENTS_DESCRIPTION = (
     "Inspect and annotate experiments. Read commands (ls/show/timeline/tree/"
-    "summary/diff/manifest/compare/fork-plan) issue only GET requests. The "
-    "mutating commands (note/artifact/checkpoint/decide) append metadata or "
-    "set the decision via the server API; they never reschedule tasks. "
-    "Actor is derived server-side from the auth token — the CLI does not "
-    "send actor."
+    "summary/diff/manifest/compare/fork-plan/bundle) issue only GET requests "
+    "and never reschedule tasks. The mutating commands (note/artifact/"
+    "checkpoint/decide) append metadata or set the decision via the server "
+    "API; they also never reschedule tasks. Actor is derived server-side "
+    "from the auth token — the CLI does not send actor."
 )
 
 
@@ -671,6 +676,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = exps_sub.add_parser("manifest", help="reproducibility manifest (git, env, task specs)")
     p.add_argument("experiment", help="experiment name or id")
     p.set_defaults(func=cmd_experiments_manifest)
+
+    p = exps_sub.add_parser(
+        "bundle",
+        help="read-only research bundle (detail + summary + diff + manifest + timeline + decision + artifacts)",
+        description=(
+            "GET /experiments/<id>/research-bundle — one-shot read-only export "
+            "of decision-relevant context for an experiment. Intended for "
+            "research handoff, notebooks, or batch export; does not replace "
+            "streaming dashboards. Issues only GET requests."
+        ),
+    )
+    p.add_argument("experiment", help="experiment name or id")
+    p.set_defaults(func=cmd_experiments_bundle)
 
     p = sub.add_parser("verify", help="poll task/stub state and assert expectations")
     p.add_argument("--task", help="task id to check")

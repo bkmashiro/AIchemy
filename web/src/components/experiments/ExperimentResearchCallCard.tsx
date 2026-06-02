@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { experimentsApi } from "../../lib/api";
 import type {
   ExperimentDetail,
   ExperimentSummaryResponse,
@@ -32,6 +34,37 @@ export function ExperimentResearchCallCard({
   const decisionBadge = decision
     ? DECISION_BADGE[decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : "bg-gray-800 text-gray-500 border-gray-700";
+
+  const [exportState, setExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  const cliRef = exp.name || exp.id;
+  const cliRefForShell = cliRef.length === 0
+    ? "''"
+    : `'${cliRef.replace(/'/g, `'\\''`)}'`;
+
+  async function downloadBundle() {
+    setExportState("loading");
+    setExportError(null);
+    try {
+      const bundle = await experimentsApi.getResearchBundle(exp.id);
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeName = (exp.name || exp.id).replace(/[^a-zA-Z0-9_.-]+/g, "_");
+      a.download = `${safeName}-research-bundle.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setExportState("done");
+      setTimeout(() => setExportState("idle"), 2000);
+    } catch (err: any) {
+      setExportError(err?.message ?? String(err));
+      setExportState("error");
+    }
+  }
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
@@ -119,6 +152,33 @@ export function ExperimentResearchCallCard({
             <p className="text-gray-300 whitespace-pre-wrap">{forkReason}</p>
           </div>
         )}
+
+        <div className="pt-2 border-t border-gray-800">
+          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">
+            Research bundle
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={downloadBundle}
+              disabled={exportState === "loading"}
+              className="text-[11px] px-2 py-1 rounded border border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700 disabled:opacity-50"
+              title="Read-only JSON export: detail + summary + diff + manifest + timeline + decision + artifacts"
+            >
+              {exportState === "loading"
+                ? "Exporting…"
+                : exportState === "done"
+                  ? "Downloaded"
+                  : "Export JSON"}
+            </button>
+            <code className="text-[10px] text-gray-500 truncate">
+              alch experiments bundle {cliRefForShell}
+            </code>
+          </div>
+          {exportError && (
+            <div className="mt-1 text-[10px] text-red-400">{exportError}</div>
+          )}
+        </div>
       </div>
     </div>
   );

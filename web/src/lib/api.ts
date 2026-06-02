@@ -518,6 +518,8 @@ export const experimentsApi = {
     api.get<ExperimentSummaryResponse>(`/experiments/${id}/summary`).then((r) => r.data),
   getDiff: (id: string) =>
     api.get<ExperimentDiffResponse>(`/experiments/${id}/diff`).then((r) => r.data),
+  getResearchBundle: (id: string) =>
+    api.get<Record<string, any>>(`/experiments/${id}/research-bundle`).then((r) => r.data),
 };
 
 // ─── Cost API ─────────────────────────────────────────────────────────────────

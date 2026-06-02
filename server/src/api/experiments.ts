@@ -6,6 +6,7 @@
  * GET    /experiments/:id       — experiment detail + task validations
  * DELETE /experiments/:id       — delete experiment (does NOT delete tasks)
  * POST   /experiments/:id/retry-failed — retry tasks that failed criteria
+ * GET    /experiments/:id/research-bundle — read-only export composite payload
  */
 
 import { Router, Request, Response } from "express";
@@ -876,6 +877,111 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     });
     webNs.emit("experiment.update", updated);
     res.json(updated);
+  });
+
+  // GET /experiments/:id/research-bundle — read-only export of decision-relevant
+  // context: detail + summary + diff + manifest + timeline + decision + artifacts.
+  // Composes existing read-only surfaces; never writes events or touches scheduler.
+  router.get("/:id/research-bundle", async (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+
+    const status = deriveExperimentStatus(exp);
+    const grid = store.getGrid(exp.grid_id);
+    const tasks = grid ? store.getGridTasks(exp.grid_id) : [];
+
+    const detail = { ...exp, status, grid, tasks };
+
+    const parent = exp.parent_id ? store.getExperiment(exp.parent_id) : undefined;
+    const children = store.getAllExperiments()
+      .filter((e) => e.parent_id === exp.id)
+      .sort(compareExperiments);
+    const storedEvents = store.getExperimentEvents(exp.id).filter((e) => !e.deleted_at);
+    const eventCount = storedEvents.length;
+
+    const summary = {
+      id: exp.id,
+      name: exp.name,
+      status,
+      family: exp.family ?? null,
+      hypothesis: exp.hypothesis ?? null,
+      expected_outcome: exp.expected_outcome ?? null,
+      fork_reason: exp.fork_reason ?? null,
+      goal_metric: exp.goal_metric ?? null,
+      goal_direction: exp.goal_direction ?? null,
+      decision: exp.decision ?? null,
+      decision_reason: exp.decision_reason ?? null,
+      decision_at: exp.decision_at ?? null,
+      created_at: exp.created_at,
+      parent: parent ? experimentBrief(parent) : null,
+      children: children.map(experimentBrief),
+      task_counts: taskCountsByStatus(exp),
+      validation: passFailSummary(exp),
+      best_metrics: bestMetricValues(exp),
+      primary_metric: primaryMetricFor(exp),
+      timeline_event_count: eventCount,
+      config: exp.config ?? null,
+      config_diff: exp.config_diff ?? null,
+    };
+
+    const diff: Record<string, any> = {
+      experiment_id: exp.id,
+      name: exp.name,
+      config: exp.config || null,
+      config_diff: exp.config_diff || null,
+      parent_name: exp.parent_name || null,
+      parent_id: exp.parent_id || null,
+    };
+    if (exp.parent_id) {
+      const parentExp = store.getExperiment(exp.parent_id);
+      if (parentExp) diff.parent_config = parentExp.config || null;
+    }
+
+    const events = timelineFor(exp);
+    const timeline = { experiment_id: exp.id, events };
+
+    // Artifacts: only artifact/checkpoint kinds, preserving locator data. The
+    // timeline already filters out deleted events and orders deterministically.
+    const artifacts = events.filter((e) => ARTIFACT_KINDS.has(e.kind));
+
+    const decision = {
+      decision: exp.decision ?? null,
+      reason: exp.decision_reason ?? null,
+      decided_at: exp.decision_at ?? null,
+    };
+
+    // Manifest is best-effort: requires git_tracking, git_repo_path, and an
+    // online stub. Failing any precondition or hitting an exec error must not
+    // 500 the bundle — surface status so consumers can show "manifest
+    // unavailable" without rerouting through /manifest themselves.
+    let manifest: { enabled: boolean; content: string | null; status: string; error: string | null };
+    if (!exp.git_tracking || !exp.git_repo_path) {
+      manifest = { enabled: false, content: null, status: "not_enabled", error: null };
+    } else {
+      const stub = store.getAllStubs().find((s) => s.status === "online");
+      if (!stub) {
+        manifest = { enabled: true, content: null, status: "no_online_stub", error: null };
+      } else {
+        try {
+          const content = await readExperimentManifest(exp, stub.id, stubNs);
+          manifest = { enabled: true, content, status: "ok", error: null };
+        } catch (err: any) {
+          logger.warn("experiment.bundle-manifest-read-failed", { id: exp.id, name: exp.name, error: String(err) });
+          manifest = { enabled: true, content: null, status: "error", error: err?.message ? String(err.message) : String(err) };
+        }
+      }
+    }
+
+    res.json({
+      experiment: detail,
+      summary,
+      diff,
+      manifest,
+      timeline,
+      decision,
+      artifacts,
+      generated_at: new Date().toISOString(),
+    });
   });
 
   // GET /experiments/:id/manifest

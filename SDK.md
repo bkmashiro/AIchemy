@@ -141,6 +141,9 @@ ec.diff("my-experiment")               # GET /api/experiments/<id>/diff
 ec.manifest("my-experiment")           # GET /api/experiments/<id>/manifest
 ec.timeline("my-experiment")           # GET /api/experiments/<id>/timeline
 ec.compare(["alpha", "beta-2"])        # GET /api/experiments/compare?ids=...
+ec.research_bundle("my-experiment")    # GET /api/experiments/<id>/research-bundle
+                                       # one-shot export of detail + summary + diff +
+                                       # manifest + timeline + decision + artifacts
 
 # Local dry-run: build a fork manifest without submitting anything. Only the
 # two GET requests below run; nothing is written to the server.
@@ -206,10 +209,21 @@ alch experiments diff <name-or-id>         # parameter / config diff vs parent
 alch experiments manifest <name-or-id>     # reproducibility manifest
 alch experiments compare <ref> <ref> ...   # multi-experiment compare
 alch experiments timeline <name-or-id>     # event timeline
+alch experiments bundle <name-or-id>       # one-shot research export
+                                           # (detail + summary + diff + manifest +
+                                           #  timeline + decision + artifacts)
 alch experiments fork-plan <name-or-id> \
     --set lr=0.0002 --unset warmup \
     --reason "ablation"                    # local dry-run: prints proposed config + diff
 ```
+
+The `bundle` command is meant for research handoff and batch export — a
+single GET that returns everything needed to reconstruct an experiment's
+context (parent/child, validation rollups, config diff, timeline, decision,
+artifact locators, best-effort git manifest). It is **not** a live dashboard
+replacement; for streaming metrics keep using `log_eval` and the web UI.
+Manifest is best-effort: when `git_tracking` is disabled or no stub is
+online, `manifest.content` is `null` and `manifest.status` explains why.
 
 These are safe to run during live training: they only issue `GET` requests
 against the Alchemy server. `fork-plan` in particular does **not** submit a

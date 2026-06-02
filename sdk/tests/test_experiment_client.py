@@ -412,6 +412,47 @@ def test_list_filtered_results_bypass_cache_writes(monkeypatch):
     assert len(calls) == 3
 
 
+def test_research_bundle_resolves_and_hits_bundle_endpoint(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    bundle_payload = {
+        "experiment": {"id": "exp-1", "name": "alpha"},
+        "summary": {"id": "exp-1"},
+        "diff": {"experiment_id": "exp-1"},
+        "manifest": {"enabled": False, "content": None, "status": "not_enabled", "error": None},
+        "timeline": {"experiment_id": "exp-1", "events": []},
+        "decision": {"decision": None, "reason": None, "decided_at": None},
+        "artifacts": [],
+        "generated_at": "2026-06-02T00:00:00.000Z",
+    }
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.research_bundle("alpha"),
+        [[{"id": "exp-1", "name": "alpha"}], bundle_payload],
+    )
+    assert result == bundle_payload
+    assert [c["method"] for c in calls] == ["GET", "GET"]
+    assert calls[0]["url"] == "http://server/api/experiments"
+    assert calls[1]["url"] == "http://server/api/experiments/exp-1/research-bundle"
+
+
+def test_research_bundle_refresh_bypasses_cache(monkeypatch):
+    client = ExperimentClient(server="http://server", cache_experiments=True)
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    first = [{"id": "exp-1", "name": "alpha"}]
+    second = [{"id": "exp-1", "name": "alpha"}, {"id": "exp-2", "name": "beta"}]
+    queue = [first, second, {"experiment": {"id": "exp-2"}}]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()  # primes cache with `first`
+        client.research_bundle("beta", refresh=True)
+    paths = [c["url"].split("/api", 1)[1] for c in calls]
+    assert paths == [
+        "/experiments",
+        "/experiments",
+        "/experiments/exp-2/research-bundle",
+    ]
+
+
 def test_timeline_resolves_and_hits_timeline_endpoint(monkeypatch):
     client = ExperimentClient(server="http://server")
     _, calls = _run(

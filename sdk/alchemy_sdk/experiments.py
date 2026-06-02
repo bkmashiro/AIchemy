@@ -187,6 +187,17 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/timeline")
 
+    def research_bundle(self, ref: str, *, refresh: bool = False) -> Any:
+        """GET /api/experiments/<id>/research-bundle.
+
+        One-shot read-only export of decision-relevant context: experiment
+        detail, summary, config diff, manifest (best-effort), full timeline,
+        decision, and artifacts. Intended for notebook handoff or batch
+        export, not for replacing W&B-style streaming.
+        """
+        exp = self.resolve(ref, refresh=refresh)
+        return self._get(f"/experiments/{exp['id']}/research-bundle")
+
     def fork_plan(
         self,
         ref: str,
