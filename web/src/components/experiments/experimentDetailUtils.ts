@@ -150,6 +150,65 @@ export function findNodePath(
   return null;
 }
 
+export function countSubtreeNodes(node: ExperimentTreeNode): number {
+  let n = 0;
+  for (const c of node.children) {
+    n += 1 + countSubtreeNodes(c);
+  }
+  return n;
+}
+
+// Sort siblings for visual continuity (does NOT mutate input).
+//  1. child-bearing nodes first
+//  2. selected-path / current nodes before non-path
+//  3. keep/fork decisions before drop/rerun/undecided
+//  4. failed/drop leaf branches after active/passed/partial/running leaves
+//  5. otherwise preserve API order via stable sort
+export function sortLineageChildren(
+  children: ExperimentTreeNode[],
+  pathIds: Set<string>,
+  currentId: string,
+): ExperimentTreeNode[] {
+  type Key = readonly [number, number, number, number];
+  const key = (n: ExperimentTreeNode): Key => {
+    const hasKids = n.children.length > 0 ? 0 : 1;
+    const onPath = pathIds.has(n.id) || n.id === currentId ? 0 : 1;
+    const decisionBucket = n.decision === "keep" || n.decision === "fork" ? 0 : 1;
+    const failedLeaf =
+      n.children.length === 0 && (n.status === "failed" || n.decision === "drop")
+        ? 1
+        : 0;
+    return [hasKids, onPath, decisionBucket, failedLeaf];
+  };
+  const decorated = children.map((node, idx) => ({ node, idx, k: key(node) }));
+  decorated.sort((a, b) => {
+    for (let i = 0; i < a.k.length; i++) {
+      if (a.k[i] !== b.k[i]) return a.k[i] - b.k[i];
+    }
+    return a.idx - b.idx;
+  });
+  return decorated.map((d) => d.node);
+}
+
+export type LineageTone = "current" | "path" | "active" | "muted";
+
+export function lineageNodeTone(
+  node: ExperimentTreeNode,
+  isCurrent: boolean,
+  onPath: boolean,
+): LineageTone {
+  if (isCurrent) return "current";
+  if (onPath) return "path";
+  if (
+    node.status === "failed" ||
+    node.decision === "drop" ||
+    (node.children.length === 0 && node.decision === null && node.status !== "running")
+  ) {
+    return "muted";
+  }
+  return "active";
+}
+
 // ─── Research call next-action copy ─────────────────────────────────────────
 
 export const NEXT_ACTION: Record<
