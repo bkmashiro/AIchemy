@@ -329,6 +329,24 @@ def test_experiments_fork_plan_rejects_dotted_keys(monkeypatch, capsys):
     assert "nested keys" in err
 
 
+
+def test_experiments_fork_plan_rejects_empty_unset_key(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    responses = [
+        [{"id": "exp-1", "name": "alpha"}],
+        {"id": "exp-1", "name": "alpha", "config": {}},
+    ]
+
+    def fake_urlopen(req, timeout=20.0):
+        return FakeResponse(responses.pop(0))
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "fork-plan", "alpha", "--unset", "  "])
+    assert code == 1
+    assert "--unset key must be non-empty" in capsys.readouterr().err
+
+
 def test_experiments_ls_passes_filters_as_query(monkeypatch):
     calls = run_cli(
         monkeypatch,
@@ -566,3 +584,31 @@ def test_move_to_stub_cancels_then_posts_target_stub(monkeypatch):
     assert calls[3]["method"] == "POST"
     assert calls[3]["body"]["target_stub_id"] == "stub-1"
     assert "target_tags" not in calls[3]["body"]
+
+
+
+def _help_text(argv, capsys):
+    try:
+        cli.main(argv)
+    except SystemExit as exc:
+        assert exc.code == 0
+    return capsys.readouterr().out
+
+
+def test_experiments_help_surfaces_research_loop_commands(capsys):
+    out = _help_text(["experiments", "--help"], capsys)
+    assert "fork-plan" in out
+    assert "artifact" in out
+    assert "checkpoint" in out
+    assert "decide" in out
+    assert "Actor is derived server-side" in out
+    assert "never reschedule tasks" in out
+
+
+def test_experiments_fork_plan_help_documents_dry_run_contract(capsys):
+    out = _help_text(["experiments", "fork-plan", "--help"], capsys)
+    assert "dry-run" in out
+    assert "Does NOT submit" in out
+    assert "Top-level keys only" in out
+    assert "--set" in out
+    assert "--unset" in out

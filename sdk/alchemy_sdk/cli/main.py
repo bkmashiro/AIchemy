@@ -436,6 +436,9 @@ def apply_overrides(config: Any, sets: list[str], unsets: list[str]) -> tuple[di
             "op": "set" if key in base else "add",
         }
     for key in unsets:
+        key = key.strip()
+        if not key:
+            raise AlchError("--unset key must be non-empty")
         if "." in key:
             raise AlchError(f"--unset does not support nested keys; got {key!r}")
         if key in proposed:
@@ -534,47 +537,146 @@ def add_global(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=float, default=20.0)
 
 
+EXPERIMENTS_DESCRIPTION = (
+    "Inspect and annotate experiments. Read commands (ls/show/timeline/tree/"
+    "summary/diff/manifest/compare/fork-plan) issue only GET requests. The "
+    "mutating commands (note/artifact/checkpoint/decide) append metadata or "
+    "set the decision via the server API; they never reschedule tasks. "
+    "Actor is derived server-side from the auth token — the CLI does not "
+    "send actor."
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="alch", description="Alchemy v2 operator CLI")
+    parser = argparse.ArgumentParser(
+        prog="alch",
+        description="Alchemy v2 operator CLI for stubs, tasks, and experiments.",
+    )
     add_global(parser)
     sub = parser.add_subparsers(dest="group", required=True)
 
-    stubs = sub.add_parser("stubs")
+    stubs = sub.add_parser("stubs", help="list, drain, or restart stubs")
     stubs_sub = stubs.add_subparsers(dest="cmd", required=True)
-    p = stubs_sub.add_parser("ls"); p.add_argument("--online", action="store_true"); p.set_defaults(func=cmd_stubs_ls)
-    p = stubs_sub.add_parser("drain"); p.add_argument("stub"); p.set_defaults(func=cmd_stubs_drain)
-    p = stubs_sub.add_parser("undrain"); p.add_argument("stub"); p.add_argument("--n", type=int, default=1); p.set_defaults(func=cmd_stubs_undrain)
-    p = stubs_sub.add_parser("restart"); p.add_argument("name"); p.add_argument("--mem"); p.add_argument("--time"); p.add_argument("--yes", action="store_true"); p.set_defaults(func=cmd_stubs_restart)
+    p = stubs_sub.add_parser("ls", help="list known stubs"); p.add_argument("--online", action="store_true", help="only include online stubs"); p.set_defaults(func=cmd_stubs_ls)
+    p = stubs_sub.add_parser("drain", help="set a stub's max_concurrent to 0"); p.add_argument("stub", help="stub id, name, or hostname"); p.set_defaults(func=cmd_stubs_drain)
+    p = stubs_sub.add_parser("undrain", help="restore a stub's max_concurrent"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("--n", type=int, default=1, help="new max_concurrent (default 1)"); p.set_defaults(func=cmd_stubs_undrain)
+    p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)
 
-    slurm = sub.add_parser("slurm")
+    slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)
-    p = slurm_sub.add_parser("submit"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"]); p.add_argument("--count", type=int, default=1); p.add_argument("--mem"); p.add_argument("--time"); p.add_argument("--yes", action="store_true"); p.set_defaults(func=cmd_slurm_submit)
+    p = slurm_sub.add_parser("submit", help="submit/restart a SLURM stub"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand (a30/a40/t4) or full slurm-* name"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
 
-    tasks = sub.add_parser("tasks")
+    tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)
-    p = tasks_sub.add_parser("ls"); p.add_argument("--status"); p.add_argument("--active", action="store_true"); p.add_argument("--stub"); p.add_argument("--limit", type=int, default=50); p.set_defaults(func=cmd_tasks_ls)
-    p = tasks_sub.add_parser("get"); p.add_argument("task"); p.add_argument("--short", action="store_true"); p.set_defaults(func=cmd_tasks_get)
-    p = tasks_sub.add_parser("cancel"); p.add_argument("task"); p.add_argument("--yes", action="store_true"); p.set_defaults(func=cmd_tasks_cancel)
-    p = tasks_sub.add_parser("move"); p.add_argument("task"); p.add_argument("--to-stub"); p.add_argument("--to-tags"); p.add_argument("--name"); p.add_argument("--yes", action="store_true"); p.set_defaults(func=cmd_tasks_move)
-    p = tasks_sub.add_parser("resubmit"); p.add_argument("task"); p.add_argument("--resume", action="store_true"); p.add_argument("--to-stub"); p.add_argument("--to-tags"); p.add_argument("--name"); p.add_argument("--wait", action="store_true"); p.add_argument("--wait-timeout", type=int, default=15); p.set_defaults(func=cmd_tasks_resubmit)
+    p = tasks_sub.add_parser("ls", help="list recent tasks (short form)"); p.add_argument("--status", help="filter by status (pending/running/...)"); p.add_argument("--active", action="store_true", help="filter to active statuses (pending/assigned/running/paused/blocked)"); p.add_argument("--stub", help="only tasks bound to this stub"); p.add_argument("--limit", type=int, default=50, help="max tasks to return (default 50)"); p.set_defaults(func=cmd_tasks_ls)
+    p = tasks_sub.add_parser("get", help="fetch a single task"); p.add_argument("task", help="task id"); p.add_argument("--short", action="store_true", help="trim to the short summary form"); p.set_defaults(func=cmd_tasks_get)
+    p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
+    p = tasks_sub.add_parser("move", help="resubmit a task targeting a new stub or tag set"); p.add_argument("task", help="task id"); p.add_argument("--to-stub", help="target stub id/name/hostname (exclusive with --to-tags)"); p.add_argument("--to-tags", help="comma-separated target_tags (exclusive with --to-stub)"); p.add_argument("--name", help="override display name of the new task"); p.add_argument("--yes", action="store_true", help="required when cancelling a running/assigned task"); p.set_defaults(func=cmd_tasks_move)
+    p = tasks_sub.add_parser("resubmit", help="clone a task as a new submission"); p.add_argument("task", help="task id to clone"); p.add_argument("--resume", action="store_true", help="append --resume to raw_args"); p.add_argument("--to-stub", help="retarget to a specific stub"); p.add_argument("--to-tags", help="retarget to comma-separated tags"); p.add_argument("--name", help="override display name"); p.add_argument("--wait", action="store_true", help="block until task is accepted"); p.add_argument("--wait-timeout", type=int, default=15, help="accept-wait timeout seconds (default 15)"); p.set_defaults(func=cmd_tasks_resubmit)
 
-    exps = sub.add_parser("experiments")
+    exps = sub.add_parser(
+        "experiments",
+        help="inspect and annotate experiments (lineage, decisions, notes)",
+        description=EXPERIMENTS_DESCRIPTION,
+    )
     exps_sub = exps.add_subparsers(dest="cmd", required=True)
-    p = exps_sub.add_parser("ls"); p.add_argument("--family"); p.add_argument("--decision", choices=["keep", "drop", "rerun", "fork", "none"]); p.add_argument("--status", choices=["running", "passed", "partial", "failed"]); p.set_defaults(func=cmd_experiments_ls)
-    p = exps_sub.add_parser("show"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_show)
-    p = exps_sub.add_parser("timeline"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_timeline)
-    p = exps_sub.add_parser("note"); p.add_argument("experiment"); p.add_argument("message"); p.add_argument("--task"); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_note)
-    p = exps_sub.add_parser("artifact"); p.add_argument("experiment"); p.add_argument("location"); p.add_argument("--type", choices=sorted(ARTIFACT_TYPES)); p.add_argument("--name"); p.add_argument("--task"); p.add_argument("--step", type=float); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_artifact)
-    p = exps_sub.add_parser("checkpoint"); p.add_argument("experiment"); p.add_argument("location"); p.add_argument("--name"); p.add_argument("--task"); p.add_argument("--step", type=float); p.add_argument("--data"); p.set_defaults(func=cmd_experiments_checkpoint)
-    p = exps_sub.add_parser("fork-plan"); p.add_argument("experiment"); p.add_argument("--set", action="append", default=[], help="key=value (json), repeatable"); p.add_argument("--unset", action="append", default=[]); p.add_argument("--name"); p.add_argument("--reason", default=""); p.set_defaults(func=cmd_experiments_fork_plan)
-    p = exps_sub.add_parser("decide"); p.add_argument("experiment"); p.add_argument("decision", choices=["keep", "drop", "rerun", "fork"]); p.add_argument("reason", nargs="?"); p.add_argument("--reason", dest="reason_flag"); p.set_defaults(func=cmd_experiments_decide)
-    p = exps_sub.add_parser("tree"); p.set_defaults(func=cmd_experiments_tree)
-    p = exps_sub.add_parser("compare"); p.add_argument("experiments", nargs="+"); p.set_defaults(func=cmd_experiments_compare)
-    p = exps_sub.add_parser("summary"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_summary)
-    p = exps_sub.add_parser("diff"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_diff)
-    p = exps_sub.add_parser("manifest"); p.add_argument("experiment"); p.set_defaults(func=cmd_experiments_manifest)
+    p = exps_sub.add_parser("ls", help="list experiments (optionally filtered)", description="List experiments with optional server-side filters.")
+    p.add_argument("--family", help="filter by experiment family name")
+    p.add_argument("--decision", choices=["keep", "drop", "rerun", "fork", "none"], help="filter by decision (use 'none' for undecided)")
+    p.add_argument("--status", choices=["running", "passed", "partial", "failed"], help="filter by rollup status")
+    p.set_defaults(func=cmd_experiments_ls)
 
-    p = sub.add_parser("verify"); p.add_argument("--task"); p.add_argument("--stub"); p.add_argument("--expect-status", default="running"); p.set_defaults(func=cmd_verify)
+    p = exps_sub.add_parser("show", help="fetch full detail for one experiment", description="Resolve <experiment> (name or id) and print the full detail document.")
+    p.add_argument("experiment", help="experiment name or id")
+    p.set_defaults(func=cmd_experiments_show)
+
+    p = exps_sub.add_parser("timeline", help="read the append-only event timeline", description="Print the experiment's append-only event log: notes, decisions, artifacts, and synthesized task lifecycle events.")
+    p.add_argument("experiment", help="experiment name or id")
+    p.set_defaults(func=cmd_experiments_timeline)
+
+    p = exps_sub.add_parser("note", help="append a free-form research note", description="Append a note event to the experiment timeline. Read-only metadata — does not touch scheduler state. Actor is derived server-side from the token.")
+    p.add_argument("experiment", help="experiment name or id")
+    p.add_argument("message", help="note text")
+    p.add_argument("--task", help="optionally attach the note to a specific task id")
+    p.add_argument("--data", help="optional JSON object payload (e.g. metric snapshot)")
+    p.set_defaults(func=cmd_experiments_note)
+
+    p = exps_sub.add_parser(
+        "artifact",
+        help="record an artifact (checkpoint/tensorboard/log/file/metrics)",
+        description="Append an artifact event. URI vs path is auto-detected (`scheme://...` becomes `uri`, otherwise `path`). Metadata only — Alchemy does not move or upload the file.",
+    )
+    p.add_argument("experiment", help="experiment name or id")
+    p.add_argument("location", help="filesystem path or URI (s3://, gs://, http(s)://)")
+    p.add_argument("--type", choices=sorted(ARTIFACT_TYPES), help="artifact kind (checkpoint/tensorboard/log/file/metrics)")
+    p.add_argument("--name", help="short label for the artifact")
+    p.add_argument("--task", help="task id this artifact belongs to")
+    p.add_argument("--step", type=float, help="training step the artifact corresponds to")
+    p.add_argument("--data", help="extra JSON object merged into data payload")
+    p.set_defaults(func=cmd_experiments_artifact)
+
+    p = exps_sub.add_parser("checkpoint", help="shorthand for `artifact --type checkpoint`", description="Append a checkpoint artifact event. Equivalent to `artifact --type checkpoint`.")
+    p.add_argument("experiment", help="experiment name or id")
+    p.add_argument("location", help="checkpoint path or URI")
+    p.add_argument("--name", help="short label, e.g. 'best' or 'step-10000'")
+    p.add_argument("--task", help="task id the checkpoint came from")
+    p.add_argument("--step", type=float, help="training step")
+    p.add_argument("--data", help="extra JSON object merged into data payload")
+    p.set_defaults(func=cmd_experiments_checkpoint)
+
+    p = exps_sub.add_parser(
+        "fork-plan",
+        help="dry-run a fork: print proposed config + diff without submitting",
+        description=(
+            "Compute a fork manifest locally. Does NOT submit a fork or create "
+            "any work — only fetches the parent and prints the proposed config "
+            "and diff so you can review before piping into a Python "
+            "Experiment().fork(...).submit(). Top-level keys only; nested "
+            "(dotted) keys are rejected."
+        ),
+    )
+    p.add_argument("experiment", help="parent experiment name or id")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="override (JSON-encoded value if possible, else string). Repeatable. Flat keys only.")
+    p.add_argument("--unset", action="append", default=[], metavar="KEY", help="remove a top-level key. Repeatable. Top-level keys only.")
+    p.add_argument("--name", help="suggested child experiment name (default <parent>-fork)")
+    p.add_argument("--reason", default="", help="fork rationale to include in the dry-run manifest")
+    p.set_defaults(func=cmd_experiments_fork_plan)
+
+    p = exps_sub.add_parser(
+        "decide",
+        help="set or update a decision (keep/drop/rerun/fork)",
+        description="Set the experiment decision via PATCH /experiments/<id>/decision. A reason is required (positional or --reason). Actor is derived server-side from the token.",
+    )
+    p.add_argument("experiment", help="experiment name or id")
+    p.add_argument("decision", choices=["keep", "drop", "rerun", "fork"], help="decision verdict")
+    p.add_argument("reason", nargs="?", help="rationale (positional). Alternative: --reason TEXT")
+    p.add_argument("--reason", dest="reason_flag", help="rationale (flag form, takes precedence over positional)")
+    p.set_defaults(func=cmd_experiments_decide)
+
+    p = exps_sub.add_parser("tree", help="print the lineage forest", description="GET /experiments/tree — full lineage forest via frozen parent_id edges.")
+    p.set_defaults(func=cmd_experiments_tree)
+
+    p = exps_sub.add_parser("compare", help="multi-experiment summary/diff (cap 6)", description="GET /experiments/compare?ids=... Order of refs is preserved. Server caps at 6 experiments.")
+    p.add_argument("experiments", nargs="+", help="experiment names or ids (up to 6, no duplicates)")
+    p.set_defaults(func=cmd_experiments_compare)
+
+    p = exps_sub.add_parser("summary", help="rollups and best metrics for one experiment")
+    p.add_argument("experiment", help="experiment name or id")
+    p.set_defaults(func=cmd_experiments_summary)
+
+    p = exps_sub.add_parser("diff", help="config diff against parent experiment")
+    p.add_argument("experiment", help="experiment name or id")
+    p.set_defaults(func=cmd_experiments_diff)
+
+    p = exps_sub.add_parser("manifest", help="reproducibility manifest (git, env, task specs)")
+    p.add_argument("experiment", help="experiment name or id")
+    p.set_defaults(func=cmd_experiments_manifest)
+
+    p = sub.add_parser("verify", help="poll task/stub state and assert expectations")
+    p.add_argument("--task", help="task id to check")
+    p.add_argument("--stub", help="stub id/name/hostname expected to be online")
+    p.add_argument("--expect-status", default="running", help="expected task status (default 'running')")
+    p.set_defaults(func=cmd_verify)
     return parser
 
 

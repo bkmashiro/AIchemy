@@ -8,8 +8,10 @@
 
 ## Status (current state)
 
-The MVP described here is **implemented**. The lineage rail and read-only
-tooling are documented in `plans/research-lineage-gitlens.md`. Quick map:
+The MVP described here is **implemented**, and the research-loop surfaces on
+top of it (timeline / note / decide / artifact / checkpoint / fork-plan /
+list filters) have shipped too. The full lineage rail is documented in
+`plans/research-lineage-gitlens.md`. Quick map:
 
 | Concept here                               | Where it lives                                                  |
 |--------------------------------------------|-----------------------------------------------------------------|
@@ -19,7 +21,11 @@ tooling are documented in `plans/research-lineage-gitlens.md`. Quick map:
 | `GET /api/experiments/:id/diff`            | `server/src/api/experiments.ts`                                  |
 | Web config diff card                       | `web/src/components/experiments/ExperimentConfigDiffCard.tsx`    |
 | CLI `experiments diff/manifest/compare`    | `sdk/alchemy_sdk/cli/main.py`                                    |
-| Read-only `ExperimentClient`               | `sdk/alchemy_sdk/experiments.py`                                 |
+| CLI `experiments timeline/note/decide`     | `sdk/alchemy_sdk/cli/main.py`                                    |
+| CLI `experiments artifact/checkpoint`      | `sdk/alchemy_sdk/cli/main.py` (`POST /experiments/<id>/events`)  |
+| CLI `experiments fork-plan` (read-only)    | `sdk/alchemy_sdk/cli/main.py` — never POSTs                      |
+| CLI `experiments ls --family/--decision/--status` | server-side filters in `server/src/api/experiments.ts`    |
+| Read-only `ExperimentClient`               | `sdk/alchemy_sdk/experiments.py` (incl. `timeline`, `fork_plan`) |
 
 Sections below describe the original design intent. Anywhere the running
 implementation has drifted, the source files above are authoritative.

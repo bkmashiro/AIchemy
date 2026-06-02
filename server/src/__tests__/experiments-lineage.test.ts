@@ -194,6 +194,114 @@ describe("experiment lineage API", () => {
     expect(undecided.body.map((e: any) => e.name)).not.toContain("fam-b-1");
   });
 
+  it("filters list by status=running for freshly-created experiments", async () => {
+    const app = makeApp();
+    // Newly-created experiments derive to "running" because their tasks are
+    // still pending. Use that as the public-API path to exercise status filter.
+    await request(app)
+      .post("/experiments")
+      .send({ name: "status-r-1", task_specs: [{ ref: "t", script: "t.py" }] })
+      .expect(201);
+    await request(app)
+      .post("/experiments")
+      .send({ name: "status-r-2", task_specs: [{ ref: "t", script: "t.py" }] })
+      .expect(201);
+
+    const running = await request(app).get("/experiments?status=running").expect(200);
+    const names = running.body.map((e: any) => e.name).sort();
+    expect(names).toEqual(["status-r-1", "status-r-2"]);
+    for (const exp of running.body) {
+      expect(exp.status).toBe("running");
+    }
+
+    // A non-existent rollup status returns an empty list rather than 4xx — the
+    // server treats status as a passthrough string filter.
+    const passed = await request(app).get("/experiments?status=passed").expect(200);
+    expect(passed.body).toEqual([]);
+  });
+
+  it("filters list by terminal status using store-level setup", async () => {
+    const app = makeApp();
+    // Drive an experiment to a terminal status without depending on the task
+    // runner: seed the store directly with a grid + completed task + matching
+    // results, then assert the HTTP filter surfaces it.
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "status-failed-1",
+        criteria: { loss: "< 0.5" },
+        task_specs: [{ ref: "t", script: "t.py" }],
+      })
+      .expect(201);
+    const exp = store.getExperiment(created.body.id)!;
+    const tasks = store.getGridTasks(exp.grid_id);
+    expect(tasks.length).toBeGreaterThan(0);
+    const archivedTasks = [];
+    for (const task of tasks) {
+      const removed = store.removeFromGlobalQueue(task.id);
+      expect(removed).toBeDefined();
+      const completed = {
+        ...removed!,
+        status: "completed" as const,
+        finished_at: new Date().toISOString(),
+      };
+      archivedTasks.push(completed);
+      exp.results[task.id] = {
+        passed: false,
+        checked_at: new Date().toISOString(),
+        details: { loss: { value: 0.9, threshold: "< 0.5", ok: false } },
+      };
+    }
+    store.setArchive([...store.getArchive(), ...archivedTasks]);
+    store.setExperiment(exp);
+
+    // Sanity: the unfiltered list should now report this experiment as failed.
+    const all = await request(app).get("/experiments").expect(200);
+    const seenExp = all.body.find((e: any) => e.id === exp.id);
+    expect(seenExp?.status).toBe("failed");
+
+    const failed = await request(app).get("/experiments?status=failed").expect(200);
+    expect(failed.body.map((e: any) => e.id)).toContain(exp.id);
+    const running = await request(app).get("/experiments?status=running").expect(200);
+    expect(running.body.map((e: any) => e.id)).not.toContain(exp.id);
+  });
+
+  it("accepts artifact with valid uri when path is the empty string", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({ name: "lineage-locator", task_specs: [{ ref: "train", script: "train.py" }] })
+      .expect(201);
+
+    // path: "" + uri set → accepted (uri carries the locator).
+    const uriOnly = await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({
+        kind: "artifact",
+        message: "tb",
+        data: { path: "", uri: "s3://bucket/tb", artifact_type: "tensorboard" },
+      })
+      .expect(201);
+    expect(uriOnly.body.data.uri).toBe("s3://bucket/tb");
+
+    // path set + uri: "" → accepted (path carries the locator).
+    const pathOnly = await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({
+        kind: "artifact",
+        message: "log",
+        data: { path: "/runs/abc/train.log", uri: "", artifact_type: "log" },
+      })
+      .expect(201);
+    expect(pathOnly.body.data.path).toBe("/runs/abc/train.log");
+
+    // Both blank → rejected.
+    await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({ kind: "checkpoint", message: "no locator", data: { path: "", uri: "  " } })
+      .expect(400);
+  });
+
   it("preserves events when experiment record is deleted", async () => {
     const app = makeApp();
     const created = await request(app)

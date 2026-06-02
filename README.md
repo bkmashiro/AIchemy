@@ -124,32 +124,67 @@ from alchemy_sdk.callbacks import AlchemyHFCallback
 trainer = Trainer(..., callbacks=[AlchemyHFCallback()])
 ```
 
-## Experiment Lineage (read-only)
+## Experiment Lineage + Research Loop
 
-Inspect experiments, lineage, and decisions from Python or the CLI without
-mutating scheduler/runtime state.
+Inspect experiments, annotate them with notes / artifacts / checkpoints, and
+record keep/drop/rerun/fork decisions — without restarting tasks or mutating
+scheduler state.
 
 ```python
 from alchemy_sdk import ExperimentClient
 
 ec = ExperimentClient(server="https://alchemy.example.com", token="...")
-ec.list()                       # list experiments
+ec.list(family="pretrain", decision="keep", status="running")  # server-side filters
 ec.tree()                       # lineage forest
 ec.summary("curiosity_s42")     # rollups + best metrics
 ec.diff("curiosity_s42")        # config diff vs parent
+ec.timeline("curiosity_s42")    # append-only event log
 ec.compare(["alpha", "beta"])   # cross-experiment compare (cap 6)
+ec.fork_plan("alpha",           # local dry-run: print proposed config + diff
+             set_overrides={"lr": 0.0002},
+             unset_keys=["warmup"],
+             reason="ablation")
 ```
 
+Read-only CLI (only `GET`s):
+
 ```bash
-alch experiments ls
+alch experiments ls --family pretrain --decision none --status running
 alch experiments show <name-or-id>
 alch experiments timeline <name-or-id>
 alch experiments summary|diff|manifest <name-or-id>
 alch experiments compare <ref> <ref> [...]
+alch experiments fork-plan <name-or-id> --set lr=0.0002 --unset warmup --reason "ablation"
 ```
 
-The companion mutating CLIs (`alch experiments note|decide`) write through the
-server API only. See `SDK.md` for the full lineage surface.
+Annotation CLI (write metadata events; the server derives the actor, the CLI
+never sends `actor`):
+
+```bash
+alch experiments note <name-or-id> "loss flattened at step 12k" \
+  --data '{"metric": 0.91}'
+
+alch experiments artifact <name-or-id> s3://bucket/runs/abc/tb \
+  --type tensorboard --name tb
+
+alch experiments checkpoint <name-or-id> /runs/abc/ckpt.pt --step 10000
+
+alch experiments decide <name-or-id> keep \
+  --reason "best zN with stable loss"
+```
+
+Semantics:
+
+- `note`, `artifact`, `checkpoint`, `decide` write **metadata only** — they
+  do not submit work, retry tasks, or mutate scheduler/runtime/stub state.
+- `fork-plan` is **read-only**: it fetches the parent and prints a proposed
+  config + diff so you can review before piping it into a Python
+  `Experiment().fork(...).submit()` call.
+- Config overrides for `fork-plan` accept **flat top-level keys only** for
+  now; dotted keys like `model.lr` are rejected at the CLI/SDK layer.
+- The CLI never sends `actor`. The server derives it from the auth token.
+
+See `SDK.md` for the full lineage surface.
 
 ## SLURM Integration
 

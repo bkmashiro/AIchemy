@@ -369,3 +369,145 @@ def test_list_returns_empty_for_null_body(monkeypatch):
     calls: list[dict] = []
     with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
         assert client.list() == []
+
+
+def test_list_passes_filters_as_query_params(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    _, calls = _run(
+        monkeypatch,
+        lambda: client.list(family="pretrain", decision="keep", status="running"),
+        [[{"id": "exp-1", "name": "alpha"}]],
+    )
+    assert calls[0]["url"].startswith("http://server/api/experiments?")
+    assert "family=pretrain" in calls[0]["url"]
+    assert "decision=keep" in calls[0]["url"]
+    assert "status=running" in calls[0]["url"]
+
+
+def test_list_rejects_invalid_decision_or_status(monkeypatch):
+    client = ExperimentClient(server="http://server", token="tk")
+    with pytest.raises(RuntimeError, match="decision must be one of"):
+        client.list(decision="nope")
+    with pytest.raises(RuntimeError, match="status must be one of"):
+        client.list(status="hot")
+
+
+def test_list_filtered_results_bypass_cache_writes(monkeypatch):
+    client = ExperimentClient(server="http://server", cache_experiments=True)
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    # Filtered list must not populate the resolution cache (otherwise resolve()
+    # would later only see the filtered subset).
+    queue = [
+        [{"id": "exp-1", "name": "alpha"}],         # filtered list
+        [{"id": "exp-1", "name": "alpha"},          # full list for resolve
+         {"id": "exp-2", "name": "beta"}],
+        {"id": "exp-2", "metrics": {}},
+    ]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list(family="pretrain")
+        client.summary("beta")
+    # 1 filtered + 1 full-list (for resolve) + 1 summary. The filtered call did
+    # not poison the cache.
+    assert len(calls) == 3
+
+
+def test_timeline_resolves_and_hits_timeline_endpoint(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    _, calls = _run(
+        monkeypatch,
+        lambda: client.timeline("alpha"),
+        [[{"id": "exp-1", "name": "alpha"}], {"experiment_id": "exp-1", "events": []}],
+    )
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://server/api/experiments/exp-1/timeline"
+
+
+def test_fork_plan_returns_dry_run_manifest_with_diff(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    plan, calls = _run(
+        monkeypatch,
+        lambda: client.fork_plan(
+            "alpha",
+            set_overrides={"lr": 0.0003, "use_curiosity": True},
+            unset_keys=["warmup"],
+            name="alpha-curiosity",
+            reason="test curiosity",
+        ),
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {
+                "id": "exp-1",
+                "name": "alpha",
+                "family": "pretrain",
+                "config": {"lr": 0.001, "warmup": 100, "seed": 7},
+            },
+        ],
+    )
+    # Two GETs only — fork_plan must never POST/PATCH.
+    assert [c["method"] for c in calls] == ["GET", "GET"]
+    assert plan["kind"] == "fork-plan"
+    assert plan["dry_run"] is True
+    assert plan["parent"] == {"id": "exp-1", "name": "alpha", "family": "pretrain"}
+    assert plan["suggested_name"] == "alpha-curiosity"
+    assert plan["reason"] == "test curiosity"
+    assert plan["parent_config"] == {"lr": 0.001, "warmup": 100, "seed": 7}
+    assert plan["proposed_config"] == {"lr": 0.0003, "seed": 7, "use_curiosity": True}
+    assert plan["config_diff"]["lr"] == {"before": 0.001, "after": 0.0003, "op": "set"}
+    assert plan["config_diff"]["use_curiosity"] == {"before": None, "after": True, "op": "add"}
+    assert plan["config_diff"]["warmup"] == {"before": 100, "after": None, "op": "unset"}
+
+
+def test_fork_plan_rejects_dotted_keys(monkeypatch):
+    client = ExperimentClient(server="http://server", token="tk")
+    queue = [
+        [{"id": "exp-1", "name": "alpha"}],
+        {"id": "exp-1", "name": "alpha", "config": {}},
+    ]
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, [])):
+        with pytest.raises(RuntimeError, match="nested keys"):
+            client.fork_plan("alpha", set_overrides={"model.lr": 0.1})
+
+
+
+def test_fork_plan_rejects_empty_unset_key(monkeypatch):
+    client = ExperimentClient(server="http://server", token="tk")
+    queue = [
+        [{"id": "exp-1", "name": "alpha"}],
+        {"id": "exp-1", "name": "alpha", "config": {}},
+    ]
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, [])):
+        with pytest.raises(RuntimeError, match="unset key must be non-empty"):
+            client.fork_plan("alpha", unset_keys=["  "])
+
+
+def test_fork_plan_default_suggested_name(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    plan, _ = _run(
+        monkeypatch,
+        lambda: client.fork_plan("alpha"),
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "exp-1", "name": "alpha", "config": {"lr": 0.001}},
+        ],
+    )
+    assert plan["suggested_name"] == "alpha-fork"
+    assert plan["proposed_config"] == {"lr": 0.001}
+    assert plan["config_diff"] == {}
+
+
+def test_fork_plan_does_not_mutate_parent_config(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    parent_config = {"layers": [1, 2, 3]}
+    plan, _ = _run(
+        monkeypatch,
+        lambda: client.fork_plan("alpha", set_overrides={"lr": 0.1}),
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "exp-1", "name": "alpha", "config": parent_config},
+        ],
+    )
+    # Mutating the returned proposed_config must not leak back into the
+    # server-side parent_config snapshot we just received.
+    plan["proposed_config"]["layers"].append(99)
+    assert plan["parent_config"]["layers"] == [1, 2, 3]

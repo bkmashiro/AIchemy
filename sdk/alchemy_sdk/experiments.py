@@ -1,14 +1,17 @@
 """Read-only HTTP client for experiment lineage endpoints."""
 from __future__ import annotations
 
+import copy
 import json
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 DEFAULT_SERVER = "http://localhost:3002"
+DECISION_CHOICES = ("keep", "drop", "rerun", "fork", "none")
+STATUS_CHOICES = ("running", "passed", "partial", "failed")
 
 
 def _resolve_server(server: Optional[str]) -> str:
@@ -80,19 +83,49 @@ class ExperimentClient:
         except URLError as exc:
             raise RuntimeError(f"request to {path} failed: {exc.reason}") from exc
 
-    def list(self, *, refresh: bool = False) -> list[dict[str, Any]]:
-        # When `cache_experiments=True`, we keep the last successful list in
-        # `self._experiments_cache` and return it on subsequent calls until
-        # `refresh=True` is passed or `clear_cache()` is called. `refresh`
-        # always forces a fresh request even on uncached clients.
+    def list(
+        self,
+        *,
+        family: Optional[str] = None,
+        decision: Optional[str] = None,
+        status: Optional[str] = None,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        # When `cache_experiments=True`, we keep the last successful unfiltered
+        # list in `self._experiments_cache` and return it on subsequent calls
+        # until `refresh=True` is passed or `clear_cache()` is called. The
+        # cache is *only* used when no server-side filter is requested — the
+        # cached payload is the canonical "all experiments" set that the
+        # resolve / compare paths depend on, and we don't want filtered
+        # responses leaking back into name-or-id resolution.
+        params: dict[str, str] = {}
+        if family is not None:
+            params["family"] = family
+        if decision is not None:
+            if decision not in DECISION_CHOICES:
+                raise RuntimeError(
+                    f"decision must be one of {list(DECISION_CHOICES)}, got {decision!r}"
+                )
+            params["decision"] = decision
+        if status is not None:
+            if status not in STATUS_CHOICES:
+                raise RuntimeError(
+                    f"status must be one of {list(STATUS_CHOICES)}, got {status!r}"
+                )
+            params["status"] = status
+
         if (
-            self._cache_experiments
+            not params
+            and self._cache_experiments
             and not refresh
             and self._experiments_cache is not None
         ):
             return self._experiments_cache
 
-        data = self._get("/experiments")
+        path = "/experiments"
+        if params:
+            path += f"?{urlencode(params)}"
+        data = self._get(path)
         # GET /experiments must return a JSON array. Fail loudly if the server
         # returns something else (e.g. an error envelope, a dict) rather than
         # silently coercing to `list(dict.keys())`, which used to mask bad
@@ -106,7 +139,7 @@ class ExperimentClient:
         else:
             result = data
 
-        if self._cache_experiments:
+        if self._cache_experiments and not params:
             self._experiments_cache = result
         return result
 
@@ -145,6 +178,57 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/manifest")
 
+    def timeline(self, ref: str, *, refresh: bool = False) -> Any:
+        """GET /api/experiments/<id>/timeline.
+
+        Returns the append-only event log (notes, decisions, artifacts,
+        synthesized task lifecycle events). Read-only; no events are written.
+        """
+        exp = self.resolve(ref, refresh=refresh)
+        return self._get(f"/experiments/{exp['id']}/timeline")
+
+    def fork_plan(
+        self,
+        ref: str,
+        *,
+        set_overrides: Optional[Mapping[str, Any]] = None,
+        unset_keys: Iterable[str] = (),
+        name: Optional[str] = None,
+        reason: str = "",
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Build a local fork manifest without submitting anything.
+
+        Mirrors ``alch experiments fork-plan``: fetches the parent experiment,
+        applies flat top-level overrides, and returns a dict describing the
+        proposed config + diff. Nothing is sent to the server beyond the two
+        read requests used to fetch parent state.
+
+        Top-level keys only — nested (dotted) keys are rejected to match the
+        CLI's current contract.
+        """
+        exp = self.resolve(ref, refresh=refresh)
+        detail = self._get(f"/experiments/{exp['id']}")
+        base_config = detail.get("config") if isinstance(detail, dict) else None
+        proposed, diff = _apply_flat_overrides(
+            base_config or {}, set_overrides or {}, list(unset_keys)
+        )
+        parent_name = detail.get("name") or exp.get("name")
+        return {
+            "kind": "fork-plan",
+            "dry_run": True,
+            "parent": {
+                "id": detail.get("id") or exp.get("id"),
+                "name": parent_name,
+                "family": detail.get("family"),
+            },
+            "suggested_name": name or f"{parent_name}-fork",
+            "reason": reason,
+            "parent_config": base_config or {},
+            "proposed_config": proposed,
+            "config_diff": diff,
+        }
+
     def compare(self, refs: Iterable[str], *, refresh: bool = False) -> Any:
         refs_list = list(refs)
         if not refs_list:
@@ -153,3 +237,39 @@ class ExperimentClient:
         resolved_ids = [self._resolve_one(experiments, ref)["id"] for ref in refs_list]
         query = urlencode({"ids": ",".join(resolved_ids)})
         return self._get(f"/experiments/compare?{query}")
+
+
+def _apply_flat_overrides(
+    config: Any,
+    sets: Mapping[str, Any],
+    unsets: list[str],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    base: dict[str, Any] = copy.deepcopy(config) if isinstance(config, dict) else {}
+    proposed: dict[str, Any] = dict(base)
+    diff: dict[str, dict[str, Any]] = {}
+    for key, value in sets.items():
+        if "." in key:
+            raise RuntimeError(
+                f"fork_plan does not support nested keys; got {key!r}"
+            )
+        if not key:
+            raise RuntimeError("fork_plan override key must be non-empty")
+        before_known = key in base
+        diff[key] = {
+            "before": base.get(key) if before_known else None,
+            "after": value,
+            "op": "set" if before_known else "add",
+        }
+        proposed[key] = value
+    for key in unsets:
+        key = key.strip()
+        if not key:
+            raise RuntimeError("fork_plan unset key must be non-empty")
+        if "." in key:
+            raise RuntimeError(
+                f"fork_plan does not support nested keys; got {key!r}"
+            )
+        if key in proposed:
+            diff[key] = {"before": base.get(key), "after": None, "op": "unset"}
+            proposed.pop(key, None)
+    return proposed, diff

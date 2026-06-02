@@ -3,13 +3,17 @@
 ## Status (current state)
 
 This document is the original design note. The Experiment SDK + server API are
-**implemented**. The shapes drifted in places — treat the live code as
-authoritative when in doubt:
+**implemented**, along with the research-loop surfaces layered on top
+(timeline, decisions, artifact/checkpoint metadata events, `fork-plan`
+dry-run, server-side `ls` filters). The shapes drifted in places — treat the
+live code as authoritative when in doubt:
 
 - SDK: `sdk/alchemy_sdk/experiment.py`, `sdk/alchemy_sdk/submit.py`
 - Server endpoints: `server/src/api/experiments.ts`
-- Read-only client / CLI: `sdk/alchemy_sdk/experiments.py`,
-  `sdk/alchemy_sdk/cli/main.py`
+- Read-only client / CLI: `sdk/alchemy_sdk/experiments.py` (now exposes
+  `timeline`, `fork_plan`, and filtered `list(family=, decision=, status=)`),
+  `sdk/alchemy_sdk/cli/main.py` (`alch experiments ls/show/timeline/note/
+  decide/tree/compare/summary/diff/manifest/artifact/checkpoint/fork-plan`)
 - Web detail/lineage UI: `web/src/pages/ExperimentsPage.tsx` and the
   components under `web/src/components/experiments/`.
 

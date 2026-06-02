@@ -130,13 +130,27 @@ from alchemy_sdk import ExperimentClient
 # Server URL: server=... → ALCHEMY_SERVER → ALCHEMY_SERVER_URL → http://localhost:3002
 ec = ExperimentClient(server="https://alchemy.example.com", token="...")
 
-ec.list()                          # GET /api/experiments → list[dict]
-ec.tree()                          # GET /api/experiments/tree → forest
-ec.resolve("my-experiment")        # name-or-id → single experiment dict
-ec.summary("my-experiment")        # GET /api/experiments/<id>/summary
-ec.diff("my-experiment")           # GET /api/experiments/<id>/diff
-ec.manifest("my-experiment")       # GET /api/experiments/<id>/manifest
-ec.compare(["alpha", "beta-2"])    # GET /api/experiments/compare?ids=...
+ec.list()                              # GET /api/experiments → list[dict]
+ec.list(family="pretrain",             # server-side filters (forwarded as
+        decision="keep",               # query params). decision="none"
+        status="running")              # selects experiments with no decision.
+ec.tree()                              # GET /api/experiments/tree → forest
+ec.resolve("my-experiment")            # name-or-id → single experiment dict
+ec.summary("my-experiment")            # GET /api/experiments/<id>/summary
+ec.diff("my-experiment")               # GET /api/experiments/<id>/diff
+ec.manifest("my-experiment")           # GET /api/experiments/<id>/manifest
+ec.timeline("my-experiment")           # GET /api/experiments/<id>/timeline
+ec.compare(["alpha", "beta-2"])        # GET /api/experiments/compare?ids=...
+
+# Local dry-run: build a fork manifest without submitting anything. Only the
+# two GET requests below run; nothing is written to the server.
+ec.fork_plan(
+    "my-experiment",
+    set_overrides={"lr": 0.0002, "use_curiosity": True},
+    unset_keys=["warmup"],
+    name="my-experiment-curiosity",
+    reason="ablate curiosity contribution",
+)
 ```
 
 Notes:
@@ -144,12 +158,21 @@ Notes:
 - All methods return raw decoded JSON (`dict` / `list`) — no dataclass wrapping.
 - `list()` raises if the server returns a non-list body (typically an error
   envelope from an auth or middleware failure) instead of silently degrading.
+- Filtered `list()` calls (with `family=` / `decision=` / `status=`) are not
+  written to the resolution cache — only the unfiltered list backs name-or-id
+  resolution.
 - `resolve()` and `compare()` accept either UUIDs or experiment names. Names
   must be unambiguous; duplicates raise `RuntimeError`.
+- `fork_plan()` accepts **flat top-level keys only**. Nested (dotted) keys
+  like `"model.lr"` raise `RuntimeError`. The returned manifest mirrors the
+  CLI's `alch experiments fork-plan` output and is purely local: the only
+  network traffic is one `GET /api/experiments` and one
+  `GET /api/experiments/<id>`.
 - HTTP errors raise `RuntimeError` with the status code and response body
   included so you can see exactly what the server said.
-- The companion CLI (`alch experiments tree|summary|diff|manifest|compare`)
-  uses the same endpoints and is also read-only by design.
+- The companion CLI (`alch experiments tree|summary|diff|manifest|compare|
+  timeline|fork-plan`) uses the same endpoints and is also read-only by
+  design.
 
 ### Caching `/experiments` lookups
 
@@ -174,6 +197,8 @@ once without flipping the flag.
 
 ```bash
 alch experiments ls                        # list all experiments
+alch experiments ls --family pretrain \
+    --decision none --status running       # server-side filters (decision=none = undecided)
 alch experiments show <name-or-id>         # full detail dict
 alch experiments tree                      # whole forest as JSON
 alch experiments summary <name-or-id>      # rollups, best metrics
@@ -181,8 +206,36 @@ alch experiments diff <name-or-id>         # parameter / config diff vs parent
 alch experiments manifest <name-or-id>     # reproducibility manifest
 alch experiments compare <ref> <ref> ...   # multi-experiment compare
 alch experiments timeline <name-or-id>     # event timeline
+alch experiments fork-plan <name-or-id> \
+    --set lr=0.0002 --unset warmup \
+    --reason "ablation"                    # local dry-run: prints proposed config + diff
 ```
 
 These are safe to run during live training: they only issue `GET` requests
-against the Alchemy server. The mutating siblings (`note`, `decide`) require
-explicit arguments and are intentionally separate.
+against the Alchemy server. `fork-plan` in particular does **not** submit a
+fork — pipe the manifest into your Python `Experiment().fork(...).submit()`
+flow when you want to actually create the child experiment.
+
+### Operator CLI: research metadata commands
+
+```bash
+alch experiments note <name-or-id> "loss flattened at step 12k" \
+    --data '{"metric": 0.91}'
+
+alch experiments artifact <name-or-id> s3://bucket/runs/abc/tb \
+    --type tensorboard --name tb           # URI vs path is auto-detected
+
+alch experiments checkpoint <name-or-id> /runs/abc/ckpt.pt --step 10000
+
+alch experiments decide <name-or-id> keep \
+    --reason "best zN with stable loss"    # also: drop / rerun / fork
+```
+
+These write **metadata only**:
+
+- `note`, `artifact`, `checkpoint` append to the append-only event log.
+- `decide` `PATCH`es the experiment decision + reason.
+- None of these submit work, retry tasks, or change scheduler / runtime /
+  stub state.
+- Actor is derived server-side from the auth token. The CLI never sends
+  `actor`.
