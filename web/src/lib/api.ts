@@ -461,6 +461,61 @@ export interface ExperimentDiffResponse {
   parent_config?: Record<string, any> | null;
 }
 
+export interface ExperimentResearchReportFilters {
+  family: string | null;
+  decision: string | null;
+  status: string | null;
+  limit: number;
+}
+
+export interface ExperimentResearchReportCounts {
+  total: number;
+  by_status: Record<string, number>;
+  by_decision: Record<string, number>;
+}
+
+export interface ExperimentResearchReportMetric {
+  name: string;
+  direction: "min" | "max";
+}
+
+export interface ExperimentResearchReportLeaderEntry {
+  rank: number;
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  decision: ExperimentDecision | null;
+  value: number;
+  metric: string;
+}
+
+export interface ExperimentResearchReportBlock {
+  id: string;
+  name: string;
+  family: string | null;
+  status: Experiment["status"];
+  decision: ExperimentDecision | null;
+  decision_reason: string | null;
+  decision_at: string | null;
+  created_at: string;
+  parent_id: string | null;
+  children: ExperimentBrief[];
+  task_counts: Record<string, number>;
+  primary_metric: { metric: string; direction: "min" | "max"; best: number | null } | null;
+  artifact_count: number;
+  checkpoint_count: number;
+  recent_events: ExperimentEvent[];
+}
+
+export interface ExperimentResearchReportResponse {
+  filters: ExperimentResearchReportFilters;
+  generated_at: string;
+  counts: ExperimentResearchReportCounts;
+  metric: ExperimentResearchReportMetric | null;
+  leaderboard: ExperimentResearchReportLeaderEntry[];
+  experiments: ExperimentResearchReportBlock[];
+}
+
 export interface ExperimentSummaryResponse {
   id: string;
   name: string;
@@ -520,6 +575,21 @@ export const experimentsApi = {
     api.get<ExperimentDiffResponse>(`/experiments/${id}/diff`).then((r) => r.data),
   getResearchBundle: (id: string) =>
     api.get<Record<string, any>>(`/experiments/${id}/research-bundle`).then((r) => r.data),
+  getResearchReport: (opts: {
+    family?: string;
+    decision?: string;
+    status?: string;
+    limit?: number;
+  } = {}) => {
+    const params: Record<string, string> = {};
+    if (opts.family) params.family = opts.family;
+    if (opts.decision) params.decision = opts.decision;
+    if (opts.status) params.status = opts.status;
+    if (opts.limit != null) params.limit = String(opts.limit);
+    return api
+      .get<ExperimentResearchReportResponse>("/experiments/research-report", { params })
+      .then((r) => r.data);
+  },
 };
 
 // ─── Cost API ─────────────────────────────────────────────────────────────────

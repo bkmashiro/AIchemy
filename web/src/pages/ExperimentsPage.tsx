@@ -22,6 +22,7 @@ import {
   ExperimentLineageGraphCard,
   ExperimentResearchCallCard,
   ExperimentConfigDiffCard,
+  ExperimentReviewWorkspace,
 } from "../components/experiments";
 
 // ─── List View ──────────────────────────────────────────────────────────────
@@ -124,6 +125,13 @@ function ExperimentsList() {
           </button>
         )}
       </div>
+      <ExperimentReviewWorkspace
+        familyFilter={familyFilter}
+        families={families}
+        decisionFilter={decisionFilter}
+        statusFilter={statusFilter}
+        onSelectFamily={setFamilyFilter}
+      />
       <ExperimentListTable experiments={filtered} />
     </div>
   );

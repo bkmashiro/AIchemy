@@ -356,8 +356,8 @@ def _md_format_task_counts(task_counts: Any) -> str:
 def _md_format_primary_metric(primary_metric: Any) -> str:
     if not isinstance(primary_metric, Mapping):
         return "-"
-    name = primary_metric.get("name")
-    value = primary_metric.get("value")
+    name = primary_metric.get("metric") or primary_metric.get("name")
+    value = primary_metric.get("best") if "best" in primary_metric else primary_metric.get("value")
     if name is None and value is None:
         return "-"
     if name is None:

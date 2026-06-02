@@ -11,4 +11,11 @@ export { ExperimentTimelineCard } from "./ExperimentTimelineCard";
 export { ExperimentLineageGraphCard } from "./ExperimentLineageGraphCard";
 export { ExperimentResearchCallCard } from "./ExperimentResearchCallCard";
 export { ExperimentConfigDiffCard } from "./ExperimentConfigDiffCard";
+export {
+  ExperimentReviewWorkspace,
+  buildReportCommand,
+  buildBundleCommand,
+  buildForkPlanCommand,
+  pickUndecided,
+} from "./ExperimentReviewWorkspace";
 export { statusBadgeClass } from "./experimentDetailUtils";

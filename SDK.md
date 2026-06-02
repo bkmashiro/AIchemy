@@ -283,3 +283,47 @@ These write **metadata only**:
   stub state.
 - Actor is derived server-side from the auth token. The CLI never sends
   `actor`.
+
+### Review workflow
+
+Once a family is in flight, the recommended loop for triaging it is:
+
+1. **Filter the family** in the dashboard (`/experiments`) — the review
+   workspace at the top of the page loads the same `research-report`
+   payload `alch experiments report` returns. The panel surfaces counts
+   by status / decision, the leaderboard against the family's goal
+   metric, and an undecided queue with artifact / checkpoint hints.
+2. **Inspect a candidate** by clicking a leaderboard or queue row.
+   The selected experiment block shows task counts, primary-metric best,
+   artifact / checkpoint counts, and the last few timeline events — just
+   enough to decide whether to keep, drop, rerun, or fork.
+3. **Export the family report** as JSON (workspace "download JSON"
+   button) or render it locally as Markdown:
+
+   ```bash
+   alch experiments report --family <family> --format markdown --output report.md
+   ```
+
+4. **Export the selected run's bundle** for batch handoff:
+
+   ```bash
+   alch experiments bundle <name-or-id>
+   ```
+
+5. **Preview a fork as a dry-run** before committing to the work:
+
+   ```bash
+   alch experiments fork-plan <name-or-id> --reason "ablate X"
+   ```
+
+6. **Decide** via the experiment detail page (which already owns the
+   decision form) or from the CLI: `alch experiments decide <ref> keep
+   --reason "…"`. The review workspace itself is intentionally
+   read-only — it never `POST`s notes or `PATCH`es decisions.
+
+All of these calls are `GET`-only except step 6. The dashboard panel,
+SDK client (`ExperimentClient.research_report` /
+`.research_report_markdown` / `.research_bundle` / `.fork_plan`), and
+CLI all hit the same endpoints and produce identical Markdown for the
+same payload — the renderer in `alchemy_sdk.experiments` is pure and
+deterministic, so output pasted into PRs or notes is reproducible.
