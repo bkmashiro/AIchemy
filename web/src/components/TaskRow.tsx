@@ -1,10 +1,24 @@
-import { memo, useState, useCallback } from "react";
+import { memo, useState, useCallback, lazy, Suspense } from "react";
 import { Task, tasksApi } from "../lib/api";
 import { taskDuration, taskEta, generateDisplayName } from "../lib/format";
-import { LossChart } from "./LossChart";
 import LogViewer from "./LogViewer";
 import ConfirmDialog from "./ConfirmDialog";
 import PhaseBadge from "./PhaseBadge";
+
+const LossChart = lazy(() =>
+  import("./LossChart").then((m) => ({ default: m.LossChart })),
+);
+
+function LossChartFallback({ height = 120 }: { height?: number }) {
+  return (
+    <div
+      className="bg-gray-900 border border-gray-800 rounded-xl p-3 text-xs text-gray-600"
+      style={{ minHeight: height + 32 }}
+    >
+      Loading chart…
+    </div>
+  );
+}
 
 interface Props {
   task: Task;
@@ -307,12 +321,14 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
 
           {/* Loss chart */}
           {lossHistory && lossHistory.length >= 2 && (
-            <LossChart
-              data={lossHistory}
-              height={120}
-              startedAt={task.started_at}
-              totalSteps={task.progress?.total}
-            />
+            <Suspense fallback={<LossChartFallback height={120} />}>
+              <LossChart
+                data={lossHistory}
+                height={120}
+                startedAt={task.started_at}
+                totalSteps={task.progress?.total}
+              />
+            </Suspense>
           )}
 
           {/* Logs */}
