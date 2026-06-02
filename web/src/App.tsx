@@ -2,19 +2,27 @@ import { useState, useEffect, useCallback, lazy, Suspense } from "react";
 import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
 import { useSocket } from "./hooks/useSocket";
 import { hasToken, setOnAuthFail, clearToken } from "./lib/api";
-import Dashboard from "./pages/Dashboard";
-import GridView from "./pages/GridView";
-import Resources from "./pages/Resources";
-import GridsPage from "./pages/GridsPage";
-import TasksPage from "./pages/TasksPage";
-import TaskDetailPage from "./pages/TaskDetailPage";
-import StubDetailPage from "./pages/StubDetail";
-import StubsPage from "./pages/StubsPage";
-import ExperimentsPage from "./pages/ExperimentsPage";
-import DeployPage from "./pages/DeployPage";
 import LoginPage from "./pages/LoginPage";
 
+const Dashboard = lazy(() => import("./pages/Dashboard"));
+const GridView = lazy(() => import("./pages/GridView"));
+const Resources = lazy(() => import("./pages/Resources"));
+const GridsPage = lazy(() => import("./pages/GridsPage"));
+const TasksPage = lazy(() => import("./pages/TasksPage"));
+const TaskDetailPage = lazy(() => import("./pages/TaskDetailPage"));
+const StubDetailPage = lazy(() => import("./pages/StubDetail"));
+const StubsPage = lazy(() => import("./pages/StubsPage"));
+const ExperimentsPage = lazy(() => import("./pages/ExperimentsPage"));
+const DeployPage = lazy(() => import("./pages/DeployPage"));
 const ExperimentLineageDemo = lazy(() => import("./pages/ExperimentLineageDemo"));
+
+function RouteFallback() {
+  return (
+    <div className="flex items-center justify-center py-16 text-sm text-gray-500">
+      Loading…
+    </div>
+  );
+}
 
 function DemoFallback() {
   return (
@@ -107,47 +115,45 @@ function AppInner(_props: { onLogout: () => void }) {
 
       <main className="flex-1 overflow-auto">
         <div className="p-5 max-w-screen-2xl mx-auto">
-          <Routes>
-            <Route
-              path="/demo/experiments-lineage"
-              element={
-                <Suspense fallback={<DemoFallback />}>
-                  <ExperimentLineageDemo />
-                </Suspense>
-              }
-            />
-            <Route
-              path="/"
-              element={
-                <Dashboard
-                  stubs={stubs}
-                  globalQueue={globalQueue}
-                  lossHistory={lossHistory}
-                  logBuffers={logBuffers}
-                  onTaskUpdate={() => {}}
-                />
-              }
-            />
-            <Route path="/tasks" element={<TasksPage />} />
-            <Route path="/tasks/:id" element={<TaskDetailPage />} />
-            <Route path="/stubs" element={<StubsPage />} />
-            <Route path="/stubs/:id" element={<StubDetailPage socket={socket} />} />
-            <Route path="/grids" element={<GridsPage />} />
-            <Route path="/grids/:id" element={<GridView />} />
-            <Route path="/experiments" element={<ExperimentsPage />} />
-            <Route path="/experiments/:id" element={<ExperimentsPage />} />
-            <Route path="/deploy" element={<DeployPage />} />
-            <Route
-              path="/resources"
-              element={
-                <Resources
-                  stubs={stubs}
-                  globalQueue={globalQueue}
-                  connected={connected}
-                />
-              }
-            />
-          </Routes>
+          <Suspense fallback={<RouteFallback />}>
+            <Routes>
+              <Route
+                path="/demo/experiments-lineage"
+                element={<ExperimentLineageDemo />}
+              />
+              <Route
+                path="/"
+                element={
+                  <Dashboard
+                    stubs={stubs}
+                    globalQueue={globalQueue}
+                    lossHistory={lossHistory}
+                    logBuffers={logBuffers}
+                    onTaskUpdate={() => {}}
+                  />
+                }
+              />
+              <Route path="/tasks" element={<TasksPage />} />
+              <Route path="/tasks/:id" element={<TaskDetailPage />} />
+              <Route path="/stubs" element={<StubsPage />} />
+              <Route path="/stubs/:id" element={<StubDetailPage socket={socket} />} />
+              <Route path="/grids" element={<GridsPage />} />
+              <Route path="/grids/:id" element={<GridView />} />
+              <Route path="/experiments" element={<ExperimentsPage />} />
+              <Route path="/experiments/:id" element={<ExperimentsPage />} />
+              <Route path="/deploy" element={<DeployPage />} />
+              <Route
+                path="/resources"
+                element={
+                  <Resources
+                    stubs={stubs}
+                    globalQueue={globalQueue}
+                    connected={connected}
+                  />
+                }
+              />
+            </Routes>
+          </Suspense>
         </div>
       </main>
     </div>
