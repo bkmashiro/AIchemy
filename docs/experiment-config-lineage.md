@@ -6,6 +6,35 @@
 
 ---
 
+## Status (current state)
+
+The MVP described here is **implemented**. The lineage rail and read-only
+tooling are documented in `plans/research-lineage-gitlens.md`. Quick map:
+
+| Concept here                               | Where it lives                                                  |
+|--------------------------------------------|-----------------------------------------------------------------|
+| `Experiment.config` + `fork()` + diff      | `sdk/alchemy_sdk/experiment.py`                                  |
+| `parent_id` frozen at write time           | `server/src/api/experiments.ts` `POST /` handler                 |
+| `resolved_config` per task                 | task spec build in server experiments router                     |
+| `GET /api/experiments/:id/diff`            | `server/src/api/experiments.ts`                                  |
+| Web config diff card                       | `web/src/components/experiments/ExperimentConfigDiffCard.tsx`    |
+| CLI `experiments diff/manifest/compare`    | `sdk/alchemy_sdk/cli/main.py`                                    |
+| Read-only `ExperimentClient`               | `sdk/alchemy_sdk/experiments.py`                                 |
+
+Sections below describe the original design intent. Anywhere the running
+implementation has drifted, the source files above are authoritative.
+
+Deferred / not implemented as written:
+
+- the `ALCHEMY_CONFIG` env-var injection path (§1.2, §6.3) is **not** wired:
+  tasks receive `resolved_config` through their spec, not via a temp JSON file.
+  Treat that flow as future work, not as the current contract.
+- the "Web 端展示" mockups in §5 predate the GitLens rail; current layout is
+  in `web/src/pages/ExperimentsPage.tsx` and the components under
+  `web/src/components/experiments/`.
+
+---
+
 ## 1. Config 作为一等公民
 
 ### 1.1 Experiment 新增 `config` 字段

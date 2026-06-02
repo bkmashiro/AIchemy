@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 DEFAULT_SERVER = "http://localhost:3002"
 ACTIVE_STATUSES = {"pending", "assigned", "running", "paused", "blocked"}
 DANGEROUS_STATUSES = {"running", "assigned"}
+COMPARE_MAX_REFS = 6  # server caps `/experiments/compare?ids=...` at 6
 TASK_FIELDS = [
     "script", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
     "requirements", "priority", "max_retries", "param_overrides", "target_tags",
@@ -343,10 +344,33 @@ def cmd_experiments_tree(args: argparse.Namespace, client: ApiClient) -> None:
 
 
 def cmd_experiments_compare(args: argparse.Namespace, client: ApiClient) -> None:
+    refs: list[str] = list(args.experiments)
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for ref in refs:
+        if ref in seen:
+            duplicates.append(ref)
+        else:
+            seen.add(ref)
+    if duplicates:
+        raise AlchError(
+            f"duplicate compare refs (pass each experiment once): {sorted(set(duplicates))}"
+        )
+    if len(refs) > COMPARE_MAX_REFS:
+        raise AlchError(
+            f"compare accepts at most {COMPARE_MAX_REFS} experiments; got {len(refs)}"
+        )
     experiments = client.get("/experiments")
-    resolved = [resolve_experiment(experiments, ref) for ref in args.experiments]
-    ids = ",".join(e["id"] for e in resolved)
-    print_json(client.get(f"/experiments/compare?{urlencode({'ids': ids})}"))
+    resolved = [resolve_experiment(experiments, ref) for ref in refs]
+    # Resolved IDs may still collide if two distinct refs (e.g. a name and its
+    # UUID) point at the same record. Detect that explicitly — the server would
+    # otherwise return a degenerate one-row compare table.
+    resolved_ids = [e["id"] for e in resolved]
+    if len(set(resolved_ids)) != len(resolved_ids):
+        raise AlchError(
+            f"compare refs resolve to the same experiment: {refs} → {resolved_ids}"
+        )
+    print_json(client.get(f"/experiments/compare?{urlencode({'ids': ','.join(resolved_ids)})}"))
 
 
 def cmd_experiments_summary(args: argparse.Namespace, client: ApiClient) -> None:

@@ -296,6 +296,53 @@ def test_experiments_compare_unknown_ref_fails(monkeypatch):
     assert code == 1
 
 
+def test_experiments_compare_rejects_duplicate_refs(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    # Fail fast before any HTTP traffic — the server would otherwise compare
+    # the same experiment against itself.
+    called = False
+
+    def fake_urlopen(req, timeout=20.0):
+        nonlocal called
+        called = True
+        return FakeResponse([])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "compare", "alpha", "alpha"])
+
+    assert code == 1
+    assert called is False
+    err = capsys.readouterr().err
+    assert "duplicate compare refs" in err
+
+
+def test_experiments_compare_rejects_more_than_six_refs(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    refs = [f"exp-{i}" for i in range(7)]
+    with patch("alchemy_sdk.cli.main.urlopen", lambda *a, **k: FakeResponse([])):
+        code = cli.main(["experiments", "compare", *refs])
+    assert code == 1
+    assert "at most 6" in capsys.readouterr().err
+
+
+def test_experiments_compare_rejects_name_uuid_alias_to_same_id(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    # Two refs that both resolve to exp-1 (name + id of same record). The
+    # earlier dedupe pass only checks the literal strings; this case proves
+    # the resolved-id check fires too.
+    experiments = [{"id": "exp-1", "name": "alpha"}]
+
+    def fake_urlopen(req, timeout=20.0):
+        assert req.method == "GET"
+        return FakeResponse(experiments)
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "compare", "alpha", "exp-1"])
+
+    assert code == 1
+    assert "resolve to the same experiment" in capsys.readouterr().err
+
+
 def test_experiments_summary_resolves_name(monkeypatch):
     calls = run_cli(
         monkeypatch,

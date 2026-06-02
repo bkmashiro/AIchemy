@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ExperimentDetail, Task } from "../../lib/api";
 import {
   CELL_COLORS,
@@ -13,10 +13,29 @@ export function ExperimentMatrixCard({ exp }: { exp: ExperimentDetail }) {
   const paramSpace = exp.grid?.param_space ?? {};
   const paramKeys = Object.keys(paramSpace);
   const tasks = exp.tasks ?? [];
+  const { rowKey, colKey, rowValues, colValues } = pickMatrixKeys(paramSpace);
+
+  // Precompute a (row, col) → task index once per render. The previous code
+  // ran `tasks.find(...)` for every cell, which is O(rows × cols × tasks);
+  // grids of 10×10 with 100 tasks were doing 10k linear scans on every
+  // re-render. The key intentionally uses `String(...)` to match how the
+  // header cells coerce param values for display.
+  const taskByCell = useMemo(() => {
+    const map = new Map<string, Task>();
+    for (const t of tasks) {
+      const overrides = t.param_overrides;
+      if (!overrides) continue;
+      const rPart = rowKey ? String(overrides[rowKey]) : "";
+      const cPart = colKey ? String(overrides[colKey]) : "";
+      const key = `${rPart}|${cPart}`;
+      // First task wins, matching the previous `find()` semantics. A grid
+      // axis collision is a data bug worth keeping deterministic.
+      if (!map.has(key)) map.set(key, t);
+    }
+    return map;
+  }, [tasks, rowKey, colKey]);
 
   if (paramKeys.length === 0) return null;
-
-  const { rowKey, colKey, rowValues, colValues } = pickMatrixKeys(paramSpace);
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 overflow-x-auto">
@@ -44,14 +63,9 @@ export function ExperimentMatrixCard({ exp }: { exp: ExperimentDetail }) {
                 {rowKey ? `${rowKey}=${rv}` : ""}
               </td>
               {colValues.map((cv) => {
-                const task: Task | undefined = tasks.find((t) => {
-                  if (!t.param_overrides) return false;
-                  const matchRow =
-                    !rowKey || String(t.param_overrides[rowKey]) === String(rv);
-                  const matchCol =
-                    !colKey || String(t.param_overrides[colKey]) === String(cv);
-                  return matchRow && matchCol;
-                });
+                const rPart = rowKey ? String(rv) : "";
+                const cPart = colKey ? String(cv) : "";
+                const task: Task | undefined = taskByCell.get(`${rPart}|${cPart}`);
 
                 const status = getCellStatus(task, exp);
                 const cellId = `${rv}|${cv}`;

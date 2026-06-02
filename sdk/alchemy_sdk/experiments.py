@@ -37,10 +37,20 @@ class ExperimentClient:
         server: Optional[str] = None,
         token: Optional[str] = None,
         timeout: float = 20.0,
+        cache_experiments: bool = False,
     ) -> None:
         self.server = _resolve_server(server).rstrip("/")
         self._token = token
         self.timeout = timeout
+        # Opt-in per-client cache for `GET /experiments`. The same payload is
+        # the source for every name-or-id resolution (`summary`, `diff`,
+        # `manifest`, `compare`), so callers that fan out across many refs in
+        # a script/notebook can flip this on to avoid N+1 round-trips. Default
+        # stays off to preserve the existing "always reflects server state"
+        # contract — flipping on without explicit caller intent would silently
+        # surprise long-running scripts.
+        self._cache_experiments = bool(cache_experiments)
+        self._experiments_cache: Optional[list[dict[str, Any]]] = None
 
     @property
     def token(self) -> str:
@@ -70,19 +80,39 @@ class ExperimentClient:
         except URLError as exc:
             raise RuntimeError(f"request to {path} failed: {exc.reason}") from exc
 
-    def list(self) -> list[dict[str, Any]]:
+    def list(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+        # When `cache_experiments=True`, we keep the last successful list in
+        # `self._experiments_cache` and return it on subsequent calls until
+        # `refresh=True` is passed or `clear_cache()` is called. `refresh`
+        # always forces a fresh request even on uncached clients.
+        if (
+            self._cache_experiments
+            and not refresh
+            and self._experiments_cache is not None
+        ):
+            return self._experiments_cache
+
         data = self._get("/experiments")
         # GET /experiments must return a JSON array. Fail loudly if the server
         # returns something else (e.g. an error envelope, a dict) rather than
         # silently coercing to `list(dict.keys())`, which used to mask bad
         # tokens and middleware that returns `{"error": ...}`.
         if data is None:
-            return []
-        if not isinstance(data, list):
+            result: list[dict[str, Any]] = []
+        elif not isinstance(data, list):
             raise RuntimeError(
                 f"unexpected /experiments response shape: expected list, got {type(data).__name__}"
             )
-        return data
+        else:
+            result = data
+
+        if self._cache_experiments:
+            self._experiments_cache = result
+        return result
+
+    def clear_cache(self) -> None:
+        """Drop the cached experiment list. No-op when caching is disabled."""
+        self._experiments_cache = None
 
     def tree(self) -> Any:
         return self._get("/experiments/tree")
@@ -100,26 +130,26 @@ class ExperimentClient:
             raise RuntimeError(f"ambiguous experiment ref {ref!r}: {names}")
         return matches[0]
 
-    def resolve(self, ref: str) -> dict[str, Any]:
-        return self._resolve_one(self.list(), ref)
+    def resolve(self, ref: str, *, refresh: bool = False) -> dict[str, Any]:
+        return self._resolve_one(self.list(refresh=refresh), ref)
 
-    def summary(self, ref: str) -> Any:
-        exp = self.resolve(ref)
+    def summary(self, ref: str, *, refresh: bool = False) -> Any:
+        exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/summary")
 
-    def diff(self, ref: str) -> Any:
-        exp = self.resolve(ref)
+    def diff(self, ref: str, *, refresh: bool = False) -> Any:
+        exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/diff")
 
-    def manifest(self, ref: str) -> Any:
-        exp = self.resolve(ref)
+    def manifest(self, ref: str, *, refresh: bool = False) -> Any:
+        exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/manifest")
 
-    def compare(self, refs: Iterable[str]) -> Any:
+    def compare(self, refs: Iterable[str], *, refresh: bool = False) -> Any:
         refs_list = list(refs)
         if not refs_list:
             raise RuntimeError("compare requires at least one experiment ref")
-        experiments = self.list()
+        experiments = self.list(refresh=refresh)
         resolved_ids = [self._resolve_one(experiments, ref)["id"] for ref in refs_list]
         query = urlencode({"ids": ",".join(resolved_ids)})
         return self._get(f"/experiments/compare?{query}")

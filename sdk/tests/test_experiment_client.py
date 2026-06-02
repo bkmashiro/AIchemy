@@ -276,6 +276,92 @@ def test_list_raises_on_non_list_response(monkeypatch):
             client.list()
 
 
+def test_cache_disabled_by_default_refetches_experiments(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    experiments = [{"id": "exp-1", "name": "alpha"}]
+    queue = [experiments, experiments]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()
+        client.list()
+    assert len(calls) == 2
+
+
+def test_cache_enabled_reuses_experiments_list_across_resolutions(monkeypatch):
+    client = ExperimentClient(server="http://server", cache_experiments=True)
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    experiments = [{"id": "exp-1", "name": "alpha"}]
+    queue = [
+        experiments,          # first list()
+        {"metrics": {}},      # summary
+        {"changes": []},      # diff
+    ]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()
+        client.summary("alpha")
+        client.diff("exp-1")
+    # Only one /experiments call: cached list serves both name and id lookups.
+    paths = [c["url"].split("/api", 1)[1] for c in calls]
+    assert paths == [
+        "/experiments",
+        "/experiments/exp-1/summary",
+        "/experiments/exp-1/diff",
+    ]
+
+
+def test_cache_refresh_forces_new_experiments_fetch(monkeypatch):
+    client = ExperimentClient(server="http://server", cache_experiments=True)
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    first = [{"id": "exp-1", "name": "alpha"}]
+    second = [{"id": "exp-1", "name": "alpha"}, {"id": "exp-2", "name": "beta"}]
+    queue = [first, second]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        assert client.list() == first
+        assert client.list() == first  # cached
+        assert client.list(refresh=True) == second
+        assert client.list() == second  # now cached value updated
+    assert len(calls) == 2
+
+
+def test_clear_cache_drops_memo(monkeypatch):
+    client = ExperimentClient(server="http://server", cache_experiments=True)
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    experiments = [{"id": "exp-1", "name": "alpha"}]
+    queue = [experiments, experiments]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()
+        client.clear_cache()
+        client.list()
+    assert len(calls) == 2
+
+
+def test_compare_refresh_bypasses_cache(monkeypatch):
+    client = ExperimentClient(server="http://server", cache_experiments=True)
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    first = [{"id": "exp-1", "name": "alpha"}]
+    second = [
+        {"id": "exp-1", "name": "alpha"},
+        {"id": "exp-2", "name": "beta"},
+    ]
+    queue = [first, second, {"experiments": []}]
+    calls: list[dict] = []
+    with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
+        client.list()  # primes cache with the old payload
+        client.compare(["alpha", "beta"], refresh=True)
+    # First /experiments primes cache, compare(refresh=True) forces another
+    # /experiments fetch, then hits /compare with both ids.
+    paths = [c["url"].split("/api", 1)[1] for c in calls]
+    assert paths == [
+        "/experiments",
+        "/experiments",
+        "/experiments/compare?ids=exp-1%2Cexp-2",
+    ]
+
+
 def test_list_returns_empty_for_null_body(monkeypatch):
     monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
     client = ExperimentClient(server="http://server")

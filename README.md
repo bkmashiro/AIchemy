@@ -99,11 +99,11 @@ with Alchemy(server="http://localhost:3001", collect_gpu=True) as al:
         loss = train_step()
         al.log(step=step, total=100000, loss=loss)
 
-        if al.should_stop:
+        if al.should_stop():
             save_checkpoint()
             break
 
-        if al.should_checkpoint:
+        if al.should_checkpoint():
             save_checkpoint()
             al.checkpoint("ckpt.pt")
 ```
@@ -123,6 +123,33 @@ from alchemy_sdk.callbacks import AlchemyHFCallback
 
 trainer = Trainer(..., callbacks=[AlchemyHFCallback()])
 ```
+
+## Experiment Lineage (read-only)
+
+Inspect experiments, lineage, and decisions from Python or the CLI without
+mutating scheduler/runtime state.
+
+```python
+from alchemy_sdk import ExperimentClient
+
+ec = ExperimentClient(server="https://alchemy.example.com", token="...")
+ec.list()                       # list experiments
+ec.tree()                       # lineage forest
+ec.summary("curiosity_s42")     # rollups + best metrics
+ec.diff("curiosity_s42")        # config diff vs parent
+ec.compare(["alpha", "beta"])   # cross-experiment compare (cap 6)
+```
+
+```bash
+alch experiments ls
+alch experiments show <name-or-id>
+alch experiments timeline <name-or-id>
+alch experiments summary|diff|manifest <name-or-id>
+alch experiments compare <ref> <ref> [...]
+```
+
+The companion mutating CLIs (`alch experiments note|decide`) write through the
+server API only. See `SDK.md` for the full lineage surface.
 
 ## SLURM Integration
 
@@ -164,6 +191,20 @@ cd . && python tests/simulate.py --stubs 2 --tasks 5
 | GET | `/api/stubs/:id` | Get stub details |
 | DELETE | `/api/stubs/offline` | Purge offline stubs |
 | GET | `/api/stubs/:id/metrics` | Stub GPU metrics history |
+| **Experiments** | | |
+| POST | `/api/experiments` | Create experiment + DAG of tasks (idempotent by name) |
+| GET | `/api/experiments` | List experiments |
+| GET | `/api/experiments/tree` | Lineage forest via frozen `parent_id` edges |
+| GET | `/api/experiments/compare?ids=a,b` | Multi-experiment summary/diff (cap 6) |
+| GET | `/api/experiments/:id` | Experiment detail (tasks, intent, decision, config) |
+| GET | `/api/experiments/:id/diff` | Config diff vs parent |
+| GET | `/api/experiments/:id/summary` | Rollups and best metrics |
+| GET | `/api/experiments/:id/manifest` | Reproducibility manifest |
+| GET | `/api/experiments/:id/timeline` | Append-only event log + synthesized task events |
+| POST | `/api/experiments/:id/events` | Append a note / op event |
+| PATCH | `/api/experiments/:id/decision` | Set keep / drop / rerun / fork + reason |
+| POST | `/api/experiments/:id/retry-failed` | Re-submit failed leaves |
+| DELETE | `/api/experiments/:id` | Soft-delete experiment record (timeline kept) |
 | **Tasks** | | |
 | POST | `/api/stubs/:id/tasks` | Submit task to stub |
 | POST | `/api/tasks` | Submit to global queue |

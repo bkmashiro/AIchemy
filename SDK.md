@@ -151,6 +151,25 @@ Notes:
 - The companion CLI (`alch experiments tree|summary|diff|manifest|compare`)
   uses the same endpoints and is also read-only by design.
 
+### Caching `/experiments` lookups
+
+`summary`, `diff`, `manifest`, and `compare` all start by fetching
+`GET /api/experiments` to resolve name-or-id refs. For notebooks/scripts that
+fan out across many refs, you can opt into a per-client cache:
+
+```python
+ec = ExperimentClient(cache_experiments=True)
+ec.summary("alpha")    # 1× /experiments  + 1× /summary
+ec.diff("alpha")       #                   + 1× /diff   (no extra /experiments)
+ec.compare(["a","b"])  #                   + 1× /compare
+ec.list(refresh=True)  # force a re-fetch
+ec.clear_cache()       # drop the memoized list
+```
+
+Default is `cache_experiments=False` so the client always reflects fresh
+server state. Every read method accepts `refresh=True` to bypass the cache
+once without flipping the flag.
+
 ### Operator CLI: read-only experiment commands
 
 ```bash
