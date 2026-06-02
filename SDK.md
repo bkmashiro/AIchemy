@@ -144,6 +144,9 @@ ec.compare(["alpha", "beta-2"])        # GET /api/experiments/compare?ids=...
 ec.research_bundle("my-experiment")    # GET /api/experiments/<id>/research-bundle
                                        # one-shot export of detail + summary + diff +
                                        # manifest + timeline + decision + artifacts
+ec.research_report(family="pretrain",  # GET /api/experiments/research-report
+                   decision="none")    # family/decision/status rollup: counts,
+                                       # leaderboard, per-experiment briefs
 
 # Local dry-run: build a fork manifest without submitting anything. Only the
 # two GET requests below run; nothing is written to the server.
@@ -212,6 +215,9 @@ alch experiments timeline <name-or-id>     # event timeline
 alch experiments bundle <name-or-id>       # one-shot research export
                                            # (detail + summary + diff + manifest +
                                            #  timeline + decision + artifacts)
+alch experiments report --family pretrain \
+    --decision none --limit 25             # filtered family/decision/status rollup:
+                                           # counts, leaderboard, per-exp briefs
 alch experiments fork-plan <name-or-id> \
     --set lr=0.0002 --unset warmup \
     --reason "ablation"                    # local dry-run: prints proposed config + diff
@@ -224,6 +230,15 @@ artifact locators, best-effort git manifest). It is **not** a live dashboard
 replacement; for streaming metrics keep using `log_eval` and the web UI.
 Manifest is best-effort: when `git_tracking` is disabled or no stub is
 online, `manifest.content` is `null` and `manifest.status` explains why.
+
+The `report` command is the family-scoped counterpart to `bundle`: one GET
+returns counts (by status, by decision), the leaderboard for the shared
+primary metric, and per-experiment briefs (decision, recent events,
+artifact/checkpoint counts). It does **not** touch git manifests and never
+writes events. Use it to answer "which runs in this family are
+keep/drop/rerun/fork/undecided, and which is currently winning the goal
+metric?" without paging through every detail page. `--limit` defaults to 50
+and is capped at 200 server-side.
 
 These are safe to run during live training: they only issue `GET` requests
 against the Alchemy server. `fork-plan` in particular does **not** submit a

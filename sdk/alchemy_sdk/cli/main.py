@@ -525,6 +525,24 @@ def cmd_experiments_bundle(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.get(f"/experiments/{exp['id']}/research-bundle"))
 
 
+def cmd_experiments_report(args: argparse.Namespace, client: ApiClient) -> None:
+    params: dict[str, Any] = {}
+    if args.family:
+        params["family"] = args.family
+    if args.decision:
+        params["decision"] = args.decision
+    if args.status:
+        params["status"] = args.status
+    if args.limit is not None:
+        if args.limit <= 0:
+            raise AlchError("--limit must be a positive integer")
+        params["limit"] = str(args.limit)
+    path = "/experiments/research-report"
+    if params:
+        path += f"?{urlencode(params)}"
+    print_json(client.get(path))
+
+
 def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
     reason = args.reason_flag or args.reason
     if not reason:
@@ -689,6 +707,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("experiment", help="experiment name or id")
     p.set_defaults(func=cmd_experiments_bundle)
+
+    p = exps_sub.add_parser(
+        "report",
+        help="read-only family/decision/status rollup (leaderboard + briefs)",
+        description=(
+            "GET /experiments/research-report — filtered family/decision/status "
+            "rollup. Issues only one GET request: counts, leaderboard by primary "
+            "metric, per-experiment briefs (decision, task counts, recent events, "
+            "artifact/checkpoint counts). Read-only; never reschedules or writes "
+            "events. Pass --decision none to select undecided experiments. "
+            "--limit defaults to 50 server-side and is capped at 200."
+        ),
+    )
+    p.add_argument("--family", help="filter by experiment family name")
+    p.add_argument(
+        "--decision",
+        choices=["keep", "drop", "rerun", "fork", "none"],
+        help="filter by decision (use 'none' for undecided)",
+    )
+    p.add_argument(
+        "--status",
+        choices=["running", "passed", "partial", "failed"],
+        help="filter by rollup status",
+    )
+    p.add_argument("--limit", type=int, default=None, help="cap experiments returned (default 50, max 200)")
+    p.set_defaults(func=cmd_experiments_report)
 
     p = sub.add_parser("verify", help="poll task/stub state and assert expectations")
     p.add_argument("--task", help="task id to check")

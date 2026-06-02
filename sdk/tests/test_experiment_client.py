@@ -435,6 +435,60 @@ def test_research_bundle_resolves_and_hits_bundle_endpoint(monkeypatch):
     assert calls[1]["url"] == "http://server/api/experiments/exp-1/research-bundle"
 
 
+def test_research_report_sends_get_with_query_params(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    payload = {
+        "filters": {"family": "alpha", "decision": "none", "status": None, "limit": 25},
+        "counts": {"total": 0, "by_status": {}, "by_decision": {}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [],
+        "generated_at": "2026-06-02T00:00:00.000Z",
+    }
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.research_report(family="alpha", decision="none", limit=25),
+        [payload],
+    )
+    assert result == payload
+    assert len(calls) == 1
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == (
+        "http://server/api/experiments/research-report"
+        "?family=alpha&decision=none&limit=25"
+    )
+
+
+def test_research_report_with_no_filters_hits_bare_endpoint(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    _, calls = _run(monkeypatch, client.research_report, [{"experiments": []}])
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://server/api/experiments/research-report"
+
+
+def test_research_report_rejects_invalid_inputs(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
+    with pytest.raises(RuntimeError, match="decision must be one of"):
+        client.research_report(decision="ship")
+    with pytest.raises(RuntimeError, match="status must be one of"):
+        client.research_report(status="nope")
+    with pytest.raises(RuntimeError, match="limit must be a positive integer"):
+        client.research_report(limit=0)
+    with pytest.raises(RuntimeError, match="limit must be a positive integer"):
+        client.research_report(limit=-3)
+
+
+def test_research_report_url_encodes_family_with_spaces(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    _, calls = _run(
+        monkeypatch,
+        lambda: client.research_report(family="space family"),
+        [{"experiments": []}],
+    )
+    assert calls[0]["url"] == "http://server/api/experiments/research-report?family=space+family"
+
+
 def test_research_bundle_refresh_bypasses_cache(monkeypatch):
     client = ExperimentClient(server="http://server", cache_experiments=True)
     monkeypatch.setenv("ALCHEMY_TOKEN", "tk")

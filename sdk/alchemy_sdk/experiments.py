@@ -187,6 +187,45 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/timeline")
 
+    def research_report(
+        self,
+        *,
+        family: Optional[str] = None,
+        decision: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Any:
+        """GET /api/experiments/research-report.
+
+        Read-only family/decision/status rollup. Returns the report payload
+        (filters, counts, metric, leaderboard, experiments). Pass
+        ``decision="none"`` to select undecided experiments. ``limit`` is
+        clamped server-side (default 50, cap 200).
+        """
+        params: dict[str, str] = {}
+        if family is not None:
+            params["family"] = family
+        if decision is not None:
+            if decision not in DECISION_CHOICES:
+                raise RuntimeError(
+                    f"decision must be one of {list(DECISION_CHOICES)}, got {decision!r}"
+                )
+            params["decision"] = decision
+        if status is not None:
+            if status not in STATUS_CHOICES:
+                raise RuntimeError(
+                    f"status must be one of {list(STATUS_CHOICES)}, got {status!r}"
+                )
+            params["status"] = status
+        if limit is not None:
+            if not isinstance(limit, int) or limit <= 0:
+                raise RuntimeError(f"limit must be a positive integer, got {limit!r}")
+            params["limit"] = str(limit)
+        path = "/experiments/research-report"
+        if params:
+            path += f"?{urlencode(params)}"
+        return self._get(path)
+
     def research_bundle(self, ref: str, *, refresh: bool = False) -> Any:
         """GET /api/experiments/<id>/research-bundle.
 

@@ -7,6 +7,7 @@
  * DELETE /experiments/:id       — delete experiment (does NOT delete tasks)
  * POST   /experiments/:id/retry-failed — retry tasks that failed criteria
  * GET    /experiments/:id/research-bundle — read-only export composite payload
+ * GET    /experiments/research-report — filtered family/decision/status rollup
  */
 
 import { Router, Request, Response } from "express";
@@ -64,6 +65,7 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
 }
 
 const DECISIONS = new Set<ExperimentDecision>(["keep", "drop", "rerun", "fork"]);
+const EXPERIMENT_STATUSES = new Set<Experiment["status"]>(["running", "passed", "partial", "failed"]);
 const EVENT_KINDS = new Set<ExperimentEventKind>([
   "created", "forked", "task_started", "task_completed", "task_failed",
   "resumed", "moved_stub", "metric_best", "note", "decision",
@@ -737,6 +739,206 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       shared_config_keys: shared,
       differing_config_keys: differing,
       metric_deltas: metricDeltas(found, bestByExp),
+    });
+  });
+
+  // GET /experiments/research-report — filtered family/decision/status rollup
+  // NOTE: must be registered before /:id so Express does not capture
+  // "research-report" as an id. Read-only: never writes events, never reads
+  // git manifests, never touches scheduler.
+  router.get("/research-report", (req: Request, res: Response) => {
+    const readScalarQuery = (name: "family" | "decision" | "status" | "limit"): string | undefined | null => {
+      const value = req.query[name];
+      if (value === undefined) return undefined;
+      if (typeof value !== "string") return null;
+      return value;
+    };
+    const familyFilter = readScalarQuery("family");
+    const decisionFilter = readScalarQuery("decision");
+    const statusFilter = readScalarQuery("status");
+    const limitFilter = readScalarQuery("limit");
+    if (familyFilter === null || decisionFilter === null || statusFilter === null || limitFilter === null) {
+      res.status(400).json({ error: "family, decision, status, and limit must be scalar query parameters" });
+      return;
+    }
+
+    // limit: positive integer, default 50, cap 200. Reject non-integer / non-positive.
+    let limit = 50;
+    if (limitFilter !== undefined) {
+      if (limitFilter.length === 0) {
+        res.status(400).json({ error: "limit must be a positive integer" });
+        return;
+      }
+      const parsed = Number(limitFilter);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+        res.status(400).json({ error: "limit must be a positive integer" });
+        return;
+      }
+      limit = Math.min(parsed, 200);
+    }
+
+    if (decisionFilter !== undefined && decisionFilter !== "none" && !DECISIONS.has(decisionFilter as ExperimentDecision)) {
+      res.status(400).json({ error: "decision must be one of keep, drop, rerun, fork, none" });
+      return;
+    }
+    if (statusFilter !== undefined && !EXPERIMENT_STATUSES.has(statusFilter as Experiment["status"])) {
+      res.status(400).json({ error: "status must be one of running, passed, partial, failed" });
+      return;
+    }
+
+    let experiments = store.getAllExperiments();
+    if (familyFilter !== undefined) experiments = experiments.filter((e) => (e.family ?? "") === familyFilter);
+    if (decisionFilter !== undefined) {
+      if (decisionFilter === "none") experiments = experiments.filter((e) => !e.decision);
+      else experiments = experiments.filter((e) => e.decision === decisionFilter);
+    }
+    const statusByExp = new Map<string, Experiment["status"]>();
+    for (const exp of experiments) statusByExp.set(exp.id, deriveExperimentStatus(exp));
+    if (statusFilter !== undefined) experiments = experiments.filter((e) => statusByExp.get(e.id) === statusFilter);
+
+    // Deterministic sort: family asc (nulls last), created_at asc, name, id.
+    experiments = experiments.slice().sort((a, b) => {
+      const fa = a.family ?? null;
+      const fb = b.family ?? null;
+      if (fa !== fb) {
+        if (fa === null) return 1;
+        if (fb === null) return -1;
+        return fa.localeCompare(fb);
+      }
+      return compareExperiments(a, b);
+    });
+
+    const matchingExperiments = experiments;
+    const returnedExperiments = matchingExperiments.slice(0, limit);
+
+    // Counts reflect the full filtered rollup, not only the returned page.
+    const byStatus: Record<string, number> = {};
+    const byDecision: Record<string, number> = {};
+    for (const exp of matchingExperiments) {
+      const status = statusByExp.get(exp.id) ?? deriveExperimentStatus(exp);
+      byStatus[status] = (byStatus[status] ?? 0) + 1;
+      const dKey = exp.decision ?? "none";
+      byDecision[dKey] = (byDecision[dKey] ?? 0) + 1;
+    }
+
+    // Report-level metric: pick the (goal_metric, goal_direction) pair shared by
+    // the most matching experiments. Ties break by metric name then direction
+    // for determinism. If no experiment in the filtered set has a goal_metric,
+    // return null and leaderboard stays empty — we never infer winners from criteria.
+    type MetricPick = { name: string; direction: "min" | "max"; n: number };
+    const picks = new Map<string, MetricPick>();
+    for (const exp of matchingExperiments) {
+      if (!exp.goal_metric || !exp.goal_direction) continue;
+      const key = `${exp.goal_metric} ${exp.goal_direction}`;
+      const existing = picks.get(key);
+      if (existing) existing.n += 1;
+      else picks.set(key, { name: exp.goal_metric, direction: exp.goal_direction, n: 1 });
+    }
+    let reportMetric: { name: string; direction: "min" | "max" } | null = null;
+    for (const candidate of picks.values()) {
+      if (
+        !reportMetric ||
+        candidate.n > (picks.get(`${reportMetric.name} ${reportMetric.direction}`)?.n ?? 0) ||
+        (candidate.n === (picks.get(`${reportMetric.name} ${reportMetric.direction}`)?.n ?? 0) &&
+          (candidate.name.localeCompare(reportMetric.name) < 0 ||
+            (candidate.name === reportMetric.name && candidate.direction.localeCompare(reportMetric.direction) < 0)))
+      ) {
+        reportMetric = { name: candidate.name, direction: candidate.direction };
+      }
+    }
+
+    // Leaderboard: experiments that have a numeric aggregate for the report
+    // metric. Sort by direction; assign deterministic rank starting at 1.
+    type LeaderboardEntry = {
+      id: string;
+      name: string;
+      status: Experiment["status"];
+      decision: ExperimentDecision | null;
+      value: number;
+      metric: string;
+      rank: number;
+    };
+    const leaderboard: LeaderboardEntry[] = [];
+    if (reportMetric) {
+      const rows: Omit<LeaderboardEntry, "rank">[] = [];
+      for (const exp of matchingExperiments) {
+        const agg = aggregateMetrics(exp)[reportMetric.name];
+        if (!agg) continue;
+        const value = reportMetric.direction === "min" ? agg.min : agg.max;
+        if (!Number.isFinite(value)) continue;
+        rows.push({
+          id: exp.id,
+          name: exp.name,
+          status: statusByExp.get(exp.id) ?? deriveExperimentStatus(exp),
+          decision: exp.decision ?? null,
+          value,
+          metric: reportMetric.name,
+        });
+      }
+      rows.sort((a, b) => {
+        if (a.value !== b.value) {
+          return reportMetric!.direction === "min" ? a.value - b.value : b.value - a.value;
+        }
+        if (a.name !== b.name) return a.name.localeCompare(b.name);
+        return a.id.localeCompare(b.id);
+      });
+      rows.slice(0, limit).forEach((row, i) => leaderboard.push({ ...row, rank: i + 1 }));
+    }
+
+    // Per-experiment block. Children come from the full experiment set (not
+    // the filtered slice) so the report still shows downstream lineage even
+    // when filters exclude the forks.
+    const allExperiments = store.getAllExperiments();
+    const childrenByParent = new Map<string, Experiment[]>();
+    for (const e of allExperiments) {
+      if (!e.parent_id) continue;
+      const bucket = childrenByParent.get(e.parent_id) ?? [];
+      bucket.push(e);
+      childrenByParent.set(e.parent_id, bucket);
+    }
+
+    const blocks = returnedExperiments.map((exp) => {
+      const storedEvents = store.getExperimentEvents(exp.id).filter((e) => !e.deleted_at);
+      const artifactCount = storedEvents.filter((e) => e.kind === "artifact").length;
+      const checkpointCount = storedEvents.filter((e) => e.kind === "checkpoint").length;
+      const events = timelineFor(exp);
+      const recent = events.slice(-3);
+      const kids = (childrenByParent.get(exp.id) ?? []).slice().sort(compareExperiments).map(experimentBrief);
+      return {
+        id: exp.id,
+        name: exp.name,
+        family: exp.family ?? null,
+        status: statusByExp.get(exp.id) ?? deriveExperimentStatus(exp),
+        decision: exp.decision ?? null,
+        decision_reason: exp.decision_reason ?? null,
+        decision_at: exp.decision_at ?? null,
+        created_at: exp.created_at,
+        parent_id: exp.parent_id ?? null,
+        children: kids,
+        task_counts: taskCountsByStatus(exp),
+        primary_metric: primaryMetricFor(exp),
+        artifact_count: artifactCount,
+        checkpoint_count: checkpointCount,
+        recent_events: recent,
+      };
+    });
+
+    res.json({
+      filters: {
+        family: familyFilter ?? null,
+        decision: decisionFilter ?? null,
+        status: statusFilter ?? null,
+        limit,
+      },
+      generated_at: new Date().toISOString(),
+      counts: {
+        total: matchingExperiments.length,
+        by_status: byStatus,
+        by_decision: byDecision,
+      },
+      metric: reportMetric,
+      leaderboard,
+      experiments: blocks,
     });
   });
 

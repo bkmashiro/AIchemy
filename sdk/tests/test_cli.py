@@ -582,6 +582,49 @@ def test_experiments_bundle_fetches_research_bundle_endpoint(monkeypatch):
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/research-bundle"
 
 
+def test_experiments_report_sends_get_with_filters(monkeypatch):
+    payload = {
+        "filters": {"family": "alpha", "decision": "none", "status": None, "limit": 10},
+        "counts": {"total": 0, "by_status": {}, "by_decision": {}},
+        "metric": None,
+        "leaderboard": [],
+        "experiments": [],
+        "generated_at": "2026-06-02T00:00:00.000Z",
+    }
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "report", "--family", "alpha", "--decision", "none", "--limit", "10"],
+        [payload],
+    )
+    assert len(calls) == 1
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == (
+        "http://localhost:3002/api/experiments/research-report"
+        "?family=alpha&decision=none&limit=10"
+    )
+    assert calls[0]["body"] is None
+
+
+def test_experiments_report_with_no_filters_hits_bare_endpoint(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "report"],
+        [{"experiments": []}],
+    )
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/research-report"
+
+
+def test_experiments_report_help_documents_read_only_contract(capsys):
+    out = _help_text(["experiments", "report", "--help"], capsys)
+    assert "read-only" in out.lower()
+    assert "research-report" in out
+
+
+def test_experiments_help_lists_report(capsys):
+    out = _help_text(["experiments", "--help"], capsys)
+    assert "report" in out
+
+
 def test_experiments_bundle_help_documents_read_only_contract(capsys):
     out = _help_text(["experiments", "bundle", "--help"], capsys)
     assert "read-only" in out.lower() or "Only GET" in out or "only GET" in out
