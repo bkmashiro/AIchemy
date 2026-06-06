@@ -212,10 +212,11 @@ const LINEAGE_SORT_PRIORITY = {
   leafTone: { active: 0, dead: 1 },
 } as const;
 
-// Sort siblings for selected-path continuity without mutating input.
+// Sort siblings for focused-path continuity without mutating input.
 //
 // Order (most → least significant):
-//  1. selected-path / current nodes first so the focused spine stays visible
+//  1. focus-path nodes first so the selected spine stays visible
+//     (preview selection is not part of this ordering)
 //  2. child-bearing nodes before leaves within the remaining siblings
 //  3. keep/fork decisions before drop/rerun/undecided
 //  4. failed/drop leaf branches after active/passed/partial/running leaves
@@ -226,13 +227,11 @@ const LINEAGE_SORT_PRIORITY = {
 export function sortLineageChildren(
   children: ExperimentTreeNode[],
   pathIds: Set<string>,
-  currentId: string,
 ): ExperimentTreeNode[] {
   const P = LINEAGE_SORT_PRIORITY;
   type Key = readonly [number, number, number, number];
   const key = (n: ExperimentTreeNode): Key => {
-    const onPath =
-      pathIds.has(n.id) || n.id === currentId ? P.onPath.yes : P.onPath.no;
+    const onPath = pathIds.has(n.id) ? P.onPath.yes : P.onPath.no;
     const hasKids = n.children.length > 0 ? P.hasKids.yes : P.hasKids.no;
     const decisionBucket =
       n.decision === "keep" || n.decision === "fork"

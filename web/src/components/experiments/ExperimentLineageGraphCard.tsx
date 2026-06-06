@@ -32,6 +32,7 @@ function flattenLineage(
   root: ExperimentTreeNode,
   currentId: string,
   pathIds: Set<string>,
+  sortPathIds: Set<string>,
 ): RailRow[] {
   const rows: RailRow[] = [];
   // ancestorIsLast[d] = "ancestor of current walk at depth d is last sibling"
@@ -44,7 +45,7 @@ function flattenLineage(
     const isCurrent = node.id === currentId;
     const tone = lineageNodeTone(node, isCurrent, onPath);
 
-    const sortedChildren = sortLineageChildren(node.children, pathIds, currentId);
+    const sortedChildren = sortLineageChildren(node.children, sortPathIds);
     const renderChildren =
       sortedChildren.length > 0 &&
       (depth < FOLD_DEPTH_LIMIT || onPath || isCurrent);
@@ -339,7 +340,11 @@ export function ExperimentLineageGraphCard({
 
   const found = findNodePath(roots, currentId);
   const pathIds = new Set(found?.path.map((n) => n.id) ?? []);
-  const rows = found ? flattenLineage(found.root, currentId, pathIds) : [];
+  const focusPath = findNodePath(roots, pageId);
+  const sortPathIds = new Set(focusPath?.path.map((n) => n.id) ?? pathIds);
+  const rows = found
+    ? flattenLineage(found.root, currentId, pathIds, sortPathIds)
+    : [];
   const selected = found?.path[found.path.length - 1];
 
   return (
