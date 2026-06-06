@@ -25,6 +25,22 @@ should be read as "shipped, not pending":
 
 Open follow-ups (not started):
 
+- Timeline ordering + pagination: show experiment timeline events newest-first
+  by default, with explicit pagination / cursor controls so long-running
+  experiments do not render an unbounded event list. Keep an affordance to read
+  oldest-first only when reconstructing a complete story.
+- Recommendation wording pass: `rerun` is too operational and sounds like
+  blindly repeating a job. For research guidance, test labels such as
+  `Needs stronger evidence`, `Run fuller experiment`, or `Insufficient evidence`
+  while preserving the underlying API enum until a migration is justified.
+- Lineage graph → Research call coupling: clicking a lineage node should update
+  the right-side Research call / compare context in-place, without a full page
+  navigation. Keep `Open detail` as the explicit route change. This makes the
+  graph a selector, not a link farm.
+- Stable subtree ordering contract: every experiment detail view should render
+  the same family subtree in the same sibling order for a given page/root. The
+  selected preview may change highlight/detail content, but must not reorder the
+  graph. Only changing the page/root focus may alter promoted-path ordering.
 - automatic recommendations driven by `goal_metric`/`goal_direction`;
 - on-tree key-diff chips (currently only in the dedicated diff card);
 - selected-lineage task links: when the lineage graph preview/highlight points
