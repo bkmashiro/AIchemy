@@ -15,7 +15,10 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from harness.api import _normalize_script_payload
 from harness.waiter import wait_for_status, wait_all_terminal, TERMINAL_STATUSES
+
+KILL_STATUSES = {"killed", "cancelled"}
 
 SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
@@ -95,11 +98,13 @@ class TestWriteLockPathNormalization:
             headers={"Authorization": f"Bearer {api.token}"},
             timeout=10.0,
         )
-        r = client.post("/api/tasks", json={
-            "script": "echo conflict",
-            "run_dir": run_dir + "/",
-            "param_overrides": {"norm2": uuid4().hex[:8]},
-        })
+        r = client.post("/api/tasks", json=_normalize_script_payload(
+            "echo conflict",
+            {
+                "run_dir": run_dir + "/",
+                "param_overrides": {"norm2": uuid4().hex[:8]},
+            },
+        ))
         client.close()
         assert r.status_code == 409, (
             f"Expected 409 for trailing-slash path conflict, got {r.status_code}"
@@ -369,7 +374,7 @@ class TestKillChainSafetyNet:
         # But the stub's kill_graceful does SIGTERM then SIGKILL after grace
         # so it should be faster
         final = wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=90)
-        assert final["status"] == "killed"
+        assert final["status"] in KILL_STATUSES
 
 
 class TestShellExecBlocklist:

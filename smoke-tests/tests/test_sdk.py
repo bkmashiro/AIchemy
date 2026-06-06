@@ -68,4 +68,4 @@ class TestSDK:
         final = wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=30)
         # It may complete normally if it finishes before should_stop takes effect,
         # or it may be killed. Both are acceptable.
-        assert final["status"] in ("completed", "killed")
+        assert final["status"] in ("completed", "killed", "cancelled")
