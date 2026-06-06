@@ -3,12 +3,61 @@ import { experimentsApi } from "../../lib/api";
 import type {
   ExperimentDetail,
   ExperimentSummaryResponse,
+  ExperimentRecommendation,
 } from "../../lib/api";
 import {
   DECISION_BADGE,
   NEXT_ACTION,
   NEXT_ACTION_DEFAULT,
 } from "./experimentDetailUtils";
+
+function isText(value: string | null | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function recommendationTone(verdict: string | null | undefined): string {
+  if (!isText(verdict)) return "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
+  return DECISION_BADGE[verdict.toLowerCase()] ?? "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
+}
+
+function recommendationAction(rec: ExperimentRecommendation | null) {
+  if (!rec) {
+    return {
+      label: NEXT_ACTION_DEFAULT.label,
+      hint: NEXT_ACTION_DEFAULT.hint,
+      tone: NEXT_ACTION_DEFAULT.tone,
+    };
+  }
+
+  const label = isText(rec.action)
+    ? rec.action.trim()
+    : isText(rec.verdict)
+      ? `Recommendation: ${rec.verdict}`
+      : NEXT_ACTION_DEFAULT.label;
+  const hint = isText(rec.reason)
+    ? rec.reason.trim()
+    : isText(rec.metric)
+      ? `Metric signal: ${rec.metric}`
+      : NEXT_ACTION_DEFAULT.hint;
+
+  return {
+    label,
+    hint,
+    tone: recommendationTone(rec.verdict),
+  };
+}
+
+function formatNumericMetric(value: number | null | undefined): string {
+  if (typeof value !== "number" || Number.isNaN(value)) return "—";
+  return value.toFixed(4);
+}
+
+function deltaClass(value: number | null | undefined): string {
+  if (typeof value !== "number" || Number.isNaN(value)) return "text-gray-400";
+  if (value > 0) return "text-emerald-400";
+  if (value < 0) return "text-rose-400";
+  return "text-gray-300";
+}
 
 export function ExperimentResearchCallCard({
   exp,
@@ -17,10 +66,16 @@ export function ExperimentResearchCallCard({
   exp: ExperimentDetail;
   summary: ExperimentSummaryResponse | null;
 }) {
-  const decision = summary?.decision ?? exp.decision ?? null;
-  const action = decision
-    ? NEXT_ACTION[decision] ?? NEXT_ACTION_DEFAULT
-    : NEXT_ACTION_DEFAULT;
+  const explicitDecision = summary?.decision ?? exp.decision ?? null;
+  const recommendation = summary?.recommendation ?? null;
+
+  const action = explicitDecision
+    ? NEXT_ACTION[explicitDecision] ?? NEXT_ACTION_DEFAULT
+    : recommendationAction(recommendation);
+
+  const decisionBadge = explicitDecision
+    ? DECISION_BADGE[explicitDecision] || "bg-gray-800 text-gray-400 border-gray-700"
+    : "bg-gray-800 text-gray-500 border-gray-700";
 
   const validation = summary?.validation;
   const primary = summary?.primary_metric ?? null;
@@ -28,12 +83,19 @@ export function ExperimentResearchCallCard({
   const bestMetrics = summary?.best_metrics ?? {};
   const bestEntries = Object.entries(bestMetrics).slice(0, 4);
   const forkReason = summary?.fork_reason ?? exp.fork_reason ?? null;
-  const decisionReason =
-    summary?.decision_reason ?? exp.decision_reason ?? null;
+  const decisionReason = summary?.decision_reason ?? exp.decision_reason ?? null;
 
-  const decisionBadge = decision
-    ? DECISION_BADGE[decision] || "bg-gray-800 text-gray-400 border-gray-700"
-    : "bg-gray-800 text-gray-500 border-gray-700";
+  const recMetric = recommendation?.metric ?? null;
+  const recValue = recommendation?.value ?? null;
+  const recBaseline = recommendation?.baseline_value ?? null;
+  const recDelta = recommendation?.delta ?? null;
+  const recDirection = recommendation?.direction ?? null;
+  const recAction = isText(recommendation?.action)
+    ? recommendation.action
+    : null;
+  const recVerdict = isText(recommendation?.verdict)
+    ? recommendation.verdict
+    : null;
 
   const [exportState, setExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [exportError, setExportError] = useState<string | null>(null);
@@ -41,7 +103,7 @@ export function ExperimentResearchCallCard({
   const cliRef = exp.name || exp.id;
   const cliRefForShell = cliRef.length === 0
     ? "''"
-    : `'${cliRef.replace(/'/g, `'\\''`)}'`;
+    : `'${cliRef.replace(/'/g, "'\"'\"'")}'`;
 
   async function downloadBundle() {
     setExportState("loading");
@@ -73,7 +135,7 @@ export function ExperimentResearchCallCard({
         <span
           className={`text-[10px] px-2 py-0.5 rounded border uppercase ${decisionBadge}`}
         >
-          {decision ?? "undecided"}
+          {explicitDecision ?? "undecided"}
         </span>
       </div>
 
@@ -81,6 +143,55 @@ export function ExperimentResearchCallCard({
         <div className="text-xs font-medium">{action.label}</div>
         <div className="mt-0.5 text-[11px] opacity-80">{action.hint}</div>
       </div>
+
+      {recommendation && (
+        <div className="mt-3 rounded-lg border border-cyan-900/40 bg-cyan-900/10">
+          <div className="px-2 py-1.5 border-b border-cyan-900/30 flex items-center justify-between gap-2">
+            <span className="text-[10px] uppercase tracking-wide text-cyan-300">Recommendation</span>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded border ${recommendationTone(recAction ?? recVerdict)}`}
+              >
+                {recAction ?? "No action"}
+              </span>
+              <span
+                className={`text-[10px] px-2 py-0.5 rounded border ${recommendationTone(recVerdict)}`}
+              >
+                {recVerdict ?? "No verdict"}
+              </span>
+            </div>
+          </div>
+
+          <div className="px-2 py-2 space-y-2">
+            {isText(recommendation.reason) && (
+              <p className="text-xs text-gray-300">{recommendation.reason}</p>
+            )}
+            {(isText(recMetric) || recValue !== null || recBaseline !== null || recDelta !== null) && (
+              <div className="grid gap-1 sm:grid-cols-2">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wide text-gray-500">Metric</div>
+                  <div className="font-mono text-gray-300 text-xs">{recMetric ?? "—"}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-wide text-gray-500">Value</div>
+                  <div className="font-mono text-gray-300 text-xs">{formatNumericMetric(recValue)}</div>
+                </div>
+                <div className="sm:col-span-2 text-xs">
+                  <div className="text-[10px] uppercase tracking-wide text-gray-500">Baseline / Delta</div>
+                  <div className="font-mono text-gray-300 mt-0.5">
+                    <span>baseline {formatNumericMetric(recBaseline)}</span>
+                    <span className="text-gray-500"> / </span>
+                    <span className={deltaClass(recDelta)}>
+                      {isText(recDirection) ? `${recDirection} ` : ""}
+                      {formatNumericMetric(recDelta)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {decisionReason && (
         <p className="mt-3 border-l-2 border-gray-800 pl-3 text-xs italic text-gray-400">

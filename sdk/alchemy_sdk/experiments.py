@@ -170,6 +170,52 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/summary")
 
+    def _get_allow_http_error(self, path: str) -> Any:
+        """Like :meth:`_get`, but lets ``HTTPError`` propagate.
+
+        This is intentionally narrow in scope: only callers that need to branch
+        on non-200 HTTP status codes (recommendation endpoint probing/fallback)
+        should use it. Regular call sites should keep using :meth:`_get` so
+        they get the same error shape as existing users expect.
+        """
+        req = Request(
+            f"{self.server}/api{path}",
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+            },
+        )
+        with urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else None
+
+    def recommend(self, ref: str, *, refresh: bool = False) -> Any:
+        """Get a recommendation for a single experiment.
+
+        The canonical route is ``/experiments/<id>/recommendation``. If that
+        endpoint is missing (HTTP 404), this method falls back to
+        ``/experiments/<id>/summary`` and returns ``summary["recommendation"]``.
+        """
+        exp = self.resolve(ref, refresh=refresh)
+        exp_id = exp["id"]
+        try:
+            return self._get_allow_http_error(f"/experiments/{exp_id}/recommendation")
+        except HTTPError as exc:
+            if exc.code != 404:
+                body = exc.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"HTTP {exc.code} on /experiments/{exp_id}/recommendation: {body}") from exc
+            summary = self._get(f"/experiments/{exp_id}/summary")
+            if not isinstance(summary, dict):
+                raise RuntimeError(
+                    f"unexpected /experiments/{exp_id}/summary response shape: expected object"
+                )
+            if "recommendation" not in summary:
+                raise RuntimeError(
+                    "summary response is missing required field: recommendation"
+                )
+            return summary["recommendation"]
+
     def diff(self, ref: str, *, refresh: bool = False) -> Any:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/diff")

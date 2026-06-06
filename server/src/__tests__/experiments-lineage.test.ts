@@ -22,6 +22,37 @@ function makeApp() {
   return app;
 }
 
+function completeExperiment(expId: string, metric: string, value: number, opts: { threshold?: string; passed?: boolean } = {}) {
+  const exp = store.getExperiment(expId);
+  expect(exp).toBeDefined();
+  if (!exp) return;
+  const tasks = store.getGridTasks(exp.grid_id);
+  const archived: any[] = [];
+  const checkedAt = new Date().toISOString();
+  for (const task of tasks) {
+    const removed = store.removeFromGlobalQueue(task.id);
+    expect(removed).toBeDefined();
+    archived.push({
+      ...removed!,
+      status: "completed" as const,
+      finished_at: checkedAt,
+    });
+    exp.results[task.id] = {
+      passed: opts.passed ?? true,
+      checked_at: checkedAt,
+      details: {
+        [metric]: {
+          value,
+          threshold: opts.threshold ?? "< 1.0",
+          ok: opts.passed ?? true,
+        },
+      },
+    };
+  }
+  store.setArchive([...store.getArchive(), ...archived]);
+  store.setExperiment(exp);
+}
+
 beforeEach(() => {
   store.reset();
   vi.clearAllMocks();
@@ -837,5 +868,278 @@ describe("experiment lineage API", () => {
       grid_id: adopted.body.grid.id,
     }));
     expect((await request(app).get(`/experiments/${adopted.body.id}`).expect(200)).body.status).toBe("passed");
+  });
+
+  it("recommends keep/improved vs rerun/inconclusive for min direction against parent", async () => {
+    const app = makeApp();
+
+    const parent = await request(app)
+      .post("/experiments")
+      .send({
+        name: "parent-min",
+        family: "family-min",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(parent.body.id, "loss", 1.2);
+
+    const improved = await request(app)
+      .post("/experiments")
+      .send({
+        name: "child-min-improved",
+        family: "family-min",
+        parent_id: parent.body.id,
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(improved.body.id, "loss", 0.8);
+
+    const improvedSummary = await request(app).get(`/experiments/${improved.body.id}/summary`).expect(200);
+    const improvedRecommendation = await request(app).get(`/experiments/${improved.body.id}/recommendation`).expect(200);
+    expect(improvedRecommendation.body).toEqual(improvedSummary.body.recommendation);
+    expect(improvedSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "keep",
+        verdict: "improved",
+        metric: "loss",
+        baseline_value: 1.2,
+        direction: "min",
+        value: 0.8,
+        delta: -0.4,
+      }),
+    );
+
+    const regressed = await request(app)
+      .post("/experiments")
+      .send({
+        name: "child-min-regressed",
+        family: "family-min",
+        parent_id: parent.body.id,
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(regressed.body.id, "loss", 1.6);
+
+    const regressedSummary = await request(app).get(`/experiments/${regressed.body.id}/summary`).expect(200);
+    expect(regressedSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "drop",
+        verdict: "regressed",
+        metric: "loss",
+        baseline_value: 1.2,
+        direction: "min",
+        value: 1.6,
+        delta: 0.4,
+      }),
+    );
+  });
+
+  it("recommends keep/improved for max direction against parent", async () => {
+    const app = makeApp();
+
+    const parent = await request(app)
+      .post("/experiments")
+      .send({
+        name: "parent-max",
+        family: "family-max",
+        goal_metric: "accuracy",
+        goal_direction: "max",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(parent.body.id, "accuracy", 0.81);
+
+    const improved = await request(app)
+      .post("/experiments")
+      .send({
+        name: "child-max-improved",
+        family: "family-max",
+        parent_id: parent.body.id,
+        goal_metric: "accuracy",
+        goal_direction: "max",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(improved.body.id, "accuracy", 0.88);
+
+    const improvedSummary = await request(app).get(`/experiments/${improved.body.id}/summary`).expect(200);
+    expect(improvedSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "keep",
+        verdict: "improved",
+        metric: "accuracy",
+        baseline_value: 0.81,
+        direction: "max",
+        value: 0.88,
+        delta: 0.07,
+      }),
+    );
+  });
+
+  it("overrides with rerun on failed or running status", async () => {
+    const app = makeApp();
+
+    const running = await request(app)
+      .post("/experiments")
+      .send({
+        name: "running-exp",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    const runningGrid = store.getGrid(running.body.grid_id)!;
+    const assigned = store.updateGlobalQueueTask(runningGrid.task_ids[0], {
+      status: "assigned",
+      stub_id: "stub-running",
+    });
+    expect(assigned).toBeDefined();
+    const started = store.updateGlobalQueueTask(runningGrid.task_ids[0], {
+      status: "running",
+      started_at: new Date().toISOString(),
+    });
+    expect(started).toBeDefined();
+
+    const runningSummary = await request(app).get(`/experiments/${running.body.id}/summary`).expect(200);
+    expect(runningSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "rerun",
+        verdict: "running",
+      }),
+    );
+
+    const failed = await request(app)
+      .post("/experiments")
+      .send({
+        name: "failed-exp",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    const failedGrid = store.getGrid(failed.body.grid_id)!;
+    const failedTask = store.removeFromGlobalQueue(failedGrid.task_ids[0]);
+    expect(failedTask).toBeDefined();
+    store.setArchive([
+      ...store.getArchive(),
+      {
+        ...failedTask!,
+        status: "failed" as const,
+        finished_at: new Date().toISOString(),
+      },
+    ]);
+
+    const failedSummary = await request(app).get(`/experiments/${failed.body.id}/summary`).expect(200);
+    expect(failedSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "rerun",
+        verdict: "failed",
+      }),
+    );
+  });
+
+  it("reruns when goal metric metadata is missing", async () => {
+    const app = makeApp();
+
+    const exp = await request(app)
+      .post("/experiments")
+      .send({
+        name: "missing-goal",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(exp.body.id, "loss", 0.4);
+
+    const summary = await request(app).get(`/experiments/${exp.body.id}/summary`).expect(200);
+    expect(summary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "rerun",
+        verdict: "inconclusive",
+        metric: null,
+        direction: null,
+      }),
+    );
+    expect(summary.body.recommendation.value).toBeNull();
+  });
+
+  it("does not use itself as same-family baseline", async () => {
+    const app = makeApp();
+
+    const exp = await request(app)
+      .post("/experiments")
+      .send({
+        name: "family-solo",
+        family: "solo-family",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    completeExperiment(exp.body.id, "loss", 0.4);
+
+    const summary = await request(app).get(`/experiments/${exp.body.id}/summary`).expect(200);
+    expect(summary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "rerun",
+        verdict: "inconclusive",
+        baseline_value: null,
+        value: 0.4,
+        reason: "No comparable numeric baseline found",
+      }),
+    );
+  });
+
+  it("uses same-family best as baseline when parent is absent", async () => {
+    const app = makeApp();
+
+    const first = await request(app)
+      .post("/experiments")
+      .send({
+        name: "family-a",
+        family: "no-parent-family",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+    const second = await request(app)
+      .post("/experiments")
+      .send({
+        name: "family-b",
+        family: "no-parent-family",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+
+    completeExperiment(first.body.id, "loss", 0.4);
+    completeExperiment(second.body.id, "loss", 0.9);
+
+    const firstSummary = await request(app).get(`/experiments/${first.body.id}/summary`).expect(200);
+    const secondSummary = await request(app).get(`/experiments/${second.body.id}/summary`).expect(200);
+
+    expect(firstSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "keep",
+        verdict: "best",
+        baseline_value: 0.9,
+        value: 0.4,
+      }),
+    );
+    expect(secondSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "rerun",
+        verdict: "inconclusive",
+        baseline_value: 0.4,
+        value: 0.9,
+      }),
+    );
   });
 });

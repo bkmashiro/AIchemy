@@ -210,6 +210,27 @@ describe("GET /experiments/tree", () => {
       id: "c", fork_reason: "baseline plateaued", goal_metric: null, goal_direction: null,
     });
   });
+
+  it("includes recommendation fields on tree brief nodes", async () => {
+    const app = makeApp();
+    const exp = makeExperiment({
+      id: "root-rec", name: "root-rec", created_at: "2025-02-01T00:00:00.000Z",
+      goal_metric: "loss", goal_direction: "min", status: "running",
+    });
+    store.setGrid(makeGrid(exp.grid_id));
+    store.setExperiment(exp);
+
+    const res = await request(app).get("/experiments/tree").expect(200);
+    expect(res.body.roots[0]).toMatchObject({
+      id: "root-rec",
+      recommendation: {
+        action: "rerun",
+        verdict: "running",
+        metric: "loss",
+        direction: "min",
+      },
+    });
+  });
 });
 
 describe("GET /experiments/compare", () => {

@@ -405,6 +405,17 @@ export interface PrimaryMetric {
   best: number | null;
 }
 
+export interface ExperimentRecommendation {
+  action: string | null;
+  verdict: string | null;
+  reason: string | null;
+  metric: string | null;
+  value: number | null;
+  baseline_value: number | null;
+  delta: number | null;
+  direction: string | null;
+}
+
 export interface MetricDeltaEntry {
   id: string;
   best: number | null;
@@ -536,6 +547,7 @@ export interface ExperimentSummaryResponse {
   validation: ExperimentPassFailSummary;
   best_metrics: Record<string, number>;
   primary_metric: PrimaryMetric | null;
+  recommendation: ExperimentRecommendation | null;
   timeline_event_count: number;
   config: Record<string, any> | null;
   config_diff: Record<string, { old: any; new: any }> | null;

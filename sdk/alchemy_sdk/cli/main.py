@@ -768,6 +768,26 @@ def cmd_experiments_summary(args: argparse.Namespace, client: ApiClient) -> None
     print_json(client.get(f"/experiments/{exp['id']}/summary"))
 
 
+def cmd_experiments_recommend(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    path = f"/experiments/{exp['id']}/recommendation"
+    try:
+        recommendation = client.get(path)
+    except AlchError as exc:
+        cause = exc.__cause__
+        if not isinstance(cause, HTTPError) or cause.code != 404:
+            raise
+        summary = client.get(f"/experiments/{exp['id']}/summary")
+        if not isinstance(summary, dict) or "recommendation" not in summary:
+            raise AlchError("experiment summary is missing recommendation")
+        recommendation = summary["recommendation"]
+    if getattr(args, "markdown", False):
+        rendered = json.dumps(recommendation, ensure_ascii=False, indent=2)
+        print(f"```json\n{rendered}\n```")
+    else:
+        print_json(recommendation)
+
+
 def cmd_experiments_diff(args: argparse.Namespace, client: ApiClient) -> None:
     exp = find_experiment(client, args.experiment)
     print_json(client.get(f"/experiments/{exp['id']}/diff"))
@@ -1017,6 +1037,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = exps_sub.add_parser("summary", help="rollups and best metrics for one experiment")
     p.add_argument("experiment", help="experiment name or id")
     p.set_defaults(func=cmd_experiments_summary)
+
+    p = exps_sub.add_parser(
+        "recommend",
+        help="fetch a recommendation for one experiment",
+        description=(
+            "Resolve <experiment> (name or id) and fetch recommendation data. "
+            "By default the command calls /experiments/<id>/recommendation; "
+            "if that endpoint returns 404, it falls back to "
+            "/experiments/<id>/summary and uses the recommendation key."
+        ),
+    )
+    p.add_argument("experiment", help="experiment name or id")
+    p.add_argument("--markdown", action="store_true", help="print recommendation payload as markdown JSON code block")
+    p.set_defaults(func=cmd_experiments_recommend)
 
     p = exps_sub.add_parser("diff", help="config diff against parent experiment")
     p.add_argument("experiment", help="experiment name or id")

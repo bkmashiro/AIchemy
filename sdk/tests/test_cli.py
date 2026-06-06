@@ -628,6 +628,54 @@ def test_experiments_summary_resolves_name(monkeypatch):
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/summary"
 
 
+def test_experiments_recommend_prints_recommendation(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "recommend", "alpha"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"best": "run"},
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/recommendation"
+    assert json.loads(capsys.readouterr().out) == {"best": "run"}
+
+
+def test_experiments_recommend_falls_back_to_summary_if_recommendation_missing(monkeypatch, capsys):
+    import io
+    from urllib.error import HTTPError
+
+    calls: list[dict] = []
+
+    def fake_urlopen(req, timeout=20.0):
+        calls.append({"method": req.method, "url": req.full_url})
+        if req.full_url == "http://localhost:3002/api/experiments":
+            return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+        if req.full_url == "http://localhost:3002/api/experiments/exp-1/recommendation":
+            raise HTTPError(
+                req.full_url,
+                404,
+                "Not Found",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(b'{"error":"not implemented"}'),
+            )
+        if req.full_url == "http://localhost:3002/api/experiments/exp-1/summary":
+            return FakeResponse({"recommendation": {"best": "run"}, "id": "exp-1"})
+        raise AssertionError(f"unexpected request {req.method} {req.full_url}")
+
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main(["experiments", "recommend", "alpha"])
+
+    assert code == 0
+    assert ["http://localhost:3002/api/experiments", "http://localhost:3002/api/experiments/exp-1/recommendation", "http://localhost:3002/api/experiments/exp-1/summary"] == [
+        c["url"] for c in calls
+    ]
+    assert json.loads(capsys.readouterr().out) == {"best": "run"}
+
+
 def test_experiments_diff_fetches_by_id(monkeypatch):
     calls = run_cli(
         monkeypatch,
@@ -850,6 +898,7 @@ def test_experiments_report_help_documents_read_only_contract(capsys):
 def test_experiments_help_lists_report(capsys):
     out = _help_text(["experiments", "--help"], capsys)
     assert "report" in out
+    assert "recommend" in out
 
 
 def test_config_set_persists_state_and_default_client_uses_it(monkeypatch, tmp_path):

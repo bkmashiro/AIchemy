@@ -132,6 +132,57 @@ def test_summary_resolves_then_gets_summary(monkeypatch):
     assert calls[1]["auth"] == "Bearer secret-token"
 
 
+def test_recommend_fetches_recommendation_endpoint(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    recommendation = {"winner": "exp-2", "reason": "best_val_accuracy"}
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.recommend("alpha"),
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            recommendation,
+        ],
+    )
+    assert result == recommendation
+    assert calls[0]["url"] == "http://server/api/experiments"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://server/api/experiments/exp-1/recommendation"
+
+
+def test_recommend_falls_back_to_summary_on_missing_endpoint(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+
+    client = ExperimentClient(server="http://server", token="secret-token")
+    calls: list[dict] = []
+
+    def fake_urlopen(req, timeout=20.0):
+        calls.append({"method": req.method, "url": req.full_url})
+        if req.full_url == "http://server/api/experiments":
+            return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+        if req.full_url == "http://server/api/experiments/exp-1/recommendation":
+            raise HTTPError(
+                req.full_url,
+                404,
+                "Not Found",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(b'{"error":"not implemented"}'),
+            )
+        if req.full_url == "http://server/api/experiments/exp-1/summary":
+            return FakeResponse({"recommendation": {"winner": "exp-2"}, "id": "exp-1"})
+        raise AssertionError(f"unexpected request {req.method} {req.full_url}")
+
+    with patch("alchemy_sdk.experiments.urlopen", fake_urlopen):
+        result = client.recommend("alpha")
+
+    assert result == {"winner": "exp-2"}
+    assert [c["url"] for c in calls] == [
+        "http://server/api/experiments",
+        "http://server/api/experiments/exp-1/recommendation",
+        "http://server/api/experiments/exp-1/summary",
+    ]
+
+
 def test_diff_and_manifest_hit_lineage_endpoints(monkeypatch):
     client = ExperimentClient(server="http://server")
     _, diff_calls = _run(

@@ -180,6 +180,7 @@ export interface ExperimentBrief {
   fork_reason: string | null;
   goal_metric: string | null;
   goal_direction: "min" | "max" | null;
+  recommendation: Recommendation;
   created_at: string;
 }
 
@@ -201,6 +202,7 @@ export interface PassFailSummary {
 }
 
 export function experimentBrief(exp: Experiment): ExperimentBrief {
+  const allExperiments = store.getAllExperiments();
   return {
     id: exp.id,
     name: exp.name,
@@ -211,6 +213,7 @@ export function experimentBrief(exp: Experiment): ExperimentBrief {
     fork_reason: exp.fork_reason ?? null,
     goal_metric: exp.goal_metric ?? null,
     goal_direction: exp.goal_direction ?? null,
+    recommendation: recommendationForExperiment(exp, allExperiments),
     created_at: exp.created_at,
   };
 }
@@ -286,6 +289,158 @@ export interface PrimaryMetric {
   metric: string;
   direction: "min" | "max";
   best: number | null;
+}
+
+export type RecommendationAction = "keep" | "drop" | "rerun" | "fork";
+export type RecommendationVerdict = "best" | "improved" | "regressed" | "inconclusive" | "failed" | "running";
+
+export interface Recommendation {
+  action: RecommendationAction;
+  verdict: RecommendationVerdict;
+  reason: string;
+  metric: string | null;
+  value: number | null;
+  baseline_value: number | null;
+  delta: number | null;
+  direction: "min" | "max" | null;
+}
+
+function numeric(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function betterDirection(direction: "min" | "max", value: number, baseline: number): boolean {
+  return direction === "min" ? value < baseline : value > baseline;
+}
+
+function recommendationForExperiment(exp: Experiment, allExperiments: Experiment[]): Recommendation {
+  const status = deriveExperimentStatus(exp);
+
+  const recommendation: Recommendation = {
+    action: "rerun",
+    verdict: "inconclusive",
+    reason: "Recommendation unavailable",
+    metric: exp.goal_metric ?? null,
+    value: null,
+    baseline_value: null,
+    delta: null,
+    direction: exp.goal_direction ?? null,
+  };
+
+  const primary = primaryMetricFor(exp);
+  if (primary?.metric && primary?.direction) {
+    recommendation.metric = primary.metric;
+    recommendation.direction = primary.direction;
+    if (numeric(primary.best)) recommendation.value = primary.best;
+  }
+
+  // Explicit status override always wins over action/verdict, but preserve
+  // declared metric/direction/value context so UI/tree nodes remain informative.
+  if (status === "failed") {
+    recommendation.verdict = "failed";
+    recommendation.action = "rerun";
+    recommendation.reason = "Experiment failed";
+    return recommendation;
+  }
+
+  if (status === "running") {
+    recommendation.verdict = "running";
+    recommendation.action = "rerun";
+    recommendation.reason = "Experiment is running";
+    return recommendation;
+  }
+
+  if (!primary?.metric || !primary?.direction) {
+    return recommendation;
+  }
+
+  if (!numeric(primary.best)) {
+    recommendation.reason = "Goal metric not yet available";
+    return recommendation;
+  }
+
+  const value = primary.best;
+
+  // Parent-first baseline lookup with exact family/generic metric+direction match.
+  let baselineValue: number | null = null;
+  let baselineReason: "parent" | "family" | null = null;
+
+  if (exp.parent_id) {
+    const parent = allExperiments.find((candidate) => candidate.id === exp.parent_id && candidate.id !== exp.id);
+    if (parent) {
+      const parentPrimary = primaryMetricFor(parent);
+      if (parentPrimary?.metric && parentPrimary.direction === primary.direction && numeric(parentPrimary.best)) {
+        baselineValue = parentPrimary.best;
+        baselineReason = "parent";
+      }
+    }
+  }
+
+  if (baselineValue === null) {
+    const sameFamily = allExperiments.filter(
+      (candidate) => candidate.family && candidate.family === exp.family && candidate.id !== exp.id,
+    );
+    const sameFamilyNumeric = sameFamily
+      .map((candidate) => ({
+        candidate,
+        primary: primaryMetricFor(candidate),
+      }))
+      .filter((entry): entry is { candidate: Experiment; primary: { metric: string; direction: "min" | "max"; best: number } } =>
+        !!entry.primary && !!entry.primary.metric && entry.primary.metric === primary.metric &&
+        entry.primary.direction === primary.direction && numeric(entry.primary.best)
+      )
+      .map((entry) => ({
+        best: entry.primary.best,
+      }));
+
+    if (sameFamilyNumeric.length > 0) {
+      baselineReason = "family";
+      baselineValue = sameFamilyNumeric
+        .map((entry) => entry.best)
+        .reduce((best, current) => (betterDirection(primary.direction, current, best) ? current : best),
+          primary.direction === "min" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY,
+        );
+    }
+  }
+
+  if (baselineValue === null) {
+    recommendation.reason = "No comparable numeric baseline found";
+    return recommendation;
+  }
+
+  recommendation.baseline_value = baselineValue;
+  recommendation.delta = Number((value - baselineValue).toPrecision(12));
+
+  if (baselineReason === "parent") {
+    if (numeric(baselineValue)) {
+      if (recommendation.delta === 0) {
+        recommendation.action = "rerun";
+        recommendation.verdict = "inconclusive";
+        recommendation.reason = "Metric equals parent baseline";
+      } else if (betterDirection(primary.direction, value, baselineValue)) {
+        recommendation.action = "keep";
+        recommendation.verdict = "improved";
+        recommendation.reason = "Better than parent baseline";
+      } else {
+        recommendation.action = "drop";
+        recommendation.verdict = "regressed";
+        recommendation.reason = "Worse than parent baseline";
+      }
+    }
+    return recommendation;
+  }
+
+  // Same-family fallback (best-in-family when no parent baseline).
+  if (recommendation.delta === 0 || betterDirection(primary.direction, value, baselineValue)) {
+    recommendation.action = "keep";
+    recommendation.verdict = "best";
+    recommendation.reason = "Current best in family";
+  } else {
+    recommendation.action = "rerun";
+    recommendation.verdict = "inconclusive";
+    recommendation.reason = "Not family best";
+  }
+  return recommendation;
 }
 
 // Surface a primary metric only when both `goal_metric` and explicit
@@ -740,8 +895,9 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       matrix, base_args, max_retries,
       requirements, target_tags, task_specs,
       python_env, cwd,
-      config, config_diff, parent_name,
+      config, config_diff, parent_name, parent_id,
       family, hypothesis, expected_outcome, fork_reason,
+      goal_metric, goal_direction,
       git_tracking, git_repo_path,
     } = req.body;
 
@@ -760,8 +916,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       const taskIds: string[] = [];
 
       // Resolve parent_id from parent_name (best-effort)
-      let parentId: string | undefined;
-      if (parent_name) {
+      let parentId: string | undefined = typeof parent_id === "string" && parent_id ? parent_id : undefined;
+      if (!parentId && parent_name) {
         const parentExp = store.findExperimentByName(parent_name);
         if (parentExp) parentId = parentExp.id;
       }
@@ -844,19 +1000,22 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         hypothesis: hypothesis || undefined,
         expected_outcome: expected_outcome || undefined,
         fork_reason: fork_reason || undefined,
+        goal_metric: goal_metric || undefined,
+        goal_direction: goal_direction || undefined,
         git_tracking: git_tracking === true ? true : undefined,
         git_repo_path: git_repo_path || undefined,
       };
 
       store.setExperiment(experiment);
+      const forkData = parentId || parent_name ? { parent_name: parent_name ?? null, parent_id: parentId ?? null } : undefined;
       store.addExperimentEvent({
         id: uuidv4(),
         experiment_id: experiment.id,
-        kind: parentId || parent_name ? "forked" : "created",
-        message: parent_name ? `Forked from ${parent_name}` : "Created experiment",
+        kind: forkData ? "forked" : "created",
+        message: forkData ? `Forked from ${parent_name || parentId}` : "Created experiment",
         actor: operatorActor(req),
         created_at: experiment.created_at,
-        data: parent_name ? { parent_name, parent_id: parentId ?? null } : undefined,
+        data: forkData,
       });
       triggerSchedule();
 
@@ -955,6 +1114,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       hypothesis: hypothesis || undefined,
       expected_outcome: expected_outcome || undefined,
       fork_reason: fork_reason || undefined,
+      goal_metric: goal_metric || undefined,
+      goal_direction: goal_direction || undefined,
       git_tracking: git_tracking === true ? true : undefined,
       git_repo_path: git_repo_path || undefined,
     };
@@ -1265,6 +1426,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         name: exp.name,
         family: exp.family ?? null,
         status: statusByExp.get(exp.id) ?? deriveExperimentStatus(exp),
+        recommendation: recommendationForExperiment(exp, allExperiments),
         decision: exp.decision ?? null,
         decision_reason: exp.decision_reason ?? null,
         decision_at: exp.decision_at ?? null,
@@ -1314,6 +1476,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       id: exp.id,
       name: exp.name,
       status: deriveExperimentStatus(exp),
+      recommendation: recommendationForExperiment(exp, store.getAllExperiments()),
       family: exp.family ?? null,
       hypothesis: exp.hypothesis ?? null,
       expected_outcome: exp.expected_outcome ?? null,
@@ -1334,6 +1497,14 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       config: exp.config ?? null,
       config_diff: exp.config_diff ?? null,
     });
+  });
+
+  // GET /experiments/:id/recommendation — decision recommendation only.
+  // Registered before /:id so clients can fetch a compact recommendation payload.
+  router.get("/:id/recommendation", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    res.json(recommendationForExperiment(exp, store.getAllExperiments()));
   });
 
   // GET /experiments/:id
@@ -1460,7 +1631,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const summary = {
       id: exp.id,
       name: exp.name,
-      status,
+      status: deriveExperimentStatus(exp),
+      recommendation: recommendationForExperiment(exp, store.getAllExperiments()),
       family: exp.family ?? null,
       hypothesis: exp.hypothesis ?? null,
       expected_outcome: exp.expected_outcome ?? null,
@@ -1481,6 +1653,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       config: exp.config ?? null,
       config_diff: exp.config_diff ?? null,
     };
+
 
     const diff: Record<string, any> = {
       experiment_id: exp.id,
