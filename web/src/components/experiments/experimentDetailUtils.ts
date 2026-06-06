@@ -31,25 +31,53 @@ export const DECISION_BADGE: Record<string, string> = {
 
 const RECOMMENDATION_BADGE_FALLBACK = "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
 
+const RECOMMENDATION_LABEL_OVERRIDES: Record<string, string> = {
+  rerun: "Needs replication",
+};
+
+function normalizeString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function normalizeRecommendationText(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed.toLowerCase() : null;
 }
 
+export function recommendationLabelValue(raw: string | null | undefined): string | null {
+  const trimmed = normalizeString(raw);
+  if (trimmed === null) return null;
+  const key = trimmed.toLowerCase();
+  return RECOMMENDATION_LABEL_OVERRIDES[key] ?? trimmed;
+}
+
+export function decisionLabelForFilter(value: string | null | undefined): string | null {
+  const trimmed = normalizeString(value);
+  if (trimmed === null) return null;
+  if (trimmed.toLowerCase() === "rerun") return "needs replication";
+  return trimmed;
+}
+
 export function recommendationBadgeClass(actionOrVerdict?: string | null): string {
-  const key = normalizeRecommendationText(actionOrVerdict);
-  return key ? DECISION_BADGE[key] ?? RECOMMENDATION_BADGE_FALLBACK : RECOMMENDATION_BADGE_FALLBACK;
+  const raw = normalizeString(actionOrVerdict);
+  if (!raw) return RECOMMENDATION_BADGE_FALLBACK;
+  const key = raw.toLowerCase();
+
+  if (key === "needs replication") return DECISION_BADGE.rerun;
+  return DECISION_BADGE[key] ?? RECOMMENDATION_BADGE_FALLBACK;
 }
 
 export function recommendationLabel(
   recommendation?: ExperimentRecommendation | null,
 ): string | null {
   const action = normalizeRecommendationText(recommendation?.action);
-  if (action) return recommendation?.action?.trim() ?? null;
+  if (action) return recommendationLabelValue(recommendation?.action ?? null);
 
   const verdict = normalizeRecommendationText(recommendation?.verdict);
-  return verdict ? recommendation?.verdict?.trim() ?? null : null;
+  return verdict ? recommendationLabelValue(recommendation?.verdict ?? null) : null;
 }
 
 export function formatMetricDelta(
@@ -364,7 +392,7 @@ export const NEXT_ACTION: Record<
     tone: "border-purple-400/30 bg-purple-500/10 text-purple-200",
   },
   rerun: {
-    label: "Re-run for more evidence",
+    label: "Run replication",
     hint: "Keep collecting before deciding keep / drop.",
     tone: "border-blue-400/30 bg-blue-500/10 text-blue-200",
   },
@@ -377,6 +405,6 @@ export const NEXT_ACTION: Record<
 
 export const NEXT_ACTION_DEFAULT = {
   label: "Awaiting decision",
-  hint: "Choose keep / fork / rerun / drop to advance.",
+  hint: "Choose keep / fork / needs replication / drop to advance.",
   tone: "border-white/[0.08] bg-white/[0.04] text-gray-300",
 };

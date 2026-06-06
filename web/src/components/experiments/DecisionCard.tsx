@@ -5,7 +5,7 @@ import {
   experimentsApi,
 } from "../../lib/api";
 import { formatRelTime } from "../../lib/format";
-import { DECISION_BADGE } from "./experimentDetailUtils";
+import { DECISION_BADGE, decisionLabelForFilter } from "./experimentDetailUtils";
 
 const DECISION_OPTIONS: ExperimentDecision[] = ["keep", "drop", "rerun", "fork"];
 
@@ -59,7 +59,7 @@ export function DecisionCard({
           <span
             className={`inline-block text-xs px-2 py-0.5 rounded border ${currentBadge}`}
           >
-            {(exp.decision ?? "undecided").toUpperCase()}
+            {decisionLabelForFilter(exp.decision ?? "undecided")?.toUpperCase() ?? "UNDECIDED"}
           </span>
           {exp.decision_at && (
             <span className="ml-2 text-gray-600">
@@ -86,7 +86,7 @@ export function DecisionCard({
             >
               {DECISION_OPTIONS.map((d) => (
                 <option key={d} value={d}>
-                  {d}
+                  {decisionLabelForFilter(d) ?? d}
                 </option>
               ))}
             </select>

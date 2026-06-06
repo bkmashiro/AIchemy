@@ -84,6 +84,18 @@ describe("ExperimentResearchCallCard", () => {
     expect(screen.getByText("Rerun with larger cohort")).toBeInTheDocument();
   });
 
+  it("uses user-facing copy for rerun decisions", () => {
+    const exp = makeExperiment({ decision: "rerun" });
+    const summary = makeSummary({
+      decision: "rerun",
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    expect(screen.getByText("Run replication")).toBeInTheDocument();
+    expect(screen.getByText("needs replication")).toBeInTheDocument();
+  });
+
   it("falls back to summary recommendation when no explicit decision exists", () => {
     const exp = makeExperiment({ fork_reason: "from null" });
     const summary = makeSummary({
@@ -97,6 +109,22 @@ describe("ExperimentResearchCallCard", () => {
     expect(screen.getByText(/\b0\.9012\b/)).toBeInTheDocument();
     expect(screen.getByText(/\b0\.9123\b/)).toBeInTheDocument();
     expect(screen.getByText(/-0\.0111/)).toBeInTheDocument();
+  });
+
+  it("renders recommendation action rerun as needs replication", () => {
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Noisy signal.",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    const labels = screen.getAllByText("Needs replication");
+    expect(labels).toHaveLength(2);
   });
 
   it("renders recommendation card defensively when partially missing fields", () => {

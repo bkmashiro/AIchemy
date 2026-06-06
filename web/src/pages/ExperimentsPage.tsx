@@ -99,7 +99,7 @@ function ExperimentsList() {
           <option value="">All decisions</option>
           <option value="keep">keep</option>
           <option value="drop">drop</option>
-          <option value="rerun">rerun</option>
+          <option value="rerun">Needs replication</option>
           <option value="fork">fork</option>
           <option value="none">undecided</option>
         </select>
@@ -154,6 +154,9 @@ function ExperimentDetailView() {
   const [diff, setDiff] = useState<ExperimentDiffResponse | null>(null);
   const [selectedLineageId, setSelectedLineageId] = useState<string | null>(null);
   const [selectedLineageTasks, setSelectedLineageTasks] = useState<Task[]>([]);
+  const [selectedLineageExp, setSelectedLineageExp] = useState<ExperimentDetail | null>(null);
+  const [selectedLineageSummary, setSelectedLineageSummary] = useState<ExperimentSummaryResponse | null>(null);
+  const [selectedLineageDiff, setSelectedLineageDiff] = useState<ExperimentDiffResponse | null>(null);
 
   const load = () => {
     if (!id) return;
@@ -177,7 +180,12 @@ function ExperimentDetailView() {
   };
 
   useEffect(() => {
-    if (id) setSelectedLineageId(id);
+    if (id) {
+      setSelectedLineageId(id);
+      setSelectedLineageExp(null);
+      setSelectedLineageSummary(null);
+      setSelectedLineageDiff(null);
+    }
   }, [id]);
 
   useEffect(() => {
@@ -188,19 +196,37 @@ function ExperimentDetailView() {
 
   useEffect(() => {
     if (!id || !exp) return;
-    if (!selectedLineageId || selectedLineageId === id) return;
+    if (!selectedLineageId || selectedLineageId === id) {
+      setSelectedLineageExp(null);
+      setSelectedLineageSummary(null);
+      setSelectedLineageDiff(null);
+      return;
+    }
 
     let cancelled = false;
     setSelectedLineageTasks([]);
-    experimentsApi
-      .get(selectedLineageId)
-      .then((selectedExp) => {
+    setSelectedLineageExp(null);
+    setSelectedLineageSummary(null);
+    setSelectedLineageDiff(null);
+
+    Promise.all([
+      experimentsApi.get(selectedLineageId),
+      experimentsApi.getSummary(selectedLineageId).catch(() => null),
+      experimentsApi.getDiff(selectedLineageId).catch(() => null),
+    ])
+      .then(([selectedExp, selectedSummary, selectedDiff]) => {
         if (cancelled) return;
+        setSelectedLineageExp(selectedExp);
         setSelectedLineageTasks(selectedExp.tasks ?? []);
+        setSelectedLineageSummary(selectedSummary);
+        setSelectedLineageDiff(selectedDiff);
       })
       .catch(() => {
         if (cancelled) return;
         setSelectedLineageTasks([]);
+        setSelectedLineageExp(null);
+        setSelectedLineageSummary(null);
+        setSelectedLineageDiff(null);
       });
 
     return () => {
@@ -251,6 +277,12 @@ function ExperimentDetailView() {
     load();
   };
 
+  const previewExp = selectedLineageId && selectedLineageId !== exp.id && selectedLineageExp
+    ? selectedLineageExp
+    : exp;
+  const previewSummary = previewExp.id === exp.id ? summary : selectedLineageSummary;
+  const previewDiff = previewExp.id === exp.id ? diff : selectedLineageDiff;
+
   return (
     <div className="space-y-6">
       <ExperimentDetailHeader
@@ -281,8 +313,8 @@ function ExperimentDetailView() {
           selectedTasks={selectedLineageTasks}
           onSelectExperiment={setSelectedLineageId}
         />
-        <ExperimentResearchCallCard exp={exp} summary={summary} />
-        <ExperimentConfigDiffCard diff={diff} summary={summary} />
+        <ExperimentResearchCallCard exp={previewExp} summary={previewSummary} />
+        <ExperimentConfigDiffCard diff={previewDiff} summary={previewSummary} />
       </div>
 
       <ExperimentTimelineCard

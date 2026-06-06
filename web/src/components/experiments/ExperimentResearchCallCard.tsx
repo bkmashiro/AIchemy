@@ -9,15 +9,25 @@ import {
   DECISION_BADGE,
   NEXT_ACTION,
   NEXT_ACTION_DEFAULT,
+  recommendationBadgeClass,
+  recommendationLabelValue,
+  decisionLabelForFilter,
 } from "./experimentDetailUtils";
 
 function isText(value: string | null | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function recommendationTone(verdict: string | null | undefined): string {
-  if (!isText(verdict)) return "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
-  return DECISION_BADGE[verdict.toLowerCase()] ?? "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
+
+function recommendationTone(
+  recommendationAction: string | null | undefined,
+  recommendationVerdict: string | null | undefined,
+): string {
+  const toneFromVerdict = isText(recommendationVerdict)
+    ? recommendationBadgeClass(recommendationVerdict)
+    : null;
+  if (toneFromVerdict) return toneFromVerdict;
+  return recommendationBadgeClass(recommendationAction);
 }
 
 function recommendationAction(rec: ExperimentRecommendation | null) {
@@ -29,11 +39,9 @@ function recommendationAction(rec: ExperimentRecommendation | null) {
     };
   }
 
-  const label = isText(rec.action)
-    ? rec.action.trim()
-    : isText(rec.verdict)
-      ? `Recommendation: ${rec.verdict}`
-      : NEXT_ACTION_DEFAULT.label;
+  const action = isText(rec.action) ? recommendationLabelValue(rec.action) : null;
+  const verdict = isText(rec.verdict) ? recommendationLabelValue(rec.verdict) : null;
+  const label = action ?? verdict ?? NEXT_ACTION_DEFAULT.label;
   const hint = isText(rec.reason)
     ? rec.reason.trim()
     : isText(rec.metric)
@@ -43,7 +51,7 @@ function recommendationAction(rec: ExperimentRecommendation | null) {
   return {
     label,
     hint,
-    tone: recommendationTone(rec.verdict),
+    tone: recommendationTone(action, rec.verdict),
   };
 }
 
@@ -67,6 +75,7 @@ export function ExperimentResearchCallCard({
   summary: ExperimentSummaryResponse | null;
 }) {
   const explicitDecision = summary?.decision ?? exp.decision ?? null;
+  const decisionLabel = explicitDecision ? decisionLabelForFilter(explicitDecision) : null;
   const recommendation = summary?.recommendation ?? null;
 
   const action = explicitDecision
@@ -91,10 +100,10 @@ export function ExperimentResearchCallCard({
   const recDelta = recommendation?.delta ?? null;
   const recDirection = recommendation?.direction ?? null;
   const recAction = isText(recommendation?.action)
-    ? recommendation.action
+    ? recommendationLabelValue(recommendation.action)
     : null;
   const recVerdict = isText(recommendation?.verdict)
-    ? recommendation.verdict
+    ? recommendationLabelValue(recommendation.verdict)
     : null;
 
   const [exportState, setExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
@@ -135,7 +144,7 @@ export function ExperimentResearchCallCard({
         <span
           className={`text-[10px] px-2 py-0.5 rounded border uppercase ${decisionBadge}`}
         >
-          {explicitDecision ?? "undecided"}
+          {decisionLabel ?? "undecided"}
         </span>
       </div>
 
@@ -150,12 +159,12 @@ export function ExperimentResearchCallCard({
             <span className="text-[10px] uppercase tracking-wide text-cyan-300">Recommendation</span>
             <div className="flex flex-wrap items-center gap-1.5">
               <span
-                className={`text-[10px] px-2 py-0.5 rounded border ${recommendationTone(recAction ?? recVerdict)}`}
+                className={`text-[10px] px-2 py-0.5 rounded border ${recommendationTone(recAction, recVerdict)}`}
               >
                 {recAction ?? "No action"}
               </span>
               <span
-                className={`text-[10px] px-2 py-0.5 rounded border ${recommendationTone(recVerdict)}`}
+                className={`text-[10px] px-2 py-0.5 rounded border ${recommendationTone(recVerdict, recAction)}`}
               >
                 {recVerdict ?? "No verdict"}
               </span>
