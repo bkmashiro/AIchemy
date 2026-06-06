@@ -237,7 +237,18 @@ function RailRowView({
   row: RailRow;
   onSelectExperiment: (id: string) => void;
 }) {
-  const { node, depth, rails, railOnPath, isCurrent, onPath, tone, isLast, hasVisibleChildren, foldedCount } = row;
+  const {
+    node,
+    depth,
+    rails,
+    railOnPath,
+    isCurrent,
+    onPath,
+    tone,
+    isLast,
+    hasVisibleChildren,
+    foldedCount,
+  } = row;
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
@@ -251,7 +262,11 @@ function RailRowView({
   const labelClass = NAME_TONE[tone];
 
   return (
-    <div className={`flex items-stretch min-h-[24px] ${rowBg}`}>
+    <div
+      className={`flex items-stretch min-h-[24px] ${rowBg}`}
+      data-lineage-tone={tone}
+      data-lineage-on-path={onPath || isCurrent ? "true" : undefined}
+    >
       {rails.map((through, d) => (
         <RailCell key={d} through={through} onPath={railOnPath[d] ?? false} />
       ))}
@@ -329,6 +344,7 @@ function SelectedDetailStrip({
   const isPage = node.id === pageId;
   const orderedTasks = orderTaskLinks(tasks ?? []);
   const shownTasks = orderedTasks.slice(0, 3);
+  const hiddenTaskCount = orderedTasks.length - shownTasks.length;
 
   return (
     <div className="mt-3 border-t border-gray-800 pt-2 text-[11px] text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -356,9 +372,11 @@ function SelectedDetailStrip({
           fork: {node.fork_reason}
         </span>
       )}
-      <span className={`text-[10px] uppercase tracking-wide ${
-        orderedTasks.length === 0 ? "text-gray-500" : "text-gray-600"
-      }`}>
+      <span
+        className={`text-[10px] uppercase tracking-wide ${
+          orderedTasks.length === 0 ? "text-gray-500" : "text-gray-600"
+        }`}
+      >
         Tasks: {orderedTasks.length}
       </span>
       {orderedTasks.length > 0 &&
@@ -366,14 +384,24 @@ function SelectedDetailStrip({
           <Link
             key={task.id}
             to={`/tasks/${task.id}`}
-            title={`${task.display_name}`}
+            title={task.display_name}
+            aria-label={`${task.display_name} (#${task.seq} · ${task.status})`}
             className={`text-[10px] px-1.5 py-0.5 rounded border ${taskStatusChipClass(
               task.status,
             )} hover:opacity-90 bg-white/5`}
           >
-            #{task.seq} · {task.status}
+            <span
+              className="max-w-[10rem] truncate inline-block align-middle mr-1"
+              title={task.display_name}
+            >
+              {task.display_name}
+            </span>
+            <span className="shrink-0">
+              #{task.seq} · {task.status}
+            </span>
           </Link>
         ))}
+      {hiddenTaskCount > 0 && <span className="text-gray-600 text-[10px]">+{hiddenTaskCount} more</span>}
       {!isPage && (
         <Link
           to={`/experiments/${node.id}`}
