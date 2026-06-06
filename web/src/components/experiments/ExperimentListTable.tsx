@@ -16,6 +16,17 @@ function progressBarColor(status: Experiment["status"]): string {
   }
 }
 
+function isPromotedForkPoint(exp: Experiment): boolean {
+  return exp.decision === "keep" || exp.decision === "fork";
+}
+
+export function filterExperimentEntryPoints(experiments: Experiment[]): Experiment[] {
+  const entries = experiments.filter(
+    (exp) => !exp.parent_id || isPromotedForkPoint(exp),
+  );
+  return entries.length > 0 ? entries : experiments;
+}
+
 export function ExperimentListTable({
   experiments,
 }: {
@@ -34,8 +45,22 @@ export function ExperimentListTable({
     );
   }
 
+  const entries = filterExperimentEntryPoints(experiments);
+  const collapsedCount = experiments.length - entries.length;
+
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+      <div className="flex items-center justify-between gap-2 border-b border-gray-800 px-4 py-2 text-xs">
+        <div>
+          <span className="font-medium text-gray-300">Series entry points</span>
+          <span className="ml-2 text-gray-600">roots + promoted forks</span>
+        </div>
+        {collapsedCount > 0 && (
+          <span className="text-gray-600">
+            {entries.length} shown · {collapsedCount} child run{collapsedCount === 1 ? "" : "s"} hidden
+          </span>
+        )}
+      </div>
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-gray-800">
@@ -47,7 +72,7 @@ export function ExperimentListTable({
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-800/50">
-          {experiments.map((exp) => {
+          {entries.map((exp) => {
             const validations = Object.values(exp.results);
             const passed = validations.filter((v) => v.passed).length;
             const total = validations.length;

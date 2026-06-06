@@ -23,6 +23,7 @@ import {
   ExperimentResearchCallCard,
   ExperimentConfigDiffCard,
   ExperimentReviewWorkspace,
+  filterExperimentEntryPoints,
 } from "../components/experiments";
 
 // ─── List View ──────────────────────────────────────────────────────────────
@@ -60,6 +61,7 @@ function ExperimentsList() {
     if (statusFilter && e.status !== statusFilter) return false;
     return true;
   });
+  const visibleEntryCount = filterExperimentEntryPoints(filtered).length;
 
   if (loading && experiments.length === 0) {
     return (
@@ -74,7 +76,7 @@ function ExperimentsList() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-white">Experiments</h1>
         <span className="text-xs text-gray-500">
-          {filtered.length} of {experiments.length}
+          {visibleEntryCount} entry point{visibleEntryCount === 1 ? "" : "s"} · {filtered.length} filtered · {experiments.length} total
         </span>
       </div>
       <div className="flex flex-wrap gap-2 items-center text-xs">
@@ -149,6 +151,7 @@ function ExperimentDetailView() {
   const [tree, setTree] = useState<ExperimentTreeNode[] | null>(null);
   const [summary, setSummary] = useState<ExperimentSummaryResponse | null>(null);
   const [diff, setDiff] = useState<ExperimentDiffResponse | null>(null);
+  const [selectedLineageId, setSelectedLineageId] = useState<string | null>(null);
 
   const load = () => {
     if (!id) return;
@@ -170,6 +173,10 @@ function ExperimentDetailView() {
       .then(setDiff)
       .catch(() => setDiff(null));
   };
+
+  useEffect(() => {
+    if (id) setSelectedLineageId(id);
+  }, [id]);
 
   useEffect(() => {
     load();
@@ -239,8 +246,9 @@ function ExperimentDetailView() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <ExperimentLineageGraphCard
           roots={tree}
-          currentId={exp.id}
-          onSelectExperiment={(nextId) => navigate(`/experiments/${nextId}`)}
+          currentId={selectedLineageId ?? exp.id}
+          pageId={exp.id}
+          onSelectExperiment={setSelectedLineageId}
         />
         <ExperimentResearchCallCard exp={exp} summary={summary} />
         <ExperimentConfigDiffCard diff={diff} summary={summary} />

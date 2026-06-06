@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import type { ExperimentTreeNode } from "../../lib/api";
 import {
   DECISION_BADGE,
@@ -219,6 +220,7 @@ function RailRowView({
           <button
             type="button"
             onClick={() => onSelectExperiment(node.id)}
+            aria-label={`Preview ${node.name}`}
             className={`font-mono truncate text-left hover:text-blue-300 ${labelClass}`}
           >
             {node.name}
@@ -258,7 +260,13 @@ function RailRowView({
   );
 }
 
-function SelectedDetailStrip({ node }: { node: ExperimentTreeNode }) {
+function SelectedDetailStrip({
+  node,
+  pageId,
+}: {
+  node: ExperimentTreeNode;
+  pageId: string;
+}) {
   const statusClass =
     node.status === "passed"
       ? "text-green-400"
@@ -270,8 +278,12 @@ function SelectedDetailStrip({ node }: { node: ExperimentTreeNode }) {
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
+  const isPage = node.id === pageId;
   return (
     <div className="mt-3 border-t border-gray-800 pt-2 text-[11px] text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1">
+      <span className="text-[10px] uppercase tracking-wide text-gray-600">
+        {isPage ? "Viewing page" : "Preview selected"}
+      </span>
       <span className="font-mono text-indigo-200 truncate max-w-[14rem]">
         {node.name}
       </span>
@@ -293,6 +305,14 @@ function SelectedDetailStrip({ node }: { node: ExperimentTreeNode }) {
           fork: {node.fork_reason}
         </span>
       )}
+      {!isPage && (
+        <Link
+          to={`/experiments/${node.id}`}
+          className="ml-auto text-blue-400 hover:text-blue-300"
+        >
+          Open detail
+        </Link>
+      )}
     </div>
   );
 }
@@ -300,10 +320,12 @@ function SelectedDetailStrip({ node }: { node: ExperimentTreeNode }) {
 export function ExperimentLineageGraphCard({
   roots,
   currentId,
+  pageId = currentId,
   onSelectExperiment,
 }: {
   roots: ExperimentTreeNode[] | null;
   currentId: string;
+  pageId?: string;
   onSelectExperiment: (id: string) => void;
 }) {
   if (roots === null) {
@@ -342,7 +364,7 @@ export function ExperimentLineageGraphCard({
               />
             ))}
           </div>
-          {selected && <SelectedDetailStrip node={selected} />}
+          {selected && <SelectedDetailStrip node={selected} pageId={pageId} />}
         </>
       )}
     </div>
