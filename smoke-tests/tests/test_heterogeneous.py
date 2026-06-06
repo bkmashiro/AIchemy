@@ -11,6 +11,7 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from harness.api import _normalize_script_payload
 from harness.docker import DockerComposeEnv
 
 pytestmark = pytest.mark.docker
@@ -92,7 +93,7 @@ def _wait_no_stub_with_tag(client: httpx.Client, tag: str, timeout: float = 30) 
 
 def _submit_task(client: httpx.Client, script: str, **kwargs) -> dict:
     """Submit a task and return the response."""
-    body = {"script": script, **kwargs}
+    body = _normalize_script_payload(script, kwargs)
     r = client.post("/api/tasks", json=body)
     assert r.status_code in (200, 201), f"Submit failed: {r.status_code} {r.text}"
     return r.json()
@@ -100,7 +101,7 @@ def _submit_task(client: httpx.Client, script: str, **kwargs) -> dict:
 
 def _wait_task_terminal(client: httpx.Client, task_id: str, timeout: float = 60) -> dict:
     """Wait for a task to reach terminal status."""
-    terminal = {"completed", "failed", "killed", "lost"}
+    terminal = {"completed", "failed", "killed", "cancelled", "lost"}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         r = client.get(f"/api/tasks/{task_id}")
@@ -116,9 +117,12 @@ class TestOldPython:
     """Python 3.8 stub should fail to start and never register."""
 
     def test_python_too_old_no_register(self, docker_env, docker_api):
-        # Start only server + oldpy stub
-        docker_env.up(services=["test-server", "stub-oldpy"], timeout=120)
+        # Start the server with health waiting, then start the intentionally
+        # failing stub without --wait; docker compose --wait returns nonzero
+        # when a selected service exits, which is the expected behavior here.
+        docker_env.up(services=["test-server"], timeout=120)
         _wait_server_healthy()
+        docker_env.up(services=["stub-oldpy"], timeout=120, wait=False)
 
         # The old-python stub should exit almost immediately.
         # Give it time to attempt startup and either crash or exit.
@@ -186,8 +190,9 @@ class TestNoPerm:
     """Stub with read-only /tmp should fail self-check and not register."""
 
     def test_noperm_fails_selfcheck(self, docker_env, docker_api):
-        docker_env.up(services=["test-server", "stub-noperm"], timeout=120)
+        docker_env.up(services=["test-server"], timeout=120)
         _wait_server_healthy()
+        docker_env.up(services=["stub-noperm"], timeout=120, wait=False)
 
         # Wait a bit for the stub to attempt startup
         time.sleep(10)
