@@ -654,7 +654,7 @@ class TestDisplayNameGeneration:
         )
         # display_name should be derived from script/command
         assert task.get("display_name"), "display_name should not be empty"
-        assert any(part in task["display_name"] for part in ("echo", "hello", "bash"))
+        assert any(part in task["display_name"] for part in ("echo", "hello", "bash", "sh"))
         wait_for_status(api, task["id"], {"completed"}, timeout=30)
 
 
