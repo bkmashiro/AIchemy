@@ -176,6 +176,31 @@ class TestBuildScript:
 
 
 # ===========================================================================
+# _task_shell
+# ===========================================================================
+
+
+class TestTaskShell:
+    def test_task_shell_prefers_bash(self, monkeypatch):
+        monkeypatch.setattr(
+            "alchemy_stub.process_mgr.shutil.which",
+            lambda name: "/usr/bin/bash" if name == "bash" else "/bin/sh",
+        )
+        assert _task_shell() == "/usr/bin/bash"
+
+    def test_task_shell_falls_back_to_sh(self, monkeypatch):
+        monkeypatch.setattr(
+            "alchemy_stub.process_mgr.shutil.which",
+            lambda name: None if name == "bash" else "/bin/sh",
+        )
+        assert _task_shell() == "/bin/sh"
+
+    def test_task_shell_falls_back_to_bin_sh_when_not_found(self, monkeypatch):
+        monkeypatch.setattr("alchemy_stub.process_mgr.shutil.which", lambda name: None)
+        assert _task_shell() == "/bin/sh"
+
+
+# ===========================================================================
 # _save_pid / _remove_pid atomicity
 # ===========================================================================
 

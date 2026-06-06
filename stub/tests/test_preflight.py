@@ -28,6 +28,29 @@ async def test_run_dir_parent_is_created_when_missing(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_dir_nested_parent_is_created_when_missing(tmp_path):
+    run_dir = tmp_path / "runs" / "2026" / "06" / "task-1"
+
+    result = await run_preflight(
+        task={
+            "task_id": "task-1",
+            "command": "echo ok",
+            "run_dir": str(run_dir),
+            "fingerprint": "abc123",
+        },
+        stub_id="stub-1",
+        stub_default_cwd=str(tmp_path),
+        server_url="http://127.0.0.1:9",
+        token="token",
+    )
+
+    assert result.ok
+    assert run_dir.exists()
+    assert run_dir.is_dir()
+    assert (run_dir / ".alchemy_owner").exists()
+
+
+@pytest.mark.asyncio
 async def test_run_dir_parent_unwritable_fails(tmp_path):
     parent_file = tmp_path / "runs"
     parent_file.write_text("not a directory")
