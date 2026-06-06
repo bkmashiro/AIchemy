@@ -211,11 +211,12 @@ describe("GET /experiments/tree", () => {
     });
   });
 
-  it("includes recommendation fields on tree brief nodes", async () => {
+  it("includes recommendation and diff_summary on tree nodes", async () => {
     const app = makeApp();
     const exp = makeExperiment({
       id: "root-rec", name: "root-rec", created_at: "2025-02-01T00:00:00.000Z",
       goal_metric: "loss", goal_direction: "min", status: "running",
+      config_diff: { lr: { old: 0.02, new: 0.01 }, bs: { old: 64, new: 128 } },
     });
     store.setGrid(makeGrid(exp.grid_id));
     store.setExperiment(exp);
@@ -229,6 +230,85 @@ describe("GET /experiments/tree", () => {
         metric: "loss",
         direction: "min",
       },
+      diff_summary: {
+        config_changed: true,
+        config_change_count: 2,
+        metric: "loss",
+        direction: "min",
+        parent_status: null,
+        status_changed_from_parent: null,
+      },
+    });
+  });
+
+  it("includes diff_summary in compare payloads", async () => {
+    const app = makeApp();
+    const parent = makeExperiment({
+      id: "cmp-parent", name: "cmp-parent", created_at: "2025-02-01T00:00:00.000Z",
+      config_diff: { lr: { old: 0.01, new: 0.02 } },
+    });
+    const child = makeExperiment({
+      id: "cmp-child", name: "cmp-child", parent_id: "cmp-parent", created_at: "2025-02-02T00:00:00.000Z",
+      config_diff: { lr: { old: 0.02, new: 0.03 } },
+    });
+
+    for (const e of [parent, child]) {
+      store.setGrid(makeGrid(e.grid_id));
+      store.setExperiment(e);
+    }
+
+    const res = await request(app).get("/experiments/compare?ids=cmp-child,cmp-parent").expect(200);
+    expect(res.body.experiments.map((e: any) => e.id)).toEqual(["cmp-child", "cmp-parent"]);
+    expect(res.body.experiments[0]).toMatchObject({
+      id: "cmp-child",
+      diff_summary: { config_changed: true, config_change_count: 1 },
+    });
+    expect(res.body.experiments[1]).toMatchObject({
+      id: "cmp-parent",
+      diff_summary: { config_changed: true, config_change_count: 1 },
+    });
+  });
+
+  it("child nodes include parent_status and status_changed_from_parent", async () => {
+    const app = makeApp();
+
+    const parent = makeExperiment({
+      id: "parent", name: "parent", created_at: "2025-01-01T00:00:00.000Z",
+    });
+    const child = makeExperiment({
+      id: "child", name: "child", parent_id: "parent", created_at: "2025-01-02T00:00:00.000Z",
+    });
+
+    const parentTask = makeTask({ id: "p-task", grid_id: parent.grid_id, status: "completed" });
+    const childTask = makeTask({ id: "c-task", grid_id: child.grid_id, status: "failed" });
+
+    store.addToGlobalQueue(parentTask);
+    store.addToGlobalQueue(childTask);
+
+    parent.results = {
+      [parentTask.id]: { passed: true, checked_at: "x", details: { loss: { value: 0.2, threshold: "< 1.0", ok: true } } },
+    };
+    child.results = {
+      [childTask.id]: { passed: false, checked_at: "x", details: { loss: { value: 1.3, threshold: "< 1.0", ok: false } } },
+    };
+
+    const parentGrid = makeGrid(parent.grid_id, [parentTask.id]);
+    const childGrid = makeGrid(child.grid_id, [childTask.id]);
+    store.setGrid(parentGrid);
+    store.setGrid(childGrid);
+    store.setExperiment(parent);
+    store.setExperiment(child);
+
+    const res = await request(app).get("/experiments/tree").expect(200);
+    const childNode = res.body.roots.find((r: any) => r.id === "parent").children[0];
+    expect(childNode.diff_summary).toMatchObject({
+      parent_status: "passed",
+      status_changed_from_parent: true,
+      metric: null,
+      direction: null,
+      metric_delta: null,
+      config_change_count: 0,
+      config_changed: false,
     });
   });
 });

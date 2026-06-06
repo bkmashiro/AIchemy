@@ -396,6 +396,8 @@ export interface ExperimentBrief {
   fork_reason: string | null;
   goal_metric: string | null;
   goal_direction: "min" | "max" | null;
+  recommendation?: ExperimentRecommendation | null;
+  diff_summary?: ExperimentDiffSummary | null;
   created_at: string;
 }
 
@@ -414,6 +416,16 @@ export interface ExperimentRecommendation {
   baseline_value: number | null;
   delta: number | null;
   direction: string | null;
+}
+
+export interface ExperimentDiffSummary {
+  config_changed: boolean;
+  config_change_count: number;
+  metric_delta: number | null;
+  metric: string | null;
+  direction: "min" | "max" | null;
+  status_changed_from_parent: boolean | null;
+  parent_status: Experiment["status"] | null;
 }
 
 export interface MetricDeltaEntry {

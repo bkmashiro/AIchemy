@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { ExperimentTreeNode, Task } from "../../../lib/api";
 import { ExperimentLineageGraphCard } from "../ExperimentLineageGraphCard";
@@ -15,6 +15,8 @@ function node(
     fork_reason: null,
     goal_metric: null,
     goal_direction: null,
+    recommendation: null,
+    diff_summary: null,
     created_at: "2026-06-01T00:00:00Z",
     children: [],
     ...overrides,
@@ -194,6 +196,163 @@ describe("ExperimentLineageGraphCard", () => {
       "running-leaf",
       "failed-leaf",
     ]);
+  });
+
+  it("renders recommendation and diff chips on lineage rows", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [
+          node({
+            id: "child",
+            name: "child/variant",
+            parent_id: "root",
+            status: "passed",
+            recommendation: {
+              action: "keep",
+              verdict: null,
+              reason: "stable metric improvements",
+              metric: "loss",
+              value: 0.4,
+              baseline_value: 0.6,
+              delta: -0.2,
+              direction: "min",
+            },
+            diff_summary: {
+              metric_delta: -0.4,
+              metric: "loss",
+              direction: "min",
+              config_changed: true,
+              config_change_count: 3,
+              status_changed_from_parent: true,
+              parent_status: "running",
+            },
+          }),
+        ],
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    const row = getRowByLabel(container, "child/variant");
+    const recommendationChips = row.querySelectorAll('[data-lineage-recommendation-chip]');
+    expect(recommendationChips).toHaveLength(1);
+    expect(recommendationChips[0]).toHaveTextContent("keep");
+
+    const diffChips = row.querySelectorAll('[data-lineage-diff-chip]');
+    expect(diffChips).toHaveLength(3);
+    expect(Array.from(diffChips).map((chip) => chip.textContent)).toEqual([
+      "loss: ↓ -0.4000",
+      "config +3",
+      "status running→passed",
+    ]);
+  });
+
+  it("shows recommendation and diff chips in the selected detail strip", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [
+          node({
+            id: "child",
+            name: "child/variant",
+            parent_id: "root",
+            status: "failed",
+            recommendation: {
+              action: "rerun",
+              verdict: null,
+              reason: "metric regression",
+              metric: "acc",
+              value: 0.3,
+              baseline_value: 0.5,
+              delta: -0.2,
+              direction: "max",
+            },
+            diff_summary: {
+              metric_delta: -0.25,
+              metric: "acc",
+              direction: "max",
+              config_changed: true,
+              config_change_count: 1,
+              status_changed_from_parent: true,
+              parent_status: "running",
+            },
+          }),
+        ],
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="child"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    const strip = container.querySelector('[data-lineage-selected-strip]');
+    if (!(strip instanceof HTMLElement)) {
+      throw new Error("Missing selected detail strip");
+    }
+
+    expect(within(strip).getByText("Preview selected")).toBeInTheDocument();
+    expect(within(strip).getByText("rerun")).toBeInTheDocument();
+
+    const detailChips = strip.querySelectorAll('[data-lineage-diff-chip]');
+    expect(Array.from(detailChips).map((chip) => chip.textContent)).toEqual([
+      "acc: ↑ -0.2500",
+      "config +1",
+      "status running→failed",
+    ]);
+    expect(within(strip).getByText("acc: ↑ -0.2500")).toBeInTheDocument();
+  });
+
+  it("does not duplicate identical decision and recommendation chips", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        decision: "keep",
+        recommendation: {
+          action: "keep",
+          verdict: "best",
+          reason: "already decided",
+          metric: "loss",
+          value: 0.2,
+          baseline_value: 0.4,
+          delta: -0.2,
+          direction: "min",
+        },
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelectorAll('[data-lineage-decision-chip]')).toHaveLength(1);
+    expect(container.querySelectorAll('[data-lineage-recommendation-chip]')).toHaveLength(0);
   });
 
   it("visually marks failed/drop branches as muted while running child branches remain active", () => {

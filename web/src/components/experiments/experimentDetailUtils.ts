@@ -2,6 +2,7 @@ import type {
   Task,
   ExperimentDetail,
   ExperimentTreeNode,
+  ExperimentRecommendation,
 } from "../../lib/api";
 
 // ─── Status badges (experiment-level) ───────────────────────────────────────
@@ -27,6 +28,80 @@ export const DECISION_BADGE: Record<string, string> = {
   rerun: "bg-blue-900/30 text-blue-400 border-blue-700/40",
   fork:  "bg-purple-900/30 text-purple-400 border-purple-700/40",
 };
+
+const RECOMMENDATION_BADGE_FALLBACK = "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
+
+function normalizeRecommendationText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed.toLowerCase() : null;
+}
+
+export function recommendationBadgeClass(actionOrVerdict?: string | null): string {
+  const key = normalizeRecommendationText(actionOrVerdict);
+  return key ? DECISION_BADGE[key] ?? RECOMMENDATION_BADGE_FALLBACK : RECOMMENDATION_BADGE_FALLBACK;
+}
+
+export function recommendationLabel(
+  recommendation?: ExperimentRecommendation | null,
+): string | null {
+  const action = normalizeRecommendationText(recommendation?.action);
+  if (action) return recommendation?.action?.trim() ?? null;
+
+  const verdict = normalizeRecommendationText(recommendation?.verdict);
+  return verdict ? recommendation?.verdict?.trim() ?? null : null;
+}
+
+export function formatMetricDelta(
+  delta?: number | null,
+  direction?: "min" | "max" | string | null,
+): string | null {
+  if (typeof delta !== "number" || Number.isNaN(delta)) return null;
+  if (!Number.isFinite(delta)) return null;
+
+  const abs = Math.abs(delta);
+  const magnitudeText =
+    abs > 0 && (abs >= 10000 || abs < 1e-4)
+      ? delta.toPrecision(4)
+      : delta.toFixed(4);
+
+  const sign = delta > 0 ? "+" : "";
+  const directionKey = normalizeRecommendationText(direction);
+  const prefix = directionKey === "max" ? "↑" : directionKey === "min" ? "↓" : "";
+
+  return prefix ? `${prefix} ${sign}${magnitudeText}` : `${sign}${magnitudeText}`;
+}
+
+export function diffChipLabels(node: ExperimentTreeNode): string[] {
+  const summary = node.diff_summary;
+  if (!summary) return [];
+
+  const labels: string[] = [];
+
+  if (summary.metric_delta !== null && summary.metric_delta !== undefined) {
+    const metricLabel =
+      summary.metric && summary.metric.trim().length > 0 ? summary.metric : "metric";
+    const deltaText = formatMetricDelta(summary.metric_delta, summary.direction);
+    if (deltaText) {
+      labels.push(`${metricLabel}: ${deltaText}`);
+    }
+  }
+
+  if (summary.config_changed && typeof summary.config_change_count === "number") {
+    const count = summary.config_change_count;
+    labels.push(count > 0 ? `config +${count}` : "config changed");
+  }
+
+  if (summary.status_changed_from_parent) {
+    if (summary.parent_status && summary.parent_status !== node.status) {
+      labels.push(`status ${summary.parent_status}→${node.status}`);
+    } else {
+      labels.push("status changed");
+    }
+  }
+
+  return labels.slice(0, 3);
+}
 
 // ─── Matrix helpers ─────────────────────────────────────────────────────────
 

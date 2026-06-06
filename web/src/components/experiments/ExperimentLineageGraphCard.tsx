@@ -3,8 +3,11 @@ import type { ExperimentTreeNode, Task } from "../../lib/api";
 import {
   DECISION_BADGE,
   countSubtreeNodes,
+  diffChipLabels,
   findNodePath,
   lineageNodeTone,
+  recommendationBadgeClass,
+  recommendationLabel,
   sortLineageChildren,
   type LineageTone,
 } from "./experimentDetailUtils";
@@ -252,6 +255,25 @@ function RailRowView({
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
+  const rawRecommendationText = recommendationLabel(node.recommendation);
+  const recommendationText =
+    rawRecommendationText && rawRecommendationText.toLowerCase() !== node.decision?.toLowerCase()
+      ? rawRecommendationText
+      : null;
+  const recommendationBadge =
+    recommendationText != null
+      ? recommendationBadgeClass(recommendationText)
+      : null;
+  const recommendationTitle = recommendationText
+    ? [
+        `Recommendation: ${recommendationText}`,
+        node.recommendation?.verdict ? `verdict: ${node.recommendation.verdict}` : null,
+        node.recommendation?.reason ? `reason: ${node.recommendation.reason}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : undefined;
+  const diffChips = diffChipLabels(node);
   const rowBg = isCurrent
     ? "bg-indigo-500/10 ring-1 ring-inset ring-indigo-400/30"
     : onPath
@@ -290,10 +312,32 @@ function RailRowView({
         {decisionBadge && (
           <span
             className={`shrink-0 text-[9px] px-1 py-px rounded border ${decisionBadge}`}
+            data-lineage-decision-chip
           >
             {node.decision}
           </span>
         )}
+        {recommendationText && recommendationBadge && (
+          <span
+            className={`shrink-0 text-[9px] px-1 py-px rounded border ${recommendationBadge}`}
+            title={recommendationTitle}
+            aria-label={`Recommendation: ${recommendationText}`}
+            data-lineage-recommendation-chip
+          >
+            {recommendationText}
+          </span>
+        )}
+        {diffChips.map((chip, index) => (
+          <span
+            key={`${index}-${chip}`}
+            className="shrink-0 text-[9px] px-1 py-px rounded border border-gray-700 bg-white/5"
+            title={chip}
+            aria-label={`Diff: ${chip}`}
+            data-lineage-diff-chip
+          >
+            {chip}
+          </span>
+        ))}
         {node.goal_metric && (
           <span className="shrink-0 text-[10px] text-gray-500 font-mono">
             {node.goal_direction === "min" ? "↓" : "↑"}
@@ -341,13 +385,35 @@ function SelectedDetailStrip({
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
+  const rawRecommendationText = recommendationLabel(node.recommendation);
+  const recommendationText =
+    rawRecommendationText && rawRecommendationText.toLowerCase() !== node.decision?.toLowerCase()
+      ? rawRecommendationText
+      : null;
+  const recommendationBadge =
+    recommendationText != null
+      ? recommendationBadgeClass(recommendationText)
+      : null;
+  const recommendationTitle = recommendationText
+    ? [
+        `Recommendation: ${recommendationText}`,
+        node.recommendation?.verdict ? `verdict: ${node.recommendation.verdict}` : null,
+        node.recommendation?.reason ? `reason: ${node.recommendation.reason}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : undefined;
+  const diffChips = diffChipLabels(node);
   const isPage = node.id === pageId;
   const orderedTasks = orderTaskLinks(tasks ?? []);
   const shownTasks = orderedTasks.slice(0, 3);
   const hiddenTaskCount = orderedTasks.length - shownTasks.length;
 
   return (
-    <div className="mt-3 border-t border-gray-800 pt-2 text-[11px] text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1">
+    <div
+      className="mt-3 border-t border-gray-800 pt-2 text-[11px] text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1"
+      data-lineage-selected-strip
+    >
       <span className="text-[10px] uppercase tracking-wide text-gray-600">
         {isPage ? "Viewing page" : "Preview selected"}
       </span>
@@ -356,6 +422,27 @@ function SelectedDetailStrip({
       </span>
       <span className="text-gray-600 font-mono truncate max-w-[10rem]">{node.id}</span>
       <span className={`font-mono ${statusClass}`}>{node.status}</span>
+      {recommendationText && recommendationBadge && (
+        <span
+          className={`text-[9px] px-1 py-px rounded border ${recommendationBadge}`}
+          title={recommendationTitle}
+          aria-label={`Recommendation: ${recommendationText}`}
+          data-lineage-recommendation-chip
+        >
+          {recommendationText}
+        </span>
+      )}
+      {diffChips.map((chip, index) => (
+        <span
+          key={`selected-${index}-${chip}`}
+          className="shrink-0 text-[9px] px-1 py-px rounded border border-gray-700 bg-white/5"
+          title={chip}
+          aria-label={`Diff: ${chip}`}
+          data-lineage-diff-chip
+        >
+          {chip}
+        </span>
+      ))}
       {decisionBadge && (
         <span className={`text-[9px] px-1 py-px rounded border ${decisionBadge}`}>
           {node.decision}

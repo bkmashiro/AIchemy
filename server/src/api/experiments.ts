@@ -181,7 +181,18 @@ export interface ExperimentBrief {
   goal_metric: string | null;
   goal_direction: "min" | "max" | null;
   recommendation: Recommendation;
+  diff_summary: ExperimentDiffSummary;
   created_at: string;
+}
+
+export interface ExperimentDiffSummary {
+  config_changed: boolean;
+  config_change_count: number;
+  metric_delta: number | null;
+  metric: string | null;
+  direction: "min" | "max" | null;
+  status_changed_from_parent: boolean | null;
+  parent_status: Experiment["status"] | null;
 }
 
 export interface MetricAggregate {
@@ -201,19 +212,54 @@ export interface PassFailSummary {
   failed: number;
 }
 
+function diffSummaryForExperiment(
+  exp: Experiment,
+  allExperiments: Experiment[],
+  recommendation: Recommendation,
+  selfStatus: Experiment["status"],
+): ExperimentDiffSummary {
+  const configDiff = exp.config_diff;
+  const configChangeCount =
+    configDiff && !Array.isArray(configDiff) && typeof configDiff === "object" ? Object.keys(configDiff).length : 0;
+
+  let parentStatus: Experiment["status"] | null = null;
+  let statusChangedFromParent: boolean | null = null;
+  if (exp.parent_id) {
+    const parent = allExperiments.find((candidate) => candidate.id === exp.parent_id);
+    if (parent) {
+      parentStatus = deriveExperimentStatus(parent);
+      statusChangedFromParent = selfStatus !== parentStatus;
+    }
+  }
+
+  return {
+    config_changed: configChangeCount > 0,
+    config_change_count: configChangeCount,
+    metric_delta: recommendation.delta,
+    metric: recommendation.metric,
+    direction: recommendation.direction,
+    status_changed_from_parent: statusChangedFromParent,
+    parent_status: parentStatus,
+  };
+}
+
 export function experimentBrief(exp: Experiment): ExperimentBrief {
   const allExperiments = store.getAllExperiments();
+  const recommendation = recommendationForExperiment(exp, allExperiments);
+  const status = deriveExperimentStatus(exp);
+
   return {
     id: exp.id,
     name: exp.name,
-    status: deriveExperimentStatus(exp),
+    status,
     family: exp.family ?? null,
     parent_id: exp.parent_id ?? null,
     decision: exp.decision ?? null,
     fork_reason: exp.fork_reason ?? null,
     goal_metric: exp.goal_metric ?? null,
     goal_direction: exp.goal_direction ?? null,
-    recommendation: recommendationForExperiment(exp, allExperiments),
+    recommendation,
+    diff_summary: diffSummaryForExperiment(exp, allExperiments, recommendation, status),
     created_at: exp.created_at,
   };
 }
