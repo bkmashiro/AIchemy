@@ -269,6 +269,7 @@ describe("ExperimentLineageGraphCard", () => {
             name: "child/variant",
             parent_id: "root",
             status: "failed",
+            decision: "drop",
             recommendation: {
               action: "rerun",
               verdict: null,
@@ -310,7 +311,9 @@ describe("ExperimentLineageGraphCard", () => {
     }
 
     expect(within(strip).getByText("Preview selected")).toBeInTheDocument();
-    expect(within(strip).getByText("rerun")).toBeInTheDocument();
+    expect(within(strip).getByText("Status: failed")).toBeInTheDocument();
+    expect(within(strip).getByText("Decision: drop")).toBeInTheDocument();
+    expect(within(strip).getByText("Recommendation: rerun")).toBeInTheDocument();
 
     const detailChips = strip.querySelectorAll('[data-lineage-diff-chip]');
     expect(Array.from(detailChips).map((chip) => chip.textContent)).toEqual([
@@ -319,6 +322,132 @@ describe("ExperimentLineageGraphCard", () => {
       "status running→failed",
     ]);
     expect(within(strip).getByText("acc: ↑ -0.2500")).toBeInTheDocument();
+  });
+
+  it("shows compact topology summary for shown vs hidden descendants", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/origin",
+        children: [
+          node({
+            id: "branch-main",
+            name: "branch-main",
+            parent_id: "root",
+            status: "running",
+            children: [
+              node({
+                id: "branch-main/continuation",
+                name: "branch-main/continuation",
+                parent_id: "branch-main",
+                children: [
+                  node({
+                    id: "branch-main/continuation/hidden-a",
+                    name: "branch-main/continuation/hidden-a",
+                    parent_id: "branch-main/continuation",
+                  }),
+                  node({
+                    id: "branch-main/continuation/hidden-b",
+                    name: "branch-main/continuation/hidden-b",
+                    parent_id: "branch-main/continuation",
+                  }),
+                ],
+              }),
+            ],
+          }),
+          node({ id: "other-branch", name: "other-branch", parent_id: "root" }),
+        ],
+      }),
+    ];
+
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("1 root · 4 shown · 2 hidden")).toBeInTheDocument();
+  });
+
+  it("shows selected-run status and folded-descendant hint in the selected detail strip", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/origin",
+        status: "running",
+        decision: "keep",
+        recommendation: {
+          action: "fork",
+          verdict: null,
+          reason: "promising",
+          metric: "loss",
+          value: 0.1,
+          baseline_value: 0.4,
+          delta: -0.3,
+          direction: "min",
+        },
+        children: [
+          node({
+            id: "continuation",
+            name: "continuation",
+            parent_id: "root",
+            children: [
+              node({
+                id: "continuation/branch",
+                name: "continuation/branch",
+                parent_id: "continuation",
+                children: [
+                  node({
+                    id: "continuation/hidden-1",
+                    name: "continuation/hidden-1",
+                    parent_id: "continuation/branch",
+                    status: "running",
+                  }),
+                  node({
+                    id: "continuation/hidden-2",
+                    name: "continuation/hidden-2",
+                    parent_id: "continuation/branch",
+                    status: "failed",
+                  }),
+                ],
+              }),
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="child"
+          selectedTasks={[
+            task({ id: "t-1", seq: 1, display_name: "task-1", status: "completed" }),
+            task({ id: "t-2", seq: 2, display_name: "task-2", status: "running" }),
+          ]}
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    const strip = container.querySelector('[data-lineage-selected-strip]');
+    if (!(strip instanceof HTMLElement)) {
+      throw new Error("Missing selected detail strip");
+    }
+
+    expect(within(strip).getByText("Preview selected")).toBeInTheDocument();
+    expect(within(strip).getByText("Status: running")).toBeInTheDocument();
+    expect(within(strip).getByText("Decision: keep")).toBeInTheDocument();
+    expect(within(strip).getByText("Recommendation: fork")).toBeInTheDocument();
+    expect(within(strip).getByText("+2 hidden descendants folded")).toBeInTheDocument();
+    expect(within(strip).getByText("Tasks: 2")).toBeInTheDocument();
   });
 
   it("does not duplicate identical decision and recommendation chips", () => {

@@ -275,54 +275,45 @@ export function countSubtreeNodes(node: ExperimentTreeNode): number {
   return n;
 }
 
-// Priority buckets used by sortLineageChildren. Lower number = earlier.
-// Keep these as a named record so the sort order is self-documenting.
-const LINEAGE_SORT_PRIORITY = {
-  onPath: { yes: 0, no: 1 },
-  // child-bearing siblings rank before leaves so the rail keeps growing
-  hasKids: { yes: 0, no: 1 },
-  // promoted decisions read as "this branch continues" — surface them first
-  decision: { promoted: 0, other: 1 },
-  // failed/drop leaves sink to the bottom of any tied bucket
-  leafTone: { active: 0, dead: 1 },
-} as const;
-
-// Sort siblings for focused-path continuity without mutating input.
+// Sort sibling nodes for lineage continuity and rail readability.
 //
-// Order (most → least significant):
-//  1. focus-path nodes first so the selected spine stays visible
-//     (preview selection is not part of this ordering)
-//  2. child-bearing nodes before leaves within the remaining siblings
-//  3. keep/fork decisions before drop/rerun/undecided
-//  4. failed/drop leaf branches after active/passed/partial/running leaves
-//  5. otherwise preserve API order (stable sort via decorated index)
+// Priority (lowest numeric first):
+//  1) Focus-path nodes always lead.
+//  2) Child-bearing nodes (continuation branches) before leaves.
+//  3) keep/fork decisions before rerun/drop/undecided decisions.
+//  4) Among child-bearing nodes, deeper/more-descendant branches first.
+//  5) Failed/drop leaves sink to the end.
+//  6) Preserve API order for true ties (stable via index).
 //
-// Note: this is a pure function — callers (e.g. ExperimentLineageGraphCard)
-// recurse into the returned array, so the sort cascades down the tree.
+// This helper is pure; callers recurse into returned arrays.
 export function sortLineageChildren(
   children: ExperimentTreeNode[],
   pathIds: Set<string>,
+  subtreeCounts?: Map<string, number>,
 ): ExperimentTreeNode[] {
-  const P = LINEAGE_SORT_PRIORITY;
-  type Key = readonly [number, number, number, number];
-  const key = (n: ExperimentTreeNode): Key => {
-    const onPath = pathIds.has(n.id) ? P.onPath.yes : P.onPath.no;
-    const hasKids = n.children.length > 0 ? P.hasKids.yes : P.hasKids.no;
-    const decisionBucket =
-      n.decision === "keep" || n.decision === "fork"
-        ? P.decision.promoted
-        : P.decision.other;
+  type Key = readonly [number, number, number, number, number];
+
+  const decorated = children.map((node, idx) => {
+    const onPath = pathIds.has(node.id) ? 0 : 1;
+    const hasKids = node.children.length > 0 ? 0 : 1;
+    const isPromotedDecision = node.decision === "keep" || node.decision === "fork" ? 0 : 1;
+    const childDepth =
+      node.children.length > 0 ? subtreeCounts?.get(node.id) ?? countSubtreeNodes(node) : 0;
     const leafTone =
-      n.children.length === 0 &&
-      (n.status === "failed" || n.decision === "drop")
-        ? P.leafTone.dead
-        : P.leafTone.active;
-    return [onPath, hasKids, decisionBucket, leafTone];
-  };
-  const decorated = children.map((node, idx) => ({ node, idx, k: key(node) }));
+      node.children.length === 0 && (node.status === "failed" || node.decision === "drop")
+        ? 1
+        : 0;
+
+    return {
+      node,
+      idx,
+      key: [onPath, hasKids, isPromotedDecision, -childDepth, leafTone] as Key,
+    };
+  });
+
   decorated.sort((a, b) => {
-    for (let i = 0; i < a.k.length; i++) {
-      if (a.k[i] !== b.k[i]) return a.k[i] - b.k[i];
+    for (let i = 0; i < a.key.length; i++) {
+      if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
     }
     return a.idx - b.idx;
   });

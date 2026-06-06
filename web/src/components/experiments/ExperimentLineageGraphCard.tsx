@@ -74,6 +74,40 @@ function taskStatusChipClass(status: Task["status"]): string {
   }
 }
 
+function countHiddenDescendantsFromVisibleSubset(
+  node: ExperimentTreeNode,
+  visibleNodeIds: Set<string>,
+  subtreeCounts: Map<string, number>,
+): number {
+  let hidden = 0;
+
+  for (const child of node.children) {
+    if (visibleNodeIds.has(child.id)) {
+      hidden += countHiddenDescendantsFromVisibleSubset(child, visibleNodeIds, subtreeCounts);
+    } else {
+      hidden += 1 + (subtreeCounts.get(child.id) ?? countSubtreeNodes(child));
+    }
+  }
+
+  return hidden;
+}
+
+function buildSubtreeCountMap(roots: ExperimentTreeNode[]): Map<string, number> {
+  const counts = new Map<string, number>();
+
+  const walk = (node: ExperimentTreeNode): number => {
+    let count = 0;
+    for (const child of node.children) {
+      count += 1 + walk(child);
+    }
+    counts.set(node.id, count);
+    return count;
+  };
+
+  roots.forEach(walk);
+  return counts;
+}
+
 const FOLD_DEPTH_LIMIT = 2;
 
 function flattenLineage(
@@ -81,6 +115,7 @@ function flattenLineage(
   currentId: string,
   pathIds: Set<string>,
   sortPathIds: Set<string>,
+  subtreeCounts: Map<string, number>,
 ): RailRow[] {
   const rows: RailRow[] = [];
   // ancestorIsLast[d] = "ancestor of current walk at depth d is last sibling"
@@ -93,7 +128,7 @@ function flattenLineage(
     const isCurrent = node.id === currentId;
     const tone = lineageNodeTone(node, isCurrent, onPath);
 
-    const sortedChildren = sortLineageChildren(node.children, sortPathIds);
+    const sortedChildren = sortLineageChildren(node.children, sortPathIds, subtreeCounts);
     const renderChildren =
       sortedChildren.length > 0 &&
       (depth < FOLD_DEPTH_LIMIT || onPath || isCurrent);
@@ -101,7 +136,7 @@ function flattenLineage(
     let foldedCount: number | undefined;
     if (!renderChildren && sortedChildren.length > 0) {
       foldedCount = sortedChildren.reduce(
-        (sum, c) => sum + 1 + countSubtreeNodes(c),
+        (sum, c) => sum + 1 + (subtreeCounts.get(c.id) ?? countSubtreeNodes(c)),
         0,
       );
     }
@@ -369,10 +404,12 @@ function SelectedDetailStrip({
   node,
   pageId,
   tasks,
+  hiddenDescendants,
 }: {
   node: ExperimentTreeNode;
   pageId: string;
   tasks?: Task[];
+  hiddenDescendants: number;
 }) {
   const statusClass =
     node.status === "passed"
@@ -417,11 +454,17 @@ function SelectedDetailStrip({
       <span className="text-[10px] uppercase tracking-wide text-gray-600">
         {isPage ? "Viewing page" : "Preview selected"}
       </span>
-      <span className="font-mono text-indigo-200 truncate max-w-[14rem]">
-        {node.name}
-      </span>
+      <span className="font-mono text-indigo-200 truncate max-w-[14rem]">{node.name}</span>
       <span className="text-gray-600 font-mono truncate max-w-[10rem]">{node.id}</span>
-      <span className={`font-mono ${statusClass}`}>{node.status}</span>
+      <span className={`font-mono ${statusClass}`}>Status: {node.status}</span>
+      {decisionBadge && (
+        <span
+          className={`text-[9px] px-1 py-px rounded border ${decisionBadge}`}
+          aria-label={`Decision: ${node.decision}`}
+        >
+          Decision: {node.decision}
+        </span>
+      )}
       {recommendationText && recommendationBadge && (
         <span
           className={`text-[9px] px-1 py-px rounded border ${recommendationBadge}`}
@@ -429,7 +472,12 @@ function SelectedDetailStrip({
           aria-label={`Recommendation: ${recommendationText}`}
           data-lineage-recommendation-chip
         >
-          {recommendationText}
+          Recommendation: {recommendationText}
+        </span>
+      )}
+      {hiddenDescendants > 0 && (
+        <span className="text-[10px] text-gray-500 whitespace-nowrap">
+          +{hiddenDescendants} hidden descendants folded
         </span>
       )}
       {diffChips.map((chip, index) => (
@@ -443,11 +491,6 @@ function SelectedDetailStrip({
           {chip}
         </span>
       ))}
-      {decisionBadge && (
-        <span className={`text-[9px] px-1 py-px rounded border ${decisionBadge}`}>
-          {node.decision}
-        </span>
-      )}
       {node.goal_metric && (
         <span className="font-mono text-gray-500">
           goal {node.goal_direction === "min" ? "↓" : "↑"}
@@ -527,11 +570,18 @@ export function ExperimentLineageGraphCard({
   const pathIds = new Set(found?.path.map((n) => n.id) ?? []);
   const focusPath = findNodePath(roots, pageId);
   const sortPathIds = new Set(focusPath?.path.map((n) => n.id) ?? pathIds);
+  const subtreeCounts = buildSubtreeCountMap(roots);
   const rows = found
-    ? flattenLineage(found.root, currentId, pathIds, sortPathIds)
+    ? flattenLineage(found.root, currentId, pathIds, sortPathIds, subtreeCounts)
     : [];
   const selected = found?.path[found.path.length - 1];
-
+  const visibleNodeIds = new Set(rows.map((row) => row.node.id));
+  const totalNodeCount = found ? 1 + (subtreeCounts.get(found.root.id) ?? countSubtreeNodes(found.root)) : 0;
+  const hiddenNodeCount = Math.max(totalNodeCount - rows.length, 0);
+  const selectedHiddenDescendants =
+    selected && visibleNodeIds.size > 0
+      ? countHiddenDescendantsFromVisibleSubset(selected, visibleNodeIds, subtreeCounts)
+      : 0;
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
@@ -539,6 +589,7 @@ export function ExperimentLineageGraphCard({
         <span className="text-xs text-gray-600">
           {roots.length} root{roots.length === 1 ? "" : "s"}
           {rows.length > 0 && ` · ${rows.length} shown`}
+          {hiddenNodeCount > 0 && ` · ${hiddenNodeCount} hidden`}
         </span>
       </div>
       {!found ? (
@@ -559,6 +610,7 @@ export function ExperimentLineageGraphCard({
               node={selected}
               pageId={pageId}
               tasks={selectedTasks}
+              hiddenDescendants={selectedHiddenDescendants}
             />
           )}
         </>
