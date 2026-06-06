@@ -206,7 +206,7 @@ vi.mock("../src/task-actions", () => ({
 
 import { initiateKillChain, cancelKillChain, setupStubNamespace } from "../src/socket/stub";
 import { notifyCancelled, notifyFailed } from "../src/discord";
-import { markDisconnected, cancelTask, clearDisconnected, resolveDeadTask, createRetryTask } from "../src/task-actions";
+import { markDisconnected, cancelTask, clearDisconnected, resolveDeadTask, createRetryTask, failTask } from "../src/task-actions";
 import { reliableEmitToStub } from "../src/reliable";
 import { triggerSchedule } from "../src/scheduler";
 import { logger } from "../src/log";
@@ -468,6 +468,32 @@ describe("markTasksDisconnected (via disconnect)", () => {
     // The disconnect guard (stub.socket_id !== socket.id) should have fired → no additional markDisconnected
     expect((markDisconnected as any).mock.calls.length).toBe(markCallsBefore);
   });
+
+  it("does not fail/retry disconnected running tasks before disconnect timeout", () => {
+    vi.useFakeTimers();
+    try {
+      const task = makeTask({ status: "running", max_retries: 2, retry_count: 0 });
+      const stub = makeStub({ tasks: [task] });
+      const { socketHandlers } = buildHarness({
+        preExistingStub: stub,
+        resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+      });
+
+      socketHandlers["disconnect"]?.();
+
+      // mark-disconnected updates flags but should not transition state or retry yet
+      expect(markDisconnected).toHaveBeenCalledWith(STUB_ID, task.id);
+      const afterDisconnect = _stubs.get(STUB_ID)!.tasks[0];
+      expect(afterDisconnect.status).toBe("running");
+      expect(afterDisconnect.stub_offline).toBe(true);
+
+      vi.advanceTimersByTime(3 * 3_600_000); // 3h
+      expect(failTask).not.toHaveBeenCalled();
+      expect(_queue).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -723,6 +749,56 @@ describe("resume reconciliation", () => {
       "stub.version_mismatch",
       expect.objectContaining({ stub_version: "2.0.0", server_version: "2.1.0" }),
     );
+  });
+
+  it("rejects missing stub version when strict enforcement is enabled", () => {
+    process.env.ALCHEMY_ENFORCE_VERSION = "true";
+    const { socketHandlers, mockSocket } = buildHarness({ skipResume: true });
+    const { stub_version, ...legacyPayload } = BASE_RESUME_PAYLOAD;
+    socketHandlers["resume"]?.(legacyPayload);
+
+    expect(mockSocket.emit).toHaveBeenCalledWith(
+      "resume_response",
+      expect.objectContaining({
+        error: expect.stringContaining("version"),
+        server_version: "2.1.0",
+      }),
+    );
+    expect(mockSocket.disconnect).toHaveBeenCalledWith(true);
+  });
+
+  it("treats ALCHEMY_ENFORCE_VERSION=true like =1 for mismatch", () => {
+    process.env.ALCHEMY_ENFORCE_VERSION = "true";
+    const { socketHandlers, mockSocket } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.({ ...BASE_RESUME_PAYLOAD, stub_version: "2.0.0" });
+
+    expect(mockSocket.emit).toHaveBeenCalledWith(
+      "resume_response",
+      expect.objectContaining({
+        error: expect.stringContaining("version mismatch"),
+        server_version: "2.1.0",
+        stub_version: "2.0.0",
+      }),
+    );
+    expect(mockSocket.disconnect).toHaveBeenCalledWith(true);
+  });
+
+  it("uses explicit client-provided stub_id even when it differs from legacy identity", () => {
+    const legacyId = computeLegacyExpectedStubId(BASE_HOSTNAME, BASE_GPU, "0", "ys25");
+    _stubs.set(legacyId, makeStub({ id: legacyId, user: "ys25", tasks: [] }));
+
+    const explicitId = `explicit-${uuidv4()}`;
+    const { socketHandlers, webNs } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.({
+      ...BASE_RESUME_PAYLOAD,
+      stub_id: explicitId,
+      user: "ys25",
+      cuda_visible_devices: "0",
+    });
+
+    expect(webNs.emit).toHaveBeenCalledWith("stub.online", expect.objectContaining({ id: explicitId }));
+    expect(_stubs.has(explicitId)).toBe(true);
+    expect(_stubs.has(legacyId)).toBe(true);
   });
 
   it("reuses existing legacy stub ID for old stubs without client-computed stub_id", () => {
