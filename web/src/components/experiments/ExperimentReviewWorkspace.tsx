@@ -7,6 +7,7 @@ import {
   type ExperimentResearchReportBlock,
 } from "../../lib/api";
 import { StatusBadge } from "./StatusBadge";
+import { ExperimentFamilyCompareBoard } from "./ExperimentFamilyCompareBoard";
 
 const REPORT_LIMIT = 50;
 
@@ -461,6 +462,14 @@ export function ExperimentReviewWorkspace({
           <CountsRow counts={report.counts.by_decision} />
         </div>
       </div>
+
+      {hasFamily && (
+        <ExperimentFamilyCompareBoard
+          report={report}
+          selectedId={selectedId}
+          onSelectExperiment={setSelectedId}
+        />
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
         <div>

@@ -448,7 +448,7 @@ describe("experiment lineage API", () => {
       .post("/experiments")
       .send({ name: "rep-alpha-1", family: "alpha", task_specs: [{ ref: "t", script: "t.py" }] })
       .expect(201);
-    await request(app)
+    const alpha2 = await request(app)
       .post("/experiments")
       .send({ name: "rep-alpha-2", family: "alpha", task_specs: [{ ref: "t", script: "t.py" }] })
       .expect(201);
@@ -470,6 +470,17 @@ describe("experiment lineage API", () => {
     expect(famAlpha.body.counts.by_decision.keep).toBe(1);
     expect(famAlpha.body.counts.by_decision.none).toBe(1);
     expect(famAlpha.body.counts.by_status.running).toBe(2);
+    for (const block of famAlpha.body.experiments) {
+      expect(block).toEqual(
+        expect.objectContaining({
+          recommendation: expect.any(Object),
+          diff_summary: expect.objectContaining({ config_change_count: expect.any(Number) }),
+        }),
+      );
+    }
+    expect(famAlpha.body.experiments.map((e: any) => e.id).sort()).toEqual(
+      [alpha1.body.id, alpha2.body.id].sort(),
+    );
 
     // decision=none excludes the keep experiment
     const undecided = await request(app).get("/experiments/research-report?decision=none").expect(200);
@@ -525,6 +536,8 @@ describe("experiment lineage API", () => {
         artifact_count: 0,
         checkpoint_count: 0,
         recent_events: expect.any(Array),
+        recommendation: expect.any(Object),
+        diff_summary: expect.objectContaining({ config_change_count: 0, config_changed: false }),
         task_counts: expect.any(Object),
         primary_metric: null,
       }),

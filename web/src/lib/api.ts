@@ -523,6 +523,8 @@ export interface ExperimentResearchReportBlock {
   created_at: string;
   parent_id: string | null;
   children: ExperimentBrief[];
+  recommendation?: ExperimentRecommendation | null;
+  diff_summary?: ExperimentDiffSummary | null;
   task_counts: Record<string, number>;
   primary_metric: { metric: string; direction: "min" | "max"; best: number | null } | null;
   artifact_count: number;

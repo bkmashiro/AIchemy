@@ -1460,19 +1460,57 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       childrenByParent.set(e.parent_id, bucket);
     }
 
+    const recommendationById = new Map<string, ReturnType<typeof recommendationForExperiment>>();
+    const diffSummaryById = new Map<string, ReturnType<typeof diffSummaryForExperiment>>();
+    const getRecommendation = (exp: Experiment) => {
+      const cached = recommendationById.get(exp.id);
+      if (cached) return cached;
+      const recommendation = recommendationForExperiment(exp, allExperiments);
+      recommendationById.set(exp.id, recommendation);
+      return recommendation;
+    };
+    const getDiffSummary = (exp: Experiment, status: Experiment["status"]) => {
+      const cached = diffSummaryById.get(exp.id);
+      if (cached) return cached;
+      const diffSummary = diffSummaryForExperiment(exp, allExperiments, getRecommendation(exp), status);
+      diffSummaryById.set(exp.id, diffSummary);
+      return diffSummary;
+    };
+    const reportBrief = (exp: Experiment) => {
+      const status = statusByExp.get(exp.id) ?? deriveExperimentStatus(exp);
+      const recommendation = getRecommendation(exp);
+      return {
+        id: exp.id,
+        name: exp.name,
+        status,
+        family: exp.family ?? null,
+        parent_id: exp.parent_id ?? null,
+        decision: exp.decision ?? null,
+        fork_reason: exp.fork_reason ?? null,
+        goal_metric: exp.goal_metric ?? null,
+        goal_direction: exp.goal_direction ?? null,
+        recommendation,
+        diff_summary: getDiffSummary(exp, status),
+        created_at: exp.created_at,
+      };
+    };
+
     const blocks = returnedExperiments.map((exp) => {
       const storedEvents = store.getExperimentEvents(exp.id).filter((e) => !e.deleted_at);
       const artifactCount = storedEvents.filter((e) => e.kind === "artifact").length;
       const checkpointCount = storedEvents.filter((e) => e.kind === "checkpoint").length;
       const events = timelineFor(exp);
       const recent = events.slice(-3);
-      const kids = (childrenByParent.get(exp.id) ?? []).slice().sort(compareExperiments).map(experimentBrief);
+      const kids = (childrenByParent.get(exp.id) ?? []).slice().sort(compareExperiments).map(reportBrief);
+      const status = statusByExp.get(exp.id) ?? deriveExperimentStatus(exp);
+      const recommendation = getRecommendation(exp);
       return {
         id: exp.id,
         name: exp.name,
         family: exp.family ?? null,
-        status: statusByExp.get(exp.id) ?? deriveExperimentStatus(exp),
-        recommendation: recommendationForExperiment(exp, allExperiments),
+        status,
+        recommendation,
+        diff_summary: getDiffSummary(exp, status),
         decision: exp.decision ?? null,
         decision_reason: exp.decision_reason ?? null,
         decision_at: exp.decision_at ?? null,

@@ -10,6 +10,7 @@ export { ExperimentMatrixCard } from "./ExperimentMatrixCard";
 export { ExperimentTimelineCard } from "./ExperimentTimelineCard";
 export { ExperimentLineageGraphCard } from "./ExperimentLineageGraphCard";
 export { ExperimentResearchCallCard } from "./ExperimentResearchCallCard";
+export { ExperimentFamilyCompareBoard } from "./ExperimentFamilyCompareBoard";
 export { ExperimentConfigDiffCard } from "./ExperimentConfigDiffCard";
 export {
   ExperimentReviewWorkspace,

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, cleanup } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import {
   experimentsApi,
@@ -263,26 +263,57 @@ describe("ExperimentReviewWorkspace component", () => {
     expect(screen.getByRole("button", { name: /download json/i })).toBeInTheDocument();
   });
 
-  it("shows a download Markdown button when a family report is loaded", async () => {
-    getReportSpy.mockResolvedValue(makeReport());
+  it("shows the family compare board and allows selecting an experiment from it", async () => {
+    getReportSpy.mockResolvedValue(
+      makeReport({
+        experiments: [
+          block({ id: "exp-1", name: "exp/baseline", parent_id: null }),
+          block({ id: "exp-2", name: "exp/v2", parent_id: "exp-1" }),
+        ],
+        leaderboard: [leader({ id: "exp-1", name: "exp/baseline" }), leader({ id: "exp-2", name: "exp/v2" })],
+      }),
+    );
     renderWithFamily("fam");
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: /download markdown/i }),
-      ).toBeInTheDocument();
+
+    const boardHeader = await screen.findByRole("heading", { name: /family compare/i });
+    expect(boardHeader).toBeInTheDocument();
+
+    const row = screen.getByRole("button", {
+      name: /select exp\/v2 for family compare/i,
     });
+    fireEvent.click(row);
+
+    await waitFor(() => {
+      expect(screen.getAllByRole("link", { name: "exp/v2" }).length).toBeGreaterThan(0);
+    });
+
+    expect(screen.getByText("alch experiments bundle exp/v2")).toBeInTheDocument();
+    expect(screen.getByText("alch experiments fork-plan exp/v2 --reason 'TODO: describe the ablation'")).toBeInTheDocument();
   });
 
-  it("clears the stale report and shows zero totals when fetch fails", async () => {
-    getReportSpy.mockRejectedValue(new Error("boom"));
-    renderWithFamily("fam");
-    await waitFor(() => {
-      expect(screen.getByText(/boom/i)).toBeInTheDocument();
-    });
-    // The Total card should now read 0 (stale data was cleared).
-    const totalLabel = screen.getByText("Total");
-    const totalCard = totalLabel.parentElement!;
-    expect(totalCard.textContent).toContain("0");
+  it("clears stale report data after a fetch failure", async () => {
+    getReportSpy.mockResolvedValueOnce(makeReport());
+    const { rerender } = renderWithFamily("fam");
+
+    fireEvent.click(await screen.findByRole("button", { name: /select exp\/baseline for family compare/i }));
+    await screen.findByText("alch experiments bundle exp/baseline");
+
+    getReportSpy.mockRejectedValueOnce(new Error("boom"));
+    rerender(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentReviewWorkspace
+          familyFilter="other"
+          families={["fam", "other"]}
+          decisionFilter=""
+          statusFilter=""
+          onSelectFamily={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    await screen.findByText("boom");
+    expect(screen.getByText("0")).toBeInTheDocument();
+    expect(screen.queryByText("alch experiments bundle exp/baseline")).not.toBeInTheDocument();
   });
 
   it("renders the no-family message when no family is selected", () => {
