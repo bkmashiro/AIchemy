@@ -15,7 +15,7 @@ import Database from "better-sqlite3";
 import { drizzle, BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { eq, sql, and, desc, asc, not, inArray } from "drizzle-orm";
 import * as schema from "./schema";
-import { Stub, Task, Grid, Token, Experiment, ServerState, TaskStatus } from "../types";
+import { Stub, Task, Grid, Token, Experiment, ExperimentEvent, ServerState, TaskStatus } from "../types";
 import { writeLockTable } from "../dedup";
 import { backupState, pruneBackups } from "./backup";
 import { logger } from "../log";
@@ -97,6 +97,19 @@ class Store {
         id TEXT PRIMARY KEY,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS experiment_events (
+        id TEXT PRIMARY KEY,
+        experiment_id TEXT NOT NULL,
+        task_id TEXT,
+        kind TEXT NOT NULL,
+        message TEXT NOT NULL,
+        actor TEXT,
+        data_json TEXT,
+        created_at TEXT NOT NULL,
+        deleted_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_experiment_events_experiment_time
+        ON experiment_events(experiment_id, created_at);
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -699,6 +712,16 @@ class Store {
     return undefined;
   }
 
+  updateArchivedTask(taskId: string, update: Partial<Task>): Task | undefined {
+    const located = this.findTask(taskId);
+    if (!located?.archived) return undefined;
+    const updated = { ...located.task, ...update };
+    this._saveTask(updated, "archive");
+    this._taskIndex.set(taskId, { location: "archive" });
+    this._reindexTask(located.task, updated);
+    return updated;
+  }
+
   updateTask(stubId: string, taskId: string, update: Partial<Task>): Task | undefined {
     const stub = this.stubs.get(stubId);
     if (!stub) return undefined;
@@ -980,10 +1003,53 @@ class Store {
   deleteExperiment(id: string): void {
     this.experiments.delete(id);
     try {
+      // Intentionally do not delete experiment_events. Timeline events are
+      // append-only audit history and must survive experiment soft deletion.
       this.db.delete(schema.experiments).where(eq(schema.experiments.id, id)).run();
     } catch (err) {
       logger.error("db.delete_experiment_failed", { exp_id: id, error: String(err) });
     }
+  }
+
+  addExperimentEvent(event: ExperimentEvent): void {
+    this.db.insert(schema.experimentEvents)
+      .values({
+        id: event.id,
+        experiment_id: event.experiment_id,
+        task_id: event.task_id ?? null,
+        kind: event.kind,
+        message: event.message,
+        actor: event.actor ?? null,
+        data_json: event.data ? JSON.stringify(event.data) : null,
+        created_at: event.created_at,
+        deleted_at: event.deleted_at ?? null,
+      })
+      .run();
+  }
+
+  getExperimentEvents(experimentId: string): ExperimentEvent[] {
+    const rows = this.db.select().from(schema.experimentEvents)
+      .where(eq(schema.experimentEvents.experiment_id, experimentId))
+      .orderBy(asc(schema.experimentEvents.created_at))
+      .all();
+    return rows.map((row) => ({
+      id: row.id,
+      experiment_id: row.experiment_id,
+      task_id: row.task_id ?? undefined,
+      kind: row.kind as ExperimentEvent["kind"],
+      message: row.message,
+      actor: row.actor ?? undefined,
+      data: row.data_json ? JSON.parse(row.data_json) : undefined,
+      created_at: row.created_at,
+      deleted_at: row.deleted_at ?? undefined,
+    }));
+  }
+
+  softDeleteExperimentEvent(eventId: string, deletedAt: string = new Date().toISOString()): void {
+    this.db.update(schema.experimentEvents)
+      .set({ deleted_at: deletedAt })
+      .where(eq(schema.experimentEvents.id, eventId))
+      .run();
   }
 
   getBlockedTasksDependingOn(taskId: string): Task[] {
@@ -1095,6 +1161,7 @@ class Store {
     this.db.delete(schema.tasks).run();
     this.db.delete(schema.grids).run();
     this.db.delete(schema.experiments).run();
+    this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
 
     this._applyState(state);
@@ -1193,6 +1260,7 @@ class Store {
     this.db.delete(schema.tasks).run();
     this.db.delete(schema.grids).run();
     this.db.delete(schema.experiments).run();
+    this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
   }
 }

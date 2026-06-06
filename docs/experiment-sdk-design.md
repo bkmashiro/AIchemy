@@ -1,5 +1,31 @@
 # Experiment SDK Design
 
+## Status (current state)
+
+This document is the original design note. The Experiment SDK + server API are
+**implemented**, along with the research-loop surfaces layered on top
+(timeline, decisions, artifact/checkpoint metadata events, `fork-plan`
+dry-run, server-side `ls` filters). The shapes drifted in places — treat the
+live code as authoritative when in doubt:
+
+- SDK: `sdk/alchemy_sdk/experiment.py`, `sdk/alchemy_sdk/submit.py`
+- Server endpoints: `server/src/api/experiments.ts`
+- Read-only client / CLI: `sdk/alchemy_sdk/experiments.py` (now exposes
+  `timeline`, `fork_plan`, and filtered `list(family=, decision=, status=)`),
+  `sdk/alchemy_sdk/cli/main.py` (`alch experiments ls/show/timeline/note/
+  decide/tree/compare/summary/diff/manifest/artifact/checkpoint/fork-plan`)
+- Web detail/lineage UI: `web/src/pages/ExperimentsPage.tsx` and the
+  components under `web/src/components/experiments/`.
+
+Known drift vs this document:
+
+- `Experiment` accepts `family`, `hypothesis`, `expected_outcome`, and
+  `fork(reason=...)` plumbs `fork_reason` — see `plans/research-lineage-gitlens.md`.
+- The fingerprint idempotency story (§2.1) is not the current contract;
+  idempotency is by experiment `name`. `force=True` is not implemented.
+- DAG promotion / cancellation rules (§5.3) live in `server/src/scheduler.ts`
+  and `server/src/dag.ts`; the snippets here are illustrative only.
+
 ## Motivation
 
 当前 Alchemy 提交任务是 flat 的：一个 `POST /tasks`，一个 script。多阶段实验（train → eval → report）需要手动串联。DAG pipeline 设计已批准（`depends_on` + experiment transaction），但缺少 Python-side API。

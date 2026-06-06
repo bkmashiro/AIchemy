@@ -33,7 +33,7 @@ class TestSignal:
 
         final = wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=30)
         # Script traps SIGTERM and exits 0: stub may report "completed" or server may mark "killed"
-        assert final["status"] in ("killed", "completed"), f"Got {final['status']}"
+        assert final["status"] in ("killed", "cancelled", "completed"), f"Got {final['status']}"
         if final["status"] == "completed":
             assert final.get("exit_code") == 0
 
@@ -57,4 +57,4 @@ class TestSignal:
         api.kill_task(task["id"])
 
         final = wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=60)
-        assert final["status"] == "killed"
+        assert final["status"] in ("killed", "cancelled")

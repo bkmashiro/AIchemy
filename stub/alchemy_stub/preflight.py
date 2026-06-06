@@ -188,10 +188,15 @@ async def run_preflight(
             if not os.access(_py_bin, os.X_OK):
                 errors.append(f"Python binary not found: {_py_bin}")
 
-    # 3. run_dir parent writable (if declared)
+    # 3. run_dir parent writable/creatable (if declared)
     if run_dir:
         parent = os.path.dirname(run_dir.rstrip("/")) or run_dir
-        if not os.access(parent, os.W_OK):
+        if not os.path.isdir(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except Exception:
+                errors.append(f"run_dir parent not writable: {parent}")
+        if not errors and not os.access(parent, os.W_OK):
             errors.append(f"run_dir parent not writable: {parent}")
 
     # 3b. Output dir pre-creation (if declared)

@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import httpx
 
+from harness.api import _normalize_script_payload
 from harness.waiter import wait_for_status, TERMINAL_STATUSES
 
 
@@ -53,12 +54,11 @@ class TestPreflight:
         )
 
         # Submit second task with same run_dir
-        body = {
-            "script": "echo hi",
+        body = _normalize_script_payload("echo hi", {
             "name": _unique_name("smoke_lock_second"),
             "run_dir": run_dir,
             "param_overrides": {"lock_run2": uuid4().hex[:8]},
-        }
+        })
         client = httpx.Client(
             base_url=api.base_url,
             headers={"Authorization": f"Bearer {api.token}"},

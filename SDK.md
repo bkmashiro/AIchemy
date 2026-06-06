@@ -113,3 +113,220 @@ lr = al.param("lr")           # crashes if missing (managed mode)
 lr = al.param("lr", 1e-3)     # default allowed in standalone mode
 params = al.params()           # full dict
 ```
+
+## Read-only Experiment Lineage
+
+The SDK also ships a thin, **read-only** HTTP client for inspecting
+experiment lineage from notebooks and scripts. It hits the same `/api/...`
+endpoints as the web dashboard and the `alch` CLI, and it never mutates
+scheduler / runtime / stub state — no decisions, no notes, no submissions.
+
+```python
+from alchemy_sdk import ExperimentClient
+
+# Auth is resolved in this order:
+#   1. token=... constructor arg (explicit wins)
+#   2. ALCHEMY_TOKEN env var
+# Server URL: server=... → ALCHEMY_SERVER → ALCHEMY_SERVER_URL → http://localhost:3002
+ec = ExperimentClient(server="https://alchemy.example.com", token="...")
+
+ec.list()                              # GET /api/experiments → list[dict]
+ec.list(family="pretrain",             # server-side filters (forwarded as
+        decision="keep",               # query params). decision="none"
+        status="running")              # selects experiments with no decision.
+ec.tree()                              # GET /api/experiments/tree → forest
+ec.resolve("my-experiment")            # name-or-id → single experiment dict
+ec.summary("my-experiment")            # GET /api/experiments/<id>/summary
+ec.diff("my-experiment")               # GET /api/experiments/<id>/diff
+ec.manifest("my-experiment")           # GET /api/experiments/<id>/manifest
+ec.timeline("my-experiment")           # GET /api/experiments/<id>/timeline
+ec.compare(["alpha", "beta-2"])        # GET /api/experiments/compare?ids=...
+ec.research_bundle("my-experiment")    # GET /api/experiments/<id>/research-bundle
+                                       # one-shot export of detail + summary + diff +
+                                       # manifest + timeline + decision + artifacts
+ec.research_report(family="pretrain",  # GET /api/experiments/research-report
+                   decision="none")    # family/decision/status rollup: counts,
+                                       # leaderboard, per-experiment briefs
+ec.research_report_markdown(           # same GET, rendered as Markdown locally
+    family="pretrain")                 # — handy for pasting into Discord / notes
+
+# Local dry-run: build a fork manifest without submitting anything. Only the
+# two GET requests below run; nothing is written to the server.
+ec.fork_plan(
+    "my-experiment",
+    set_overrides={"lr": 0.0002, "use_curiosity": True},
+    unset_keys=["warmup"],
+    name="my-experiment-curiosity",
+    reason="ablate curiosity contribution",
+)
+```
+
+Notes:
+
+- All methods return raw decoded JSON (`dict` / `list`) — no dataclass wrapping.
+- `list()` raises if the server returns a non-list body (typically an error
+  envelope from an auth or middleware failure) instead of silently degrading.
+- Filtered `list()` calls (with `family=` / `decision=` / `status=`) are not
+  written to the resolution cache — only the unfiltered list backs name-or-id
+  resolution.
+- `resolve()` and `compare()` accept either UUIDs or experiment names. Names
+  must be unambiguous; duplicates raise `RuntimeError`.
+- `fork_plan()` accepts **flat top-level keys only**. Nested (dotted) keys
+  like `"model.lr"` raise `RuntimeError`. The returned manifest mirrors the
+  CLI's `alch experiments fork-plan` output and is purely local: the only
+  network traffic is one `GET /api/experiments` and one
+  `GET /api/experiments/<id>`.
+- HTTP errors raise `RuntimeError` with the status code and response body
+  included so you can see exactly what the server said.
+- The companion CLI (`alch experiments tree|summary|diff|manifest|compare|
+  timeline|fork-plan`) uses the same endpoints and is also read-only by
+  design.
+
+### Caching `/experiments` lookups
+
+`summary`, `diff`, `manifest`, and `compare` all start by fetching
+`GET /api/experiments` to resolve name-or-id refs. For notebooks/scripts that
+fan out across many refs, you can opt into a per-client cache:
+
+```python
+ec = ExperimentClient(cache_experiments=True)
+ec.summary("alpha")    # 1× /experiments  + 1× /summary
+ec.diff("alpha")       #                   + 1× /diff   (no extra /experiments)
+ec.compare(["a","b"])  #                   + 1× /compare
+ec.list(refresh=True)  # force a re-fetch
+ec.clear_cache()       # drop the memoized list
+```
+
+Default is `cache_experiments=False` so the client always reflects fresh
+server state. Every read method accepts `refresh=True` to bypass the cache
+once without flipping the flag.
+
+### Operator CLI: read-only experiment commands
+
+```bash
+alch experiments ls                        # list all experiments
+alch experiments ls --family pretrain \
+    --decision none --status running       # server-side filters (decision=none = undecided)
+alch experiments show <name-or-id>         # full detail dict
+alch experiments tree                      # whole forest as JSON
+alch experiments summary <name-or-id>      # rollups, best metrics
+alch experiments diff <name-or-id>         # parameter / config diff vs parent
+alch experiments manifest <name-or-id>     # reproducibility manifest
+alch experiments compare <ref> <ref> ...   # multi-experiment compare
+alch experiments timeline <name-or-id>     # event timeline
+alch experiments bundle <name-or-id>       # one-shot research export
+                                           # (detail + summary + diff + manifest +
+                                           #  timeline + decision + artifacts)
+alch experiments report --family pretrain \
+    --decision none --limit 25             # filtered family/decision/status rollup:
+                                           # counts, leaderboard, per-exp briefs
+alch experiments report --family pretrain \
+    --format markdown                      # render the same report as Markdown
+                                           # (default --format json is unchanged)
+alch experiments report --family pretrain \
+    --format markdown --output report.md   # write rendered output to a local file
+alch experiments fork-plan <name-or-id> \
+    --set lr=0.0002 --unset warmup \
+    --reason "ablation"                    # local dry-run: prints proposed config + diff
+```
+
+The `bundle` command is meant for research handoff and batch export — a
+single GET that returns everything needed to reconstruct an experiment's
+context (parent/child, validation rollups, config diff, timeline, decision,
+artifact locators, best-effort git manifest). It is **not** a live dashboard
+replacement; for streaming metrics keep using `log_eval` and the web UI.
+Manifest is best-effort: when `git_tracking` is disabled or no stub is
+online, `manifest.content` is `null` and `manifest.status` explains why.
+
+The `report` command is the family-scoped counterpart to `bundle`: one GET
+returns counts (by status, by decision), the leaderboard for the shared
+primary metric, and per-experiment briefs (decision, recent events,
+artifact/checkpoint counts). It does **not** touch git manifests and never
+writes events. Use it to answer "which runs in this family are
+keep/drop/rerun/fork/undecided, and which is currently winning the goal
+metric?" without paging through every detail page. `--limit` defaults to 50
+and is capped at 200 server-side.
+
+`--format markdown` is a **local-only** formatter applied on top of the same
+read-only GET — no extra requests, no server-side rendering. It produces a
+deterministic Markdown table layout (filters, counts, metric, leaderboard,
+per-experiment briefs) suitable for pasting into Discord / PRs / notes. The
+JSON shape is unchanged and remains the default. `--output PATH` writes the
+selected format to a local file (parent dir must exist) and prints a short
+confirmation to stderr instead of dumping to stdout.
+
+These are safe to run during live training: they only issue `GET` requests
+against the Alchemy server. `fork-plan` in particular does **not** submit a
+fork — pipe the manifest into your Python `Experiment().fork(...).submit()`
+flow when you want to actually create the child experiment.
+
+### Operator CLI: research metadata commands
+
+```bash
+alch experiments note <name-or-id> "loss flattened at step 12k" \
+    --data '{"metric": 0.91}'
+
+alch experiments artifact <name-or-id> s3://bucket/runs/abc/tb \
+    --type tensorboard --name tb           # URI vs path is auto-detected
+
+alch experiments checkpoint <name-or-id> /runs/abc/ckpt.pt --step 10000
+
+alch experiments decide <name-or-id> keep \
+    --reason "best zN with stable loss"    # also: drop / rerun / fork
+```
+
+These write **metadata only**:
+
+- `note`, `artifact`, `checkpoint` append to the append-only event log.
+- `decide` `PATCH`es the experiment decision + reason.
+- None of these submit work, retry tasks, or change scheduler / runtime /
+  stub state.
+- Actor is derived server-side from the auth token. The CLI never sends
+  `actor`.
+
+### Review workflow
+
+Once a family is in flight, the recommended loop for triaging it is:
+
+1. **Filter the family** in the dashboard (`/experiments`) — the review
+   workspace at the top of the page loads the same `research-report`
+   payload `alch experiments report` returns. The panel surfaces counts
+   by status / decision, the leaderboard against the family's goal
+   metric, and an undecided queue with artifact / checkpoint hints.
+2. **Inspect a candidate** by clicking a leaderboard or queue row.
+   The selected experiment block shows task counts, primary-metric best,
+   artifact / checkpoint counts, and the last few timeline events — just
+   enough to decide whether to keep, drop, rerun, or fork.
+3. **Export the family report** straight from the dashboard — the
+   workspace has both a "download JSON" and a "download Markdown"
+   button (Markdown is rendered locally from the already-fetched
+   report, so it works offline against the same payload the panel
+   shows). For a CLI-driven copy:
+
+   ```bash
+   alch experiments report --family <family> --format markdown --output report.md
+   ```
+
+4. **Export the selected run's bundle** for batch handoff:
+
+   ```bash
+   alch experiments bundle <name-or-id>
+   ```
+
+5. **Preview a fork as a dry-run** before committing to the work:
+
+   ```bash
+   alch experiments fork-plan <name-or-id> --reason "ablate X"
+   ```
+
+6. **Decide** via the experiment detail page (which already owns the
+   decision form) or from the CLI: `alch experiments decide <ref> keep
+   --reason "…"`. The review workspace itself is intentionally
+   read-only — it never `POST`s notes or `PATCH`es decisions.
+
+All of these calls are `GET`-only except step 6. The dashboard panel,
+SDK client (`ExperimentClient.research_report` /
+`.research_report_markdown` / `.research_bundle` / `.fork_plan`), and
+CLI all hit the same endpoints and produce identical Markdown for the
+same payload — the renderer in `alchemy_sdk.experiments` is pure and
+deterministic, so output pasted into PRs or notes is reproducible.

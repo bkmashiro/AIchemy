@@ -580,6 +580,14 @@ function handleResume(
   const stubVersion = payload.stub_version;
   const enforceVersion = process.env.ALCHEMY_ENFORCE_VERSION === "1" || process.env.ALCHEMY_ENFORCE_VERSION === "true";
   if (!stubVersion) {
+    if (enforceVersion) {
+      const error = `Alchemy version missing in resume payload. Expected server=${ALCHEMY_VERSION}.`;
+      const details = { hostname, server_version: ALCHEMY_VERSION };
+      logger.error("stub.version_missing", details);
+      socket.emit("resume_response", { error, server_version: ALCHEMY_VERSION, stub_version: undefined });
+      socket.disconnect(true);
+      return;
+    }
     logger.warn("stub.version_missing", { hostname, server_version: ALCHEMY_VERSION });
   } else if (stubVersion !== ALCHEMY_VERSION) {
     const details = { hostname, stub_version: stubVersion, server_version: ALCHEMY_VERSION };

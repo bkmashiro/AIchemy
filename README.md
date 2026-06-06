@@ -99,11 +99,11 @@ with Alchemy(server="http://localhost:3001", collect_gpu=True) as al:
         loss = train_step()
         al.log(step=step, total=100000, loss=loss)
 
-        if al.should_stop:
+        if al.should_stop():
             save_checkpoint()
             break
 
-        if al.should_checkpoint:
+        if al.should_checkpoint():
             save_checkpoint()
             al.checkpoint("ckpt.pt")
 ```
@@ -123,6 +123,68 @@ from alchemy_sdk.callbacks import AlchemyHFCallback
 
 trainer = Trainer(..., callbacks=[AlchemyHFCallback()])
 ```
+
+## Experiment Lineage + Research Loop
+
+Inspect experiments, annotate them with notes / artifacts / checkpoints, and
+record keep/drop/rerun/fork decisions — without restarting tasks or mutating
+scheduler state.
+
+```python
+from alchemy_sdk import ExperimentClient
+
+ec = ExperimentClient(server="https://alchemy.example.com", token="...")
+ec.list(family="pretrain", decision="keep", status="running")  # server-side filters
+ec.tree()                       # lineage forest
+ec.summary("curiosity_s42")     # rollups + best metrics
+ec.diff("curiosity_s42")        # config diff vs parent
+ec.timeline("curiosity_s42")    # append-only event log
+ec.compare(["alpha", "beta"])   # cross-experiment compare (cap 6)
+ec.fork_plan("alpha",           # local dry-run: print proposed config + diff
+             set_overrides={"lr": 0.0002},
+             unset_keys=["warmup"],
+             reason="ablation")
+```
+
+Read-only CLI (only `GET`s):
+
+```bash
+alch experiments ls --family pretrain --decision none --status running
+alch experiments show <name-or-id>
+alch experiments timeline <name-or-id>
+alch experiments summary|diff|manifest <name-or-id>
+alch experiments compare <ref> <ref> [...]
+alch experiments fork-plan <name-or-id> --set lr=0.0002 --unset warmup --reason "ablation"
+```
+
+Annotation CLI (write metadata events; the server derives the actor, the CLI
+never sends `actor`):
+
+```bash
+alch experiments note <name-or-id> "loss flattened at step 12k" \
+  --data '{"metric": 0.91}'
+
+alch experiments artifact <name-or-id> s3://bucket/runs/abc/tb \
+  --type tensorboard --name tb
+
+alch experiments checkpoint <name-or-id> /runs/abc/ckpt.pt --step 10000
+
+alch experiments decide <name-or-id> keep \
+  --reason "best zN with stable loss"
+```
+
+Semantics:
+
+- `note`, `artifact`, `checkpoint`, `decide` write **metadata only** — they
+  do not submit work, retry tasks, or mutate scheduler/runtime/stub state.
+- `fork-plan` is **read-only**: it fetches the parent and prints a proposed
+  config + diff so you can review before piping it into a Python
+  `Experiment().fork(...).submit()` call.
+- Config overrides for `fork-plan` accept **flat top-level keys only** for
+  now; dotted keys like `model.lr` are rejected at the CLI/SDK layer.
+- The CLI never sends `actor`. The server derives it from the auth token.
+
+See `SDK.md` for the full lineage surface.
 
 ## SLURM Integration
 
@@ -164,6 +226,20 @@ cd . && python tests/simulate.py --stubs 2 --tasks 5
 | GET | `/api/stubs/:id` | Get stub details |
 | DELETE | `/api/stubs/offline` | Purge offline stubs |
 | GET | `/api/stubs/:id/metrics` | Stub GPU metrics history |
+| **Experiments** | | |
+| POST | `/api/experiments` | Create experiment + DAG of tasks (idempotent by name) |
+| GET | `/api/experiments` | List experiments |
+| GET | `/api/experiments/tree` | Lineage forest via frozen `parent_id` edges |
+| GET | `/api/experiments/compare?ids=a,b` | Multi-experiment summary/diff (cap 6) |
+| GET | `/api/experiments/:id` | Experiment detail (tasks, intent, decision, config) |
+| GET | `/api/experiments/:id/diff` | Config diff vs parent |
+| GET | `/api/experiments/:id/summary` | Rollups and best metrics |
+| GET | `/api/experiments/:id/manifest` | Reproducibility manifest |
+| GET | `/api/experiments/:id/timeline` | Append-only event log + synthesized task events |
+| POST | `/api/experiments/:id/events` | Append a note / op event |
+| PATCH | `/api/experiments/:id/decision` | Set keep / drop / rerun / fork + reason |
+| POST | `/api/experiments/:id/retry-failed` | Re-submit failed leaves |
+| DELETE | `/api/experiments/:id` | Soft-delete experiment record (timeline kept) |
 | **Tasks** | | |
 | POST | `/api/stubs/:id/tasks` | Submit task to stub |
 | POST | `/api/tasks` | Submit to global queue |

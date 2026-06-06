@@ -6,6 +6,41 @@
 
 ---
 
+## Status (current state)
+
+The MVP described here is **implemented**, and the research-loop surfaces on
+top of it (timeline / note / decide / artifact / checkpoint / fork-plan /
+list filters) have shipped too. The full lineage rail is documented in
+`plans/research-lineage-gitlens.md`. Quick map:
+
+| Concept here                               | Where it lives                                                  |
+|--------------------------------------------|-----------------------------------------------------------------|
+| `Experiment.config` + `fork()` + diff      | `sdk/alchemy_sdk/experiment.py`                                  |
+| `parent_id` frozen at write time           | `server/src/api/experiments.ts` `POST /` handler                 |
+| `resolved_config` per task                 | task spec build in server experiments router                     |
+| `GET /api/experiments/:id/diff`            | `server/src/api/experiments.ts`                                  |
+| Web config diff card                       | `web/src/components/experiments/ExperimentConfigDiffCard.tsx`    |
+| CLI `experiments diff/manifest/compare`    | `sdk/alchemy_sdk/cli/main.py`                                    |
+| CLI `experiments timeline/note/decide`     | `sdk/alchemy_sdk/cli/main.py`                                    |
+| CLI `experiments artifact/checkpoint`      | `sdk/alchemy_sdk/cli/main.py` (`POST /experiments/<id>/events`)  |
+| CLI `experiments fork-plan` (read-only)    | `sdk/alchemy_sdk/cli/main.py` — never POSTs                      |
+| CLI `experiments ls --family/--decision/--status` | server-side filters in `server/src/api/experiments.ts`    |
+| Read-only `ExperimentClient`               | `sdk/alchemy_sdk/experiments.py` (incl. `timeline`, `fork_plan`) |
+
+Sections below describe the original design intent. Anywhere the running
+implementation has drifted, the source files above are authoritative.
+
+Deferred / not implemented as written:
+
+- the `ALCHEMY_CONFIG` env-var injection path (§1.2, §6.3) is **not** wired:
+  tasks receive `resolved_config` through their spec, not via a temp JSON file.
+  Treat that flow as future work, not as the current contract.
+- the "Web 端展示" mockups in §5 predate the GitLens rail; current layout is
+  in `web/src/pages/ExperimentsPage.tsx` and the components under
+  `web/src/components/experiments/`.
+
+---
+
 ## 1. Config 作为一等公民
 
 ### 1.1 Experiment 新增 `config` 字段
@@ -159,7 +194,44 @@ interface Experiment {
 }
 ```
 
-Server 在收到 `parent_name` 时，尝试查找最近同名已完成的 experiment，填充 `parent_id`。找不到也不报错——lineage 是 best-effort。
+Server 在收到 `parent_name` 时，尝试查找最近同名已完成的 experiment，填充并冻结 `parent_id`。找不到也不报错——lineage 是 best-effort，但后续读取不再重新猜 parent。
+
+### 2.4 Intent / Decision / Timeline（已落地的 MVP）
+
+Experiment 现在还可以记录科研意图和后续决策：
+
+```python
+exp = Experiment(
+    "scale40_v2",
+    family="scale40",
+    hypothesis="降低 batch size 会改善不稳定训练",
+    expected_outcome="eval win-rate 提升且 loss variance 下降",
+)
+
+v3 = exp.fork(
+    "scale40_v3",
+    fork_reason="v2 loss variance 仍高，继续调 var_coef",
+)
+```
+
+CLI 查询和注释：
+
+```bash
+alch experiments ls
+alch experiments show scale40_v2
+alch experiments timeline scale40_v2
+alch experiments note scale40_v2 "seed 42 明显更稳" --data '{"eval_win_rate":0.91}'
+alch experiments decide scale40_v2 keep --reason "目前 best run，可作为下一轮 parent"
+```
+
+Web dashboard 的 experiment detail 页会显示：
+
+- Intent：hypothesis、expected outcome、family、parent/fork reason
+- Decision：keep/drop/rerun/fork 和 reason，可直接在页面更新
+- Lineage：ancestor breadcrumb 和直接 forks
+- Timeline：created/forked/note/decision 等 append-only events，可直接添加 note
+
+事件存储是 append-only；软删除 experiment 不删除 timeline/audit 历史。`actor` 由 server 端身份推导，CLI/Web 不传。
 
 ---
 

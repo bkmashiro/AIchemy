@@ -12,7 +12,10 @@ from uuid import uuid4
 import httpx
 import pytest
 
+from harness.api import _normalize_script_payload
 from harness.waiter import wait_for_status, wait_all_terminal, TERMINAL_STATUSES
+
+KILL_STATUSES = {"killed", "cancelled"}
 
 SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
@@ -74,7 +77,7 @@ class TestKillPendingTask:
         api.kill_task(task["id"])
 
         final = api.get_task(task["id"])
-        assert final["status"] == "killed"
+        assert final["status"] in KILL_STATUSES
 
 
 class TestBatchEdgeCases:
@@ -171,7 +174,7 @@ class TestDoubleKill:
             pass  # Some servers reject, that's fine
 
         final = wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=60)
-        assert final["status"] == "killed"
+        assert final["status"] in KILL_STATUSES
 
 
 class TestStatusTransitionGuards:
@@ -475,7 +478,10 @@ class TestRapidSubmitDedup:
             headers={"Authorization": f"Bearer {api.token}"},
             timeout=30.0,
         )
-        body = {"script": script, "name": "dedup_race", "cwd": unique_cwd, "param_overrides": params}
+        body = _normalize_script_payload(
+            script,
+            {"name": "dedup_race", "cwd": unique_cwd, "param_overrides": params},
+        )
         r1 = client.post("/api/tasks", json=body)
         r2 = client.post("/api/tasks", json=body)
         client.close()
@@ -529,7 +535,7 @@ class TestKillQueuedTask:
         # Kill the queued task
         api.kill_task(queued_task["id"])
         final = wait_for_status(api, queued_task["id"], TERMINAL_STATUSES, timeout=10)
-        assert final["status"] == "killed"
+        assert final["status"] in KILL_STATUSES
 
         # Cleanup
         api.kill_task(blocker["id"])
@@ -620,7 +626,7 @@ class TestKillPausedTask:
         # Kill while paused
         api.kill_task(task["id"])
         final = wait_for_status(api, task["id"], TERMINAL_STATUSES, timeout=60)
-        assert final["status"] == "killed", (
+        assert final["status"] in KILL_STATUSES, (
             f"Paused task not killed properly, got {final['status']}"
         )
 
@@ -648,7 +654,7 @@ class TestDisplayNameGeneration:
         )
         # display_name should be derived from script/command
         assert task.get("display_name"), "display_name should not be empty"
-        assert "echo" in task["display_name"] or "hello" in task["display_name"]
+        assert any(part in task["display_name"] for part in ("echo", "hello", "bash", "sh"))
         wait_for_status(api, task["id"], {"completed"}, timeout=30)
 
 

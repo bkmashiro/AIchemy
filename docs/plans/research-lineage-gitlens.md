@@ -2,6 +2,42 @@
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
+## Status
+
+Phase 1 (intent / decision / timeline / detail panel), Phase 2
+(lineage tree, summary, compare, GitLens-style rail with detached labels,
+selected-path continuity), and the research-loop closeout (artifact /
+checkpoint metadata events, `fork-plan` dry-run, server-side `ls` filters) are
+**implemented**. The implementation tasks below are kept for context but
+should be read as "shipped, not pending":
+
+- Server: `server/src/api/experiments.ts`, `server/src/store/index.ts`
+  (`experiment_events` table), `server/src/experiment-summary.ts`.
+- SDK: `sdk/alchemy_sdk/experiment.py`, `sdk/alchemy_sdk/submit.py`,
+  `sdk/alchemy_sdk/experiments.py` (read-only client; now also exposes
+  `timeline()`, `fork_plan()`, and filtered `list(family=, decision=,
+  status=)`), `sdk/alchemy_sdk/cli/main.py` (`experiments ls/show/timeline/
+  note/decide/tree/compare/summary/diff/manifest/artifact/checkpoint/
+  fork-plan`).
+- Web: `web/src/pages/ExperimentsPage.tsx` +
+  `web/src/components/experiments/*` (Intent, Decision, Lineage, Timeline,
+  Matrix, GitLens lineage rail, Config diff, Research call cards).
+
+Open follow-ups (not started):
+
+- automatic recommendations driven by `goal_metric`/`goal_direction`;
+- on-tree key-diff chips (currently only in the dedicated diff card);
+- selected-lineage task links: when the lineage graph preview/highlight points
+  at another experiment, the selected detail strip should expose associated
+  task links directly (for example task count plus running/best/first task
+  chips linking to `/tasks/:id`) instead of forcing users to open the
+  experiment detail page and scroll to the Tasks table;
+- graph-canvas / spatial layout beyond the current vertical rail;
+- mutating `add_note` / `decide` / `add_artifact` / `add_checkpoint`
+  helpers on `ExperimentClient`. Deliberately deferred to preserve the
+  client's read-only contract — use the `alch experiments …` CLI for now,
+  or call the `POST/PATCH` endpoints directly.
+
 **Goal:** Turn Alchemy's existing Experiment feature into a research lineage system: a GitLens-like view where researchers can see what changed, why it changed, what ran, what failed, what won, and where each experiment fork came from.
 
 **Architecture:** Reuse the existing Experiment SDK/API/Web surfaces. Add persistent timeline/decision metadata, explicit intent fields, CLI annotation/query commands, and a web detail panel first. Do **not** create a parallel tracking service; Alchemy remains the source of truth for tasks, metrics, configs, artifacts, and lineage.

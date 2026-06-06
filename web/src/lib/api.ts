@@ -290,6 +290,334 @@ export const metricsApi = {
   getTaskMetrics: (taskId: string) => api.get(`/tasks/${taskId}/metrics`).then((r) => r.data),
 };
 
+// ─── Experiments API ─────────────────────────────────────────────────────────
+
+export type ExperimentDecision = "keep" | "drop" | "rerun" | "fork";
+
+export type ExperimentEventKind =
+  | "created"
+  | "forked"
+  | "task_started"
+  | "task_completed"
+  | "task_failed"
+  | "resumed"
+  | "moved_stub"
+  | "metric_best"
+  | "note"
+  | "decision"
+  | "artifact"
+  | "checkpoint";
+
+export interface ExperimentEvent {
+  id: string;
+  experiment_id: string;
+  task_id?: string;
+  kind: ExperimentEventKind;
+  message: string;
+  created_at: string;
+  actor?: string;
+  data?: Record<string, any>;
+  deleted_at?: string;
+}
+
+export interface CriterionResult {
+  value: number;
+  threshold: string;
+  ok: boolean;
+}
+
+export interface TaskValidation {
+  passed: boolean;
+  checked_at: string;
+  details: Record<string, CriterionResult>;
+}
+
+export interface Experiment {
+  id: string;
+  name: string;
+  description?: string;
+  criteria: Record<string, string>;
+  grid_id: string;
+  status: "running" | "passed" | "partial" | "failed";
+  results: Record<string, TaskValidation>;
+  created_at: string;
+  // Lineage
+  config?: Record<string, any>;
+  config_diff?: Record<string, { old: any; new: any }>;
+  parent_name?: string;
+  parent_id?: string;
+  // Intent
+  family?: string;
+  hypothesis?: string;
+  expected_outcome?: string;
+  fork_reason?: string;
+  // Decision
+  decision?: ExperimentDecision;
+  decision_reason?: string;
+  decision_at?: string;
+  // Goal metric (lineage phase 2)
+  goal_metric?: string;
+  goal_direction?: "min" | "max";
+  // Git tracking
+  git_tracking?: boolean;
+  git_repo_path?: string;
+}
+
+export interface ExperimentDetail extends Experiment {
+  grid?: {
+    id: string;
+    display_name: string;
+    script: string;
+    param_space: Record<string, unknown[]>;
+    task_ids: string[];
+  };
+  tasks?: Task[];
+}
+
+export interface ExperimentTimelineResponse {
+  experiment_id: string;
+  events: ExperimentEvent[];
+}
+
+export interface AddEventPayload {
+  kind: ExperimentEventKind;
+  message: string;
+  task_id?: string;
+  data?: Record<string, any>;
+}
+
+export interface ExperimentBrief {
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  family: string | null;
+  parent_id: string | null;
+  decision: ExperimentDecision | null;
+  fork_reason: string | null;
+  goal_metric: string | null;
+  goal_direction: "min" | "max" | null;
+  recommendation?: ExperimentRecommendation | null;
+  diff_summary?: ExperimentDiffSummary | null;
+  created_at: string;
+}
+
+export interface PrimaryMetric {
+  metric: string;
+  direction: "min" | "max";
+  best: number | null;
+}
+
+export interface ExperimentRecommendation {
+  action: string | null;
+  verdict: string | null;
+  reason: string | null;
+  metric: string | null;
+  value: number | null;
+  baseline_value: number | null;
+  delta: number | null;
+  direction: string | null;
+}
+
+export interface ExperimentDiffSummary {
+  config_changed: boolean;
+  config_change_count: number;
+  metric_delta: number | null;
+  metric: string | null;
+  direction: "min" | "max" | null;
+  status_changed_from_parent: boolean | null;
+  parent_status: Experiment["status"] | null;
+}
+
+export interface MetricDeltaEntry {
+  id: string;
+  best: number | null;
+  delta: number | null;
+}
+
+export interface ExperimentTreeNode extends ExperimentBrief {
+  children: ExperimentTreeNode[];
+}
+
+export interface ExperimentMetricAggregate {
+  count: number;
+  values: number[];
+  min: number;
+  max: number;
+  mean: number;
+  best: number;
+  passed: number;
+  failed: number;
+}
+
+export interface ExperimentPassFailSummary {
+  total: number;
+  passed: number;
+  failed: number;
+}
+
+export interface ExperimentCompareItem extends ExperimentBrief {
+  config: Record<string, any> | null;
+  criteria: Record<string, string>;
+  metrics: Record<string, ExperimentMetricAggregate>;
+  best_metrics: Record<string, number>;
+  primary_metric: PrimaryMetric | null;
+  pass_fail: ExperimentPassFailSummary;
+}
+
+export interface ExperimentCompareResponse {
+  ids: string[];
+  found: string[];
+  missing: string[];
+  experiments: ExperimentCompareItem[];
+  shared_config_keys: string[];
+  differing_config_keys: string[];
+  metric_deltas: Record<string, MetricDeltaEntry[]>;
+}
+
+export interface ExperimentDiffResponse {
+  experiment_id: string;
+  name: string;
+  config: Record<string, any> | null;
+  config_diff: Record<string, { old: any; new: any }> | null;
+  parent_name: string | null;
+  parent_id: string | null;
+  parent_config?: Record<string, any> | null;
+}
+
+export interface ExperimentResearchReportFilters {
+  family: string | null;
+  decision: string | null;
+  status: string | null;
+  limit: number;
+}
+
+export interface ExperimentResearchReportCounts {
+  total: number;
+  by_status: Record<string, number>;
+  by_decision: Record<string, number>;
+}
+
+export interface ExperimentResearchReportMetric {
+  name: string;
+  direction: "min" | "max";
+}
+
+export interface ExperimentResearchReportLeaderEntry {
+  rank: number;
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  decision: ExperimentDecision | null;
+  value: number;
+  metric: string;
+}
+
+export interface ExperimentResearchReportBlock {
+  id: string;
+  name: string;
+  family: string | null;
+  status: Experiment["status"];
+  decision: ExperimentDecision | null;
+  decision_reason: string | null;
+  decision_at: string | null;
+  created_at: string;
+  parent_id: string | null;
+  children: ExperimentBrief[];
+  recommendation?: ExperimentRecommendation | null;
+  diff_summary?: ExperimentDiffSummary | null;
+  task_counts: Record<string, number>;
+  primary_metric: { metric: string; direction: "min" | "max"; best: number | null } | null;
+  artifact_count: number;
+  checkpoint_count: number;
+  recent_events: ExperimentEvent[];
+}
+
+export interface ExperimentResearchReportResponse {
+  filters: ExperimentResearchReportFilters;
+  generated_at: string;
+  counts: ExperimentResearchReportCounts;
+  metric: ExperimentResearchReportMetric | null;
+  leaderboard: ExperimentResearchReportLeaderEntry[];
+  experiments: ExperimentResearchReportBlock[];
+}
+
+export interface ExperimentSummaryResponse {
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  family: string | null;
+  hypothesis: string | null;
+  expected_outcome: string | null;
+  fork_reason: string | null;
+  goal_metric: string | null;
+  goal_direction: "min" | "max" | null;
+  decision: ExperimentDecision | null;
+  decision_reason: string | null;
+  decision_at: string | null;
+  created_at: string;
+  parent: ExperimentBrief | null;
+  children: ExperimentBrief[];
+  task_counts: Record<string, number>;
+  validation: ExperimentPassFailSummary;
+  best_metrics: Record<string, number>;
+  primary_metric: PrimaryMetric | null;
+  recommendation: ExperimentRecommendation | null;
+  timeline_event_count: number;
+  config: Record<string, any> | null;
+  config_diff: Record<string, { old: any; new: any }> | null;
+}
+
+export const experimentsApi = {
+  list: () => api.get<Experiment[]>("/experiments").then((r) => r.data),
+  get: (id: string) => api.get<ExperimentDetail>(`/experiments/${id}`).then((r) => r.data),
+  delete: (id: string) => api.delete(`/experiments/${id}`).then((r) => r.data),
+  retryFailed: (id: string) => api.post(`/experiments/${id}/retry-failed`).then((r) => r.data),
+  getTimeline: (id: string) =>
+    api.get<ExperimentTimelineResponse>(`/experiments/${id}/timeline`).then((r) => r.data),
+  addEvent: (id: string, payload: AddEventPayload) =>
+    api.post<ExperimentEvent>(`/experiments/${id}/events`, payload).then((r) => r.data),
+  addNote: (id: string, message: string, opts?: { task_id?: string; data?: Record<string, any> }) =>
+    api
+      .post<ExperimentEvent>(`/experiments/${id}/events`, {
+        kind: "note" as ExperimentEventKind,
+        message,
+        task_id: opts?.task_id,
+        data: opts?.data,
+      })
+      .then((r) => r.data),
+  decide: (id: string, decision: ExperimentDecision, reason: string) =>
+    api
+      .patch<Experiment>(`/experiments/${id}/decision`, { decision, reason })
+      .then((r) => r.data),
+  getTree: () =>
+    api.get<{ roots: ExperimentTreeNode[] }>("/experiments/tree").then((r) => r.data.roots),
+  compare: (ids: string[]) =>
+    api
+      .get<ExperimentCompareResponse>("/experiments/compare", { params: { ids: ids.join(",") } })
+      .then((r) => r.data),
+  getSummary: (id: string) =>
+    api.get<ExperimentSummaryResponse>(`/experiments/${id}/summary`).then((r) => r.data),
+  getDiff: (id: string) =>
+    api.get<ExperimentDiffResponse>(`/experiments/${id}/diff`).then((r) => r.data),
+  getResearchBundle: (id: string) =>
+    api.get<Record<string, any>>(`/experiments/${id}/research-bundle`).then((r) => r.data),
+  getResearchReport: (opts: {
+    family?: string;
+    decision?: string;
+    status?: string;
+    limit?: number;
+  } = {}) => {
+    const params: Record<string, string> = {};
+    if (opts.family) params.family = opts.family;
+    if (opts.decision) params.decision = opts.decision;
+    if (opts.status) params.status = opts.status;
+    if (opts.limit != null) params.limit = String(opts.limit);
+    return api
+      .get<ExperimentResearchReportResponse>("/experiments/research-report", { params })
+      .then((r) => r.data);
+  },
+};
+
 // ─── Cost API ─────────────────────────────────────────────────────────────────
 
 export interface CostSummary {

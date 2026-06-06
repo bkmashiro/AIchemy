@@ -1,11 +1,23 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, lazy, Suspense } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { Task, tasksApi, costApi, TaskCost } from "../lib/api";
 import { taskDuration, taskEta, formatRelTime, generateDisplayName } from "../lib/format";
 import LogViewer from "../components/LogViewer";
-import MetricsChart from "../components/MetricsChart";
 import ConfirmDialog from "../components/ConfirmDialog";
 import PhaseBadge from "../components/PhaseBadge";
+
+const MetricsChart = lazy(() => import("../components/MetricsChart"));
+
+function MetricsChartFallback({ height = 220 }: { height?: number }) {
+  return (
+    <div
+      className="bg-gray-900 border border-gray-800 rounded-xl p-3 text-xs text-gray-500"
+      style={{ minHeight: height + 44 }}
+    >
+      Loading metrics…
+    </div>
+  );
+}
 
 const STATUS_COLORS: Record<string, string> = {
   running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
@@ -158,7 +170,9 @@ export default function TaskDetailPage() {
 
       {/* Metrics chart */}
       {(task.status === "running" || task.status === "completed" || task.status === "failed") && (
-        <MetricsChart taskId={task.id} socket={null} />
+        <Suspense fallback={<MetricsChartFallback />}>
+          <MetricsChart taskId={task.id} socket={null} />
+        </Suspense>
       )}
 
       {/* Command */}

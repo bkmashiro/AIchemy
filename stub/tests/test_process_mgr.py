@@ -32,7 +32,7 @@ import pytest
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from alchemy_stub.process_mgr import ProcessInfo, ProcessManager, _log_path, _log_dir
+from alchemy_stub.process_mgr import ProcessInfo, ProcessManager, _log_path, _log_dir, _task_shell
 
 
 # ===========================================================================
@@ -173,6 +173,31 @@ class TestBuildScript:
         lines = [l for l in script.splitlines() if l.strip()]
         assert lines[0] == "set -e"
         assert lines[-1] == "mycommand"
+
+
+# ===========================================================================
+# _task_shell
+# ===========================================================================
+
+
+class TestTaskShell:
+    def test_task_shell_prefers_bash(self, monkeypatch):
+        monkeypatch.setattr(
+            "alchemy_stub.process_mgr.shutil.which",
+            lambda name: "/usr/bin/bash" if name == "bash" else "/bin/sh",
+        )
+        assert _task_shell() == "/usr/bin/bash"
+
+    def test_task_shell_falls_back_to_sh(self, monkeypatch):
+        monkeypatch.setattr(
+            "alchemy_stub.process_mgr.shutil.which",
+            lambda name: None if name == "bash" else "/bin/sh",
+        )
+        assert _task_shell() == "/bin/sh"
+
+    def test_task_shell_falls_back_to_bin_sh_when_not_found(self, monkeypatch):
+        monkeypatch.setattr("alchemy_stub.process_mgr.shutil.which", lambda name: None)
+        assert _task_shell() == "/bin/sh"
 
 
 # ===========================================================================
@@ -647,6 +672,45 @@ class TestStart:
         assert pid == 42
         assert "task-spawn" in mgr._procs
         mock_popen.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_prefers_bash_for_wrapper_shell(self, mgr, log_dir):
+        mock_proc = MagicMock()
+        mock_proc.pid = 43
+        popen_args = []
+
+        def capture_popen(*args, **kwargs):
+            popen_args.append(args[0])
+            return mock_proc
+
+        with patch("alchemy_stub.process_mgr.shutil.which", side_effect=lambda name: "/bin/bash" if name == "bash" else "/bin/sh"):
+            with patch("subprocess.Popen", side_effect=capture_popen):
+                await mgr.start(task_id="task-shell-bash", command="echo hello")
+
+        assert popen_args[0][0] == "/bin/bash"
+
+    @pytest.mark.asyncio
+    async def test_start_falls_back_to_sh_when_bash_missing(self, mgr, log_dir):
+        mock_proc = MagicMock()
+        mock_proc.pid = 44
+        popen_args = []
+
+        def capture_popen(*args, **kwargs):
+            popen_args.append(args[0])
+            return mock_proc
+
+        def fake_which(name):
+            return None if name == "bash" else "/bin/sh"
+
+        with patch("alchemy_stub.process_mgr.shutil.which", side_effect=fake_which):
+            with patch("subprocess.Popen", side_effect=capture_popen):
+                await mgr.start(task_id="task-shell-sh", command="echo hello")
+
+        assert popen_args[0][0] == "/bin/sh"
+
+    def test_task_shell_last_resort_is_bin_sh(self):
+        with patch("alchemy_stub.process_mgr.shutil.which", return_value=None):
+            assert _task_shell() == "/bin/sh"
 
     @pytest.mark.asyncio
     async def test_start_saves_pid(self, mgr, log_dir, pid_file):
