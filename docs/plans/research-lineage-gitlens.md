@@ -27,6 +27,11 @@ Open follow-ups (not started):
 
 - automatic recommendations driven by `goal_metric`/`goal_direction`;
 - on-tree key-diff chips (currently only in the dedicated diff card);
+- selected-lineage task links: when the lineage graph preview/highlight points
+  at another experiment, the selected detail strip should expose associated
+  task links directly (for example task count plus running/best/first task
+  chips linking to `/tasks/:id`) instead of forcing users to open the
+  experiment detail page and scroll to the Tasks table;
 - graph-canvas / spatial layout beyond the current vertical rail;
 - mutating `add_note` / `decide` / `add_artifact` / `add_checkpoint`
   helpers on `ExperimentClient`. Deliberately deferred to preserve the
