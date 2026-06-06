@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import type { ExperimentTreeNode } from "../../lib/api";
+import type { ExperimentTreeNode, Task } from "../../lib/api";
 import {
   DECISION_BADGE,
   countSubtreeNodes,
@@ -25,6 +25,51 @@ type RailRow = {
   // so the rail at that column should render with the path-highlight color.
   railOnPath: boolean[];
 };
+
+function taskPriority(status: Task["status"]): number {
+  switch (status) {
+    case "running":
+      return 0;
+    case "completed":
+      return 1;
+    case "pending":
+    case "queued":
+    case "dispatched":
+    case "paused":
+      return 2;
+    case "failed":
+    case "killed":
+    case "lost":
+      return 3;
+    default:
+      return 2;
+  }
+}
+
+function orderTaskLinks(tasks: Task[]): Task[] {
+  return tasks
+    .map((task, index) => ({ task, index, priority: taskPriority(task.status) }))
+    .sort((a, b) => {
+      if (a.priority !== b.priority) return a.priority - b.priority;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.task);
+}
+
+function taskStatusChipClass(status: Task["status"]): string {
+  switch (status) {
+    case "running":
+      return "text-blue-400 border-blue-700/60";
+    case "completed":
+      return "text-green-400 border-green-700/60";
+    case "failed":
+    case "killed":
+    case "lost":
+      return "text-red-400 border-red-700/60";
+    default:
+      return "text-gray-500 border-gray-700/60";
+  }
+}
 
 const FOLD_DEPTH_LIMIT = 2;
 
@@ -264,9 +309,11 @@ function RailRowView({
 function SelectedDetailStrip({
   node,
   pageId,
+  tasks,
 }: {
   node: ExperimentTreeNode;
   pageId: string;
+  tasks?: Task[];
 }) {
   const statusClass =
     node.status === "passed"
@@ -280,6 +327,9 @@ function SelectedDetailStrip({
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
   const isPage = node.id === pageId;
+  const orderedTasks = orderTaskLinks(tasks ?? []);
+  const shownTasks = orderedTasks.slice(0, 3);
+
   return (
     <div className="mt-3 border-t border-gray-800 pt-2 text-[11px] text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1">
       <span className="text-[10px] uppercase tracking-wide text-gray-600">
@@ -306,6 +356,24 @@ function SelectedDetailStrip({
           fork: {node.fork_reason}
         </span>
       )}
+      <span className={`text-[10px] uppercase tracking-wide ${
+        orderedTasks.length === 0 ? "text-gray-500" : "text-gray-600"
+      }`}>
+        Tasks: {orderedTasks.length}
+      </span>
+      {orderedTasks.length > 0 &&
+        shownTasks.map((task) => (
+          <Link
+            key={task.id}
+            to={`/tasks/${task.id}`}
+            title={`${task.display_name}`}
+            className={`text-[10px] px-1.5 py-0.5 rounded border ${taskStatusChipClass(
+              task.status,
+            )} hover:opacity-90 bg-white/5`}
+          >
+            #{task.seq} · {task.status}
+          </Link>
+        ))}
       {!isPage && (
         <Link
           to={`/experiments/${node.id}`}
@@ -322,11 +390,13 @@ export function ExperimentLineageGraphCard({
   roots,
   currentId,
   pageId = currentId,
+  selectedTasks,
   onSelectExperiment,
 }: {
   roots: ExperimentTreeNode[] | null;
   currentId: string;
   pageId?: string;
+  selectedTasks?: Task[];
   onSelectExperiment: (id: string) => void;
 }) {
   if (roots === null) {
@@ -369,7 +439,13 @@ export function ExperimentLineageGraphCard({
               />
             ))}
           </div>
-          {selected && <SelectedDetailStrip node={selected} pageId={pageId} />}
+          {selected && (
+            <SelectedDetailStrip
+              node={selected}
+              pageId={pageId}
+              tasks={selectedTasks}
+            />
+          )}
         </>
       )}
     </div>

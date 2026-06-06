@@ -5,6 +5,7 @@ import {
   ExperimentDetail,
   ExperimentEvent,
   ExperimentTreeNode,
+  Task,
   ExperimentSummaryResponse,
   ExperimentDiffResponse,
   experimentsApi,
@@ -152,6 +153,7 @@ function ExperimentDetailView() {
   const [summary, setSummary] = useState<ExperimentSummaryResponse | null>(null);
   const [diff, setDiff] = useState<ExperimentDiffResponse | null>(null);
   const [selectedLineageId, setSelectedLineageId] = useState<string | null>(null);
+  const [selectedLineageTasks, setSelectedLineageTasks] = useState<Task[]>([]);
 
   const load = () => {
     if (!id) return;
@@ -177,6 +179,34 @@ function ExperimentDetailView() {
   useEffect(() => {
     if (id) setSelectedLineageId(id);
   }, [id]);
+
+  useEffect(() => {
+    if (!id || !exp) return;
+    if (selectedLineageId !== null && selectedLineageId !== id) return;
+    setSelectedLineageTasks(exp.tasks ?? []);
+  }, [selectedLineageId, id, exp?.tasks]);
+
+  useEffect(() => {
+    if (!id || !exp) return;
+    if (!selectedLineageId || selectedLineageId === id) return;
+
+    let cancelled = false;
+    setSelectedLineageTasks([]);
+    experimentsApi
+      .get(selectedLineageId)
+      .then((selectedExp) => {
+        if (cancelled) return;
+        setSelectedLineageTasks(selectedExp.tasks ?? []);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSelectedLineageTasks([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedLineageId, id, exp?.id]);
 
   useEffect(() => {
     load();
@@ -248,6 +278,7 @@ function ExperimentDetailView() {
           roots={tree}
           currentId={selectedLineageId ?? exp.id}
           pageId={exp.id}
+          selectedTasks={selectedLineageTasks}
           onSelectExperiment={setSelectedLineageId}
         />
         <ExperimentResearchCallCard exp={exp} summary={summary} />
