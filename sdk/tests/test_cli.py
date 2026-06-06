@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from unittest.mock import patch
 
 from alchemy_sdk.cli import main as cli
@@ -117,7 +118,7 @@ def test_slurm_submit_t4_posts_deploy_restart(monkeypatch):
         {
             "method": "POST",
             "url": "http://localhost:3002/api/deploy/stubs/slurm-t4/restart",
-            "body": {},
+            "body": {"server_url": "http://localhost:3002", "token": "secret-token"},
             "auth": "Bearer secret-token",
             "timeout": 20.0,
         }
@@ -186,6 +187,103 @@ def test_experiments_note_posts_event_without_actor(monkeypatch):
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/events"
     assert calls[1]["body"] == {"kind": "note", "message": "looks good", "data": {"metric": 0.9}}
     assert "actor" not in calls[1]["body"]
+
+
+def test_experiments_adopt_posts_existing_tasks_when_confirmed(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "experiments", "adopt", "--name", "retro", "--task", "task-1", "--task", "task-2",
+            "--family", "nh", "--goal-metric", "score", "--goal-direction", "max",
+            "--criteria", '{"score": "> 0"}', "--config", '{"seed": 42}', "--yes",
+        ],
+        [{"id": "exp-1", "name": "retro"}],
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/adopt"
+    assert calls[0]["body"] == {
+        "name": "retro",
+        "task_ids": ["task-1", "task-2"],
+        "family": "nh",
+        "goal_metric": "score",
+        "goal_direction": "max",
+        "criteria": {"score": "> 0"},
+        "config": {"seed": 42},
+    }
+
+
+def test_experiments_adopt_dry_run_does_not_post(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "adopt", "--name", "retro", "--task", "task-1"],
+        [],
+    )
+
+    assert calls == []
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True
+    assert out["method"] == "POST"
+    assert out["path"] == "/experiments/adopt"
+
+
+def test_experiments_adopt_task_dry_run_resolves_but_does_not_post(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "adopt-task", "retro", "--task", "task-1"],
+        [[{"id": "exp-1", "name": "retro"}]],
+    )
+
+    assert [c["method"] for c in calls] == ["GET"]
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True
+    assert out["method"] == "POST"
+    assert out["path"] == "/experiments/exp-1/tasks/adopt"
+
+
+def test_experiments_patch_dry_run_resolves_but_does_not_patch(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "patch", "retro", "--family", "nh"],
+        [[{"id": "exp-1", "name": "retro"}]],
+    )
+
+    assert [c["method"] for c in calls] == ["GET"]
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True
+    assert out["method"] == "PATCH"
+    assert out["path"] == "/experiments/exp-1"
+
+
+def test_experiments_adopt_task_resolves_and_posts_move(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "adopt-task", "retro", "--task", "task-1", "--mode", "move", "--yes"],
+        [
+            [{"id": "exp-1", "name": "retro"}],
+            {"ok": True},
+        ],
+    )
+
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["method"] == "POST"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/tasks/adopt"
+    assert calls[1]["body"] == {"task_ids": ["task-1"], "mode": "move"}
+
+
+def test_experiments_patch_updates_metadata(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "patch", "retro", "--family", "nh", "--goal-direction", "min", "--yes"],
+        [
+            [{"id": "exp-1", "name": "retro"}],
+            {"id": "exp-1", "family": "nh"},
+        ],
+    )
+
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1"
+    assert calls[1]["body"] == {"family": "nh", "goal_direction": "min"}
 
 
 def test_experiments_artifact_posts_event_with_path(monkeypatch):
@@ -752,6 +850,110 @@ def test_experiments_report_help_documents_read_only_contract(capsys):
 def test_experiments_help_lists_report(capsys):
     out = _help_text(["experiments", "--help"], capsys)
     assert "report" in out
+
+
+def test_config_set_persists_state_and_default_client_uses_it(monkeypatch, tmp_path):
+    config_path = tmp_path / "alch-config.json"
+    state_db = tmp_path / "state.db"
+    con = sqlite3.connect(state_db)
+    con.execute("create table tokens (token text)")
+    con.execute("insert into tokens values ('state-token')")
+    con.commit()
+    con.close()
+    monkeypatch.delenv("ALCHEMY_TOKEN", raising=False)
+    monkeypatch.setenv("ALCHEMY_CLI_CONFIG", str(config_path))
+
+    assert cli.main(["config", "set", "--server", "http://alchemy.local", "--state-db", str(state_db)]) == 0
+
+    calls = []
+    def fake_urlopen(req, timeout=20.0):
+        calls.append({"url": req.full_url, "auth": req.headers.get("Authorization")})
+        return FakeResponse([])
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        assert cli.main(["stubs", "ls"]) == 0
+
+    assert json.loads(config_path.read_text())["state_db"] == str(state_db)
+    assert calls == [{"url": "http://alchemy.local/api/stubs", "auth": "Bearer state-token"}]
+
+
+def test_tasks_logs_reads_task_log_buffer(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "logs", "task-1", "--tail", "2"],
+        [{"id": "task-1", "log_buffer": ["a", "b", "c"]}],
+    )
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1"
+    assert capsys.readouterr().out == "b\nc\n"
+
+
+def test_tasks_metrics_reads_task_metric_buffers(monkeypatch, capsys):
+    run_cli(
+        monkeypatch,
+        ["tasks", "metrics", "task-1"],
+        [{"id": "task-1", "metrics_buffer": [{"step": 1, "loss": 0.5}], "metrics": {"loss": 0.5}}],
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"metrics": {"loss": 0.5}, "metrics_buffer": [{"step": 1, "loss": 0.5}]}
+
+
+def test_stubs_canary_posts_deploy_with_connection_body(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["stubs", "canary", "a30", "--mem", "40G", "--stub-server-url", "https://alchemy-v2.yuzhes.com", "--yes"],
+        [{"ok": True, "job_id": "247"}],
+    )
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30"
+    assert calls[0]["body"]["server_url"] == "https://alchemy-v2.yuzhes.com"
+    assert calls[0]["body"]["token"] == "secret-token"
+    assert calls[0]["body"]["mem"] == "40G"
+
+
+def test_tasks_lost_filters_terminal_pretrain_without_active_successor(monkeypatch, capsys):
+    failed = {
+        "id": "old-1", "seq": 1, "status": "failed", "script": "/repo/scripts/train_pretrain_nethack.py",
+        "raw_args": "--config configs/a.yaml --seed 42 --policy twostage", "name": "old",
+    }
+    active_successor = {
+        "id": "new-1", "seq": 2, "status": "running", "script": failed["script"],
+        "raw_args": failed["raw_args"] + " --resume", "name": "old_resume",
+    }
+    orphan = {
+        "id": "old-2", "seq": 3, "status": "cancelled", "script": "/repo/scripts/train_pretrain_nethack.py",
+        "raw_args": "--config configs/b.yaml --seed 7", "name": "orphan",
+    }
+    run_cli(
+        monkeypatch,
+        ["tasks", "lost", "--kind", "nethack-pretrain"],
+        [
+            {"tasks": [failed, orphan]},
+            {"tasks": [active_successor]},
+        ],
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert [row["id"] for row in out] == ["old-2"]
+
+
+def test_tasks_resume_lost_dry_run_does_not_post(monkeypatch, capsys):
+    orphan = {
+        "id": "old-2", "seq": 3, "status": "failed", "script": "/repo/scripts/train_pretrain_nethack.py",
+        "raw_args": "--config configs/b.yaml --seed 7", "name": "orphan", "cwd": "/repo", "run_dir": "/repo/runs/x",
+    }
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "resume-lost", "--kind", "nethack-pretrain", "--to-stub", "stub-a", "--dry-run"],
+        [
+            {"tasks": [orphan]},
+            {"tasks": []},
+            [{"id": "stub-1", "name": "stub-a", "status": "online"}],
+        ],
+    )
+    assert [c["method"] for c in calls] == ["GET", "GET", "GET"]
+    planned = json.loads(capsys.readouterr().out)
+    assert planned[0]["body"]["target_stub_id"] == "stub-1"
+    assert planned[0]["body"]["raw_args"].endswith("--resume")
+    assert "run_dir" not in planned[0]["body"]
 
 
 def test_experiments_bundle_help_documents_read_only_contract(capsys):

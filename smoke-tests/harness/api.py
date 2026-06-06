@@ -2,8 +2,23 @@
 from __future__ import annotations
 
 from typing import Any
+import shlex
 
 import httpx
+
+
+def _normalize_script_payload(script: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Preserve older smoke tests that submit shell command strings."""
+    body = {"script": script, **kwargs}
+    if script.startswith("/"):
+        return body
+    if script.startswith("bash /") and "raw_args" not in kwargs:
+        body["script"] = script[len("bash "):]
+        return body
+    if "raw_args" not in kwargs:
+        body["script"] = "/bin/bash"
+        body["raw_args"] = f"-lc {shlex.quote(script)}"
+    return body
 
 
 class ApiClient:
@@ -29,13 +44,13 @@ class ApiClient:
 
     def submit(self, script: str, **kwargs: Any) -> tuple[dict[str, Any], int]:
         """POST /api/tasks. Returns (response_dict, status_code)."""
-        body = {"script": script, **kwargs}
+        body = _normalize_script_payload(script, kwargs)
         r = self._client.post("/api/tasks", json=body)
         return r.json(), r.status_code
 
     def submit_expect(self, script: str, expected_status: int = 201, **kwargs: Any) -> dict[str, Any]:
         """Submit and assert expected HTTP status. Returns task/error dict."""
-        body = {"script": script, **kwargs}
+        body = _normalize_script_payload(script, kwargs)
         r = self._client.post("/api/tasks", json=body)
         assert r.status_code == expected_status, (
             f"Expected {expected_status}, got {r.status_code}: {r.text}"

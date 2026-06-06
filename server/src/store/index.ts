@@ -712,6 +712,16 @@ class Store {
     return undefined;
   }
 
+  updateArchivedTask(taskId: string, update: Partial<Task>): Task | undefined {
+    const located = this.findTask(taskId);
+    if (!located?.archived) return undefined;
+    const updated = { ...located.task, ...update };
+    this._saveTask(updated, "archive");
+    this._taskIndex.set(taskId, { location: "archive" });
+    this._reindexTask(located.task, updated);
+    return updated;
+  }
+
   updateTask(stubId: string, taskId: string, update: Partial<Task>): Task | undefined {
     const stub = this.stubs.get(stubId);
     if (!stub) return undefined;

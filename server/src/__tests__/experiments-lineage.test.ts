@@ -12,6 +12,7 @@ vi.mock("../git-tracking", () => ({
 }));
 
 import { store } from "../store";
+import { createTask } from "../api/tasks";
 import { createExperimentsRouter } from "../api/experiments";
 
 function makeApp() {
@@ -629,5 +630,212 @@ describe("experiment lineage API", () => {
     expect(store.getExperimentEvents(created.body.id)).toEqual(
       expect.arrayContaining([expect.objectContaining({ kind: "note", message: "keep audit history" })]),
     );
+  });
+
+  it("adopts a running task without changing runtime fields", async () => {
+    const app = makeApp();
+    const task = createTask({ script: "/tmp/train.py", name: "running-adopt", priority: 7 });
+    store.addToGlobalQueue(task);
+    store.setStub({
+      id: "stub-a", name: "stub-a", hostname: "host-a",
+      gpu: { name: "A30", vram_total_mb: 24576, count: 1 },
+      status: "online", type: "slurm",
+      connected_at: "2026-01-01T00:00:00.000Z", last_heartbeat: "2026-01-01T00:00:00.000Z",
+      max_concurrent: 1, tasks: [],
+    });
+    store.moveToStubQueue(task.id, "stub-a");
+    const running = store.updateTask("stub-a", task.id, {
+      status: "running",
+      pid: 1234,
+      started_at: "2026-01-01T00:01:00.000Z",
+      run_dir: "/runs/abc",
+    });
+    expect(running).toBeTruthy();
+
+    const adopted = await request(app)
+      .post("/experiments/adopt")
+      .send({
+        name: "retro-run",
+        task_ids: [task.id],
+        family: "retro",
+        goal_metric: "loss",
+        goal_direction: "min",
+        criteria: { loss: "< 1" },
+      })
+      .expect(201);
+
+    const after = store.findTask(task.id)?.task;
+    expect(after).toEqual(expect.objectContaining({
+      status: "running",
+      pid: 1234,
+      stub_id: "stub-a",
+      run_dir: "/runs/abc",
+      experiment_id: adopted.body.id,
+      grid_id: adopted.body.grid.id,
+      ref: "task-1",
+    }));
+    expect(store.getGrid(adopted.body.grid.id)?.task_ids).toEqual([task.id]);
+    expect(store.getExperimentEvents(adopted.body.id)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: "note", message: "Adopted 1 existing task" })]),
+    );
+  });
+
+  it("attaches and moves tasks between experiment grids safely", async () => {
+    const app = makeApp();
+    const task = createTask({ script: "/tmp/train.py", name: "attach-me" });
+    store.addToGlobalQueue(task);
+
+    const first = await request(app)
+      .post("/experiments/adopt")
+      .send({ name: "first-retro", task_ids: [task.id] })
+      .expect(201);
+    const second = await request(app)
+      .post("/experiments")
+      .send({ name: "second-retro", task_specs: [{ ref: "seed", script: "/tmp/seed.py" }] })
+      .expect(201);
+
+    await request(app)
+      .post(`/experiments/${second.body.id}/tasks/adopt`)
+      .send({ task_ids: [task.id] })
+      .expect(409);
+
+    await request(app)
+      .post(`/experiments/${second.body.id}/tasks/adopt`)
+      .send({ task_ids: [task.id], mode: "move" })
+      .expect(200);
+
+    expect(store.findTask(task.id)?.task.experiment_id).toBe(second.body.id);
+    expect(store.getGrid(first.body.grid.id)?.task_ids).toEqual([]);
+    expect(Object.values(store.getExperiment(first.body.id)?.task_refs || {})).not.toContain(task.id);
+    expect(store.getExperiment(first.body.id)?.status).toBe("running");
+    expect(store.getGrid(second.body.grid_id)?.task_ids).toContain(task.id);
+  });
+
+  it("rejects attach for grid-owned tasks unless move is explicit", async () => {
+    const app = makeApp();
+    const task = createTask({ script: "/tmp/train.py", name: "grid-owned" });
+    store.addToGlobalQueue(task);
+    store.setGrid({
+      id: "old-grid-only",
+      name: "old-grid-only",
+      display_name: "old grid only",
+      script: task.script,
+      param_space: {},
+      task_ids: [task.id],
+      status: "running",
+      created_at: "2026-01-01T00:00:00.000Z",
+      max_retries: 0,
+    });
+    store.updateGlobalQueueTask(task.id, { grid_id: "old-grid-only" });
+    const target = await request(app)
+      .post("/experiments")
+      .send({ name: "grid-owner-target", task_specs: [{ ref: "seed", script: "/tmp/seed.py" }] })
+      .expect(201);
+
+    await request(app)
+      .post(`/experiments/${target.body.id}/tasks/adopt`)
+      .send({ task_ids: [task.id] })
+      .expect(409);
+  });
+
+  it("patches experiment research metadata only", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({ name: "patch-me", task_specs: [{ ref: "train", script: "/tmp/train.py" }] })
+      .expect(201);
+
+    await request(app)
+      .patch(`/experiments/${created.body.id}`)
+      .send({ goal_direction: "sideways" })
+      .expect(400);
+
+    const patched = await request(app)
+      .patch(`/experiments/${created.body.id}`)
+      .send({ family: "nh", goal_metric: "score", goal_direction: "max", config: { seed: 42 }, unknown: "ignored" })
+      .expect(200);
+
+    expect(patched.body).toEqual(expect.objectContaining({
+      family: "nh",
+      goal_metric: "score",
+      goal_direction: "max",
+      config: { seed: 42 },
+    }));
+    expect((patched.body as any).unknown).toBeUndefined();
+    expect(store.getExperimentEvents(created.body.id)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: "note", message: expect.stringContaining("Updated experiment metadata") })]),
+    );
+  });
+
+  it("makes adopt idempotent by name and task set, and rejects owned tasks for new names", async () => {
+    const app = makeApp();
+    const task = createTask({ script: "/tmp/train.py", name: "idempotent-adopt" });
+    store.addToGlobalQueue(task);
+
+    const first = await request(app)
+      .post("/experiments/adopt")
+      .send({ name: "same-retro", task_ids: [task.id] })
+      .expect(201);
+
+    const retry = await request(app)
+      .post("/experiments/adopt")
+      .send({ name: "same-retro", task_ids: [task.id] })
+      .expect(200);
+
+    expect(retry.body.id).toBe(first.body.id);
+    expect(retry.body.idempotent).toBe(true);
+    expect(store.getGrid(first.body.grid.id)?.task_ids).toEqual([task.id]);
+
+    await request(app)
+      .post("/experiments/adopt")
+      .send({ name: "other-retro", task_ids: [task.id] })
+      .expect(409);
+  });
+
+  it("allocates collision-free refs when adopting and moving tasks", async () => {
+    const app = makeApp();
+    const a = createTask({ script: "/tmp/train.py", name: "dup-a" });
+    const b = createTask({ script: "/tmp/train.py", name: "dup-b" });
+    store.addToGlobalQueue({ ...a, ref: "train" });
+    store.addToGlobalQueue({ ...b, ref: "train" });
+
+    const adopted = await request(app)
+      .post("/experiments/adopt")
+      .send({ name: "dup-retro", task_ids: [a.id, b.id] })
+      .expect(201);
+
+    expect(Object.keys(adopted.body.task_refs).sort()).toEqual(["task-2", "train"]);
+    expect(new Set(Object.values(adopted.body.task_refs))).toEqual(new Set([a.id, b.id]));
+  });
+
+  it("adopts archived completed tasks and reports terminal status", async () => {
+    const app = makeApp();
+    const task = createTask({ script: "/tmp/train.py", name: "done-adopt" });
+    store.addToGlobalQueue(task);
+    store.setStub({
+      id: "stub-done", name: "stub-done", hostname: "host-done",
+      gpu: { name: "A30", vram_total_mb: 24576, count: 1 },
+      status: "online", type: "slurm",
+      connected_at: "2026-01-01T00:00:00.000Z", last_heartbeat: "2026-01-01T00:00:00.000Z",
+      max_concurrent: 1, tasks: [],
+    });
+    store.moveToStubQueue(task.id, "stub-done");
+    store.updateTask("stub-done", task.id, { status: "running", started_at: "2026-01-01T00:01:00.000Z" });
+    store.updateTask("stub-done", task.id, { status: "completed", finished_at: "2026-01-01T00:02:00.000Z" });
+    expect(store.findTask(task.id)?.archived).toBe(true);
+
+    const adopted = await request(app)
+      .post("/experiments/adopt")
+      .send({ name: "done-retro", task_ids: [task.id] })
+      .expect(201);
+
+    expect(adopted.body.status).toBe("passed");
+    expect(adopted.body.grid.status).toBe("completed");
+    expect(store.findTask(task.id)?.task).toEqual(expect.objectContaining({
+      status: "completed",
+      experiment_id: adopted.body.id,
+      grid_id: adopted.body.grid.id,
+    }));
+    expect((await request(app).get(`/experiments/${adopted.body.id}`).expect(200)).body.status).toBe("passed");
   });
 });

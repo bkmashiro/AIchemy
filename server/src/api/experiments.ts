@@ -55,12 +55,18 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
 
   // Check if all tasks in grid are terminal
   const tasks = store.getGridTasks(exp.grid_id);
-  const allDone = tasks.every((t) =>
-    ["completed", "failed", "killed", "lost"].includes(t.status)
+  const allDone = tasks.length > 0 && tasks.every((t) =>
+    ["completed", "failed", "cancelled"].includes(t.status)
   );
+  const completed = tasks.filter((t) => t.status === "completed").length;
+  const terminalFailed = tasks.filter((t) => ["failed", "cancelled"].includes(t.status)).length;
 
   if (passed === totalTasks && totalTasks > 0) return "passed";
   if (allDone && failed > 0) return passed > 0 ? "partial" : "failed";
+  if (allDone && validated.length === 0) {
+    if (completed === totalTasks) return "passed";
+    return completed > 0 && terminalFailed > 0 ? "partial" : "failed";
+  }
   return "running";
 }
 
@@ -372,10 +378,360 @@ function taskCountsByStatus(exp: Experiment): Record<string, number> {
   return counts;
 }
 
+type FoundTask = NonNullable<ReturnType<typeof store.findTask>>;
+
+const METADATA_FIELDS = [
+  "description", "family", "parent_id", "parent_name", "hypothesis",
+  "expected_outcome", "fork_reason", "goal_metric", "goal_direction",
+  "config", "config_diff", "criteria",
+] as const;
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateTaskIdList(value: unknown): string[] | string {
+  if (!Array.isArray(value) || value.length === 0) return "task_ids required (non-empty array)";
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== "string" || item.trim().length === 0) return "task_ids must contain non-empty strings";
+    const id = item.trim();
+    if (seen.has(id)) return `duplicate task_id: ${id}`;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function validateExperimentMetadata(body: Record<string, any>): string | undefined {
+  if (body.goal_direction !== undefined && body.goal_direction !== null && !["min", "max"].includes(body.goal_direction)) {
+    return "goal_direction must be min or max";
+  }
+  for (const field of ["config", "config_diff"] as const) {
+    if (body[field] !== undefined && body[field] !== null && !isPlainObject(body[field])) {
+      return `${field} must be an object`;
+    }
+  }
+  if (body.criteria !== undefined && !isPlainObject(body.criteria)) return "criteria must be an object";
+  return undefined;
+}
+
+function metadataFromBody(body: Record<string, any>): Partial<Experiment> {
+  const out: Partial<Experiment> = {};
+  for (const field of METADATA_FIELDS) {
+    if (body[field] !== undefined) (out as Record<string, any>)[field] = body[field] || undefined;
+  }
+  return out;
+}
+
+function findTasksOrError(taskIds: string[]): { found?: FoundTask[]; error?: { status: number; body: any } } {
+  const found: FoundTask[] = [];
+  const missing: string[] = [];
+  for (const id of taskIds) {
+    const located = store.findTask(id);
+    if (!located) missing.push(id);
+    else found.push(located);
+  }
+  if (missing.length > 0) return { error: { status: 404, body: { error: "Task not found", missing } } };
+  return { found };
+}
+
+function updateFoundTask(found: FoundTask, update: Partial<Task>): Task | undefined {
+  if (found.archived) return store.updateArchivedTask(found.task.id, update);
+  if (found.stubId) return store.updateTask(found.stubId, found.task.id, update);
+  return store.updateGlobalQueueTask(found.task.id, update);
+}
+
+function sameStringSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const bs = new Set(b);
+  return a.every((item) => bs.has(item));
+}
+
+function gridStatusFromTasks(tasks: Task[]): Grid["status"] {
+  if (tasks.length === 0) return "pending";
+  const terminal = tasks.filter((t) => ["completed", "failed", "cancelled"].includes(t.status)).length;
+  if (terminal !== tasks.length) return "running";
+  const completed = tasks.filter((t) => t.status === "completed").length;
+  if (completed === tasks.length) return "completed";
+  return completed > 0 ? "partial" : "failed";
+}
+
+function experimentStatusFromTasks(tasks: Task[]): Experiment["status"] {
+  const gridStatus = gridStatusFromTasks(tasks);
+  if (gridStatus === "completed") return "passed";
+  if (gridStatus === "partial") return "partial";
+  if (gridStatus === "failed") return "failed";
+  return "running";
+}
+
+function allocateRef(preferred: string | undefined, used: Set<string>, fallbackBase: string): string {
+  const trimmed = preferred?.trim();
+  if (trimmed && !used.has(trimmed)) {
+    used.add(trimmed);
+    return trimmed;
+  }
+  let i = 1;
+  let candidate = fallbackBase;
+  while (used.has(candidate)) {
+    i += 1;
+    candidate = `${fallbackBase}-${i}`;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+function addUniqueTaskIds(grid: Grid, taskIds: string[]): boolean {
+  let changed = false;
+  for (const taskId of taskIds) {
+    if (!grid.task_ids.includes(taskId)) {
+      grid.task_ids.push(taskId);
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function tasksForIds(taskIds: string[]): Task[] {
+  return taskIds.flatMap((id) => {
+    const found = store.findTask(id);
+    return found ? [found.task] : [];
+  });
+}
+
+function removeTaskFromGrid(taskId: string, gridId: string | undefined): Grid | undefined {
+  if (!gridId) return undefined;
+  const oldGrid = store.getGrid(gridId);
+  if (!oldGrid) return undefined;
+  const next = oldGrid.task_ids.filter((id) => id !== taskId);
+  if (next.length === oldGrid.task_ids.length) return oldGrid;
+  const updated: Grid = { ...oldGrid, task_ids: next, status: gridStatusFromTasks(tasksForIds(next)) };
+  store.setGrid(updated);
+  return updated;
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Router {
   const router = Router();
+
+  // POST /experiments/adopt — retroactively create an experiment from existing tasks.
+  // Metadata-only operation: does not reschedule, kill, retry, or otherwise touch runtime state.
+  router.post("/adopt", (req: Request, res: Response) => {
+    const body = req.body as Record<string, any>;
+    const { name } = body;
+    if (typeof name !== "string" || name.trim().length === 0) { res.status(400).json({ error: "name required" }); return; }
+    const experimentName = name.trim();
+    const taskIds = validateTaskIdList(body.task_ids);
+    if (typeof taskIds === "string") { res.status(400).json({ error: taskIds }); return; }
+    const metadataError = validateExperimentMetadata(body);
+    if (metadataError) { res.status(400).json({ error: metadataError }); return; }
+    const existing = store.findExperimentByName(experimentName);
+    if (existing) {
+      const existingGrid = store.getGrid(existing.grid_id);
+      if (existingGrid && sameStringSet(existingGrid.task_ids, taskIds)) {
+        res.status(200).json({ ...existing, grid: existingGrid, tasks: store.getGridTasks(existing.grid_id), idempotent: true }); return;
+      }
+      res.status(409).json({ error: "Experiment name already exists", experiment_id: existing.id }); return;
+    }
+    const located = findTasksOrError(taskIds);
+    if (located.error) { res.status(located.error.status).json(located.error.body); return; }
+    const found = located.found!;
+    for (const entry of found) {
+      if (entry.task.experiment_id || entry.task.grid_id) {
+        res.status(409).json({
+          error: "Task already belongs to an experiment; use /experiments/:id/tasks/adopt with mode=move",
+          task_id: entry.task.id,
+          experiment_id: entry.task.experiment_id,
+          grid_id: entry.task.grid_id,
+        }); return;
+      }
+    }
+
+    const experimentId = uuidv4();
+    const gridId = uuidv4();
+    const now = new Date().toISOString();
+    const firstTask = found[0].task;
+    const gridStatus = gridStatusFromTasks(found.map((entry) => entry.task));
+    const grid: Grid = {
+      id: gridId,
+      name: `exp:${experimentName}`,
+      display_name: `${experimentName} — adopted (${taskIds.length} tasks)`,
+      script: firstTask.script,
+      param_space: {},
+      task_ids: [...taskIds],
+      status: gridStatus,
+      created_at: now,
+      max_retries: 0,
+      target_tags: firstTask.target_tags,
+    };
+
+    const usedRefs = new Set<string>();
+    const taskRefs: Record<string, string> = {};
+    const updatedTasks: Task[] = [];
+    for (const [index, entry] of found.entries()) {
+      const ref = allocateRef(entry.task.ref, usedRefs, `task-${index + 1}`);
+      taskRefs[ref] = entry.task.id;
+      const updated = updateFoundTask(entry, { experiment_id: experimentId, grid_id: gridId, ref });
+      if (!updated) {
+        res.status(409).json({ error: "Task could not be updated", task_id: entry.task.id }); return;
+      }
+      updatedTasks.push(updated);
+      webNs.emit("task.update", updated);
+    }
+
+    store.setGrid(grid);
+    const experiment: Experiment = {
+      id: experimentId,
+      name: experimentName,
+      description: body.description || undefined,
+      grid_id: gridId,
+      status: experimentStatusFromTasks(updatedTasks),
+      results: {},
+      created_at: now,
+      task_refs: taskRefs,
+      ...metadataFromBody(body),
+      criteria: body.criteria || {},
+    };
+    store.setExperiment(experiment);
+    store.addExperimentEvent({
+      id: uuidv4(), experiment_id: experiment.id, kind: "created",
+      message: "Created experiment by adopting existing tasks",
+      actor: operatorActor(req), created_at: now,
+      data: { adopted_task_count: taskIds.length, task_ids: taskIds },
+    });
+    store.addExperimentEvent({
+      id: uuidv4(), experiment_id: experiment.id, kind: "note",
+      message: `Adopted ${taskIds.length} existing task${taskIds.length === 1 ? "" : "s"}`,
+      actor: operatorActor(req), created_at: now,
+      data: { task_ids: taskIds },
+    });
+    webNs.emit("grid.update", grid);
+    webNs.emit("experiment.update", experiment);
+    logger.info("experiment.adopted", { id: experiment.id, name: experiment.name, tasks: taskIds.length });
+    res.status(201).json({ ...experiment, grid, tasks: updatedTasks });
+  });
+
+  // POST /experiments/:id/tasks/adopt — attach existing tasks to an experiment.
+  router.post("/:id/tasks/adopt", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    const body = req.body as Record<string, any>;
+    const mode = body.mode ?? "attach";
+    if (!["attach", "move"].includes(mode)) { res.status(400).json({ error: "mode must be attach or move" }); return; }
+    const taskIds = validateTaskIdList(body.task_ids);
+    if (typeof taskIds === "string") { res.status(400).json({ error: taskIds }); return; }
+    const located = findTasksOrError(taskIds);
+    if (located.error) { res.status(located.error.status).json(located.error.body); return; }
+    const found = located.found!;
+
+    for (const entry of found) {
+      const ownedByOtherExperiment = !!entry.task.experiment_id && entry.task.experiment_id !== exp.id;
+      const ownedByOtherGrid = !!entry.task.grid_id && entry.task.grid_id !== exp.grid_id;
+      if (mode === "attach" && (ownedByOtherExperiment || ownedByOtherGrid)) {
+        res.status(409).json({
+          error: "Task already belongs to a different experiment or grid",
+          task_id: entry.task.id,
+          experiment_id: entry.task.experiment_id,
+          grid_id: entry.task.grid_id,
+        }); return;
+      }
+    }
+
+    const grid = store.getGrid(exp.grid_id);
+    if (!grid) { res.status(404).json({ error: "Grid not found" }); return; }
+    const nextGrid: Grid = { ...grid, task_ids: [...grid.task_ids] };
+    const taskRefs: Record<string, string> = { ...(exp.task_refs || {}) };
+    const usedRefs = new Set(Object.keys(taskRefs));
+    for (const [ref, taskId] of Object.entries(taskRefs)) {
+      if (taskIds.includes(taskId)) usedRefs.delete(ref);
+    }
+    const updatedTasks: Task[] = [];
+    const sourceUpdates = new Map<string, { experiment: Experiment; grid?: Grid }>();
+    const initialTaskCount = nextGrid.task_ids.length;
+    for (const [index, entry] of found.entries()) {
+      if (mode === "move" && entry.task.grid_id && entry.task.grid_id !== exp.grid_id) {
+        const sourceGrid = removeTaskFromGrid(entry.task.id, entry.task.grid_id);
+        if (entry.task.experiment_id && entry.task.experiment_id !== exp.id) {
+          const sourceExp = store.getExperiment(entry.task.experiment_id);
+          if (sourceExp) {
+            const nextRefs = Object.fromEntries(
+              Object.entries(sourceExp.task_refs || {}).filter(([, taskId]) => taskId !== entry.task.id),
+            );
+            const sourceTasks = tasksForIds(sourceGrid?.task_ids || []);
+            const updatedSourceExp: Experiment = {
+              ...sourceExp,
+              task_refs: nextRefs,
+              status: experimentStatusFromTasks(sourceTasks),
+            };
+            store.setExperiment(updatedSourceExp);
+            sourceUpdates.set(updatedSourceExp.id, { experiment: updatedSourceExp, grid: sourceGrid });
+          }
+        }
+      }
+      const existingRef = Object.entries(taskRefs).find(([, taskId]) => taskId === entry.task.id)?.[0];
+      const ref = existingRef || allocateRef(entry.task.ref, usedRefs, `task-${initialTaskCount + index + 1}`);
+      taskRefs[ref] = entry.task.id;
+      addUniqueTaskIds(nextGrid, [entry.task.id]);
+      const updated = updateFoundTask(entry, { experiment_id: exp.id, grid_id: exp.grid_id, ref });
+      if (!updated) {
+        res.status(409).json({ error: "Task could not be updated", task_id: entry.task.id }); return;
+      }
+      updatedTasks.push(updated);
+      webNs.emit("task.update", updated);
+    }
+    nextGrid.status = gridStatusFromTasks(store.getGridTasks(exp.grid_id).filter((task) => !taskIds.includes(task.id)).concat(updatedTasks));
+    store.setGrid(nextGrid);
+    const updatedExp = { ...exp, task_refs: taskRefs, status: experimentStatusFromTasks(store.getGridTasks(exp.grid_id).filter((task) => !taskIds.includes(task.id)).concat(updatedTasks)) };
+    store.setExperiment(updatedExp);
+    const now = new Date().toISOString();
+    store.addExperimentEvent({
+      id: uuidv4(), experiment_id: exp.id, kind: "note",
+      message: `${mode === "move" ? "Moved" : "Attached"} ${taskIds.length} existing task${taskIds.length === 1 ? "" : "s"}`,
+      actor: operatorActor(req), created_at: now,
+      data: { mode, task_ids: taskIds },
+    });
+    webNs.emit("grid.update", nextGrid);
+    webNs.emit("experiment.update", updatedExp);
+    for (const { experiment: sourceExp, grid: sourceGrid } of sourceUpdates.values()) {
+      if (sourceGrid) webNs.emit("grid.update", sourceGrid);
+      webNs.emit("experiment.update", sourceExp);
+    }
+    res.json({ experiment: updatedExp, grid: nextGrid, tasks: updatedTasks });
+  });
+
+  // PATCH /experiments/:id — update research metadata only.
+  router.patch("/:id", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    const body = req.body as Record<string, any>;
+    const metadataError = validateExperimentMetadata(body);
+    if (metadataError) { res.status(400).json({ error: metadataError }); return; }
+    const allowed = new Set<string>(METADATA_FIELDS as readonly string[]);
+    const changed: string[] = [];
+    const patch: Partial<Experiment> = {};
+    for (const [key, value] of Object.entries(body)) {
+      if (!allowed.has(key)) continue;
+      const nextValue = value || undefined;
+      if (JSON.stringify((exp as any)[key]) !== JSON.stringify(nextValue)) {
+        (patch as any)[key] = nextValue;
+        changed.push(key);
+      }
+    }
+    if (changed.length === 0) { res.json(exp); return; }
+    const updated: Experiment = { ...exp, ...patch };
+    store.setExperiment(updated);
+    const now = new Date().toISOString();
+    store.addExperimentEvent({
+      id: uuidv4(), experiment_id: exp.id, kind: "note",
+      message: `Updated experiment metadata: ${changed.join(", ")}`,
+      actor: operatorActor(req), created_at: now,
+      data: { fields: changed },
+    });
+    webNs.emit("experiment.update", updated);
+    res.json(updated);
+  });
 
   // POST /experiments
   router.post("/", (req: Request, res: Response) => {

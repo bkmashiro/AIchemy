@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import httpx
 
+from harness.api import _normalize_script_payload
 from harness.waiter import wait_for_status
 
 SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -32,7 +33,7 @@ class TestDedup:
 
         # Second submission with same fingerprint should be rejected
         name2 = _unique_name("smoke_dedup_dup")
-        body = {"script": script, "name": name2, "cwd": unique_cwd}
+        body = _normalize_script_payload(script, {"name": name2, "cwd": unique_cwd})
         client = httpx.Client(
             base_url=api.base_url,
             headers={"Authorization": f"Bearer {api.token}"},
@@ -47,7 +48,7 @@ class TestDedup:
 
         # Kill the long-running task
         api.kill_task(task1["id"])
-        wait_for_status(api, task1["id"], {"killed", "completed"}, timeout=30)
+        wait_for_status(api, task1["id"], {"killed", "cancelled", "completed"}, timeout=30)
 
         import shutil
         shutil.rmtree(unique_cwd, ignore_errors=True)
@@ -88,12 +89,11 @@ class TestDedup:
         )
 
         # Second submit with same key — should return existing task
-        body = {
-            "script": script,
+        body = _normalize_script_payload(script, {
             "name": _unique_name("smoke_idem2"),
             "idempotency_key": idem_key,
             "param_overrides": {"idem_run": uuid4().hex[:8]},
-        }
+        })
         client = httpx.Client(
             base_url=api.base_url,
             headers={"Authorization": f"Bearer {api.token}"},

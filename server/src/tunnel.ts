@@ -42,12 +42,28 @@ export function createTunnelManager(config: TunnelConfig): TunnelManager {
     }
   }
 
+  function scheduleRestart(): void {
+    if (shuttingDown) return;
+    if (!config.restart_on_failure) return;
+
+    const delay = BACKOFF_STEPS_MS[Math.min(backoffStep, BACKOFF_STEPS_MS.length - 1)];
+    backoffStep = Math.min(backoffStep + 1, BACKOFF_STEPS_MS.length - 1);
+    restarts += 1;
+
+    logger.info("tunnel.restart_scheduled", { delay_ms: delay, restarts });
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      spawnProc();
+    }, delay);
+  }
+
   function spawnProc(): void {
     if (shuttingDown) return;
 
     proc = spawn(config.cloudflared, ["tunnel", "run", "--token", config.token], {
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const child = proc;
 
     startedAt = new Date().toISOString();
     logger.info("tunnel.started", { pid: proc.pid, restarts });
@@ -74,27 +90,24 @@ export function createTunnelManager(config: TunnelConfig): TunnelManager {
       });
     }
 
-    proc.on("exit", (code, signal) => {
+    proc.on("error", (err: NodeJS.ErrnoException) => {
+      if (proc !== child) return;
       clearUptimeTimer();
-      const wasProc = proc;
+      proc = null;
+      startedAt = undefined;
+      logger.error("tunnel.error", { error: err.message, code: err.code, path: err.path });
+      scheduleRestart();
+    });
+
+    proc.on("exit", (code, signal) => {
+      if (proc !== child) return;
+      clearUptimeTimer();
       proc = null;
       startedAt = undefined;
 
       logger.info("tunnel.exit", { code, signal, shuttingDown });
 
-      if (shuttingDown) return;
-      if (!config.restart_on_failure) return;
-
-      // Exponential backoff restart
-      const delay = BACKOFF_STEPS_MS[Math.min(backoffStep, BACKOFF_STEPS_MS.length - 1)];
-      backoffStep = Math.min(backoffStep + 1, BACKOFF_STEPS_MS.length - 1);
-      restarts += 1;
-
-      logger.info("tunnel.restart_scheduled", { delay_ms: delay, restarts });
-      restartTimer = setTimeout(() => {
-        restartTimer = null;
-        spawnProc();
-      }, delay);
+      scheduleRestart();
     });
   }
 

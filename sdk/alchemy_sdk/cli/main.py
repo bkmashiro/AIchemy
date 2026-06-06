@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import sqlite3
 import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -14,6 +17,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_SERVER = "http://localhost:3002"
 ACTIVE_STATUSES = {"pending", "assigned", "running", "paused", "blocked"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 DANGEROUS_STATUSES = {"running", "assigned"}
 COMPARE_MAX_REFS = 6  # server caps `/experiments/compare?ids=...` at 6
 TASK_FIELDS = [
@@ -69,6 +73,51 @@ class ApiClient:
         return self.request("PATCH", path, body)
 
 
+def config_path() -> Path:
+    override = os.environ.get("ALCHEMY_CLI_CONFIG")
+    if override:
+        return Path(override).expanduser()
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "alchemy" / "alch.json"
+
+
+def load_config() -> dict[str, Any]:
+    path = config_path()
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise AlchError(f"invalid config file {path}: {exc.msg}") from exc
+    if not isinstance(loaded, dict):
+        raise AlchError(f"invalid config file {path}: expected JSON object")
+    return loaded
+
+
+def save_config(config: dict[str, Any]) -> Path:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def cmd_config_set(args: argparse.Namespace) -> None:
+    config = load_config()
+    if args.server:
+        config["server"] = args.server.rstrip("/")
+    if args.state_db:
+        config["state_db"] = str(Path(args.state_db).expanduser())
+    if args.timeout is not None:
+        config["timeout"] = args.timeout
+    path = save_config(config)
+    print_json({"ok": True, "path": str(path), "server": config.get("server"), "state_db": config.get("state_db")})
+
+
+def cmd_config_show(_args: argparse.Namespace) -> None:
+    config = load_config()
+    print_json({"path": str(config_path()), **config})
+
+
 def read_local_token(db_path: str) -> str:
     con = sqlite3.connect(db_path)
     try:
@@ -81,13 +130,16 @@ def read_local_token(db_path: str) -> str:
 
 
 def build_client(args: argparse.Namespace) -> ApiClient:
-    server = args.server or os.environ.get("ALCHEMY_SERVER_URL") or DEFAULT_SERVER
+    config = load_config()
+    server = args.server or os.environ.get("ALCHEMY_SERVER_URL") or config.get("server") or DEFAULT_SERVER
     token = args.token or os.environ.get("ALCHEMY_TOKEN")
-    if not token and args.local:
-        token = read_local_token(args.state_db or os.environ.get("ALCHEMY_STATE_DB") or "state.db")
+    state_db = args.state_db or os.environ.get("ALCHEMY_STATE_DB") or config.get("state_db")
+    if not token and (args.local or state_db):
+        token = read_local_token(state_db or "state.db")
     if not token:
-        raise AlchError("missing token: set ALCHEMY_TOKEN or pass --local [--state-db state.db]")
-    return ApiClient(server, token, timeout=args.timeout)
+        raise AlchError("missing token: run `alch config set --state-db /path/to/state.db`, set ALCHEMY_TOKEN, or pass --local [--state-db state.db]")
+    timeout = args.timeout if args.timeout != 20.0 else float(config.get("timeout", args.timeout))
+    return ApiClient(str(server), token, timeout=timeout)
 
 
 def print_json(data: Any) -> None:
@@ -135,14 +187,18 @@ def resolve_experiment(experiments: list[dict[str, Any]], ref: str) -> dict[str,
 
 
 def parse_data_object(raw: str | None) -> dict[str, Any] | None:
+    return parse_json_object(raw, "--data")
+
+
+def parse_json_object(raw: str | None, flag: str) -> dict[str, Any] | None:
     if raw is None:
         return None
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise AlchError(f"--data must be valid JSON: {exc.msg}") from exc
+        raise AlchError(f"{flag} must be valid JSON: {exc.msg}") from exc
     if not isinstance(parsed, dict):
-        raise AlchError("--data must be a JSON object")
+        raise AlchError(f"{flag} must be a JSON object")
     return parsed
 
 
@@ -187,15 +243,36 @@ def cmd_stubs_undrain(args: argparse.Namespace, client: ApiClient) -> None:
     print_json({"ok": True, "stub": result.get("stub", {}).get("name"), "max_concurrent": args.n})
 
 
+def deploy_connection_body(args: argparse.Namespace, client: ApiClient) -> dict[str, Any]:
+    server_url = (
+        getattr(args, "stub_server_url", None)
+        or os.environ.get("ALCHEMY_STUB_SERVER_URL")
+        or client.server
+    )
+    return {"server_url": str(server_url).rstrip("/"), "token": client.token}
+
+
 def cmd_stubs_restart(args: argparse.Namespace, client: ApiClient) -> None:
     if not args.yes:
         raise AlchError("stubs restart submits/restarts a real worker; pass --yes")
-    body: dict[str, Any] = {}
+    body: dict[str, Any] = deploy_connection_body(args, client)
     if args.mem:
         body["mem"] = args.mem
     if args.time:
         body["time"] = args.time
     print_json(client.post(f"/deploy/stubs/{args.name}/restart", body))
+
+
+def cmd_stubs_canary(args: argparse.Namespace, client: ApiClient) -> None:
+    if not args.yes:
+        raise AlchError("stubs canary submits a real worker; pass --yes")
+    target = args.kind if args.kind.startswith("slurm-") else f"slurm-{args.kind}"
+    body: dict[str, Any] = deploy_connection_body(args, client)
+    if args.mem:
+        body["mem"] = args.mem
+    if args.time:
+        body["time"] = args.time
+    print_json(client.post(f"/deploy/stubs/{target}", body))
 
 
 def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
@@ -204,7 +281,7 @@ def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
     target = args.kind if args.kind.startswith("slurm-") else f"slurm-{args.kind}"
     results = []
     for _ in range(args.count):
-        body: dict[str, Any] = {}
+        body: dict[str, Any] = deploy_connection_body(args, client)
         if args.mem:
             body["mem"] = args.mem
         if args.time:
@@ -294,6 +371,139 @@ def cmd_tasks_resubmit(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(short_task(client.post(path, body)))
 
 
+def cmd_tasks_logs(args: argparse.Namespace, client: ApiClient) -> None:
+    task = client.get(f"/tasks/{args.task}")
+    logs = task.get("log_buffer") or task.get("logs") or []
+    if isinstance(logs, str):
+        lines = logs.splitlines()
+    else:
+        lines = [str(line) for line in logs]
+    for line in lines[-args.tail:]:
+        print(line)
+
+
+def cmd_tasks_metrics(args: argparse.Namespace, client: ApiClient) -> None:
+    task = client.get(f"/tasks/{args.task}")
+    print_json({
+        "metrics": task.get("metrics") or {},
+        "metrics_buffer": task.get("metrics_buffer") or [],
+    })
+
+
+def task_matches_kind(task: dict[str, Any], kind: str) -> bool:
+    script = str(task.get("script") or "").lower()
+    name = str(task.get("name") or task.get("display_name") or "").lower()
+    raw_args = str(task.get("raw_args") or "").lower()
+    if kind in {"all", "any"}:
+        return True
+    if kind == "nethack-pretrain":
+        return (
+            script.endswith("train_pretrain_nethack.py")
+            or "nethack_pretrain" in name
+            or name.startswith("pretrain_nh")
+            or ("train_pretrain_nethack.py" in raw_args)
+        )
+    if kind == "jema-pretrain":
+        return "pretrain" in f"{script} {name}" and "jema" in f"{script} {name}"
+    return kind.lower() in f"{script} {name} {raw_args}"
+
+
+def normalize_raw_args(raw: Any) -> str:
+    try:
+        parts = shlex.split(str(raw or ""))
+    except ValueError:
+        parts = str(raw or "").split()
+    return " ".join(p for p in parts if p != "--resume")
+
+
+def normalize_task_name(name: Any) -> str:
+    text = str(name or "")
+    return re.sub(r"_resume(?:_[a-z0-9-]+)?$", "", text)
+
+
+def task_intent_key(task: dict[str, Any]) -> tuple[str, str, str | None]:
+    raw = normalize_raw_args(task.get("raw_args"))
+    if not raw and task.get("args") is not None:
+        raw = normalize_raw_args(task.get("args"))
+    if not raw:
+        raw = normalize_task_name(task.get("name") or task.get("display_name") or "")
+    return (
+        str(task.get("script") or ""),
+        raw,
+        str(task.get("cwd")) if task.get("cwd") else None,
+    )
+
+
+def fetch_tasks(client: ApiClient, *, status_group: str, limit: int) -> list[dict[str, Any]]:
+    params = {"limit": limit, "logs": "false", "sort": "seq", "order": "desc", "status_group": status_group}
+    data = client.get(f"/tasks?{urlencode(params)}")
+    return list(data.get("tasks") or [])
+
+
+def is_resume_task(task: dict[str, Any]) -> bool:
+    raw = str(task.get("raw_args") or "")
+    name = str(task.get("name") or task.get("display_name") or "").lower()
+    return "--resume" in raw.split() or "_resume" in name or name.endswith("resume")
+
+
+def find_lost_tasks(client: ApiClient, kind: str, limit: int) -> list[dict[str, Any]]:
+    terminal = fetch_tasks(client, status_group="terminal", limit=limit)
+    active = fetch_tasks(client, status_group="active", limit=limit)
+    successor_keys = {task_intent_key(t) for t in active if is_resume_task(t)}
+    successor_keys |= {
+        task_intent_key(t)
+        for t in terminal
+        if t.get("status") == "completed" and is_resume_task(t)
+    }
+    candidates = [
+        t for t in terminal
+        if t.get("status") != "completed"
+        and task_matches_kind(t, kind)
+        and task_intent_key(t) not in successor_keys
+    ]
+    # Keep one newest failed/cancelled task per stable intent.
+    newest: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    for task in candidates:
+        key = task_intent_key(task)
+        if key not in newest or (task.get("seq") or 0) > (newest[key].get("seq") or 0):
+            newest[key] = task
+    return sorted(newest.values(), key=lambda t: t.get("seq") or 0, reverse=True)
+
+
+def cmd_tasks_lost(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json([short_task(t) | {"script": t.get("script"), "raw_args": t.get("raw_args")} for t in find_lost_tasks(client, args.kind, args.limit)])
+
+
+def build_resume_body(task: dict[str, Any], *, stub_id: str | None, tags: list[str] | None) -> dict[str, Any]:
+    body = clone_task_body(task)
+    body["raw_args"] = add_resume(body.get("raw_args"))
+    if stub_id:
+        body["target_stub_id"] = stub_id
+        body.pop("target_tags", None)
+    if tags:
+        body["target_tags"] = tags
+        body.pop("target_stub_id", None)
+    body["name"] = f"{task.get('display_name') or task.get('name') or task.get('id')}_resume"
+    body["idempotency_key"] = f"resume-lost:{task.get('id')}:{uuid.uuid4()}"
+    return body
+
+
+def cmd_tasks_resume_lost(args: argparse.Namespace, client: ApiClient) -> None:
+    if not args.dry_run and not args.yes:
+        raise AlchError("resume-lost submits tasks; pass --dry-run or --yes")
+    lost = find_lost_tasks(client, args.kind, args.limit)
+    stub_id = find_stub(client, args.to_stub)["id"] if args.to_stub else None
+    tags = [t.strip() for t in args.to_tags.split(",") if t.strip()] if args.to_tags else None
+    if stub_id and tags:
+        raise AlchError("pass at most one of --to-stub or --to-tags")
+    plans = [{"source": short_task(task), "body": build_resume_body(task, stub_id=stub_id, tags=tags)} for task in lost]
+    if args.dry_run:
+        print_json(plans)
+        return
+    created = [short_task(client.post("/tasks", plan["body"])) for plan in plans]
+    print_json(created)
+
+
 def cmd_verify(args: argparse.Namespace, client: ApiClient) -> None:
     ok = True
     out: dict[str, Any] = {"ok": True}
@@ -347,6 +557,54 @@ def cmd_experiments_note(args: argparse.Namespace, client: ApiClient) -> None:
     if data is not None:
         body["data"] = data
     print_json(client.post(f"/experiments/{exp['id']}/events", body))
+
+
+def experiment_metadata_payload(args: argparse.Namespace) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    for attr in [
+        "description", "family", "parent_id", "parent_name", "hypothesis",
+        "expected_outcome", "fork_reason", "goal_metric", "goal_direction",
+    ]:
+        value = getattr(args, attr, None)
+        if value is not None:
+            body[attr] = value
+    for attr, flag in [("config", "--config"), ("config_diff", "--config-diff"), ("criteria", "--criteria")]:
+        parsed = parse_json_object(getattr(args, attr, None), flag)
+        if parsed is not None:
+            body[attr] = parsed
+    return body
+
+
+def cmd_experiments_adopt(args: argparse.Namespace, client: ApiClient) -> None:
+    body = experiment_metadata_payload(args)
+    body["name"] = args.name
+    body["task_ids"] = list(args.task)
+    if not args.yes:
+        print_json({"dry_run": True, "write": False, "method": "POST", "path": "/experiments/adopt", "payload": body})
+        return
+    print_json(client.post("/experiments/adopt", body))
+
+
+def cmd_experiments_adopt_task(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    body = {"task_ids": list(args.task), "mode": args.mode}
+    path = f"/experiments/{exp['id']}/tasks/adopt"
+    if not args.yes:
+        print_json({"dry_run": True, "write": False, "method": "POST", "path": path, "payload": body})
+        return
+    print_json(client.post(path, body))
+
+
+def cmd_experiments_patch(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    body = experiment_metadata_payload(args)
+    if not body:
+        raise AlchError("no metadata fields provided")
+    path = f"/experiments/{exp['id']}"
+    if not args.yes:
+        print_json({"dry_run": True, "write": False, "method": "PATCH", "path": path, "payload": body})
+        return
+    print_json(client.patch(path, body))
 
 
 ARTIFACT_TYPES = {"checkpoint", "tensorboard", "log", "file", "metrics"}
@@ -602,16 +860,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_global(parser)
     sub = parser.add_subparsers(dest="group", required=True)
 
+    config = sub.add_parser("config", help="persist default server/state-db for this operator")
+    config_sub = config.add_subparsers(dest="cmd", required=True)
+    p = config_sub.add_parser("set", help="save default server/state-db; token is not stored")
+    p.add_argument("--server", help=f"default Alchemy server URL (default {DEFAULT_SERVER})")
+    p.add_argument("--state-db", help="SQLite state db to read the operator token from automatically")
+    p.add_argument("--timeout", type=float, default=None, help="default request timeout")
+    p.set_defaults(func=cmd_config_set, no_client=True)
+    p = config_sub.add_parser("show", help="show persisted CLI config (never prints tokens)")
+    p.set_defaults(func=cmd_config_show, no_client=True)
+
     stubs = sub.add_parser("stubs", help="list, drain, or restart stubs")
     stubs_sub = stubs.add_subparsers(dest="cmd", required=True)
     p = stubs_sub.add_parser("ls", help="list known stubs"); p.add_argument("--online", action="store_true", help="only include online stubs"); p.set_defaults(func=cmd_stubs_ls)
     p = stubs_sub.add_parser("drain", help="set a stub's max_concurrent to 0"); p.add_argument("stub", help="stub id, name, or hostname"); p.set_defaults(func=cmd_stubs_drain)
     p = stubs_sub.add_parser("undrain", help="restore a stub's max_concurrent"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("--n", type=int, default=1, help="new max_concurrent (default 1)"); p.set_defaults(func=cmd_stubs_undrain)
-    p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)
+    p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (defaults to REST server)"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)
+    p = stubs_sub.add_parser("canary", help="deploy one managed SLURM stub canary with code sync"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand or full slurm-* name"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="confirm: this submits a real worker"); p.set_defaults(func=cmd_stubs_canary)
 
     slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)
-    p = slurm_sub.add_parser("submit", help="submit/restart a SLURM stub"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand (a30/a40/t4) or full slurm-* name"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
+    p = slurm_sub.add_parser("submit", help="submit/restart a SLURM stub"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand (a30/a40/t4) or full slurm-* name"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
 
     tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)
@@ -620,6 +889,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
     p = tasks_sub.add_parser("move", help="resubmit a task targeting a new stub or tag set"); p.add_argument("task", help="task id"); p.add_argument("--to-stub", help="target stub id/name/hostname (exclusive with --to-tags)"); p.add_argument("--to-tags", help="comma-separated target_tags (exclusive with --to-stub)"); p.add_argument("--name", help="override display name of the new task"); p.add_argument("--yes", action="store_true", help="required when cancelling a running/assigned task"); p.set_defaults(func=cmd_tasks_move)
     p = tasks_sub.add_parser("resubmit", help="clone a task as a new submission"); p.add_argument("task", help="task id to clone"); p.add_argument("--resume", action="store_true", help="append --resume to raw_args"); p.add_argument("--to-stub", help="retarget to a specific stub"); p.add_argument("--to-tags", help="retarget to comma-separated tags"); p.add_argument("--name", help="override display name"); p.add_argument("--wait", action="store_true", help="block until task is accepted"); p.add_argument("--wait-timeout", type=int, default=15, help="accept-wait timeout seconds (default 15)"); p.set_defaults(func=cmd_tasks_resubmit)
+    p = tasks_sub.add_parser("logs", help="print recent log_buffer lines for a task"); p.add_argument("task", help="task id"); p.add_argument("--tail", type=int, default=80, help="number of log lines to print (default 80)"); p.set_defaults(func=cmd_tasks_logs)
+    p = tasks_sub.add_parser("metrics", help="print task metrics and metrics_buffer"); p.add_argument("task", help="task id"); p.set_defaults(func=cmd_tasks_metrics)
+    p = tasks_sub.add_parser("lost", help="find terminal pretrain tasks without active/completed resume successors"); p.add_argument("--kind", default="nethack-pretrain", help="intent filter (default nethack-pretrain; use all for everything)"); p.add_argument("--limit", type=int, default=500, help="tasks to inspect per status group (default 500)"); p.set_defaults(func=cmd_tasks_lost)
+    p = tasks_sub.add_parser("resume-lost", help="resubmit lost tasks with --resume; dry-run by default unless --yes"); p.add_argument("--kind", default="nethack-pretrain", help="intent filter (default nethack-pretrain)"); p.add_argument("--limit", type=int, default=500, help="tasks to inspect per status group (default 500)"); p.add_argument("--to-stub", help="target stub id/name/hostname"); p.add_argument("--to-tags", help="comma-separated target tags"); p.add_argument("--dry-run", action="store_true", help="print planned submissions without POSTing"); p.add_argument("--yes", action="store_true", help="confirm: submit the planned resume tasks"); p.set_defaults(func=cmd_tasks_resume_lost)
 
     exps = sub.add_parser(
         "experiments",
@@ -647,6 +920,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", help="optionally attach the note to a specific task id")
     p.add_argument("--data", help="optional JSON object payload (e.g. metric snapshot)")
     p.set_defaults(func=cmd_experiments_note)
+
+    def add_experiment_metadata_flags(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--description")
+        parser.add_argument("--family")
+        parser.add_argument("--parent-id")
+        parser.add_argument("--parent-name")
+        parser.add_argument("--hypothesis")
+        parser.add_argument("--expected-outcome")
+        parser.add_argument("--fork-reason")
+        parser.add_argument("--goal-metric")
+        parser.add_argument("--goal-direction", choices=["min", "max"])
+        parser.add_argument("--config", help="JSON object")
+        parser.add_argument("--config-diff", help="JSON object")
+        parser.add_argument("--criteria", help="JSON object")
+
+    p = exps_sub.add_parser("adopt", help="create a retroactive experiment from existing tasks", description="Dry-run by default. With --yes, POST /experiments/adopt and attach existing tasks without rescheduling or changing runtime state.")
+    p.add_argument("--name", required=True, help="new experiment name")
+    p.add_argument("--task", action="append", required=True, help="task id to adopt; repeatable")
+    add_experiment_metadata_flags(p)
+    p.add_argument("--yes", action="store_true", help="confirm write")
+    p.set_defaults(func=cmd_experiments_adopt)
+
+    p = exps_sub.add_parser("adopt-task", help="attach existing tasks to an experiment", description="Dry-run by default. With --yes, POST /experiments/<id>/tasks/adopt. attach rejects tasks owned by another experiment; move rebinds them.")
+    p.add_argument("experiment", help="experiment name or id")
+    p.add_argument("--task", action="append", required=True, help="task id to attach; repeatable")
+    p.add_argument("--mode", choices=["attach", "move"], default="attach")
+    p.add_argument("--yes", action="store_true", help="confirm write")
+    p.set_defaults(func=cmd_experiments_adopt_task)
+
+    p = exps_sub.add_parser("patch", help="update experiment research metadata", description="Dry-run by default. With --yes, PATCH /experiments/<id>. Runtime/scheduler fields are not touched.")
+    p.add_argument("experiment", help="experiment name or id")
+    add_experiment_metadata_flags(p)
+    p.add_argument("--yes", action="store_true", help="confirm write")
+    p.set_defaults(func=cmd_experiments_patch)
 
     p = exps_sub.add_parser(
         "artifact",
@@ -780,8 +1087,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        client = build_client(args)
-        args.func(args, client)
+        if getattr(args, "no_client", False):
+            args.func(args)
+        else:
+            client = build_client(args)
+            args.func(args, client)
         return 0
     except AlchError as exc:
         print(f"alch: error: {exc}", file=sys.stderr)

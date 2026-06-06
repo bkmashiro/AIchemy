@@ -6,7 +6,7 @@ from typing import Any
 
 from .api import ApiClient
 
-TERMINAL_STATUSES = {"completed", "failed", "killed", "lost"}
+TERMINAL_STATUSES = {"completed", "failed", "killed", "cancelled", "lost"}
 
 
 def wait_for_status(
