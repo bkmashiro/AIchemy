@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -119,6 +120,16 @@ def _extract_script_path(command: str) -> str | None:
     if not script.endswith(".py"):
         return None
     return script
+
+
+def _task_shell() -> str:
+    """Return the shell used to execute task wrapper scripts.
+
+    Prefer bash for compatibility with existing env_setup snippets, but fall
+    back to POSIX sh so minimal Docker/Python images without bash can still run
+    simple tasks.
+    """
+    return shutil.which("bash") or shutil.which("sh") or "/bin/sh"
 
 
 class ProcessInfo:
@@ -468,7 +479,7 @@ class ProcessManager:
         log_file = open(log_path, "w")
         try:
             proc = subprocess.Popen(
-                ["bash", "-c", script],
+                [_task_shell(), "-c", script],
                 cwd=effective_cwd,
                 env=proc_env,
                 stdout=log_file,
