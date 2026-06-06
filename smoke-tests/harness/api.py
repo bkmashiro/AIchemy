@@ -16,8 +16,10 @@ def _normalize_script_payload(script: str, kwargs: dict[str, Any]) -> dict[str, 
         body["script"] = script[len("bash "):]
         return body
     if "raw_args" not in kwargs:
-        body["script"] = "/bin/bash"
-        body["raw_args"] = f"-lc {shlex.quote(script)}"
+        # Use /bin/sh for broad compatibility with minimal Docker images
+        # such as python:*-slim, which may not include /bin/bash.
+        body["script"] = "/bin/sh"
+        body["raw_args"] = f"-c {shlex.quote(script)}"
     return body
 
 
