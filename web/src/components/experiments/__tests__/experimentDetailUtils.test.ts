@@ -195,6 +195,11 @@ describe("recommendationLabel", () => {
     expect(recommendationLabel(rec)).toBe("Fork this run");
   });
 
+  it("maps recommendation rerun to 'Needs replication'", () => {
+    const rec = mkRecommendation({ action: "rerun", verdict: null });
+    expect(recommendationLabel(rec)).toBe("Needs replication");
+  });
+
   it("falls back to verdict only when action is absent", () => {
     const rec = mkRecommendation({
       action: "   ",
@@ -206,6 +211,14 @@ describe("recommendationLabel", () => {
   it("returns null when no action or verdict exists", () => {
     expect(recommendationLabel(null)).toBeNull();
     expect(recommendationLabel(mkRecommendation({}))).toBeNull();
+  });
+
+  it("uses fallback copy for recommendation verdict rerun", () => {
+    const rec = mkRecommendation({
+      action: "   ",
+      verdict: "rerun",
+    });
+    expect(recommendationLabel(rec)).toBe("Needs replication");
   });
 });
 

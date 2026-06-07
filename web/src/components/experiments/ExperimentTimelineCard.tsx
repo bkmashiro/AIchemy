@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ExperimentEvent, experimentsApi } from "../../lib/api";
 import { formatRelTime } from "../../lib/format";
@@ -8,10 +8,12 @@ export function ExperimentTimelineCard({
   experimentId,
   events,
   onNoteAdded,
+  pageSize = 20,
 }: {
   experimentId: string;
   events: ExperimentEvent[];
   onNoteAdded: () => void;
+  pageSize?: number;
 }) {
   const [message, setMessage] = useState("");
   const [taskId, setTaskId] = useState("");
@@ -42,15 +44,29 @@ export function ExperimentTimelineCard({
   }
 
   const sorted = [...events].sort((a, b) =>
-    a.created_at.localeCompare(b.created_at),
+    b.created_at.localeCompare(a.created_at),
   );
+  const safePageSize = Math.max(1, pageSize);
+  const totalPages = Math.max(1, Math.ceil(sorted.length / safePageSize));
+  const [currentPage, setCurrentPage] = useState(0);
+
+  useEffect(() => {
+    setCurrentPage((page) => Math.min(page, totalPages - 1));
+  }, [totalPages]);
+
+  const pageStart = currentPage * safePageSize;
+  const pageEvents = sorted.slice(pageStart, pageStart + safePageSize);
+  const visibleStart = sorted.length === 0 ? 0 : pageStart + 1;
+  const visibleEnd = pageStart + pageEvents.length;
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-medium text-gray-400">Timeline</h2>
         <span className="text-xs text-gray-600">
-          {sorted.length} event{sorted.length === 1 ? "" : "s"}
+          {sorted.length === 0
+            ? "0 events"
+            : `${visibleStart}-${visibleEnd} of ${sorted.length} event${sorted.length === 1 ? "" : "s"}`}
         </span>
       </div>
 
@@ -91,63 +107,86 @@ export function ExperimentTimelineCard({
           No timeline events yet
         </p>
       ) : (
-        <ul className="space-y-2">
-          {sorted.map((ev) => {
-            const badge =
-              EVENT_BADGE[ev.kind] || "bg-gray-800 text-gray-400 border-gray-700";
-            const isArtifactKind = ev.kind === "artifact" || ev.kind === "checkpoint";
-            const artifact = isArtifactKind ? artifactLocator(ev.data) : null;
-            const dataStr = !artifact ? formatEventData(ev.data) : null;
-            return (
-              <li
-                key={ev.id}
-                className="text-xs border-l-2 border-gray-800 pl-3 py-1"
-              >
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span
-                    className={`px-1.5 py-0.5 rounded border text-[10px] ${badge}`}
-                  >
-                    {ev.kind}
-                  </span>
-                  <span className="text-gray-300">{ev.message}</span>
-                  <span className="text-gray-600 ml-auto">
-                    {formatRelTime(ev.created_at)}
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 mt-0.5 text-gray-600 text-[11px]">
-                  {ev.actor && <span>by {ev.actor}</span>}
-                  {ev.task_id && (
-                    <Link
-                      to={`/tasks/${ev.task_id}`}
-                      className="text-blue-500 hover:text-blue-400 font-mono"
+        <>
+          <ul className="space-y-2">
+            {pageEvents.map((ev) => {
+              const badge =
+                EVENT_BADGE[ev.kind] || "bg-gray-800 text-gray-400 border-gray-700";
+              const isArtifactKind = ev.kind === "artifact" || ev.kind === "checkpoint";
+              const artifact = isArtifactKind ? artifactLocator(ev.data) : null;
+              const dataStr = !artifact ? formatEventData(ev.data) : null;
+              return (
+                <li
+                  key={ev.id}
+                  className="text-xs border-l-2 border-gray-800 pl-3 py-1"
+                >
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span
+                      className={`px-1.5 py-0.5 rounded border text-[10px] ${badge}`}
                     >
-                      task {ev.task_id.slice(0, 8)}
-                    </Link>
-                  )}
-                </div>
-                {artifact && (
-                  <div className="mt-1 text-[11px] flex items-center gap-2 flex-wrap">
-                    {artifact.type && (
-                      <span className="px-1 py-0.5 rounded border text-[10px] bg-gray-800 text-gray-400 border-gray-700">
-                        {artifact.type}
-                      </span>
-                    )}
-                    {artifact.name && <span className="text-gray-400">{artifact.name}</span>}
-                    {typeof artifact.step === "number" && (
-                      <span className="text-gray-500">step {artifact.step}</span>
-                    )}
-                    <code className="font-mono text-gray-300 break-all">{artifact.locator}</code>
+                      {ev.kind}
+                    </span>
+                    <span className="text-gray-300">{ev.message}</span>
+                    <span className="text-gray-600 ml-auto">
+                      {formatRelTime(ev.created_at)}
+                    </span>
                   </div>
-                )}
-                {dataStr && (
-                  <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/40 rounded px-2 py-1 overflow-x-auto font-mono">
-                    {dataStr}
-                  </pre>
-                )}
-              </li>
-            );
-          })}
-        </ul>
+                  <div className="flex items-center gap-3 mt-0.5 text-gray-600 text-[11px]">
+                    {ev.actor && <span>by {ev.actor}</span>}
+                    {ev.task_id && (
+                      <Link
+                        to={`/tasks/${ev.task_id}`}
+                        className="text-blue-500 hover:text-blue-400 font-mono"
+                      >
+                        task {ev.task_id.slice(0, 8)}
+                      </Link>
+                    )}
+                  </div>
+                  {artifact && (
+                    <div className="mt-1 text-[11px] flex items-center gap-2 flex-wrap">
+                      {artifact.type && (
+                        <span className="px-1 py-0.5 rounded border text-[10px] bg-gray-800 text-gray-400 border-gray-700">
+                          {artifact.type}
+                        </span>
+                      )}
+                      {artifact.name && <span className="text-gray-400">{artifact.name}</span>}
+                      {typeof artifact.step === "number" && (
+                        <span className="text-gray-500">step {artifact.step}</span>
+                      )}
+                      <code className="font-mono text-gray-300 break-all">{artifact.locator}</code>
+                    </div>
+                  )}
+                  {dataStr && (
+                    <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/40 rounded px-2 py-1 overflow-x-auto font-mono">
+                      {dataStr}
+                    </pre>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          <div className="mt-3 flex items-center justify-end gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() => setCurrentPage((page) => Math.max(0, page - 1))}
+              disabled={currentPage === 0}
+              className="px-2 py-1 rounded border border-gray-700 text-gray-400 hover:text-gray-200 disabled:opacity-40 disabled:hover:text-gray-400"
+            >
+              Previous
+            </button>
+            <span className="text-gray-600">
+              Page {currentPage + 1} / {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => setCurrentPage((page) => Math.min(totalPages - 1, page + 1))}
+              disabled={currentPage >= totalPages - 1}
+              className="px-2 py-1 rounded border border-gray-700 text-gray-400 hover:text-gray-200 disabled:opacity-40 disabled:hover:text-gray-400"
+            >
+              Next
+            </button>
+          </div>
+        </>
       )}
     </div>
   );
