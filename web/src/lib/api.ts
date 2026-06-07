@@ -416,6 +416,11 @@ export interface ExperimentRecommendation {
   baseline_value: number | null;
   delta: number | null;
   direction: string | null;
+  evidence_quality?: "strong" | "moderate" | "weak" | "insufficient" | null;
+  evidence_reason?: string | null;
+  sample_count?: number | null;
+  baseline_source?: "parent" | "family" | "none" | null;
+  comparable_count?: number | null;
 }
 
 export interface ExperimentDiffSummary {

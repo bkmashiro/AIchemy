@@ -50,9 +50,8 @@ Open follow-ups (not started):
   experiment detail page and scroll to the Tasks table;
 - graph-canvas / spatial layout beyond the current vertical rail;
 - mutating `add_note` / `decide` / `add_artifact` / `add_checkpoint`
-  helpers on `ExperimentClient`. Deliberately deferred to preserve the
-  client's read-only contract — use the `alch experiments …` CLI for now,
-  or call the `POST/PATCH` endpoints directly.
+  helpers on `ExperimentClient` are implemented as explicit write helpers.
+  Read helpers stay GET-only; callers must opt into these side-effecting names.
 
 **Goal:** Turn Alchemy's existing Experiment feature into a research lineage system: a GitLens-like view where researchers can see what changed, why it changed, what ran, what failed, what won, and where each experiment fork came from.
 

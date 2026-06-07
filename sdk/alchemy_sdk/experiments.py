@@ -1,8 +1,9 @@
-"""Read-only HTTP client for experiment lineage endpoints."""
+"""HTTP client for experiment lineage endpoints."""
 from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 from typing import Any, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
@@ -11,7 +12,9 @@ from urllib.request import Request, urlopen
 
 DEFAULT_SERVER = "http://localhost:3002"
 DECISION_CHOICES = ("keep", "drop", "rerun", "fork", "none")
+DECISION_WRITE_CHOICES = ("keep", "drop", "rerun", "fork")
 STATUS_CHOICES = ("running", "passed", "partial", "failed")
+ARTIFACT_TYPES = ("checkpoint", "tensorboard", "log", "file", "metrics")
 
 
 def _resolve_server(server: Optional[str]) -> str:
@@ -27,12 +30,42 @@ def _resolve_token(token: Optional[str]) -> Optional[str]:
     return token or os.environ.get("ALCHEMY_TOKEN")
 
 
-class ExperimentClient:
-    """Thin read-only client for experiment lineage endpoints.
+def _validate_event_message(value: Any, field: str = "message") -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"{field} must be a non-empty string")
+    if len(value) > 4096:
+        raise RuntimeError(f"{field} too long")
 
-    Returns raw decoded JSON (dict/list) — no dataclass wrapping. Resolves
-    name-or-id refs against ``GET /api/experiments`` before issuing detail
-    requests.
+
+def _copy_event_data(data: Optional[Mapping[str, Any]], *, label: str) -> dict[str, Any]:
+    if data is None:
+        return {}
+    if not isinstance(data, Mapping):
+        raise RuntimeError(f"{label} data must be a mapping, got {type(data).__name__}")
+    copied = dict(data)
+    if "artifact_type" in copied and copied["artifact_type"] is not None:
+        if copied["artifact_type"] not in ARTIFACT_TYPES:
+            raise RuntimeError(
+                f"artifact_type must be one of {list(ARTIFACT_TYPES)}, got {copied['artifact_type']!r}"
+            )
+    if "step" in copied and copied["step"] is not None:
+        _validate_artifact_step(copied["step"])
+    return copied
+
+
+def _validate_artifact_step(step: Any) -> None:
+    is_number = isinstance(step, (int, float)) and not isinstance(step, bool)
+    if not is_number or not math.isfinite(float(step)):
+        raise RuntimeError("artifact step must be a finite number")
+
+
+class ExperimentClient:
+    """Thin client for experiment lineage endpoints.
+
+    Read helpers return raw decoded JSON (dict/list) and only perform GETs.
+    Explicit mutators (`add_note`, `decide`, `add_artifact`, `add_checkpoint`)
+    write to server state and are named accordingly. Name-or-id refs are
+    resolved against ``GET /api/experiments`` before detail requests.
     """
 
     def __init__(
@@ -64,14 +97,20 @@ class ExperimentClient:
             )
         return token
 
-    def _get(self, path: str) -> Any:
+    def _request(self, path: str, method: str, body: Optional[Any] = None) -> Any:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+
         req = Request(
             f"{self.server}/api{path}",
-            method="GET",
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-            },
+            data=data,
+            method=method,
+            headers=headers,
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:  # noqa: S310
@@ -82,6 +121,9 @@ class ExperimentClient:
             raise RuntimeError(f"HTTP {exc.code} on {path}: {body}") from exc
         except URLError as exc:
             raise RuntimeError(f"request to {path} failed: {exc.reason}") from exc
+
+    def _get(self, path: str) -> Any:
+        return self._request(path, method="GET")
 
     def list(
         self,
@@ -233,6 +275,155 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/timeline")
 
+    def add_note(
+        self,
+        ref: str,
+        message: str,
+        *,
+        task_id: Optional[str] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        refresh: bool = False,
+    ) -> Any:
+        """POST /api/experiments/<id>/events with kind note.
+
+        Mutates server state by creating a new note event on the experiment.
+        Use this helper when caller intent is explicitly to write a note.
+        """
+        _validate_event_message(message)
+        if data is not None and not isinstance(data, Mapping):
+            raise RuntimeError(f"note data must be a mapping, got {type(data).__name__}")
+        exp = self.resolve(ref, refresh=refresh)
+        body: dict[str, Any] = {"kind": "note", "message": message}
+        if task_id is not None:
+            body["task_id"] = task_id
+        if data is not None:
+            body["data"] = dict(data)
+        return self._request(f"/experiments/{exp['id']}/events", method="POST", body=body)
+
+    def decide(
+        self,
+        ref: str,
+        decision: str,
+        reason: str,
+        *,
+        refresh: bool = False,
+    ) -> Any:
+        """PATCH /api/experiments/<id>/decision.
+
+        Mutates server state by setting experiment decision and reason.
+        """
+        if decision not in DECISION_WRITE_CHOICES:
+            raise RuntimeError(
+                f"decision must be one of {list(DECISION_WRITE_CHOICES)}, got {decision!r}"
+            )
+        _validate_event_message(reason, "reason")
+
+        exp = self.resolve(ref, refresh=refresh)
+        body = {"decision": decision, "reason": reason}
+        return self._request(f"/experiments/{exp['id']}/decision", method="PATCH", body=body)
+
+    def add_artifact(
+        self,
+        ref: str,
+        locator: str,
+        *,
+        artifact_type: Optional[str] = None,
+        name: Optional[str] = None,
+        task_id: Optional[str] = None,
+        step: Optional[Any] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        message: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Any:
+        """POST /api/experiments/<id>/events with kind artifact.
+
+        Builds the payload used by ``alch experiments artifact`` and posts to the
+        same endpoint. Locator is mapped to ``data.path`` unless it looks like URI.
+        Extra data is merged first and can be overridden by locator/type/name/step.
+        """
+        if not locator or not locator.strip():
+            raise RuntimeError("artifact locator must be a non-empty path or URI")
+
+        payload_data = _copy_event_data(data, label="artifact")
+
+        if artifact_type is not None and artifact_type not in ARTIFACT_TYPES:
+            raise RuntimeError(
+                f"artifact_type must be one of {list(ARTIFACT_TYPES)}, got {artifact_type!r}"
+            )
+
+        if "://" in locator:
+            payload_data["uri"] = locator
+        else:
+            payload_data["path"] = locator
+        if artifact_type is not None:
+            payload_data["artifact_type"] = artifact_type
+        if name is not None:
+            payload_data["name"] = name
+        if step is not None:
+            _validate_artifact_step(step)
+            payload_data["step"] = step
+        if message is not None:
+            _validate_event_message(message)
+
+        exp = self.resolve(ref, refresh=refresh)
+        return self._request(
+            f"/experiments/{exp['id']}/events",
+            method="POST",
+            body={
+                "kind": "artifact",
+                "message": (f"Artifact: {name or locator}" if message is None else message),
+                "data": payload_data,
+                **({"task_id": task_id} if task_id is not None else {}),
+            },
+        )
+
+    def add_checkpoint(
+        self,
+        ref: str,
+        locator: str,
+        *,
+        name: Optional[str] = None,
+        task_id: Optional[str] = None,
+        step: Optional[Any] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        message: Optional[str] = None,
+        refresh: bool = False,
+    ) -> Any:
+        """POST /api/experiments/<id>/events with kind checkpoint.
+
+        Same payload shape as ``add_artifact`` but default type/message are
+        checkpoint-specific.
+        """
+        if not locator or not locator.strip():
+            raise RuntimeError("artifact locator must be a non-empty path or URI")
+
+        payload_data = _copy_event_data(data, label="artifact")
+
+        if "://" in locator:
+            payload_data["uri"] = locator
+        else:
+            payload_data["path"] = locator
+        payload_data["artifact_type"] = "checkpoint"
+        if name is not None:
+            payload_data["name"] = name
+        if step is not None:
+            _validate_artifact_step(step)
+            payload_data["step"] = step
+        if message is not None:
+            _validate_event_message(message)
+
+        exp = self.resolve(ref, refresh=refresh)
+        return self._request(
+            f"/experiments/{exp['id']}/events",
+            method="POST",
+            body={
+                "kind": "checkpoint",
+                "message": (f"Checkpoint: {name or locator}" if message is None else message),
+                "data": payload_data,
+                **({"task_id": task_id} if task_id is not None else {}),
+            },
+        )
+
     def research_report_markdown(
         self,
         *,
@@ -344,6 +535,42 @@ class ExperimentClient:
             },
             "suggested_name": name or f"{parent_name}-fork",
             "reason": reason,
+            "parent_config": base_config or {},
+            "proposed_config": proposed,
+            "config_diff": diff,
+        }
+
+    def replication_plan(
+        self,
+        ref: str,
+        *,
+        set_overrides: Optional[Mapping[str, Any]] = None,
+        unset: Iterable[str] = (),
+        reason: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build a local replication manifest without submitting anything.
+
+        Mirrors ``fork_plan`` exactly, but uses a ``replication`` naming scheme
+        for downstream tooling. This method performs only GET requests.
+        """
+        exp = self.resolve(ref)
+        detail = self._get(f"/experiments/{exp['id']}")
+        base_config = detail.get("config") if isinstance(detail, dict) else None
+        proposed, diff = _apply_flat_overrides(
+            base_config or {}, set_overrides or {}, list(unset)
+        )
+        parent_name = detail.get("name") or exp.get("name")
+        return {
+            "kind": "replication-plan",
+            "dry_run": True,
+            "parent": {
+                "id": detail.get("id") or exp.get("id"),
+                "name": parent_name,
+                "family": detail.get("family"),
+            },
+            "suggested_name": name or f"{parent_name}-replication",
+            "reason": reason or "",
             "parent_config": base_config or {},
             "proposed_config": proposed,
             "config_diff": diff,
@@ -553,10 +780,10 @@ def _apply_flat_overrides(
     for key, value in sets.items():
         if "." in key:
             raise RuntimeError(
-                f"fork_plan does not support nested keys; got {key!r}"
+                f"experiment plan overrides do not support nested keys; got {key!r}"
             )
         if not key:
-            raise RuntimeError("fork_plan override key must be non-empty")
+            raise RuntimeError("experiment plan override key must be non-empty")
         before_known = key in base
         diff[key] = {
             "before": base.get(key) if before_known else None,
@@ -567,10 +794,10 @@ def _apply_flat_overrides(
     for key in unsets:
         key = key.strip()
         if not key:
-            raise RuntimeError("fork_plan unset key must be non-empty")
+            raise RuntimeError("experiment plan unset key must be non-empty")
         if "." in key:
             raise RuntimeError(
-                f"fork_plan does not support nested keys; got {key!r}"
+                f"experiment plan overrides do not support nested keys; got {key!r}"
             )
         if key in proposed:
             diff[key] = {"before": base.get(key), "after": None, "op": "unset"}
