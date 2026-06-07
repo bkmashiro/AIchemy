@@ -22,7 +22,7 @@ export function LineageCard({
   const hasAny = ancestors.length > 0 || descendants.length > 0;
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
       <h2 className="text-sm font-medium text-gray-400 mb-3">Lineage</h2>
       {!hasAny && (
         <p className="text-xs text-gray-600">No related experiments</p>

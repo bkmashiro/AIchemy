@@ -73,7 +73,7 @@ function ExperimentsList() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-white">Experiments</h1>
         <span className="text-xs text-gray-500">
@@ -326,7 +326,7 @@ function ExperimentDetailView() {
   const previewEvents = previewExp.id === exp.id ? events : selectedLineageEvents;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-3 xl:space-y-2">
       <ExperimentDetailHeader
         exp={exp}
         onRetryFailed={handleRetry}
@@ -335,7 +335,7 @@ function ExperimentDetailView() {
 
       <ExperimentCriteriaCard criteria={exp.criteria} />
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         <IntentCard exp={exp} />
         <DecisionCard
           exp={exp}
@@ -347,7 +347,7 @@ function ExperimentDetailView() {
         <LineageCard exp={exp} allExperiments={allExperiments} />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-2 xl:gap-3">
         <ExperimentLineageGraphCard
           roots={tree}
           currentId={selectedLineageId ?? exp.id}

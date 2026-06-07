@@ -546,7 +546,7 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
   }
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-medium text-gray-400">Research call</h2>
         <span

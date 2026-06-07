@@ -52,7 +52,7 @@ export function DecisionCard({
     : "bg-gray-800 text-gray-500 border-gray-700";
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
       <h2 className="text-sm font-medium text-gray-400 mb-3">Decision</h2>
       <div className="space-y-3 text-xs">
         <div>
