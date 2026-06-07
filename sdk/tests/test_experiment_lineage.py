@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from alchemy_sdk.experiment import Experiment
-from alchemy_sdk.experiments import ExperimentClient
+from alchemy_sdk.experiments import ExperimentClient, render_research_bundle_markdown
 
 
 class FakeResponse:
@@ -342,3 +342,71 @@ def test_add_artifact_rejects_empty_locator(monkeypatch):
     client = ExperimentClient(server="http://server", token="tk")
     with pytest.raises(RuntimeError, match="non-empty"):
         client.add_artifact("alpha", "   ", data={})
+
+
+def test_research_bundle_markdown_render_is_deterministic_for_minimal_payload():
+    payload = {
+        "experiment": {"id": "exp-1", "name": "alpha", "family": "rl", "status": "passed"},
+        "summary": {
+            "recommendation": {
+                "action": "keep",
+                "verdict": "best",
+                "reason": "beats baseline",
+                "metric": "acc",
+                "value": 0.88,
+                "baseline_value": 0.8,
+                "delta": 0.08,
+                "evidence_quality": "high",
+                "sample_count": 10,
+                "comparable_count": 3,
+                "baseline_source": "parent",
+            },
+            "best_metrics": {"acc": 0.88},
+            "primary_metric": {"name": "acc", "value": 0.88},
+            "validation": {"source": "held-out"},
+        },
+        "diff": {"config_diff_summary": {"seed": {"before": 7, "after": 8, "op": "set"}}},
+        "timeline": {"events": [{"kind": "artifact", "created_at": "t", "message": "saved"}]},
+        "decision": {"decision": "keep", "reason": "improves"},
+        "artifacts": [{"kind": "artifact", "data": {"uri": "s3://bucket", "name": "best", "step": 3}}],
+        "generated_at": "2026-06-02T00:00:00Z",
+    }
+
+    md = render_research_bundle_markdown(payload)
+    assert "# Research Bundle: alpha (exp-1)" in md
+    assert "## Decision" in md
+    assert "## Artifacts" in md
+    assert "keep" in md
+    assert "beats baseline" in md
+    assert "metric: acc" in md
+    assert "baseline_value: 0.8" in md
+    assert "baseline_source: parent" in md
+    assert "s3://bucket" in md
+    md_repeat = render_research_bundle_markdown(payload)
+    assert md == md_repeat
+
+
+def test_experiment_client_research_bundle_markdown_fetches_and_renders(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    bundle = {
+        "experiment": {"id": "exp-1", "name": "alpha", "status": "running"},
+        "summary": {},
+        "diff": {},
+        "manifest": {},
+        "timeline": {"events": []},
+        "decision": {"decision": None, "reason": None},
+        "artifacts": [],
+        "generated_at": "2026-06-02T00:00:00Z",
+    }
+    markdown, calls = _run(
+        monkeypatch,
+        lambda: client.research_bundle_markdown("alpha"),
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            bundle,
+        ],
+    )
+
+    assert [c["method"] for c in calls] == ["GET", "GET"]
+    assert calls[1]["url"] == "http://server/api/experiments/exp-1/research-bundle"
+    assert markdown.startswith("# Research Bundle:")

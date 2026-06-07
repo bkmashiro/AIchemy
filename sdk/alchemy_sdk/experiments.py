@@ -498,6 +498,21 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/research-bundle")
 
+    def research_bundle_markdown(self, ref: str, *, refresh: bool = False) -> str:
+        """Fetch the research bundle and render it as Markdown.
+
+        Convenience wrapper around :meth:`research_bundle` plus
+        :func:`render_research_bundle_markdown`. One GET request total — the
+        rendering is local and side-effect-free.
+        """
+        bundle = self.research_bundle(ref, refresh=refresh)
+        if not isinstance(bundle, Mapping):
+            raise RuntimeError(
+                "unexpected research-bundle response shape: expected object, "
+                f"got {type(bundle).__name__}"
+            )
+        return render_research_bundle_markdown(bundle)
+
     def fork_plan(
         self,
         ref: str,
@@ -660,6 +675,235 @@ def _md_filter_value(value: Any) -> str:
     if value is None or value == "":
         return "*all*"
     return str(value)
+
+
+def _bundle_get(mapping: Mapping[str, Any], *keys: str) -> Any:
+    value: Any = mapping
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _bundle_locator(artifact: Mapping[str, Any]) -> str:
+    data = artifact.get("data") if isinstance(artifact.get("data"), Mapping) else {}
+    if not isinstance(data, Mapping):
+        return "-"
+    return (
+        data.get("uri")
+        or data.get("path")
+        or data.get("locator")
+        or data.get("source")
+        or "-"
+    )
+
+
+def _md_format_mapping_entries(mapping: Mapping[str, Any] | Any) -> str:
+    if not isinstance(mapping, Mapping) or not mapping:
+        return "-"
+    return ", ".join(
+        f"{_md_escape_cell(k)}={_md_format_number(v)}" for k, v in sorted(mapping.items(), key=lambda item: str(item[0]))
+    )
+
+
+def _md_pick_first_dict(*candidates: Any) -> dict[str, Any] | None:
+    for candidate in candidates:
+        if isinstance(candidate, Mapping) and candidate:
+            return dict(candidate)
+    return None
+
+
+def _safe_recent_events(events: Any, limit: int = 8) -> list[dict[str, Any]]:
+    if not isinstance(events, list):
+        return []
+    selected: list[dict[str, Any]] = []
+    for event in events[:limit]:
+        if not isinstance(event, Mapping):
+            continue
+        selected.append(dict(event))
+    return selected
+
+
+def render_research_bundle_markdown(bundle: Mapping[str, Any]) -> str:
+    """Render a research-bundle payload as Markdown.
+
+    Pure formatter — no I/O, no network. The output is deterministic given
+    the input (no clock reads, no random ordering).
+    """
+    if not isinstance(bundle, Mapping):
+        raise TypeError(
+            f"render_research_bundle_markdown expects a mapping, got {type(bundle).__name__}"
+        )
+
+    experiment = bundle.get("experiment") if isinstance(bundle.get("experiment"), Mapping) else {}
+    summary = bundle.get("summary") if isinstance(bundle.get("summary"), Mapping) else {}
+    decision = bundle.get("decision") if isinstance(bundle.get("decision"), Mapping) else {}
+    diff = bundle.get("diff") if isinstance(bundle.get("diff"), Mapping) else {}
+    manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), Mapping) else {}
+    timeline = bundle.get("timeline") if isinstance(bundle.get("timeline"), Mapping) else {}
+    artifacts = bundle.get("artifacts") if isinstance(bundle.get("artifacts"), list) else []
+
+    exp_name = experiment.get("name") or experiment.get("id") or "(unnamed)"
+    exp_id = experiment.get("id")
+    family = experiment.get("family")
+    status = experiment.get("status")
+    title = f"{exp_name} ({exp_id})" if exp_id else exp_name
+    if title == "(unnamed)" and not exp_id:
+        title = "unknown"
+
+    lines: list[str] = [f"# Research Bundle: {title}"]
+    lines.append("")
+    lines.append("## Experiment")
+    lines.append(f"- id: {_md_escape_cell(exp_id or '-')}")
+    lines.append(f"- family: {_md_escape_cell(family or '-')}")
+    lines.append(f"- status: {_md_escape_cell(status or '-')}")
+    lines.append(f"- generated_at: {_md_escape_cell(bundle.get('generated_at') or '-')}")
+    lines.append("")
+
+    lines.append("## Decision")
+    if decision:
+        lines.append(f"- decision: {_md_escape_cell(decision.get('decision') or '-')}")
+        lines.append(f"- reason: {_md_escape_cell(decision.get('reason') or '-')}")
+        if decision.get("decided_at"):
+            lines.append(f"- decided_at: {_md_escape_cell(decision.get('decided_at'))}")
+    else:
+        lines.append("- no decision recorded")
+    lines.append("")
+
+    recommendation = _bundle_get(summary, "recommendation") if isinstance(summary, Mapping) else None
+    lines.append("## Recommendation")
+    if isinstance(recommendation, Mapping):
+        recommendation_rows = [
+            "action",
+            "verdict",
+            "reason",
+            "metric",
+            "value",
+            "baseline_value",
+            "delta",
+            "direction",
+            "evidence_quality",
+            "evidence_reason",
+            "sample_count",
+            "comparable_count",
+            "baseline_source",
+        ]
+        has_any = False
+        for key in recommendation_rows:
+            if recommendation.get(key) is None:
+                continue
+            has_any = True
+            lines.append(f"- {key}: {_md_escape_cell(_md_format_number(recommendation.get(key)))}")
+        if not has_any:
+            lines.append("- no recommendation details available")
+    else:
+        lines.append("- no recommendation available")
+    lines.append("")
+
+    lines.append("## Metrics")
+    primary_metric = _bundle_get(summary, "primary_metric")
+    if isinstance(primary_metric, Mapping):
+        lines.append(f"- primary metric: {_md_escape_cell(_md_format_primary_metric(primary_metric))}")
+    elif isinstance(summary.get("metric"), Mapping):
+        lines.append(f"- primary metric: {_md_escape_cell(_md_format_primary_metric(summary['metric']))}")
+    else:
+        lines.append("- primary metric: -")
+
+    best_metrics = _bundle_get(summary, "best_metrics")
+    if isinstance(best_metrics, Mapping) and best_metrics:
+        lines.append(f"- best metrics: {_md_format_mapping_entries(best_metrics)}")
+    elif isinstance(best_metrics, (list, tuple)) and best_metrics:
+        lines.append(
+            "- best metrics: "
+            + _md_format_mapping_entries({str(i): v for i, v in enumerate(best_metrics)})
+        )
+    else:
+        lines.append("- best metrics: -")
+
+    validation = _bundle_get(summary, "validation")
+    if isinstance(validation, Mapping) and validation:
+        lines.append(f"- validation: {_md_format_mapping_entries(validation)}")
+    elif validation is not None:
+        lines.append(f"- validation: {_md_escape_cell(validation)}")
+    else:
+        lines.append("- validation: -")
+    lines.append("")
+
+    lines.append("## Config diff summary")
+    config_diff = _md_pick_first_dict(
+        _bundle_get(diff, "config_diff_summary"),
+        _bundle_get(diff, "config_change_summary"),
+        _bundle_get(summary, "diff_summary"),
+        _bundle_get(summary, "config_diff"),
+        _bundle_get(summary, "config_diff_summary"),
+        _bundle_get(manifest, "config_diff"),
+    )
+    if config_diff:
+        has_table = False
+        for key, value in sorted(config_diff.items(), key=lambda item: str(item[0])):
+            if isinstance(value, Mapping):
+                before = _md_format_number(value.get("before"))
+                after = _md_format_number(value.get("after"))
+                op = _md_format_number(value.get("op"))
+                if not has_table:
+                    lines.append("| Key | Before | After | Op |")
+                    lines.append("|-----|--------|-------|----|")
+                    has_table = True
+                lines.append(f"| {_md_escape_cell(key)} | {before} | {after} | {op} |")
+            else:
+                if not has_table:
+                    lines.append("| Key | Value |")
+                    lines.append("|-----|-------|")
+                    has_table = True
+                lines.append(f"| {_md_escape_cell(key)} | {_md_format_number(value)} |")
+        if not has_table:
+            lines.append("- no config diff entries")
+    else:
+        lines.append("- no config diff summary")
+    lines.append("")
+
+    lines.append("## Artifacts")
+    if artifacts:
+        lines.append("| Kind | Name | Locator | Step |")
+        lines.append("|------|------|---------|------|")
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                continue
+            artifact_kind = _md_escape_cell(artifact.get("kind") or "artifact")
+            data = artifact.get("data") if isinstance(artifact.get("data"), Mapping) else {}
+            locator = _md_escape_cell(_bundle_locator(artifact))
+            name = _md_escape_cell(
+                (data.get("name") if isinstance(data, Mapping) else None)
+                or artifact.get("name")
+                or "-"
+            )
+            step = _md_format_number((data.get("step") if isinstance(data, Mapping) else None))
+            lines.append(f"| {artifact_kind} | {name} | {locator} | {step} |")
+    else:
+        lines.append("- no artifacts")
+    lines.append("")
+
+    lines.append("## Recent timeline events")
+    recent_events = _safe_recent_events(_bundle_get(timeline, "events"), limit=8)
+    if not recent_events:
+        lines.append("- no timeline events")
+    else:
+        for event in recent_events:
+            kind = event.get("kind") or event.get("type") or "event"
+            ts = event.get("created_at") or event.get("timestamp") or event.get("ts")
+            msg = event.get("message")
+            if ts:
+                if msg is not None:
+                    lines.append(f"- {ts}: {_md_escape_cell(kind)} — {_md_escape_cell(msg)}")
+                else:
+                    lines.append(f"- {ts}: {_md_escape_cell(kind)}")
+            elif msg is not None:
+                lines.append(f"- {_md_escape_cell(kind)} — {_md_escape_cell(msg)}")
+            else:
+                lines.append(f"- {_md_escape_cell(kind)}")
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def render_research_report_markdown(report: Mapping[str, Any]) -> str:

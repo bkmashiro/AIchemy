@@ -145,6 +145,7 @@ export function ExperimentResearchCallCard({
   const parentRef = parent?.id ?? exp.parent_id ?? parentName ?? null;
   const family = summary?.family ?? exp.family ?? null;
   const goalDirection = summary?.goal_direction ?? exp.goal_direction ?? null;
+  const parentFamily = parent?.family ?? family;
   const replicationReason = isText(recommendation?.reason)
     ? recommendation.reason.trim()
     : isText(decisionReason)
@@ -156,11 +157,82 @@ export function ExperimentResearchCallCard({
 
   const [exportState, setExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [exportError, setExportError] = useState<string | null>(null);
+  const [copyState, setCopyState] = useState<"idle" | "success" | "error">("idle");
+  const [copyError, setCopyError] = useState<string | null>(null);
 
   const cliRef = exp.name || exp.id;
-  const cliRefForShell = cliRef.length === 0
-    ? "''"
-    : `'${cliRef.replace(/'/g, "'\"'\"'")}'`;
+  const cliRefForShell = shellQuote(cliRef);
+  const sdkRef = JSON.stringify(exp.name || exp.id);
+  const sdkReason = JSON.stringify(replicationReason);
+  const sdkSnippet = `client = ExperimentClient(...)
+client.replication_plan(${sdkRef}, reason=${sdkReason})`;
+  const replicationPlanManifest = {
+    kind: "replication-plan",
+    dry_run: true,
+    experiment: {
+      id: exp.id,
+      name: exp.name || exp.id,
+    },
+    parent: {
+      ...(parent?.id ? { id: parent.id } : {}),
+      ...(parentName ? { name: parentName } : {}),
+      ...(parent?.id || parentName || parentFamily ? { family: parentFamily } : {}),
+    },
+    goal_metric: goalMetric,
+    goal_direction: goalDirection,
+    recommendation: {
+      action: recAction,
+      verdict: recVerdict,
+      reason: recommendation?.reason ?? null,
+      metric: recMetric,
+      value: recValue,
+      baseline: recBaseline,
+      delta: recDelta,
+      evidence: evidenceQuality,
+    },
+    cli: replicationPlanHint,
+    safeguards: [
+      "This manifest is dry_run=true and does not submit any task by itself.",
+      "Explicit submit is required before running replication",
+    ],
+  };
+
+  async function copyReplicationPlanCli() {
+    setCopyState("idle");
+    setCopyError(null);
+
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      setCopyState("error");
+      setCopyError("Clipboard is unavailable in this environment.");
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(replicationPlanHint);
+      setCopyState("success");
+    } catch (err: unknown) {
+      setCopyError(err instanceof Error ? err.message : String(err));
+      setCopyState("error");
+    }
+  }
+
+  async function downloadReplicationPlan() {
+    try {
+      const manifest = JSON.stringify(replicationPlanManifest, null, 2);
+      const blob = new Blob([manifest], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeName = (exp.name || exp.id).replace(/[^a-zA-Z0-9_.-]+/g, "_");
+      a.download = `${safeName}-replication-plan.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err: unknown) {
+      setExportError(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   async function downloadBundle() {
     setExportState("loading");
@@ -328,6 +400,34 @@ export function ExperimentResearchCallCard({
             </p>
             <p className="text-[11px] text-gray-400">CLI hint:</p>
             <code className="block text-[10px] text-gray-500 break-all">{replicationPlanHint}</code>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={copyReplicationPlanCli}
+                className="text-[11px] px-2 py-1 rounded border border-blue-700 bg-blue-900/40 text-blue-100 hover:bg-blue-900/60"
+              >
+                Copy CLI
+              </button>
+              <button
+                type="button"
+                onClick={downloadReplicationPlan}
+                className="text-[11px] px-2 py-1 rounded border border-blue-700 bg-blue-900/40 text-blue-100 hover:bg-blue-900/60"
+              >
+                Download plan JSON
+              </button>
+            </div>
+            {copyState === "success" && (
+              <p className="mt-1 text-[11px] text-emerald-400">CLI copied to clipboard.</p>
+            )}
+            {copyState === "error" && (
+              <p className="mt-1 text-[11px] text-rose-400">{copyError ?? "Failed to copy CLI hint."}</p>
+            )}
+            <div>
+              <p className="mt-2 text-[11px] text-gray-400">SDK snippet:</p>
+              <pre className="mt-1 rounded border border-gray-800 bg-gray-950/40 p-2 text-[10px] text-gray-300 overflow-x-auto">
+                <code>{sdkSnippet}</code>
+              </pre>
+            </div>
           </div>
         </div>
       )}

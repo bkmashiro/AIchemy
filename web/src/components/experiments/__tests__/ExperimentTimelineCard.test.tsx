@@ -16,11 +16,16 @@ vi.mock("../../../lib/api", async (importOriginal) => {
   };
 });
 
-function makeEvent(id: string, created_at: string, message = id): ExperimentEvent {
+function makeEvent(
+  id: string,
+  created_at: string,
+  message = id,
+  kind: ExperimentEvent["kind"] = "note",
+): ExperimentEvent {
   return {
     id,
     experiment_id: "exp-a",
-    kind: "note",
+    kind,
     message,
     created_at,
     actor: "tester",
@@ -48,9 +53,9 @@ describe("ExperimentTimelineCard", () => {
 
   it("renders newest events first", () => {
     renderCard([
-      makeEvent("old", "2026-06-01T00:00:00.000Z", "old event"),
-      makeEvent("new", "2026-06-03T00:00:00.000Z", "new event"),
-      makeEvent("mid", "2026-06-02T00:00:00.000Z", "mid event"),
+      makeEvent("old", "2026-06-01T00:00:00.000Z", "old event", "note"),
+      makeEvent("new", "2026-06-03T00:00:00.000Z", "new event", "note"),
+      makeEvent("mid", "2026-06-02T00:00:00.000Z", "mid event", "note"),
     ]);
 
     const items = screen.getAllByRole("listitem");
@@ -59,11 +64,59 @@ describe("ExperimentTimelineCard", () => {
     expect(items[2]).toHaveTextContent("old event");
   });
 
+  it("renders filter chips with counts", () => {
+    renderCard([
+      makeEvent("n1", "2026-06-01T00:00:00.000Z", "note 1", "note"),
+      makeEvent("d1", "2026-06-02T00:00:00.000Z", "decision 1", "decision"),
+      makeEvent("a1", "2026-06-03T00:00:00.000Z", "artifact 1", "artifact"),
+      makeEvent("c1", "2026-06-04T00:00:00.000Z", "checkpoint 1", "checkpoint"),
+      makeEvent("t1", "2026-06-05T00:00:00.000Z", "task started", "task_started"),
+      makeEvent("t2", "2026-06-06T00:00:00.000Z", "task completed", "task_completed"),
+    ]);
+
+    expect(screen.getByRole("button", { name: "All (6)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Notes (1)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Decisions (1)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Artifacts (1)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Checkpoints (1)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Tasks (2)" })).toBeInTheDocument();
+  });
+
+  it("filters by decisions, artifacts, and tasks", () => {
+    renderCard([
+      makeEvent("task-start", "2026-06-01T00:00:00.000Z", "task started", "task_started"),
+      makeEvent("artifact", "2026-06-02T00:00:00.000Z", "artifact event", "artifact"),
+      makeEvent("decision", "2026-06-03T00:00:00.000Z", "decision event", "decision"),
+      makeEvent("task-fail", "2026-06-04T00:00:00.000Z", "task failed", "task_failed"),
+      makeEvent("task-done", "2026-06-05T00:00:00.000Z", "task completed", "task_completed"),
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Decisions (1)" }));
+    expect(screen.getByText("Showing decisions evidence")).toBeInTheDocument();
+    const listItemsAfterDecisions = screen.getAllByRole("listitem");
+    expect(listItemsAfterDecisions).toHaveLength(1);
+    expect(listItemsAfterDecisions[0]).toHaveTextContent("decision event");
+
+    fireEvent.click(screen.getByRole("button", { name: "Artifacts (1)" }));
+    expect(screen.getByText("Showing artifacts evidence")).toBeInTheDocument();
+    const listItemsAfterArtifacts = screen.getAllByRole("listitem");
+    expect(listItemsAfterArtifacts).toHaveLength(1);
+    expect(listItemsAfterArtifacts[0]).toHaveTextContent("artifact event");
+
+    fireEvent.click(screen.getByRole("button", { name: "Tasks (3)" }));
+    expect(screen.getByText("Showing tasks evidence")).toBeInTheDocument();
+    const listItemsAfterTasks = screen.getAllByRole("listitem");
+    expect(listItemsAfterTasks).toHaveLength(3);
+    expect(listItemsAfterTasks[0]).toHaveTextContent("task completed");
+    expect(listItemsAfterTasks[1]).toHaveTextContent("task failed");
+    expect(listItemsAfterTasks[2]).toHaveTextContent("task started");
+  });
+
   it("paginates timeline events and disables controls at bounds", () => {
     renderCard([
-      makeEvent("one", "2026-06-01T00:00:00.000Z", "oldest"),
-      makeEvent("two", "2026-06-02T00:00:00.000Z", "middle"),
-      makeEvent("three", "2026-06-03T00:00:00.000Z", "newest"),
+      makeEvent("one", "2026-06-01T00:00:00.000Z", "oldest", "note"),
+      makeEvent("two", "2026-06-02T00:00:00.000Z", "middle", "note"),
+      makeEvent("three", "2026-06-03T00:00:00.000Z", "newest", "note"),
     ], 2);
 
     expect(screen.getByText("1-2 of 3 events")).toBeInTheDocument();
@@ -82,9 +135,31 @@ describe("ExperimentTimelineCard", () => {
     expect(screen.queryByText("newest")).not.toBeInTheDocument();
   });
 
+  it("resets to first page after applying a filter", () => {
+    renderCard([
+      makeEvent("t1", "2026-06-01T00:00:00.000Z", "task1", "task_started"),
+      makeEvent("d1", "2026-06-02T00:00:00.000Z", "decision1", "decision"),
+      makeEvent("t2", "2026-06-03T00:00:00.000Z", "task2", "task_completed"),
+      makeEvent("t3", "2026-06-04T00:00:00.000Z", "task3", "task_failed"),
+      makeEvent("a1", "2026-06-05T00:00:00.000Z", "artifact1", "artifact"),
+    ], 2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("3-4 of 5 events")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Artifacts (1)" }));
+
+    expect(screen.getByText("Showing artifacts evidence")).toBeInTheDocument();
+    expect(screen.getByText("1-1 of 1 event")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Previous" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
+    expect(screen.getByText("artifact1")).toBeInTheDocument();
+    expect(screen.queryByText("task3")).not.toBeInTheDocument();
+  });
+
   it("still allows adding a note from the empty state", async () => {
     const onNoteAdded = vi.fn();
-    vi.mocked(experimentsApi.addNote).mockResolvedValue(makeEvent("note", "2026-06-04T00:00:00.000Z"));
+    vi.mocked(experimentsApi.addNote).mockResolvedValue(makeEvent("note", "2026-06-04T00:00:00.000Z", "new note"));
     renderCard([], 2, onNoteAdded);
 
     fireEvent.change(screen.getByPlaceholderText("Add a note..."), {

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
 import type {
   ExperimentDetail,
   ExperimentRecommendation,
@@ -153,6 +153,151 @@ describe("ExperimentResearchCallCard", () => {
     expect(
       screen.getByText("alch experiments replication-plan research-call --reason 'Need higher confidence before shipping'"),
     ).toBeInTheDocument();
+    expect(screen.getByText((content) => /Explicit submit required\./.test(content))).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Copy CLI/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Download plan JSON/i })).toBeInTheDocument();
+    expect(screen.getByText((content) => content.includes("client.replication_plan(\"research-call\""))).toBeInTheDocument();
+  });
+
+  it("copies replication plan CLI hint to clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Need higher confidence before shipping",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Copy CLI/i }));
+
+    expect(writeText).toHaveBeenCalledWith(
+      "alch experiments replication-plan research-call --reason 'Need higher confidence before shipping'",
+    );
+    expect(await screen.findByText((content) => content.includes("CLI copied to clipboard."))).toBeInTheDocument();
+  });
+
+  it("shows an error if copying CLI hint fails", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Need higher confidence before shipping",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Copy CLI/i }));
+
+    expect(await screen.findByText("denied")).toBeInTheDocument();
+  });
+
+  it("downloads a replication-plan manifest JSON with explicit safeguards", async () => {
+    const exp = makeExperiment({
+      parent_id: "parent-exp",
+      parent_name: "Parent Experiment",
+      family: "research",
+      goal_metric: "val_loss",
+      goal_direction: "min",
+    });
+    const summary = makeSummary({
+      goal_metric: "val_loss",
+      goal_direction: "min",
+      parent: {
+        id: "parent-exp",
+        name: "Parent Experiment",
+        status: "running",
+        family: "research",
+        parent_id: null,
+        decision: null,
+        fork_reason: null,
+        goal_metric: null,
+        goal_direction: null,
+        created_at: "2026-06-01T00:00:00.000Z",
+      },
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Need higher confidence before shipping",
+      }),
+    });
+
+    let manifestBlob: any = null;
+    const originalCreateObjectURL = (URL as any).createObjectURL;
+    const originalRevokeObjectURL = (URL as any).revokeObjectURL;
+    const OriginalBlob = (globalThis as any).Blob;
+    const anchorClickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    (globalThis as any).Blob = class {
+      chunks: any[];
+
+      constructor(chunks: any[]) {
+        this.chunks = chunks;
+      }
+
+      text() {
+        return Promise.resolve(this.chunks.join(""));
+      }
+    };
+    (URL as any).createObjectURL = (value: any) => {
+      manifestBlob = value;
+      return "blob:mock-manifest";
+    };
+    (URL as any).revokeObjectURL = () => undefined;
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Download plan JSON/i }));
+
+    const payloadText = manifestBlob ? await manifestBlob.text() : "{}";
+    const payload = JSON.parse(payloadText);
+
+    expect(payload.kind).toBe("replication-plan");
+    expect(payload.dry_run).toBe(true);
+    expect(payload.experiment).toMatchObject({
+      id: "exp-a",
+      name: "research-call",
+    });
+    expect(payload.parent).toMatchObject({
+      id: "parent-exp",
+      name: "Parent Experiment",
+      family: "research",
+    });
+    expect(payload.goal_metric).toBe("val_loss");
+    expect(payload.goal_direction).toBe("min");
+    expect(payload.recommendation).toMatchObject({
+      action: "Needs replication",
+      verdict: null,
+      reason: "Need higher confidence before shipping",
+      metric: "val_loss",
+      value: 0.9012,
+      baseline: 0.9123,
+      delta: -0.0111,
+      evidence: "weak",
+    });
+    expect(payload.cli).toContain("--reason");
+    expect(payload.safeguards).toContain("This manifest is dry_run=true and does not submit any task by itself.");
+    expect(payload.safeguards).toContain("Explicit submit is required before running replication");
+
+    (URL as any).createObjectURL = originalCreateObjectURL;
+    (URL as any).revokeObjectURL = originalRevokeObjectURL;
+    (globalThis as any).Blob = OriginalBlob;
+    anchorClickSpy.mockRestore();
   });
 
   it("shell-quotes replication plan reasons with embedded single quotes", () => {
