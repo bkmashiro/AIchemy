@@ -10,6 +10,7 @@ import {
   NEXT_ACTION,
   NEXT_ACTION_DEFAULT,
   recommendationBadgeClass,
+  recommendationLabel,
   recommendationLabelValue,
   decisionLabelForFilter,
 } from "./experimentDetailUtils";
@@ -18,6 +19,13 @@ function isText(value: string | null | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+// Quote a CLI argument that may contain spaces or shell metacharacters.
+// Single-quote escape is enough for /bin/sh, zsh, and bash.
+function shellQuote(s: string): string {
+  if (s === "") return "''";
+  if (/^[A-Za-z0-9_./@:=+-]+$/.test(s)) return s;
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
 
 function recommendationTone(
   recommendationAction: string | null | undefined,
@@ -67,6 +75,21 @@ function deltaClass(value: number | null | undefined): string {
   return "text-gray-300";
 }
 
+function evidenceBadgeClass(value: string | null | undefined): string {
+  switch (value) {
+    case "strong":
+      return "border-emerald-700/50 bg-emerald-900/30 text-emerald-300";
+    case "moderate":
+      return "border-cyan-700/50 bg-cyan-900/30 text-cyan-300";
+    case "weak":
+      return "border-amber-700/50 bg-amber-900/30 text-amber-300";
+    case "insufficient":
+      return "border-gray-700 bg-gray-800 text-gray-400";
+    default:
+      return "border-gray-700 bg-gray-800 text-gray-500";
+  }
+}
+
 export function ExperimentResearchCallCard({
   exp,
   summary,
@@ -105,6 +128,31 @@ export function ExperimentResearchCallCard({
   const recVerdict = isText(recommendation?.verdict)
     ? recommendationLabelValue(recommendation.verdict)
     : null;
+  const evidenceQuality = recommendation?.evidence_quality ?? null;
+  const evidenceReason = recommendation?.evidence_reason ?? null;
+  const sampleCount = recommendation?.sample_count ?? null;
+  const baselineSource = recommendation?.baseline_source ?? null;
+  const comparableCount = recommendation?.comparable_count ?? null;
+
+  const explicitDecisionIsRerun = explicitDecision === "rerun";
+  const recommendationLabelText = recommendationLabel(recommendation);
+  const recommendationIsRerun =
+    recommendationLabelText != null && recommendationLabelText.toLowerCase() === "needs replication";
+  const showReplicationPlan = explicitDecisionIsRerun || recommendationIsRerun;
+
+  const parent = summary?.parent ?? null;
+  const parentName = parent?.name ?? exp.parent_name ?? null;
+  const parentRef = parent?.id ?? exp.parent_id ?? parentName ?? null;
+  const family = summary?.family ?? exp.family ?? null;
+  const goalDirection = summary?.goal_direction ?? exp.goal_direction ?? null;
+  const replicationReason = isText(recommendation?.reason)
+    ? recommendation.reason.trim()
+    : isText(decisionReason)
+      ? decisionReason.trim()
+      : "TODO: describe the ablation";
+  const replicationPlanHint = `alch experiments replication-plan ${shellQuote(exp.name || exp.id)} --reason ${shellQuote(
+    replicationReason,
+  )}`;
 
   const [exportState, setExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [exportError, setExportError] = useState<string | null>(null);
@@ -198,6 +246,88 @@ export function ExperimentResearchCallCard({
                 </div>
               </div>
             )}
+            {evidenceQuality && (
+              <div className="rounded border border-gray-800 bg-gray-950/30 px-2 py-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[10px] uppercase tracking-wide text-gray-500">Evidence</span>
+                  <span className={`text-[10px] px-2 py-0.5 rounded border ${evidenceBadgeClass(evidenceQuality)}`}>
+                    {evidenceQuality}
+                  </span>
+                  {baselineSource && (
+                    <span className="text-[10px] text-gray-500">baseline: {baselineSource}</span>
+                  )}
+                </div>
+                <div className="mt-1 text-[11px] text-gray-400">
+                  {isText(evidenceReason) ? evidenceReason : "Evidence details unavailable."}
+                  {sampleCount !== null && ` Samples: ${sampleCount}.`}
+                  {comparableCount !== null && ` Comparables: ${comparableCount}.`}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showReplicationPlan && (
+        <div className="mt-3 rounded-lg border border-blue-900/40 bg-blue-900/10">
+          <div className="px-2 py-1.5 border-b border-blue-900/30 text-[10px] uppercase tracking-wide text-blue-300">
+            Replication plan
+          </div>
+          <div className="px-2 py-2 space-y-2 text-xs text-gray-300">
+            <p className="text-emerald-300">
+              Preview dry run only — no task will be submitted without explicit submit.
+            </p>
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-gray-500">Parent experiment</div>
+              {parentName || parentRef ? (
+                <p className="font-mono">
+                  {parentName ? `${parentName} ` : ""}
+                  {parentRef ? `(id: ${parentRef})` : ""}
+                </p>
+              ) : (
+                <p className="text-gray-600">No parent reference available</p>
+              )}
+            </div>
+            {family && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-gray-500">Family</div>
+                <p className="font-mono">{family}</p>
+              </div>
+            )}
+            {goalMetric && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-gray-500">Goal metric</div>
+                <p className="font-mono">
+                  {goalMetric}
+                  {goalDirection ? ` (${goalDirection})` : ""}
+                </p>
+              </div>
+            )}
+            {(isText(recMetric) || recValue !== null || recBaseline !== null || recDelta !== null) && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wide text-gray-500">Current metric</div>
+                <div className="font-mono">
+                  {isText(recMetric) ? recMetric : "—"}
+                  {" / value "}
+                  {formatNumericMetric(recValue)}
+                  {" / baseline "}
+                  {formatNumericMetric(recBaseline)}
+                  {" / delta "}
+                  <span className={deltaClass(recDelta)}>{formatNumericMetric(recDelta)}</span>
+                </div>
+              </div>
+            )}
+            <div>
+              <div className="text-[10px] uppercase tracking-wide text-gray-500">Suggested reason</div>
+              <p className="italic">{replicationReason}</p>
+            </div>
+            <p className="text-[11px] text-gray-400">
+              Before submit, review config diff and target / cwd / args in CLI output.
+              <br />
+              Explicit submit required.
+            </p>
+            <p className="text-[11px] text-gray-400">CLI hint:</p>
+            <code className="block text-[10px] text-gray-500 break-all">{replicationPlanHint}</code>
           </div>
         </div>
       )}

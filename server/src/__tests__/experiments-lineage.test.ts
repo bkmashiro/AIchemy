@@ -923,6 +923,11 @@ describe("experiment lineage API", () => {
         direction: "min",
         value: 0.8,
         delta: -0.4,
+        evidence_quality: "moderate",
+        evidence_reason: "Better than parent baseline",
+        baseline_source: "parent",
+        sample_count: 1,
+        comparable_count: 1,
       }),
     );
 
@@ -940,6 +945,8 @@ describe("experiment lineage API", () => {
     completeExperiment(regressed.body.id, "loss", 1.6);
 
     const regressedSummary = await request(app).get(`/experiments/${regressed.body.id}/summary`).expect(200);
+    const regressedRecommendation = await request(app).get(`/experiments/${regressed.body.id}/recommendation`).expect(200);
+    expect(regressedRecommendation.body).toEqual(regressedSummary.body.recommendation);
     expect(regressedSummary.body.recommendation).toEqual(
       expect.objectContaining({
         action: "drop",
@@ -949,6 +956,58 @@ describe("experiment lineage API", () => {
         direction: "min",
         value: 1.6,
         delta: 0.4,
+        evidence_quality: "moderate",
+        evidence_reason: "Worse than parent baseline",
+        baseline_source: "parent",
+        sample_count: 1,
+        comparable_count: 1,
+      }),
+    );
+  });
+
+  it("uses strong evidence when parent baseline has multiple validation rows", async () => {
+    const app = makeApp();
+
+    const parent = await request(app)
+      .post("/experiments")
+      .send({
+        name: "parent-min-multi",
+        family: "family-min-multi",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [
+          { ref: "train-a", script: "/tmp/train.py" },
+          { ref: "train-b", script: "/tmp/train.py" },
+        ],
+      })
+      .expect(201);
+    completeExperiment(parent.body.id, "loss", 1.2);
+
+    const child = await request(app)
+      .post("/experiments")
+      .send({
+        name: "child-min-multi",
+        family: "family-min-multi",
+        parent_id: parent.body.id,
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [
+          { ref: "train-a", script: "/tmp/train.py" },
+          { ref: "train-b", script: "/tmp/train.py" },
+        ],
+      })
+      .expect(201);
+    completeExperiment(child.body.id, "loss", 0.8);
+
+    const recommendation = await request(app).get(`/experiments/${child.body.id}/recommendation`).expect(200);
+    expect(recommendation.body).toEqual(
+      expect.objectContaining({
+        action: "keep",
+        verdict: "improved",
+        evidence_quality: "strong",
+        baseline_source: "parent",
+        sample_count: 2,
+        comparable_count: 1,
       }),
     );
   });
@@ -991,6 +1050,11 @@ describe("experiment lineage API", () => {
         direction: "max",
         value: 0.88,
         delta: 0.07,
+        evidence_quality: "moderate",
+        evidence_reason: "Better than parent baseline",
+        baseline_source: "parent",
+        sample_count: 1,
+        comparable_count: 1,
       }),
     );
   });
@@ -1024,6 +1088,11 @@ describe("experiment lineage API", () => {
       expect.objectContaining({
         action: "rerun",
         verdict: "running",
+        evidence_quality: "insufficient",
+        baseline_source: "none",
+        sample_count: 0,
+        comparable_count: 0,
+        evidence_reason: expect.stringContaining("running"),
       }),
     );
 
@@ -1053,6 +1122,10 @@ describe("experiment lineage API", () => {
       expect.objectContaining({
         action: "rerun",
         verdict: "failed",
+        evidence_quality: "insufficient",
+        baseline_source: "none",
+        sample_count: 0,
+        comparable_count: 0,
       }),
     );
   });
@@ -1076,6 +1149,10 @@ describe("experiment lineage API", () => {
         verdict: "inconclusive",
         metric: null,
         direction: null,
+        evidence_quality: "insufficient",
+        baseline_source: "none",
+        sample_count: null,
+        comparable_count: 0,
       }),
     );
     expect(summary.body.recommendation.value).toBeNull();
@@ -1104,6 +1181,10 @@ describe("experiment lineage API", () => {
         baseline_value: null,
         value: 0.4,
         reason: "No comparable numeric baseline found",
+        evidence_quality: "weak",
+        baseline_source: "none",
+        sample_count: 1,
+        comparable_count: 0,
       }),
     );
   });
@@ -1144,6 +1225,10 @@ describe("experiment lineage API", () => {
         verdict: "best",
         baseline_value: 0.9,
         value: 0.4,
+        evidence_quality: "weak",
+        baseline_source: "family",
+        sample_count: 1,
+        comparable_count: 1,
       }),
     );
     expect(secondSummary.body.recommendation).toEqual(
@@ -1152,6 +1237,10 @@ describe("experiment lineage API", () => {
         verdict: "inconclusive",
         baseline_value: 0.4,
         value: 0.9,
+        evidence_quality: "weak",
+        baseline_source: "family",
+        sample_count: 1,
+        comparable_count: 1,
       }),
     );
   });

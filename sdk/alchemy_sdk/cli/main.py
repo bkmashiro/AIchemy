@@ -705,27 +705,65 @@ def apply_overrides(config: Any, sets: list[str], unsets: list[str]) -> tuple[di
     return proposed, diff
 
 
-def cmd_experiments_fork_plan(args: argparse.Namespace, client: ApiClient) -> None:
-    exp = find_experiment(client, args.experiment)
-    detail = client.get(f"/experiments/{exp['id']}")
+def build_fork_plan_manifest(
+    *,
+    exp: dict[str, Any],
+    detail: dict[str, Any],
+    sets: list[str],
+    unsets: list[str],
+    name: str | None,
+    reason: str,
+    suffix: str,
+    kind: str,
+) -> dict[str, Any]:
     base_config = detail.get("config") if isinstance(detail, dict) else None
-    proposed, diff = apply_overrides(base_config or {}, args.set or [], args.unset or [])
+    proposed, diff = apply_overrides(base_config or {}, sets, unsets)
     parent_name = detail.get("name") or exp.get("name")
-    suggested_name = args.name or f"{parent_name}-fork"
-    manifest = {
-        "kind": "fork-plan",
+    return {
+        "kind": kind,
         "dry_run": True,
         "parent": {
             "id": detail.get("id") or exp.get("id"),
             "name": parent_name,
             "family": detail.get("family"),
         },
-        "suggested_name": suggested_name,
-        "reason": args.reason,
+        "suggested_name": name or f"{parent_name}-{suffix}",
+        "reason": reason,
         "parent_config": base_config or {},
         "proposed_config": proposed,
         "config_diff": diff,
     }
+
+
+def cmd_experiments_fork_plan(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    detail = client.get(f"/experiments/{exp['id']}")
+    manifest = build_fork_plan_manifest(
+        exp=exp,
+        detail=detail,
+        sets=args.set or [],
+        unsets=args.unset or [],
+        name=args.name,
+        reason=args.reason,
+        suffix="fork",
+        kind="fork-plan",
+    )
+    print_json(manifest)
+
+
+def cmd_experiments_replication_plan(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    detail = client.get(f"/experiments/{exp['id']}")
+    manifest = build_fork_plan_manifest(
+        exp=exp,
+        detail=detail,
+        sets=args.set or [],
+        unsets=args.unset or [],
+        name=args.name,
+        reason=args.reason,
+        suffix="replication",
+        kind="replication-plan",
+    )
     print_json(manifest)
 
 
@@ -1015,6 +1053,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", help="suggested child experiment name (default <parent>-fork)")
     p.add_argument("--reason", default="", help="fork rationale to include in the dry-run manifest")
     p.set_defaults(func=cmd_experiments_fork_plan)
+
+    p = exps_sub.add_parser(
+        "replication-plan",
+        help="dry-run a replication: print proposed config + diff without submitting",
+        description=(
+            "Compute a replication manifest locally. Does NOT submit a fork or "
+            "create any work — only fetches the parent and prints the proposed "
+            "config and diff so you can review before using it in research "
+            "notes. Top-level keys only; nested (dotted) keys are rejected."
+        ),
+    )
+    p.add_argument("experiment", help="parent experiment name or id")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="override (JSON-encoded value if possible, else string). Repeatable. Flat keys only.")
+    p.add_argument("--unset", action="append", default=[], metavar="KEY", help="remove a top-level key. Repeatable. Top-level keys only.")
+    p.add_argument("--name", help="suggested child experiment name (default <parent>-replication)")
+    p.add_argument("--reason", default="", help="replication rationale to include in the dry-run manifest")
+    p.set_defaults(func=cmd_experiments_replication_plan)
 
     p = exps_sub.add_parser(
         "decide",

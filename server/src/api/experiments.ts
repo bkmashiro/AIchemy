@@ -349,6 +349,11 @@ export interface Recommendation {
   baseline_value: number | null;
   delta: number | null;
   direction: "min" | "max" | null;
+  evidence_quality: "strong" | "moderate" | "weak" | "insufficient";
+  evidence_reason: string;
+  sample_count: number | null;
+  baseline_source: "parent" | "family" | "none";
+  comparable_count: number;
 }
 
 function numeric(value: unknown): value is number {
@@ -359,25 +364,107 @@ function betterDirection(direction: "min" | "max", value: number, baseline: numb
   return direction === "min" ? value < baseline : value > baseline;
 }
 
+function goalMetricSampleCount(exp: Experiment, metricName: string | null | undefined): number | null {
+  if (!metricName) return null;
+  let count = 0;
+  for (const validation of Object.values(exp.results)) {
+    const detail = validation.details[metricName];
+    if (detail && numeric(detail.value)) count += 1;
+  }
+  return count;
+}
+
+type BaselineCandidate = {
+  source: "parent" | "family";
+  value: number;
+  comparable_count: number;
+};
+
+function baselineCandidateForExperiment(
+  exp: Experiment,
+  allExperiments: Experiment[],
+  primary: PrimaryMetric | null,
+): BaselineCandidate | null {
+  if (!primary || !primary.metric || !primary.direction || !numeric(primary.best)) return null;
+
+  if (exp.parent_id) {
+    const parent = allExperiments.find((candidate) => candidate.id === exp.parent_id && candidate.id !== exp.id);
+    if (parent) {
+      const parentPrimary = primaryMetricFor(parent);
+      if (
+        parentPrimary?.metric === primary.metric &&
+        parentPrimary.direction === primary.direction &&
+        numeric(parentPrimary.best)
+      ) {
+        return {
+          source: "parent",
+          value: parentPrimary.best,
+          comparable_count: 1,
+        };
+      }
+    }
+  }
+
+  const family = allExperiments.filter(
+    (candidate) => candidate.family && candidate.family === exp.family && candidate.id !== exp.id,
+  );
+  const comparableValues: number[] = [];
+  for (const candidate of family) {
+    const candidatePrimary = primaryMetricFor(candidate);
+    if (
+      candidatePrimary &&
+      candidatePrimary.metric === primary.metric &&
+      candidatePrimary.direction === primary.direction
+    ) {
+      const bestValue = candidatePrimary.best;
+      if (numeric(bestValue)) {
+        comparableValues.push(bestValue);
+      }
+    }
+  }
+
+  if (comparableValues.length === 0) return null;
+
+  const baseline = comparableValues.reduce(
+    (best, current) => (betterDirection(primary.direction, current, best) ? current : best),
+    primary.direction === "min" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY,
+  );
+
+  return {
+    source: "family",
+    value: baseline,
+    comparable_count: comparableValues.length,
+  };
+}
+
 function recommendationForExperiment(exp: Experiment, allExperiments: Experiment[]): Recommendation {
   const status = deriveExperimentStatus(exp);
+  const primary = primaryMetricFor(exp);
 
   const recommendation: Recommendation = {
     action: "rerun",
     verdict: "inconclusive",
     reason: "Recommendation unavailable",
-    metric: exp.goal_metric ?? null,
-    value: null,
+    metric: primary?.metric ?? exp.goal_metric ?? null,
+    value: primary && numeric(primary.best) ? primary.best : null,
     baseline_value: null,
     delta: null,
-    direction: exp.goal_direction ?? null,
+    direction: primary?.direction ?? exp.goal_direction ?? null,
+    evidence_quality: "insufficient",
+    evidence_reason: "Recommendation unavailable",
+    sample_count: goalMetricSampleCount(exp, primary?.metric ?? exp.goal_metric ?? null),
+    baseline_source: "none",
+    comparable_count: 0,
   };
 
-  const primary = primaryMetricFor(exp);
-  if (primary?.metric && primary?.direction) {
-    recommendation.metric = primary.metric;
-    recommendation.direction = primary.direction;
-    if (numeric(primary.best)) recommendation.value = primary.best;
+  const baseline = baselineCandidateForExperiment(exp, allExperiments, primary ?? null);
+  if (baseline) {
+    recommendation.baseline_source = baseline.source;
+    recommendation.comparable_count = baseline.comparable_count;
+    recommendation.baseline_value = baseline.value;
+    if (numeric(recommendation.value)) {
+      recommendation.delta = Number((recommendation.value - baseline.value).toPrecision(12));
+    }
   }
 
   // Explicit status override always wins over action/verdict, but preserve
@@ -386,6 +473,11 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
     recommendation.verdict = "failed";
     recommendation.action = "rerun";
     recommendation.reason = "Experiment failed";
+    recommendation.evidence_quality = "insufficient";
+    recommendation.evidence_reason = recommendation.reason;
+    if (recommendation.baseline_source === "none" && recommendation.sample_count === null) {
+      recommendation.sample_count = null;
+    }
     return recommendation;
   }
 
@@ -393,91 +485,59 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
     recommendation.verdict = "running";
     recommendation.action = "rerun";
     recommendation.reason = "Experiment is running";
+    recommendation.evidence_reason = "Experiment is running; evidence is incomplete";
+    recommendation.evidence_quality = recommendation.sample_count && recommendation.sample_count > 0 ? "weak" : "insufficient";
     return recommendation;
   }
 
   if (!primary?.metric || !primary?.direction) {
+    recommendation.evidence_quality = "insufficient";
+    recommendation.evidence_reason = recommendation.reason;
+    recommendation.baseline_source = "none";
+    recommendation.comparable_count = 0;
     return recommendation;
   }
 
   if (!numeric(primary.best)) {
     recommendation.reason = "Goal metric not yet available";
+    recommendation.evidence_reason = recommendation.reason;
+    recommendation.evidence_quality = recommendation.sample_count && recommendation.sample_count > 0 ? "weak" : "insufficient";
+    recommendation.baseline_source = "none";
+    recommendation.comparable_count = 0;
     return recommendation;
   }
 
-  const value = primary.best;
-
-  // Parent-first baseline lookup with exact family/generic metric+direction match.
-  let baselineValue: number | null = null;
-  let baselineReason: "parent" | "family" | null = null;
-
-  if (exp.parent_id) {
-    const parent = allExperiments.find((candidate) => candidate.id === exp.parent_id && candidate.id !== exp.id);
-    if (parent) {
-      const parentPrimary = primaryMetricFor(parent);
-      if (parentPrimary?.metric && parentPrimary.direction === primary.direction && numeric(parentPrimary.best)) {
-        baselineValue = parentPrimary.best;
-        baselineReason = "parent";
-      }
-    }
-  }
-
-  if (baselineValue === null) {
-    const sameFamily = allExperiments.filter(
-      (candidate) => candidate.family && candidate.family === exp.family && candidate.id !== exp.id,
-    );
-    const sameFamilyNumeric = sameFamily
-      .map((candidate) => ({
-        candidate,
-        primary: primaryMetricFor(candidate),
-      }))
-      .filter((entry): entry is { candidate: Experiment; primary: { metric: string; direction: "min" | "max"; best: number } } =>
-        !!entry.primary && !!entry.primary.metric && entry.primary.metric === primary.metric &&
-        entry.primary.direction === primary.direction && numeric(entry.primary.best)
-      )
-      .map((entry) => ({
-        best: entry.primary.best,
-      }));
-
-    if (sameFamilyNumeric.length > 0) {
-      baselineReason = "family";
-      baselineValue = sameFamilyNumeric
-        .map((entry) => entry.best)
-        .reduce((best, current) => (betterDirection(primary.direction, current, best) ? current : best),
-          primary.direction === "min" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY,
-        );
-    }
-  }
-
-  if (baselineValue === null) {
+  if (recommendation.baseline_value === null || baseline === null) {
     recommendation.reason = "No comparable numeric baseline found";
+    recommendation.evidence_reason = recommendation.reason;
+    recommendation.evidence_quality = recommendation.sample_count && recommendation.sample_count > 0 ? "weak" : "insufficient";
+    recommendation.baseline_source = "none";
+    recommendation.comparable_count = 0;
     return recommendation;
   }
 
-  recommendation.baseline_value = baselineValue;
-  recommendation.delta = Number((value - baselineValue).toPrecision(12));
-
-  if (baselineReason === "parent") {
-    if (numeric(baselineValue)) {
-      if (recommendation.delta === 0) {
-        recommendation.action = "rerun";
-        recommendation.verdict = "inconclusive";
-        recommendation.reason = "Metric equals parent baseline";
-      } else if (betterDirection(primary.direction, value, baselineValue)) {
-        recommendation.action = "keep";
-        recommendation.verdict = "improved";
-        recommendation.reason = "Better than parent baseline";
-      } else {
-        recommendation.action = "drop";
-        recommendation.verdict = "regressed";
-        recommendation.reason = "Worse than parent baseline";
-      }
+  if (baseline.source === "parent") {
+    recommendation.evidence_quality = recommendation.sample_count && recommendation.sample_count >= 2 ? "strong" : "moderate";
+    if (recommendation.delta === 0) {
+      recommendation.action = "rerun";
+      recommendation.verdict = "inconclusive";
+      recommendation.reason = "Metric equals parent baseline";
+    } else if (betterDirection(primary.direction, primary.best, recommendation.baseline_value)) {
+      recommendation.action = "keep";
+      recommendation.verdict = "improved";
+      recommendation.reason = "Better than parent baseline";
+    } else {
+      recommendation.action = "drop";
+      recommendation.verdict = "regressed";
+      recommendation.reason = "Worse than parent baseline";
     }
+    recommendation.evidence_reason = recommendation.reason;
     return recommendation;
   }
 
   // Same-family fallback (best-in-family when no parent baseline).
-  if (recommendation.delta === 0 || betterDirection(primary.direction, value, baselineValue)) {
+  recommendation.evidence_quality = recommendation.comparable_count >= 2 ? "moderate" : "weak";
+  if (recommendation.delta === 0 || betterDirection(primary.direction, primary.best, recommendation.baseline_value)) {
     recommendation.action = "keep";
     recommendation.verdict = "best";
     recommendation.reason = "Current best in family";
@@ -486,6 +546,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
     recommendation.verdict = "inconclusive";
     recommendation.reason = "Not family best";
   }
+  recommendation.evidence_reason = recommendation.reason;
   return recommendation;
 }
 

@@ -1056,6 +1056,7 @@ def _help_text(argv, capsys):
 def test_experiments_help_surfaces_research_loop_commands(capsys):
     out = _help_text(["experiments", "--help"], capsys)
     assert "fork-plan" in out
+    assert "replication-plan" in out
     assert "artifact" in out
     assert "checkpoint" in out
     assert "decide" in out
@@ -1068,5 +1069,71 @@ def test_experiments_fork_plan_help_documents_dry_run_contract(capsys):
     assert "dry-run" in out
     assert "Does NOT submit" in out
     assert "Top-level keys only" in out
+    assert "--set" in out
+    assert "--unset" in out
+
+
+def test_experiments_replication_plan_returns_manifest_without_posting(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "experiments", "replication-plan", "alpha",
+            "--set", "lr=0.0003",
+            "--set", "use_curiosity=true",
+            "--unset", "warmup",
+            "--reason", "replicate this branch",
+        ],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {
+                "id": "exp-1",
+                "name": "alpha",
+                "family": "pretrain",
+                "config": {"lr": 0.001, "warmup": 100, "seed": 7},
+            },
+        ],
+    )
+
+    # Two GETs only — must not POST/PATCH.
+    assert [c["method"] for c in calls] == ["GET", "GET"]
+    out = capsys.readouterr().out
+    manifest = json.loads(out)
+    assert manifest["kind"] == "replication-plan"
+    assert manifest["dry_run"] is True
+    assert manifest["parent"]["name"] == "alpha"
+    assert manifest["suggested_name"] == "alpha-replication"
+    assert manifest["reason"] == "replicate this branch"
+    assert manifest["parent_config"] == {"lr": 0.001, "warmup": 100, "seed": 7}
+    assert manifest["proposed_config"] == {"lr": 0.0003, "seed": 7, "use_curiosity": True}
+    assert manifest["config_diff"]["lr"] == {"before": 0.001, "after": 0.0003, "op": "set"}
+    assert manifest["config_diff"]["use_curiosity"] == {"before": None, "after": True, "op": "add"}
+    assert manifest["config_diff"]["warmup"] == {"before": 100, "after": None, "op": "unset"}
+
+
+def test_experiments_replication_plan_rejects_dotted_keys(monkeypatch, capsys):
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+
+    responses = [
+        [{"id": "exp-1", "name": "alpha"}],
+        {"id": "exp-1", "name": "alpha", "config": {}},
+    ]
+
+    def fake_urlopen(req, timeout=20.0):
+        return FakeResponse(responses.pop(0))
+
+    with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
+        code = cli.main([
+            "experiments", "replication-plan", "alpha",
+            "--set", "model.lr=0.1",
+        ])
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "nested keys" in err
+
+
+def test_experiments_replication_plan_help_documents_dry_run_contract(capsys):
+    out = _help_text(["experiments", "replication-plan", "--help"], capsys)
+    assert "dry-run" in out
+    assert "Does NOT submit" in out
     assert "--set" in out
     assert "--unset" in out

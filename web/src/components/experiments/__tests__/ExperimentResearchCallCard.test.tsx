@@ -66,6 +66,11 @@ function makeRecommendation(
     baseline_value: 0.9123,
     delta: -0.0111,
     direction: "down",
+    evidence_quality: "weak",
+    evidence_reason: "Signal is still noisy and sample count is low.",
+    sample_count: 1,
+    baseline_source: "parent",
+    comparable_count: 1,
     ...overrides,
   };
 }
@@ -109,6 +114,10 @@ describe("ExperimentResearchCallCard", () => {
     expect(screen.getByText(/\b0\.9012\b/)).toBeInTheDocument();
     expect(screen.getByText(/\b0\.9123\b/)).toBeInTheDocument();
     expect(screen.getByText(/-0\.0111/)).toBeInTheDocument();
+    expect(screen.getByText("weak")).toBeInTheDocument();
+    expect(screen.getByText(/baseline: parent/)).toBeInTheDocument();
+    expect(screen.getByText(/Samples: 1/)).toBeInTheDocument();
+    expect(screen.getByText(/Comparables: 1/)).toBeInTheDocument();
   });
 
   it("renders recommendation action rerun as needs replication", () => {
@@ -126,6 +135,60 @@ describe("ExperimentResearchCallCard", () => {
     const labels = screen.getAllByText("Needs replication");
     expect(labels).toHaveLength(2);
   });
+
+  it("renders a dry-run replication plan preview for rerun recommendations", () => {
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Need higher confidence before shipping",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    expect(screen.getByText("Replication plan")).toBeInTheDocument();
+    expect(screen.getByText(/Preview dry run only/)).toBeInTheDocument();
+    expect(
+      screen.getByText("alch experiments replication-plan research-call --reason 'Need higher confidence before shipping'"),
+    ).toBeInTheDocument();
+  });
+
+  it("shell-quotes replication plan reasons with embedded single quotes", () => {
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Need 'higher' confidence",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    expect(
+      screen.getByText("alch experiments replication-plan research-call --reason 'Need '\\''higher'\\'' confidence'"),
+    ).toBeInTheDocument();
+  });
+
+  it.each(["keep", "drop", "fork"])(
+    "does not render a replication plan for recommendation %s",
+    (recAction) => {
+      const exp = makeExperiment({});
+      const summary = makeSummary({
+        recommendation: makeRecommendation({
+          action: recAction,
+          verdict: null,
+          reason: "Steady signal.",
+        }),
+      });
+
+      render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+      expect(screen.queryByText("Replication plan")).not.toBeInTheDocument();
+    },
+  );
 
   it("renders recommendation card defensively when partially missing fields", () => {
     const exp = makeExperiment();
