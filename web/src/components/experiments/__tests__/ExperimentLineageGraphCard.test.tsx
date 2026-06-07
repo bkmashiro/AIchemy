@@ -47,7 +47,9 @@ function task(
 }
 
 function getRowNames(container: HTMLElement): string[] {
-  const rows = Array.from(container.querySelectorAll("div.flex.items-stretch"));
+  const rows = Array.from(
+    container.querySelectorAll("div.flex.items-stretch, button.flex.items-stretch"),
+  );
   const names: string[] = [];
 
   for (const row of rows) {
@@ -62,14 +64,14 @@ function getRowNames(container: HTMLElement): string[] {
   return names;
 }
 
-function getRowByLabel(container: HTMLElement, name: string): HTMLDivElement {
+function getRowByLabel(container: HTMLElement, name: string): HTMLElement {
   const row = container.querySelector(`button[aria-label="Preview ${name}"]`)?.closest(
-    "div.flex.items-stretch",
+    "button.flex.items-stretch, div.flex.items-stretch",
   );
-  if (!(row instanceof HTMLDivElement)) {
+  if (!row) {
     throw new Error(`Missing lineage row for ${name}`);
   }
-  return row;
+  return row as HTMLDivElement;
 }
 
 function taskChipByDisplayName(name: string): HTMLAnchorElement {
@@ -123,6 +125,82 @@ describe("ExperimentLineageGraphCard", () => {
       "href",
       "/experiments/child",
     );
+  });
+
+  it("lets a wide row area and chip area trigger sibling preview selection", () => {
+    const onSelectExperiment = vi.fn();
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start-with-a-very-long-name-that-truncates",
+        children: [
+          node({
+            id: "branch-a",
+            name: "branch-a",
+            parent_id: "root",
+            status: "passed",
+          }),
+          node({
+            id: "branch-b-extremely-long-name-that-should-have-chips-and-changes",
+            name: "branch-b-extremely-long-name-that-should-have-chips-and-changes",
+            parent_id: "root",
+            status: "passed",
+            decision: "fork",
+            recommendation: {
+              action: "fork",
+              verdict: null,
+              reason: "branch breadth test",
+              metric: "loss",
+              value: 0.2,
+              baseline_value: 0.3,
+              delta: -0.1,
+              direction: "min",
+            },
+            diff_summary: {
+              metric_delta: -0.05,
+              metric: "loss",
+              direction: "min",
+              config_changed: true,
+              config_change_count: 7,
+              status_changed_from_parent: true,
+              parent_status: "running",
+            },
+          }),
+        ],
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={onSelectExperiment}
+        />
+      </MemoryRouter>,
+    );
+
+    const row = getRowByLabel(
+      container,
+      "branch-b-extremely-long-name-that-should-have-chips-and-changes",
+    );
+
+    fireEvent.click(row);
+    expect(onSelectExperiment).toHaveBeenCalledWith(
+      "branch-b-extremely-long-name-that-should-have-chips-and-changes",
+    );
+
+    const chip = row.querySelector("[data-lineage-diff-chip]");
+    if (!(chip instanceof HTMLElement)) {
+      throw new Error("Missing diff chip summary on selected row");
+    }
+
+    fireEvent.click(chip);
+    expect(onSelectExperiment).toHaveBeenLastCalledWith(
+      "branch-b-extremely-long-name-that-should-have-chips-and-changes",
+    );
+    expect(onSelectExperiment).toHaveBeenCalledTimes(2);
   });
 
   it("preserves sibling order with child-bearing and failed leaf siblings", () => {
@@ -198,7 +276,7 @@ describe("ExperimentLineageGraphCard", () => {
     ]);
   });
 
-  it("renders recommendation and diff chips on lineage rows", () => {
+  it("renders compact recommendation and diff summary chips on lineage rows", () => {
     const roots: ExperimentTreeNode[] = [
       node({
         id: "root",
@@ -250,11 +328,10 @@ describe("ExperimentLineageGraphCard", () => {
     expect(recommendationChips[0]).toHaveTextContent("keep");
 
     const diffChips = row.querySelectorAll('[data-lineage-diff-chip]');
-    expect(diffChips).toHaveLength(3);
+    expect(diffChips).toHaveLength(2);
     expect(Array.from(diffChips).map((chip) => chip.textContent)).toEqual([
       "loss: ↓ -0.4000",
-      "config +3",
-      "status running→passed",
+      "+2 diff",
     ]);
   });
 

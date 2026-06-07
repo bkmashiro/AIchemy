@@ -27,7 +27,7 @@ export function IntentCard({ exp }: { exp: ExperimentDetail }) {
     exp.fork_reason;
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
       <h2 className="text-sm font-medium text-gray-400 mb-3">Intent</h2>
       {!hasIntent && <p className="text-xs text-gray-600">No intent recorded</p>}
       <div className="space-y-2 text-xs">

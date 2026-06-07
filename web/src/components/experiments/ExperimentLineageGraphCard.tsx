@@ -194,7 +194,7 @@ const NAME_TONE: Record<LineageTone, string> = {
 const RAIL_LINE = "bg-gray-700";
 const RAIL_LINE_PATH = "bg-indigo-400/40";
 
-const COL_W = 18; // px per gutter column
+const COL_W = 16; // px per gutter column
 
 function RailCell({ through, onPath }: { through: boolean; onPath: boolean }) {
   const color = onPath ? RAIL_LINE_PATH : RAIL_LINE;
@@ -312,6 +312,9 @@ function RailRowView({
         .join(" · ")
     : undefined;
   const diffChips = diffChipLabels(node);
+  const primaryDiffChip = diffChips[0] ?? null;
+  const extraDiffCount = diffChips.length > 0 ? diffChips.length - 1 : 0;
+  const diffSummaryTitle = diffChips.join(" · ");
   const rowBg = isCurrent
     ? "bg-indigo-500/10 ring-1 ring-inset ring-indigo-400/30"
     : onPath
@@ -320,36 +323,23 @@ function RailRowView({
   const drawBelowAtDot = hasVisibleChildren;
   const drawBelowAtConnector = !isLast;
   const labelClass = NAME_TONE[tone];
-
-  return (
-    <div
-      className={`flex items-stretch min-h-[24px] ${rowBg}`}
-      data-lineage-tone={tone}
-      data-lineage-on-path={onPath || isCurrent ? "true" : undefined}
-    >
+  const rowClass = `relative flex items-stretch min-h-[22px] w-full text-left rounded-sm ${rowBg}`;
+  const nameClasses = `font-mono truncate leading-snug ${labelClass}`;
+  const rowContent = (
+    <>
       {rails.map((through, d) => (
         <RailCell key={d} through={through} onPath={railOnPath[d] ?? false} />
       ))}
-      {depth > 0 && (
-        <ConnectorCell drawBelow={drawBelowAtConnector} onPath={onPath} />
-      )}
+      {depth > 0 && <ConnectorCell drawBelow={drawBelowAtConnector} onPath={onPath} />}
       <DotCell tone={tone} drawBelow={drawBelowAtDot} onPath={onPath || isCurrent} />
-      <div className="flex-1 min-w-0 flex items-center gap-2 px-2 py-1 text-xs">
-        {isCurrent ? (
-          <span className={`font-mono truncate ${labelClass}`}>{node.name}</span>
-        ) : (
-          <button
-            type="button"
-            onClick={() => onSelectExperiment(node.id)}
-            aria-label={`Preview ${node.name}`}
-            className={`font-mono truncate text-left hover:text-blue-300 ${labelClass}`}
-          >
-            {node.name}
-          </button>
-        )}
+      <div className="relative z-10 flex-1 min-w-0 flex items-center gap-1.5 px-1.5 py-1 text-[10px]">
+        <span className={nameClasses} data-lineage-name>
+          {node.name}
+        </span>
         {decisionBadge && (
           <span
-            className={`shrink-0 text-[9px] px-1 py-px rounded border ${decisionBadge}`}
+            className={`shrink-0 max-w-[4.5rem] truncate text-[8px] px-1 py-0 rounded-sm border ${decisionBadge}`}
+            title={decisionLabel ?? node.decision ?? undefined}
             data-lineage-decision-chip
           >
             {decisionLabel}
@@ -357,7 +347,7 @@ function RailRowView({
         )}
         {recommendationText && recommendationBadge && (
           <span
-            className={`shrink-0 text-[9px] px-1 py-px rounded border ${recommendationBadge}`}
+            className={`shrink-0 max-w-[4.75rem] truncate text-[8px] px-1 py-0 rounded-sm border ${recommendationBadge}`}
             title={recommendationTitle}
             aria-label={`Recommendation: ${recommendationText}`}
             data-lineage-recommendation-chip
@@ -365,26 +355,35 @@ function RailRowView({
             {recommendationText}
           </span>
         )}
-        {diffChips.map((chip, index) => (
+        {primaryDiffChip && (
           <span
-            key={`${index}-${chip}`}
-            className="shrink-0 text-[9px] px-1 py-px rounded border border-gray-700 bg-white/5"
-            title={chip}
-            aria-label={`Diff: ${chip}`}
+            className="shrink-0 text-[8px] px-1 py-0 rounded-sm border border-gray-700 bg-white/5"
+            title={diffSummaryTitle}
+            aria-label={`Diff: ${primaryDiffChip}`}
             data-lineage-diff-chip
           >
-            {chip}
+            {primaryDiffChip}
           </span>
-        ))}
+        )}
+        {extraDiffCount > 0 && (
+          <span
+            className="shrink-0 text-[8px] px-1 py-0 rounded-sm border border-gray-700 bg-white/5"
+            title={`${extraDiffCount} additional diff detail${extraDiffCount === 1 ? "" : "s"} in selected strip`}
+            aria-label={`Diff: +${extraDiffCount} more`}
+            data-lineage-diff-chip
+          >
+            +{extraDiffCount} diff
+          </span>
+        )}
         {node.goal_metric && (
-          <span className="shrink-0 text-[10px] text-gray-500 font-mono">
+          <span className="shrink-0 text-[9px] text-gray-500 font-mono">
             {node.goal_direction === "min" ? "↓" : "↑"}
             {node.goal_metric}
           </span>
         )}
         {foldedCount !== undefined && foldedCount > 0 && (
           <span
-            className="shrink-0 text-[10px] text-gray-500 italic"
+            className="shrink-0 text-[9px] text-gray-500 italic"
             title={`${foldedCount} descendant run${foldedCount === 1 ? "" : "s"} hidden — select this run to expand the branch`}
           >
             +{foldedCount} hidden
@@ -392,14 +391,39 @@ function RailRowView({
         )}
         {node.fork_reason && (
           <span
-            className="text-[10px] text-gray-600 truncate ml-1"
+            className="text-[9px] text-gray-600 truncate ml-1"
             title={node.fork_reason}
           >
             — {node.fork_reason}
           </span>
         )}
       </div>
-    </div>
+    </>
+  );
+
+  if (isCurrent) {
+    return (
+      <div
+        className={rowClass}
+        data-lineage-tone={tone}
+        data-lineage-on-path={onPath || isCurrent ? "true" : undefined}
+      >
+        {rowContent}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => onSelectExperiment(node.id)}
+      aria-label={`Preview ${node.name}`}
+      className={`${rowClass} hover:bg-white/[0.03]`}
+      data-lineage-tone={tone}
+      data-lineage-on-path={onPath || isCurrent ? "true" : undefined}
+    >
+      {rowContent}
+    </button>
   );
 }
 
@@ -564,7 +588,7 @@ export function ExperimentLineageGraphCard({
 }) {
   if (roots === null) {
     return (
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
         <h2 className="text-sm font-medium text-gray-400 mb-3">Lineage graph</h2>
         <p className="text-xs text-gray-600">Loading...</p>
       </div>
@@ -588,8 +612,8 @@ export function ExperimentLineageGraphCard({
       ? countHiddenDescendantsFromVisibleSubset(selected, visibleNodeIds, subtreeCounts)
       : 0;
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
-      <div className="flex items-center justify-between mb-3">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
+      <div className="flex items-center justify-between mb-2">
         <h2 className="text-sm font-medium text-gray-400">Lineage graph</h2>
         <span className="text-xs text-gray-600">
           {roots.length} root{roots.length === 1 ? "" : "s"}

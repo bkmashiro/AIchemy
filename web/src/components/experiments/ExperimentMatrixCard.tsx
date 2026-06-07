@@ -38,7 +38,7 @@ export function ExperimentMatrixCard({ exp }: { exp: ExperimentDetail }) {
   if (paramKeys.length === 0) return null;
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 overflow-x-auto">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3 overflow-x-auto">
       <h2 className="text-sm font-medium text-gray-400 mb-3">Result Matrix</h2>
       <table className="text-sm">
         <thead>

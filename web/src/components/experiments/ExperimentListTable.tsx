@@ -49,7 +49,7 @@ export function ExperimentListTable({
   const collapsedCount = experiments.length - entries.length;
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div className="bg-gray-900 border border-gray-800 rounded-md overflow-hidden">
       <div className="flex items-center justify-between gap-2 border-b border-gray-800 px-4 py-2 text-xs">
         <div>
           <span className="font-medium text-gray-300">Series entry points</span>

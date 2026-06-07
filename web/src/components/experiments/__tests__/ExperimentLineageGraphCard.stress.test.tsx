@@ -73,7 +73,9 @@ function foldedDropBranch(parentId: string, id: string, hiddenCount = 2): Experi
 }
 
 function getRowNames(container: HTMLElement): string[] {
-  const rows = Array.from(container.querySelectorAll("div.flex.items-stretch"));
+  const rows = Array.from(
+    container.querySelectorAll("div.flex.items-stretch, button.flex.items-stretch"),
+  );
   const names: string[] = [];
 
   for (const row of rows) {
@@ -88,13 +90,12 @@ function getRowNames(container: HTMLElement): string[] {
   return names;
 }
 
-function getRowByName(container: HTMLElement, name: string): HTMLDivElement {
-  const byButton = container.querySelector(`button[aria-label="Preview ${name}"]`);
-  if (byButton instanceof HTMLButtonElement) {
-    const row = byButton.closest("div.flex.items-stretch");
-    if (row instanceof HTMLDivElement) {
-      return row;
-    }
+function getRowByName(container: HTMLElement, name: string): HTMLElement {
+  const byButton = container.querySelector(
+    `button[aria-label="Preview ${name}"]`,
+  )?.closest("button.flex.items-stretch, div.flex.items-stretch");
+  if (byButton instanceof HTMLElement) {
+    return byButton as HTMLDivElement;
   }
 
   const byLabel = Array.from(container.querySelectorAll("span.font-mono.truncate"))

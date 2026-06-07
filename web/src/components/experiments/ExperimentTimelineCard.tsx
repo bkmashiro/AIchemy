@@ -195,7 +195,7 @@ export function ExperimentTimelineCard({
   const visibleEnd = pageStart + pageEvents.length;
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-medium text-gray-400">Timeline</h2>
         <span className="text-xs text-gray-600">

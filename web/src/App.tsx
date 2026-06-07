@@ -114,7 +114,7 @@ function AppInner(_props: { onLogout: () => void }) {
       </header>
 
       <main className="flex-1 overflow-auto">
-        <div className="p-5 max-w-screen-2xl mx-auto">
+        <div className="w-full max-w-none p-2 xl:p-3">
           <Suspense fallback={<RouteFallback />}>
             <Routes>
               <Route

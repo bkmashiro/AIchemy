@@ -22,7 +22,7 @@ export function ExperimentTaskTable({
   results: Record<string, TaskValidation>;
 }) {
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+    <div className="bg-gray-900 border border-gray-800 rounded-md overflow-hidden">
       <div className="px-4 py-3 border-b border-gray-800">
         <h2 className="text-sm font-medium text-gray-400">
           Tasks ({tasks.length})

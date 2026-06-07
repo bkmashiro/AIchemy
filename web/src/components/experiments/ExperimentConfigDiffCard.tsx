@@ -17,7 +17,7 @@ export function ExperimentConfigDiffCard({
 
   if (!diff && !summary) {
     return (
-      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
         <h2 className="text-sm font-medium text-gray-400 mb-3">Config diff</h2>
         <p className="text-xs text-gray-600">Loading...</p>
       </div>
@@ -25,7 +25,7 @@ export function ExperimentConfigDiffCard({
   }
 
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+    <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-medium text-gray-400">Config diff</h2>
         <span className="text-xs text-gray-600">
