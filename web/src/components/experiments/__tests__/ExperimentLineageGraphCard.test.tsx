@@ -83,7 +83,75 @@ function taskChipByDisplayName(name: string): HTMLAnchorElement {
   return link;
 }
 
+function setLineageMode(container: HTMLElement, mode: "Canvas" | "Rows"): void {
+  const targetMode = mode.toLowerCase();
+  const toggle =
+    Array.from(container.querySelectorAll<HTMLButtonElement>("button[data-lineage-mode]"))
+      .find((node) => node.dataset.lineageMode === targetMode);
+  if (!toggle) {
+    throw new Error(`Missing LineageGraphCard mode toggle for ${mode}`);
+  }
+  if (!toggle.getAttribute("aria-pressed") || toggle.getAttribute("aria-pressed") !== "true") {
+    fireEvent.click(toggle);
+  }
+}
+
+function showRowsMode(container: HTMLElement): void {
+  setLineageMode(container, "Rows");
+}
+
 describe("ExperimentLineageGraphCard", () => {
+  it("defaults to canvas mode and exposes a compact canvas node list", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [node({ id: "child", name: "child/variant", parent_id: "root", status: "passed" })],
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("button", { name: "Canvas" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Rows" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: "Preview child/variant" })).toBeInTheDocument();
+    expect(container.querySelector("[data-lineage-canvas-node]") != null).toBe(true);
+  });
+
+  it("clicking a canvas node selects it without navigating", () => {
+    const onSelectExperiment = vi.fn();
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [node({ id: "child", name: "child/variant", parent_id: "root" })],
+      }),
+    ];
+
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={onSelectExperiment}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Preview child/variant" }));
+    expect(onSelectExperiment).toHaveBeenCalledWith("child");
+  });
+
   it("clicking a lineage node selects it for preview without requesting page navigation", () => {
     const onSelectExperiment = vi.fn();
     const roots: ExperimentTreeNode[] = [
@@ -181,6 +249,8 @@ describe("ExperimentLineageGraphCard", () => {
       </MemoryRouter>,
     );
 
+    showRowsMode(container);
+
     const row = getRowByLabel(
       container,
       "branch-b-extremely-long-name-that-should-have-chips-and-changes",
@@ -244,6 +314,7 @@ describe("ExperimentLineageGraphCard", () => {
         />
       </MemoryRouter>,
     );
+    showRowsMode(container);
 
     expect(getRowNames(container)).toEqual([
       "root/start",
@@ -321,6 +392,8 @@ describe("ExperimentLineageGraphCard", () => {
         />
       </MemoryRouter>,
     );
+
+    showRowsMode(container);
 
     const row = getRowByLabel(container, "child/variant");
     const recommendationChips = row.querySelectorAll('[data-lineage-recommendation-chip]');
@@ -595,6 +668,8 @@ describe("ExperimentLineageGraphCard", () => {
         />
       </MemoryRouter>,
     );
+
+    showRowsMode(container);
 
     expect(getRowByLabel(container, "running-branch")).toHaveAttribute(
       "data-lineage-tone",
