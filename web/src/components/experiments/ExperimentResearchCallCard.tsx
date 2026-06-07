@@ -136,9 +136,12 @@ export function ExperimentResearchCallCard({
 
   const explicitDecisionIsRerun = explicitDecision === "rerun";
   const recommendationLabelText = recommendationLabel(recommendation);
-  const recommendationIsRerun =
-    recommendationLabelText != null && recommendationLabelText.toLowerCase() === "needs replication";
-  const showReplicationPlan = explicitDecisionIsRerun || recommendationIsRerun;
+  const recommendationIsRerunLike =
+    recommendationLabelText != null &&
+    ["needs stronger evidence", "needs replication"].includes(
+      recommendationLabelText.toLowerCase(),
+    );
+  const showReplicationPlan = explicitDecisionIsRerun || recommendationIsRerunLike;
 
   const parent = summary?.parent ?? null;
   const parentName = parent?.name ?? exp.parent_name ?? null;
@@ -347,7 +350,8 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
           </div>
           <div className="px-2 py-2 space-y-2 text-xs text-gray-300">
             <p className="text-emerald-300">
-              Preview dry run only — no task will be submitted without explicit submit.
+              Replication plan preview for stronger evidence; this is dry-run only and no task will be submitted without
+              explicit submit.
             </p>
             <div>
               <div className="text-[10px] uppercase tracking-wide text-gray-500">Parent experiment</div>

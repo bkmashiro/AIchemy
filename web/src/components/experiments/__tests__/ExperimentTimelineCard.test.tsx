@@ -58,10 +58,50 @@ describe("ExperimentTimelineCard", () => {
       makeEvent("mid", "2026-06-02T00:00:00.000Z", "mid event", "note"),
     ]);
 
+    expect(screen.getByRole("button", { name: "Newest first" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
     const items = screen.getAllByRole("listitem");
     expect(items[0]).toHaveTextContent("new event");
     expect(items[1]).toHaveTextContent("mid event");
     expect(items[2]).toHaveTextContent("old event");
+  });
+
+  it("renders oldest-first chronology for story reconstruction", () => {
+    renderCard([
+      makeEvent("old", "2026-06-01T00:00:00.000Z", "old event", "note"),
+      makeEvent("new", "2026-06-03T00:00:00.000Z", "new event", "note"),
+      makeEvent("mid", "2026-06-02T00:00:00.000Z", "mid event", "note"),
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Oldest first" }));
+
+    const items = screen.getAllByRole("listitem");
+    expect(items[0]).toHaveTextContent("old event");
+    expect(items[1]).toHaveTextContent("mid event");
+    expect(items[2]).toHaveTextContent("new event");
+  });
+
+  it("resets to page 1 when chronology changes", () => {
+    renderCard([
+      makeEvent("e1", "2026-06-01T00:00:00.000Z", "event-1", "note"),
+      makeEvent("e2", "2026-06-02T00:00:00.000Z", "event-2", "note"),
+      makeEvent("e3", "2026-06-03T00:00:00.000Z", "event-3", "note"),
+      makeEvent("e4", "2026-06-04T00:00:00.000Z", "event-4", "note"),
+      makeEvent("e5", "2026-06-05T00:00:00.000Z", "event-5", "note"),
+    ], 2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("3-4 of 5 events")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Oldest first" }));
+
+    expect(screen.getByText("1-2 of 5 events")).toBeInTheDocument();
+    expect(screen.getByText("event-1")).toBeInTheDocument();
+    expect(screen.getByText("event-2")).toBeInTheDocument();
+    expect(screen.queryByText("event-5")).not.toBeInTheDocument();
   });
 
   it("renders filter chips with counts", () => {

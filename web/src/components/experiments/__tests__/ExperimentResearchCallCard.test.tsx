@@ -86,7 +86,7 @@ describe("ExperimentResearchCallCard", () => {
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
     expect(screen.getByText("Fold into background")).toBeInTheDocument();
-    expect(screen.getByText("Rerun with larger cohort")).toBeInTheDocument();
+    expect(screen.getByText("Plan replication with larger cohort")).toBeInTheDocument();
   });
 
   it("uses user-facing copy for rerun decisions", () => {
@@ -97,8 +97,8 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    expect(screen.getByText("Run replication")).toBeInTheDocument();
-    expect(screen.getByText("needs replication")).toBeInTheDocument();
+    expect(screen.getByText("Plan replication")).toBeInTheDocument();
+    expect(screen.getByText("needs stronger evidence")).toBeInTheDocument();
   });
 
   it("falls back to summary recommendation when no explicit decision exists", () => {
@@ -120,7 +120,7 @@ describe("ExperimentResearchCallCard", () => {
     expect(screen.getByText(/Comparables: 1/)).toBeInTheDocument();
   });
 
-  it("renders recommendation action rerun as needs replication", () => {
+  it("renders recommendation action rerun as needs stronger evidence", () => {
     const exp = makeExperiment({});
     const summary = makeSummary({
       recommendation: makeRecommendation({
@@ -132,7 +132,7 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    const labels = screen.getAllByText("Needs replication");
+    const labels = screen.getAllByText("Needs stronger evidence");
     expect(labels).toHaveLength(2);
   });
 
@@ -149,7 +149,7 @@ describe("ExperimentResearchCallCard", () => {
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
     expect(screen.getByText("Replication plan")).toBeInTheDocument();
-    expect(screen.getByText(/Preview dry run only/)).toBeInTheDocument();
+    expect(screen.getByText(/Replication plan preview for stronger evidence/)).toBeInTheDocument();
     expect(
       screen.getByText("alch experiments replication-plan research-call --reason 'Need higher confidence before shipping'"),
     ).toBeInTheDocument();
@@ -281,7 +281,7 @@ describe("ExperimentResearchCallCard", () => {
     expect(payload.goal_metric).toBe("val_loss");
     expect(payload.goal_direction).toBe("min");
     expect(payload.recommendation).toMatchObject({
-      action: "Needs replication",
+      action: "Needs stronger evidence",
       verdict: null,
       reason: "Need higher confidence before shipping",
       metric: "val_loss",

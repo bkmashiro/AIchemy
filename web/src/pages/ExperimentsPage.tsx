@@ -99,7 +99,7 @@ function ExperimentsList() {
           <option value="">All decisions</option>
           <option value="keep">keep</option>
           <option value="drop">drop</option>
-          <option value="rerun">Needs replication</option>
+          <option value="rerun">Needs stronger evidence</option>
           <option value="fork">fork</option>
           <option value="none">undecided</option>
         </select>

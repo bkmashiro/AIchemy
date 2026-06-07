@@ -32,7 +32,7 @@ export const DECISION_BADGE: Record<string, string> = {
 const RECOMMENDATION_BADGE_FALLBACK = "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
 
 const RECOMMENDATION_LABEL_OVERRIDES: Record<string, string> = {
-  rerun: "Needs replication",
+  rerun: "Needs stronger evidence",
 };
 
 function normalizeString(value: unknown): string | null {
@@ -51,13 +51,17 @@ export function recommendationLabelValue(raw: string | null | undefined): string
   const trimmed = normalizeString(raw);
   if (trimmed === null) return null;
   const key = trimmed.toLowerCase();
-  return RECOMMENDATION_LABEL_OVERRIDES[key] ?? trimmed;
+  const override = RECOMMENDATION_LABEL_OVERRIDES[key];
+  if (override) return override;
+  if (/^re-?run\b/i.test(trimmed)) return trimmed.replace(/^re-?run\b/i, "Plan replication");
+  return trimmed;
 }
 
 export function decisionLabelForFilter(value: string | null | undefined): string | null {
   const trimmed = normalizeString(value);
   if (trimmed === null) return null;
-  if (trimmed.toLowerCase() === "rerun") return "needs replication";
+  const key = trimmed.toLowerCase();
+  if (key === "rerun") return "needs stronger evidence";
   return trimmed;
 }
 
@@ -66,7 +70,7 @@ export function recommendationBadgeClass(actionOrVerdict?: string | null): strin
   if (!raw) return RECOMMENDATION_BADGE_FALLBACK;
   const key = raw.toLowerCase();
 
-  if (key === "needs replication") return DECISION_BADGE.rerun;
+  if (key === "needs replication" || key === "needs stronger evidence") return DECISION_BADGE.rerun;
   return DECISION_BADGE[key] ?? RECOMMENDATION_BADGE_FALLBACK;
 }
 
@@ -392,8 +396,8 @@ export const NEXT_ACTION: Record<
     tone: "border-purple-400/30 bg-purple-500/10 text-purple-200",
   },
   rerun: {
-    label: "Run replication",
-    hint: "Keep collecting before deciding keep / drop.",
+    label: "Plan replication",
+    hint: "Collect stronger evidence before deciding keep / drop.",
     tone: "border-blue-400/30 bg-blue-500/10 text-blue-200",
   },
   drop: {
@@ -405,6 +409,6 @@ export const NEXT_ACTION: Record<
 
 export const NEXT_ACTION_DEFAULT = {
   label: "Awaiting decision",
-  hint: "Choose keep / fork / needs replication / drop to advance.",
+  hint: "Choose keep / fork / needs stronger evidence / drop to advance.",
   tone: "border-white/[0.08] bg-white/[0.04] text-gray-300",
 };
