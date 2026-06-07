@@ -33,14 +33,18 @@ vi.mock("../../components/experiments", async () => {
     ExperimentResearchCallCard: ({
       exp,
       summary,
+      recentEvents,
       onChanged,
     }: {
       exp: ExperimentDetail;
       summary: ExperimentSummaryResponse | null;
+      recentEvents?: { id: string }[];
       onChanged?: (experimentId: string) => void;
     }) => (
-      React.createElement("section", { "aria-label": "research-call" },
-        React.createElement("span", null, `${exp.name} / ${summary?.name ?? "no summary"}`),
+      React.createElement(
+        "section",
+        { "aria-label": "research-call" },
+        React.createElement("span", null, `${exp.name} / ${summary?.name ?? "no summary"} / events:${(recentEvents ?? []).length}`),
         React.createElement("button", {
           type: "button",
           onClick: () => onChanged?.(exp.id),
@@ -123,6 +127,37 @@ function diff(id: string, name: string): ExperimentDiffResponse {
   };
 }
 
+function timelineEvents(id: string): { experiment_id: string; events: Array<any> } {
+  const now = "2026-06-01T00:00:00.000Z";
+  if (id === "child") {
+    return {
+      experiment_id: "child",
+      events: [
+        {
+          id: "child-note-1",
+          experiment_id: "child",
+          kind: "note",
+          message: "child note",
+          created_at: now,
+        },
+        {
+          id: "child-artifact-1",
+          experiment_id: "child",
+          kind: "artifact",
+          message: "artifact uploaded",
+          created_at: now,
+          data: { locator: "s3://child-artifact" },
+        },
+      ],
+    };
+  }
+
+  return {
+    experiment_id: "root",
+    events: [],
+  };
+}
+
 function tree(): ExperimentTreeNode[] {
   return [{
     id: "root",
@@ -176,7 +211,7 @@ describe("ExperimentsPage lineage preview", () => {
   beforeEach(() => {
     childSummaryName = "child summary";
     vi.mocked(experimentsApi.list).mockResolvedValue([]);
-    vi.mocked(experimentsApi.getTimeline).mockResolvedValue({ experiment_id: "root", events: [] });
+    vi.mocked(experimentsApi.getTimeline).mockImplementation((id: string) => Promise.resolve(timelineEvents(id)));
     vi.mocked(experimentsApi.getTree).mockResolvedValue(tree());
     vi.mocked(experimentsApi.get).mockImplementation((id: string) =>
       Promise.resolve(id === "child" ? detail("child", "child experiment") : detail("root", "root experiment")),
@@ -187,19 +222,20 @@ describe("ExperimentsPage lineage preview", () => {
     vi.mocked(experimentsApi.getDiff).mockImplementation((id: string) =>
       Promise.resolve(id === "child" ? diff("child", "child diff") : diff("root", "root diff")),
     );
+
   });
 
   it("updates right-side research and diff context on lineage click without route navigation", async () => {
     renderDetailPage();
 
-    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary");
+    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary / events:0");
     expect(screen.getByLabelText("config-diff")).toHaveTextContent("root diff");
     expect(screen.getByTestId("location")).toHaveTextContent("/experiments/root");
 
     fireEvent.click(screen.getByRole("button", { name: "select child" }));
 
     await waitFor(() => {
-      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child summary");
+      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child summary / events:2");
       expect(screen.getByLabelText("config-diff")).toHaveTextContent("child diff");
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/experiments/root");
@@ -208,18 +244,36 @@ describe("ExperimentsPage lineage preview", () => {
   it("refreshes selected-lineage research context after writeback", async () => {
     renderDetailPage();
 
-    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary");
+    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary / events:0");
     fireEvent.click(screen.getByRole("button", { name: "select child" }));
 
     await waitFor(() => {
-      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child summary");
+      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child summary / events:2");
     });
 
     childSummaryName = "child refreshed summary";
+    vi.mocked(experimentsApi.getTimeline).mockImplementation((id: string) =>
+      Promise.resolve(
+        id === "child"
+          ? {
+              experiment_id: "child",
+              events: [
+                {
+                  id: "child-refreshed-note",
+                  experiment_id: "child",
+                  kind: "note",
+                  message: "child refreshed note",
+                  created_at: "2026-06-01T00:00:00.000Z",
+                },
+              ],
+            }
+          : timelineEvents(id),
+      ),
+    );
     fireEvent.click(screen.getByRole("button", { name: "refresh research child" }));
 
     await waitFor(() => {
-      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child refreshed summary");
+      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child refreshed summary / events:1");
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/experiments/root");
   });
@@ -230,7 +284,7 @@ describe("ExperimentsPage lineage preview", () => {
     );
     renderDetailPage();
 
-    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary");
+    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary / events:0");
     fireEvent.click(screen.getByRole("button", { name: "select child" }));
 
     await waitFor(() => {
