@@ -277,6 +277,23 @@ function ExperimentDetailView() {
     load();
   };
 
+  const refreshResearchCall = (changedId: string) => {
+    load();
+    if (!changedId || changedId === exp.id) return;
+    Promise.all([
+      experimentsApi.get(changedId),
+      experimentsApi.getSummary(changedId).catch(() => null),
+      experimentsApi.getDiff(changedId).catch(() => null),
+    ])
+      .then(([selectedExp, selectedSummary, selectedDiff]) => {
+        setSelectedLineageExp(selectedExp);
+        setSelectedLineageTasks(selectedExp.tasks ?? []);
+        setSelectedLineageSummary(selectedSummary);
+        setSelectedLineageDiff(selectedDiff);
+      })
+      .catch(() => {});
+  };
+
   const previewExp = selectedLineageId && selectedLineageId !== exp.id && selectedLineageExp
     ? selectedLineageExp
     : exp;
@@ -313,7 +330,7 @@ function ExperimentDetailView() {
           selectedTasks={selectedLineageTasks}
           onSelectExperiment={setSelectedLineageId}
         />
-        <ExperimentResearchCallCard exp={previewExp} summary={previewSummary} />
+        <ExperimentResearchCallCard exp={previewExp} summary={previewSummary} onChanged={refreshResearchCall} />
         <ExperimentConfigDiffCard diff={previewDiff} summary={previewSummary} />
       </div>
 
