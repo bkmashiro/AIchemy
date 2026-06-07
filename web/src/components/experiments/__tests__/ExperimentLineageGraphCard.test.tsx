@@ -152,6 +152,125 @@ describe("ExperimentLineageGraphCard", () => {
     expect(onSelectExperiment).toHaveBeenCalledWith("child");
   });
 
+  it("shows a canvas inspector with recommendation, diff, tasks, and explicit detail link", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [
+          node({
+            id: "child",
+            name: "child/variant",
+            parent_id: "root",
+            status: "passed",
+            decision: "keep",
+            recommendation: {
+              action: "fork",
+              verdict: "candidate",
+              reason: "beats parent",
+              metric: "loss",
+              value: 0.2,
+              baseline_value: 0.4,
+              delta: -0.2,
+              direction: "min",
+            },
+            diff_summary: {
+              metric_delta: -0.2,
+              metric: "loss",
+              direction: "min",
+              config_changed: true,
+              config_change_count: 2,
+              status_changed_from_parent: true,
+              parent_status: "running",
+            },
+          }),
+        ],
+      }),
+    ];
+
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="child"
+          pageId="root"
+          selectedTasks={[task({ id: "task-child", seq: 7, display_name: "child-task", status: "running" })]}
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    const inspector = screen.getByLabelText("Canvas inspector");
+    expect(within(inspector).getByText("Canvas inspector")).toBeInTheDocument();
+    expect(within(inspector).getByText("child/variant")).toBeInTheDocument();
+    expect(within(inspector).getByText("Decision: keep")).toBeInTheDocument();
+    expect(within(inspector).getByText("Recommendation: fork")).toBeInTheDocument();
+    expect(within(inspector).getByText("loss: ↓ -0.2000")).toBeInTheDocument();
+    expect(within(inspector).getByText("child-task")).toBeInTheDocument();
+    expect(within(inspector).getByRole("link", { name: /open detail/i })).toHaveAttribute(
+      "href",
+      "/experiments/child",
+    );
+  });
+
+  it("focuses the selected path and can reveal folded canvas branches", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [
+          node({
+            id: "main",
+            name: "main/path",
+            parent_id: "root",
+            children: [
+              node({
+                id: "selected",
+                name: "selected/path",
+                parent_id: "main",
+              }),
+            ],
+          }),
+          node({
+            id: "side",
+            name: "side/branch",
+            parent_id: "root",
+            children: [
+              node({
+                id: "side-child",
+                name: "side/child",
+                parent_id: "side",
+                children: [node({ id: "deep", name: "deep/hidden", parent_id: "side-child" })],
+              }),
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="selected"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("button", { name: "Preview side/branch" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Preview deep/hidden" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Focus selected path" }));
+    expect(screen.queryByRole("button", { name: "Preview side/branch" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Canvas inspector")).toHaveTextContent("selected/path");
+
+    fireEvent.click(screen.getByRole("button", { name: "Focus selected path" }));
+    fireEvent.click(screen.getByRole("button", { name: "Show folded branches" }));
+    expect(screen.getByRole("button", { name: "Preview deep/hidden" })).toBeInTheDocument();
+  });
+
   it("clicking a lineage node selects it for preview without requesting page navigation", () => {
     const onSelectExperiment = vi.fn();
     const roots: ExperimentTreeNode[] = [

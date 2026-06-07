@@ -140,6 +140,7 @@ function flattenLineage(
   pathIds: Set<string>,
   sortPathIds: Set<string>,
   subtreeCounts: Map<string, number>,
+  showFoldedBranches = false,
 ): RailRow[] {
   const rows: RailRow[] = [];
   // ancestorIsLast[d] = "ancestor of current walk at depth d is last sibling"
@@ -155,7 +156,7 @@ function flattenLineage(
     const sortedChildren = sortLineageChildren(node.children, sortPathIds, subtreeCounts);
     const renderChildren =
       sortedChildren.length > 0 &&
-      (depth < FOLD_DEPTH_LIMIT || onPath || isCurrent);
+      (showFoldedBranches || depth < FOLD_DEPTH_LIMIT || onPath || isCurrent);
 
     let foldedCount: number | undefined;
     if (!renderChildren && sortedChildren.length > 0) {
@@ -677,8 +678,12 @@ function SelectedDetailStrip({
   return (
     <div
       className="mt-3 border-t border-gray-800 pt-2 text-[11px] text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1"
+      aria-label="Canvas inspector"
       data-lineage-selected-strip
     >
+      <span className="text-[10px] uppercase tracking-wide text-gray-500">
+        Canvas inspector
+      </span>
       <span className="text-[10px] uppercase tracking-wide text-gray-600">
         {isPage ? "Viewing page" : "Preview selected"}
       </span>
@@ -787,6 +792,8 @@ export function ExperimentLineageGraphCard({
   onSelectExperiment: (id: string) => void;
 }) {
   const [viewMode, setViewMode] = useState<LineageViewMode>("canvas");
+  const [focusPathOnly, setFocusPathOnly] = useState(false);
+  const [showFoldedBranches, setShowFoldedBranches] = useState(false);
 
   if (roots === null) {
     return (
@@ -802,9 +809,19 @@ export function ExperimentLineageGraphCard({
   const focusPath = findNodePath(roots, pageId);
   const sortPathIds = new Set(focusPath?.path.map((n) => n.id) ?? pathIds);
   const subtreeCounts = buildSubtreeCountMap(roots);
-  const rows = found
-    ? flattenLineage(found.root, currentId, pathIds, sortPathIds, subtreeCounts)
+  const allRows = found
+    ? flattenLineage(
+        found.root,
+        currentId,
+        pathIds,
+        sortPathIds,
+        subtreeCounts,
+        showFoldedBranches,
+      )
     : [];
+  const rows = focusPathOnly
+    ? allRows.filter((row) => row.onPath || row.isCurrent)
+    : allRows;
   const selected = found?.path[found.path.length - 1];
   const visibleNodeIds = new Set(rows.map((row) => row.node.id));
   const totalNodeCount = found ? 1 + (subtreeCounts.get(found.root.id) ?? countSubtreeNodes(found.root)) : 0;
@@ -835,6 +852,35 @@ export function ExperimentLineageGraphCard({
                 {mode === "canvas" ? "Canvas" : "Rows"}
               </button>
             ))}
+          </div>
+          <div className="hidden md:inline-flex rounded-sm border border-gray-800 bg-gray-950 p-0.5 text-[10px]">
+            <button
+              type="button"
+              aria-pressed={focusPathOnly}
+              onClick={() => setFocusPathOnly((value) => !value)}
+              className={`px-2 py-0.5 rounded-sm ${
+                focusPathOnly ? "bg-gray-800 text-gray-200" : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              Focus selected path
+            </button>
+            <button
+              type="button"
+              aria-pressed={showFoldedBranches}
+              onClick={() => setShowFoldedBranches((value) => !value)}
+              className={`px-2 py-0.5 rounded-sm ${
+                showFoldedBranches ? "bg-gray-800 text-gray-200" : "text-gray-500 hover:text-gray-300"
+              }`}
+            >
+              Show folded branches
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode("canvas")}
+              className="px-2 py-0.5 rounded-sm text-gray-500 hover:text-gray-300"
+            >
+              Fit selected
+            </button>
           </div>
         </div>
         <span className="shrink-0 text-xs text-gray-600">
