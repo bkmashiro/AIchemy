@@ -1,11 +1,26 @@
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import type {
   ExperimentDetail,
   ExperimentRecommendation,
   ExperimentSummaryResponse,
 } from "../../../lib/api";
+import { experimentsApi } from "../../../lib/api";
 import { ExperimentResearchCallCard } from "../ExperimentResearchCallCard";
+
+vi.mock("../../../lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../lib/api")>();
+  return {
+    ...actual,
+    experimentsApi: {
+      ...actual.experimentsApi,
+      getResearchBundle: vi.fn(),
+      addNote: vi.fn(),
+      addEvent: vi.fn(),
+      decide: vi.fn(),
+    },
+  };
+});
 
 function makeExperiment(
   overrides: Partial<ExperimentDetail> = {},
@@ -54,6 +69,101 @@ function makeSummary(
   };
 }
 
+function installDownloadSpy() {
+  let blobValue: any = null;
+  const originalCreateObjectURL = (URL as any).createObjectURL;
+  const originalRevokeObjectURL = (URL as any).revokeObjectURL;
+  const originalBlob = (globalThis as any).Blob;
+  const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+
+  (globalThis as any).Blob = class {
+    chunks: any[];
+
+    constructor(chunks: any[]) {
+      this.chunks = chunks;
+    }
+
+    text() {
+      return Promise.resolve(this.chunks.join(""));
+    }
+  } as any;
+
+  (URL as any).createObjectURL = (value: any) => {
+    blobValue = value;
+    return "blob:mock";
+  };
+  (URL as any).revokeObjectURL = () => undefined;
+
+  return {
+    getBlobText: async () => {
+      return blobValue ? blobValue.text() : "";
+    },
+    restore: () => {
+      (URL as any).createObjectURL = originalCreateObjectURL;
+      (URL as any).revokeObjectURL = originalRevokeObjectURL;
+      (globalThis as any).Blob = originalBlob;
+      clickSpy.mockRestore();
+    },
+  };
+}
+
+function makeResearchBundle() {
+  return {
+    experiment: {
+      id: "exp-a",
+      name: "research-call",
+      status: "running",
+      family: "research",
+    },
+    summary: {
+      recommendation: {
+        action: "rerun",
+        verdict: "rerun",
+        reason: "Signal remains noisy and sample count is limited.",
+        metric: "val_loss",
+        value: 0.9012,
+        baseline_value: 0.9123,
+        delta: -0.0111,
+        direction: "down",
+      },
+      decision: "rerun",
+      decision_reason: "Need stronger confidence before shipping",
+      best_metrics: { val_loss: 0.9012 },
+      timeline_event_count: 2,
+    },
+    decision: {
+      decision: "rerun",
+      reason: "Need stronger confidence before shipping",
+      decided_at: "2026-06-02T00:00:00.000Z",
+    },
+    timeline: {
+      events: [
+        {
+          kind: "artifact",
+          created_at: "2026-06-01T00:00:00.000Z",
+          message: "artifact emitted",
+        },
+        {
+          kind: "checkpoint",
+          created_at: "2026-06-01T01:00:00.000Z",
+          message: "checkpoint saved",
+        },
+      ],
+    },
+    manifest: { enabled: false },
+    generated_at: "2026-06-01T00:00:00.000Z",
+  };
+}
+
+function copyToSection(name: string) {
+  const heading = screen.getByText(name);
+  const container = heading.parentElement?.parentElement ?? heading.closest("div");
+  if (!container) {
+    throw new Error(`Unable to find section ${name}`);
+  }
+  return container;
+}
+
 function makeRecommendation(
   overrides: Partial<ExperimentRecommendation> = {},
 ): ExperimentRecommendation {
@@ -76,6 +186,130 @@ function makeRecommendation(
 }
 
 describe("ExperimentResearchCallCard", () => {
+  beforeEach(() => {
+    vi.mocked(experimentsApi.getResearchBundle).mockReset();
+    vi.mocked(experimentsApi.addNote).mockReset();
+    vi.mocked(experimentsApi.addEvent).mockReset();
+    vi.mocked(experimentsApi.decide).mockReset();
+  });
+
+  it("submits a note via research writeback", async () => {
+    vi.mocked(experimentsApi.addNote).mockResolvedValue({
+      id: "note-1",
+      experiment_id: "exp-a",
+      kind: "note",
+      message: "Need stronger prior",
+      created_at: "2026-06-01T00:00:00.000Z",
+      data: {},
+    });
+    const onChanged = vi.fn();
+
+    render(<ExperimentResearchCallCard exp={makeExperiment()} summary={makeSummary()} onChanged={onChanged} />);
+
+    const writebackSection = copyToSection("Research writeback");
+    const noteInput = within(writebackSection).getByPlaceholderText("Write a research note");
+
+    expect(within(writebackSection).getByRole("button", { name: "Submit writeback" })).toBeDisabled();
+    fireEvent.change(noteInput, { target: { value: "Need stronger prior" } });
+    fireEvent.click(within(writebackSection).getByRole("button", { name: "Submit writeback" }));
+
+    await waitFor(() => {
+      expect(experimentsApi.addNote).toHaveBeenCalledWith("exp-a", "Need stronger prior");
+      expect(screen.getByText("Writeback saved.")).toBeInTheDocument();
+    });
+
+    expect(onChanged).toHaveBeenCalledWith("exp-a");
+    expect(noteInput).toHaveValue("");
+  });
+
+  it("submits a decision via research writeback", async () => {
+    vi.mocked(experimentsApi.decide).mockResolvedValue(makeExperiment({ decision: "rerun" }));
+
+    render(<ExperimentResearchCallCard exp={makeExperiment()} summary={makeSummary()} />);
+
+    const writebackSection = copyToSection("Research writeback");
+    fireEvent.click(within(writebackSection).getByRole("button", { name: "Record decision" }));
+    expect(within(writebackSection).getByRole("button", { name: "Submit writeback" })).toBeDisabled();
+
+    fireEvent.change(within(writebackSection).getByRole("combobox", { name: "Decision" }), {
+      target: { value: "rerun" },
+    });
+    fireEvent.change(within(writebackSection).getByPlaceholderText("Write decision reason"), {
+      target: { value: "Need stronger evidence from second run" },
+    });
+
+    fireEvent.click(within(writebackSection).getByRole("button", { name: "Submit writeback" }));
+
+    await waitFor(() => {
+      expect(experimentsApi.decide).toHaveBeenCalledWith(
+        "exp-a",
+        "rerun",
+        "Need stronger evidence from second run",
+      );
+    });
+
+    expect(screen.getByText("Needs stronger evidence")).toBeInTheDocument();
+    expect(screen.getByText("Writeback saved.")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["artifact", "Attach artifact"],
+    ["checkpoint", "Attach checkpoint"],
+  ])("submits %s locator via research writeback", async (kind, modeLabel) => {
+    vi.mocked(experimentsApi.addEvent).mockResolvedValue({
+      id: `${kind}-1`,
+      experiment_id: "exp-a",
+      kind: kind as "artifact" | "checkpoint",
+      message: `${kind}: locator://example/path`,
+      created_at: "2026-06-01T00:00:00.000Z",
+      data: {},
+    });
+
+    render(<ExperimentResearchCallCard exp={makeExperiment()} summary={makeSummary()} />);
+
+    const writebackSection = copyToSection("Research writeback");
+    fireEvent.click(within(writebackSection).getByRole("button", { name: modeLabel }));
+    const locatorInput = within(writebackSection).getByPlaceholderText("Write locator");
+    const locator = `locator://${kind}/example/path`;
+
+    expect(within(writebackSection).getByRole("button", { name: "Submit writeback" })).toBeDisabled();
+    fireEvent.change(locatorInput, { target: { value: locator } });
+    fireEvent.click(within(writebackSection).getByRole("button", { name: "Submit writeback" }));
+
+    await waitFor(() => {
+      expect(experimentsApi.addEvent).toHaveBeenCalledWith("exp-a", {
+        kind: kind as "artifact" | "checkpoint",
+        message: expect.stringContaining(locator),
+        data: expect.objectContaining({ locator, type: kind }),
+      });
+    });
+
+    expect(screen.getByText("Writeback saved.")).toBeInTheDocument();
+  });
+
+  it("refreshes parent state through callback after successful writeback", async () => {
+    vi.mocked(experimentsApi.addNote).mockResolvedValue({
+      id: "note-2",
+      experiment_id: "exp-a",
+      kind: "note",
+      message: "callback test",
+      created_at: "2026-06-01T00:00:00.000Z",
+      data: {},
+    });
+
+    const onChanged = vi.fn();
+    render(<ExperimentResearchCallCard exp={makeExperiment()} summary={makeSummary()} onChanged={onChanged} />);
+
+    const writebackSection = copyToSection("Research writeback");
+    const noteInput = within(writebackSection).getByPlaceholderText("Write a research note");
+    fireEvent.change(noteInput, { target: { value: "callback test" } });
+    fireEvent.click(within(writebackSection).getByRole("button", { name: "Submit writeback" }));
+
+    await waitFor(() => {
+      expect(onChanged).toHaveBeenCalledWith("exp-a");
+    });
+  });
+
   it("uses explicit decision action when present even if recommendation exists", () => {
     const exp = makeExperiment({ decision: "drop" });
     const summary = makeSummary({
@@ -154,12 +388,17 @@ describe("ExperimentResearchCallCard", () => {
       screen.getByText("alch experiments replication-plan research-call --reason 'Need higher confidence before shipping'"),
     ).toBeInTheDocument();
     expect(screen.getByText((content) => /Explicit submit required\./.test(content))).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Copy CLI/i })).toBeInTheDocument();
+    const replicationSection = copyToSection("Replication plan");
+    expect(
+      within(replicationSection).getByRole("button", {
+        name: /copy replication plan cli/i,
+      }),
+    ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Download plan JSON/i })).toBeInTheDocument();
     expect(screen.getByText((content) => content.includes("client.replication_plan(\"research-call\""))).toBeInTheDocument();
   });
 
-  it("copies replication plan CLI hint to clipboard", async () => {
+  it("copies replication-plan CLI hint to clipboard", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
       value: { writeText },
@@ -177,7 +416,12 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Copy CLI/i }));
+    const replicationSection = copyToSection("Replication plan");
+    fireEvent.click(
+      within(replicationSection).getByRole("button", {
+        name: /copy replication plan cli/i,
+      }),
+    );
 
     expect(writeText).toHaveBeenCalledWith(
       "alch experiments replication-plan research-call --reason 'Need higher confidence before shipping'",
@@ -203,9 +447,105 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    fireEvent.click(screen.getByRole("button", { name: /Copy CLI/i }));
+    const replicationSection = copyToSection("Replication plan");
+    fireEvent.click(
+      within(replicationSection).getByRole("button", {
+        name: /copy replication plan cli/i,
+      }),
+    );
 
     expect(await screen.findByText("denied")).toBeInTheDocument();
+  });
+
+  it("downloads research bundle markdown with recommendation and timeline details", async () => {
+    const bundle = makeResearchBundle();
+    vi.mocked(experimentsApi.getResearchBundle).mockResolvedValue(bundle as any);
+    const spy = installDownloadSpy();
+
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "rerun",
+        verdict: null,
+        reason: "Need stronger confidence before shipping",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Export Markdown/i }));
+    await waitFor(async () => {
+      const markdown = await spy.getBlobText();
+      expect(markdown).toContain("# Research bundle: research-call (exp-a)");
+      expect(markdown).toContain("- action: Needs stronger evidence");
+      expect(markdown).toContain("- verdict: Needs stronger evidence");
+      expect(markdown).toContain("- reason: Signal remains noisy and sample count is limited.");
+      expect(markdown).toContain("## Decision");
+      expect(markdown).toContain("- decision: needs stronger evidence");
+      expect(markdown).toContain("- reason: Need stronger confidence before shipping");
+      expect(markdown).toContain("Recent timeline events");
+      expect(markdown).toContain("artifact emitted");
+      expect(markdown).toContain("checkpoint saved");
+      expect(markdown).toContain("alch experiments replication-plan research-call --reason 'Need stronger confidence before shipping'");
+      spy.restore();
+    });
+  });
+
+  it("copies the research bundle CLI command to clipboard", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "keep",
+        verdict: null,
+        reason: "Looks solid",
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    const bundleSection = copyToSection("Research bundle");
+    fireEvent.click(
+      within(bundleSection).getByRole("button", {
+        name: /copy bundle cli/i,
+      }),
+    );
+
+    expect(writeText).toHaveBeenCalledWith("alch experiments bundle research-call");
+    expect(await screen.findByText((content) => content.includes("Bundle CLI copied to clipboard."))).toBeInTheDocument();
+  });
+
+  it("downloads the existing research bundle JSON export", async () => {
+    const bundle = makeResearchBundle();
+    vi.mocked(experimentsApi.getResearchBundle).mockResolvedValue(bundle as any);
+    const spy = installDownloadSpy();
+
+    const exp = makeExperiment({});
+    const summary = makeSummary({
+      recommendation: makeRecommendation({
+        action: "keep",
+        verdict: null,
+      }),
+    });
+
+    render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /Export JSON/i }));
+    await waitFor(async () => {
+      const raw = await spy.getBlobText();
+      const payload = JSON.parse(raw);
+
+      expect(payload.experiment.id).toBe("exp-a");
+      expect(payload.summary).toEqual(bundle.summary);
+      expect(payload.timeline.events).toHaveLength(2);
+
+      spy.restore();
+    });
   });
 
   it("downloads a replication-plan manifest JSON with explicit safeguards", async () => {

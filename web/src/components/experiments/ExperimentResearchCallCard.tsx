@@ -2,8 +2,9 @@ import { useState } from "react";
 import { experimentsApi } from "../../lib/api";
 import type {
   ExperimentDetail,
-  ExperimentSummaryResponse,
   ExperimentRecommendation,
+  ExperimentDecision,
+  ExperimentSummaryResponse,
 } from "../../lib/api";
 import {
   DECISION_BADGE,
@@ -90,12 +91,150 @@ function evidenceBadgeClass(value: string | null | undefined): string {
   }
 }
 
+const WRITEBACK_MODES = ["note", "decision", "artifact", "checkpoint"] as const;
+type WritebackMode = (typeof WRITEBACK_MODES)[number];
+const WRITEBACK_DECISIONS: ExperimentDecision[] = ["keep", "drop", "rerun", "fork"];
+const WRITEBACK_DECISION_LABEL: Record<ExperimentDecision, string> = {
+  keep: "Keep",
+  drop: "Drop",
+  rerun: "Needs stronger evidence",
+  fork: "Fork",
+};
+const WRITEBACK_MODE_LABEL: Record<WritebackMode, string> = {
+  note: "Add note",
+  decision: "Record decision",
+  artifact: "Attach artifact",
+  checkpoint: "Attach checkpoint",
+};
+
+function normalizeBundleValue(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "number") return Number.isFinite(value) ? value.toString() : "—";
+  return String(value);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function renderResearchBundleMarkdown(
+  bundle: Record<string, any>,
+  refForFallback: string,
+  includeReplicationHint: boolean,
+  replicationHint: string,
+): string {
+  const experiment = asRecord(bundle.experiment) ?? {};
+  const summary = asRecord(bundle.summary) ?? {};
+  const decision = asRecord(bundle.decision) ?? {};
+  const timeline = asRecord(bundle.timeline) ?? {};
+  const recommendation = asRecord(summary.recommendation) ?? {};
+
+  const name =
+    typeof experiment.name === "string" && experiment.name.trim() ? experiment.name : refForFallback;
+  const id =
+    typeof experiment.id === "string" && experiment.id.trim() ? experiment.id : null;
+  const title = `# Research bundle: ${name}${id && id !== name ? ` (${id})` : ""}`;
+
+  const recAction =
+    (isText(typeof recommendation.action === "string" ? recommendation.action : "")
+      ? recommendationLabelValue(recommendation.action as string)
+      : null) ?? normalizeBundleValue(recommendation.action);
+  const recVerdict =
+    (isText(typeof recommendation.verdict === "string" ? recommendation.verdict : "")
+      ? recommendationLabelValue(recommendation.verdict as string)
+      : null) ?? normalizeBundleValue(recommendation.verdict);
+  const recReason =
+    isText(typeof recommendation.reason === "string" ? recommendation.reason : "")
+      ? (recommendation.reason as string)
+      : "";
+
+  const rawDecisionValue = isText(typeof decision.decision === "string" ? decision.decision : "")
+    ? (decision.decision as string)
+    : "";
+  const decisionValue = WRITEBACK_DECISIONS.includes(rawDecisionValue as ExperimentDecision)
+    ? decisionLabelForFilter(rawDecisionValue as ExperimentDecision)
+    : rawDecisionValue;
+  const decisionReason =
+    isText(typeof decision.reason === "string" ? decision.reason : "")
+      ? (decision.reason as string)
+      : "";
+  const bundleSuggestsReplication = [recAction, recVerdict, recommendation.action, recommendation.verdict]
+    .some((value) =>
+      isText(typeof value === "string" ? value : "") &&
+      /rerun|replication|stronger evidence/i.test(value as string),
+    );
+
+  const lines: string[] = [];
+  lines.push(title);
+  lines.push("");
+
+  lines.push("## Recommendation");
+  if (recAction || recVerdict || recReason) {
+    if (recAction) lines.push(`- action: ${normalizeBundleValue(recAction)}`);
+    if (recVerdict) lines.push(`- verdict: ${normalizeBundleValue(recVerdict)}`);
+    if (recReason) lines.push(`- reason: ${normalizeBundleValue(recReason)}`);
+  } else {
+    lines.push("- no recommendation available");
+  }
+  lines.push("");
+
+  lines.push("## Decision");
+  if (decisionValue || decisionReason) {
+    if (decisionValue) lines.push(`- decision: ${normalizeBundleValue(decisionValue)}`);
+    if (decisionReason) lines.push(`- reason: ${normalizeBundleValue(decisionReason)}`);
+  } else {
+    lines.push("- no decision recorded");
+  }
+  lines.push("");
+
+  lines.push("## Recent timeline events");
+  const timelineEvents = Array.isArray(timeline.events) ? timeline.events : [];
+  const recentEvents = timelineEvents.slice(0, 8);
+  if (recentEvents.length === 0) {
+    lines.push("- none");
+  } else {
+    for (const event of recentEvents) {
+      if (!asRecord(event)) continue;
+      const ts =
+        normalizeBundleValue((event as Record<string, unknown>).created_at) !== "—"
+          ? normalizeBundleValue((event as Record<string, unknown>).created_at)
+          : normalizeBundleValue((event as Record<string, unknown>).timestamp);
+      const kind = normalizeBundleValue((event as Record<string, unknown>).kind);
+      const msg = normalizeBundleValue((event as Record<string, unknown>).message);
+      const renderedKind = kind === "—" ? "event" : kind;
+      if (ts !== "—" && msg !== "—") {
+        lines.push(`- ${ts}: ${renderedKind} — ${msg}`);
+      } else if (ts !== "—") {
+        lines.push(`- ${ts}: ${renderedKind}`);
+      } else if (msg !== "—") {
+        lines.push(`- ${renderedKind} — ${msg}`);
+      } else {
+        lines.push(`- ${renderedKind}`);
+      }
+    }
+    if (lines[lines.length - 1] === "## Recent timeline events") {
+      lines.push("- no timeline events");
+    }
+  }
+  lines.push("");
+
+  if (includeReplicationHint || bundleSuggestsReplication) {
+    lines.push("## Replication CLI hint");
+    lines.push(`- ${replicationHint}`);
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
 export function ExperimentResearchCallCard({
   exp,
   summary,
+  onChanged,
 }: {
   exp: ExperimentDetail;
   summary: ExperimentSummaryResponse | null;
+  onChanged?: (experimentId: string) => void;
 }) {
   const explicitDecision = summary?.decision ?? exp.decision ?? null;
   const decisionLabel = explicitDecision ? decisionLabelForFilter(explicitDecision) : null;
@@ -160,11 +299,24 @@ export function ExperimentResearchCallCard({
 
   const [exportState, setExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [exportError, setExportError] = useState<string | null>(null);
+  const [markdownExportState, setMarkdownExportState] = useState<"idle" | "loading" | "done" | "error">("idle");
+  const [markdownExportError, setMarkdownExportError] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "success" | "error">("idle");
   const [copyError, setCopyError] = useState<string | null>(null);
+  const [bundleCopyState, setBundleCopyState] = useState<"idle" | "success" | "error">("idle");
+  const [bundleCopyError, setBundleCopyError] = useState<string | null>(null);
+  const [writeMode, setWriteMode] = useState<WritebackMode>("note");
+  const [writeNote, setWriteNote] = useState("");
+  const [writeDecision, setWriteDecision] = useState<ExperimentDecision>("keep");
+  const [writeDecisionReason, setWriteDecisionReason] = useState("");
+  const [writeLocator, setWriteLocator] = useState("");
+  const [writeState, setWriteState] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [writeError, setWriteError] = useState<string | null>(null);
 
   const cliRef = exp.name || exp.id;
   const cliRefForShell = shellQuote(cliRef);
+  const safeName = (cliRef || "experiment").replace(/[^a-zA-Z0-9_.-]+/g, "_");
+  const bundleCli = `alch experiments bundle ${cliRefForShell}`;
   const sdkRef = JSON.stringify(exp.name || exp.id);
   const sdkReason = JSON.stringify(replicationReason);
   const sdkSnippet = `client = ExperimentClient(...)
@@ -200,22 +352,36 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
     ],
   };
 
+  async function copyClipboardText(text: string) {
+    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+      throw new Error("Clipboard is unavailable in this environment.");
+    }
+    await navigator.clipboard.writeText(text);
+  }
+
   async function copyReplicationPlanCli() {
     setCopyState("idle");
     setCopyError(null);
 
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-      setCopyState("error");
-      setCopyError("Clipboard is unavailable in this environment.");
-      return;
-    }
-
     try {
-      await navigator.clipboard.writeText(replicationPlanHint);
+      await copyClipboardText(replicationPlanHint);
       setCopyState("success");
     } catch (err: unknown) {
       setCopyError(err instanceof Error ? err.message : String(err));
       setCopyState("error");
+    }
+  }
+
+  async function copyResearchBundleCli() {
+    setBundleCopyState("idle");
+    setBundleCopyError(null);
+
+    try {
+      await copyClipboardText(bundleCli);
+      setBundleCopyState("success");
+    } catch (err: unknown) {
+      setBundleCopyError(err instanceof Error ? err.message : String(err));
+      setBundleCopyState("error");
     }
   }
 
@@ -226,7 +392,6 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const safeName = (exp.name || exp.id).replace(/[^a-zA-Z0-9_.-]+/g, "_");
       a.download = `${safeName}-replication-plan.json`;
       document.body.appendChild(a);
       a.click();
@@ -237,16 +402,19 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
     }
   }
 
-  async function downloadBundle() {
+  async function loadResearchBundle() {
+    return experimentsApi.getResearchBundle(exp.id);
+  }
+
+  async function downloadResearchBundleJson() {
     setExportState("loading");
     setExportError(null);
     try {
-      const bundle = await experimentsApi.getResearchBundle(exp.id);
+      const bundle = await loadResearchBundle();
       const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const safeName = (exp.name || exp.id).replace(/[^a-zA-Z0-9_.-]+/g, "_");
       a.download = `${safeName}-research-bundle.json`;
       document.body.appendChild(a);
       a.click();
@@ -257,6 +425,78 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
     } catch (err: any) {
       setExportError(err?.message ?? String(err));
       setExportState("error");
+    }
+  }
+
+  async function downloadResearchBundleMarkdown() {
+    setMarkdownExportState("loading");
+    setMarkdownExportError(null);
+    try {
+      const bundle = await loadResearchBundle();
+      const markdown = renderResearchBundleMarkdown(
+        bundle as Record<string, any>,
+        cliRef,
+        showReplicationPlan,
+        replicationPlanHint,
+      );
+      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${safeName}-research-bundle.md`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setMarkdownExportState("done");
+      setTimeout(() => setMarkdownExportState("idle"), 2000);
+    } catch (err: any) {
+      setMarkdownExportError(err?.message ?? String(err));
+      setMarkdownExportState("error");
+    }
+  }
+
+  const writebackValid = () => {
+    if (writeMode === "note") return isText(writeNote);
+    if (writeMode === "decision") return isText(writeDecisionReason);
+    return isText(writeLocator);
+  };
+
+  async function submitWriteback() {
+    if (!writebackValid() || writeState === "saving") return;
+
+    const payloadLocator = writeLocator.trim();
+    const payloadNote = writeNote.trim();
+    const payloadReason = writeDecisionReason.trim();
+
+    setWriteState("saving");
+    setWriteError(null);
+
+    try {
+      if (writeMode === "note") {
+        await experimentsApi.addNote(exp.id, payloadNote);
+        setWriteNote("");
+      } else if (writeMode === "decision") {
+        await experimentsApi.decide(exp.id, writeDecision, payloadReason);
+        setWriteDecisionReason("");
+      } else {
+        await experimentsApi.addEvent(exp.id, {
+          kind: writeMode,
+          message: `${writeMode === "artifact" ? "Artifact" : "Checkpoint"} locator: ${payloadLocator}`,
+          data: {
+            locator: payloadLocator,
+            type: writeMode,
+          },
+        });
+        setWriteLocator("");
+      }
+
+      setWriteState("success");
+      onChanged?.(exp.id);
+      setTimeout(() => setWriteState("idle"), 2000);
+    } catch (err: unknown) {
+      setWriteError(err instanceof Error ? err.message : String(err));
+      setWriteState("error");
     }
   }
 
@@ -408,8 +648,9 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
               <button
                 type="button"
                 onClick={copyReplicationPlanCli}
+                aria-label="Copy replication plan CLI"
                 className="text-[11px] px-2 py-1 rounded border border-blue-700 bg-blue-900/40 text-blue-100 hover:bg-blue-900/60"
-              >
+                >
                 Copy CLI
               </button>
               <button
@@ -443,10 +684,97 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
       )}
 
       <div className="mt-3 space-y-2 text-xs">
-        <div>
-          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">
-            Goal metric
+        <div className="rounded-lg border border-indigo-900/40 bg-indigo-900/10">
+          <div className="px-2 py-1.5 border-b border-indigo-900/30 text-[10px] uppercase tracking-wide text-indigo-300">
+            Research writeback
           </div>
+
+          <div className="px-2 py-2 space-y-2">
+            <div className="flex flex-wrap gap-1.5">
+              {WRITEBACK_MODES.map((mode) => {
+                const isActive = writeMode === mode;
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setWriteMode(mode)}
+                    disabled={writeState === "saving"}
+                    className={`text-[11px] px-2 py-1 rounded border ${
+                      isActive
+                        ? "border-indigo-400 bg-indigo-900/40 text-indigo-100"
+                        : "border-gray-700 bg-gray-900 text-gray-300 hover:bg-gray-800"
+                    }`}
+                    aria-pressed={isActive}
+                  >
+                    {WRITEBACK_MODE_LABEL[mode]}
+                  </button>
+                );
+              })}
+            </div>
+
+            {writeMode === "note" ? (
+              <input
+                type="text"
+                placeholder="Write a research note"
+                value={writeNote}
+                onChange={(e) => setWriteNote(e.target.value)}
+                className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[12px] text-gray-200 focus:border-indigo-400 focus:outline-none"
+              />
+            ) : writeMode === "decision" ? (
+              <div className="space-y-2">
+                <label htmlFor="research-call-decision" className="sr-only">
+                  Decision
+                </label>
+                <select
+                  id="research-call-decision"
+                  value={writeDecision}
+                  onChange={(e) => setWriteDecision(e.target.value as ExperimentDecision)}
+                  aria-label="Decision"
+                  className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[12px] text-gray-200 focus:border-indigo-400 focus:outline-none"
+                >
+                  {WRITEBACK_DECISIONS.map((d) => (
+                    <option key={d} value={d}>
+                      {WRITEBACK_DECISION_LABEL[d]}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  placeholder="Write decision reason"
+                  value={writeDecisionReason}
+                  onChange={(e) => setWriteDecisionReason(e.target.value)}
+                  className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[12px] text-gray-200 focus:border-indigo-400 focus:outline-none"
+                />
+              </div>
+            ) : (
+              <input
+                type="text"
+                placeholder="Write locator"
+                value={writeLocator}
+                onChange={(e) => setWriteLocator(e.target.value)}
+                className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[12px] text-gray-200 focus:border-indigo-400 focus:outline-none"
+              />
+            )}
+
+            <button
+              type="button"
+              onClick={submitWriteback}
+              disabled={writeState === "saving" || !writebackValid()}
+              className="text-[11px] px-2 py-1 rounded border border-indigo-700 bg-indigo-900/40 text-indigo-100 hover:bg-indigo-900/60 disabled:opacity-50"
+            >
+              Submit writeback
+            </button>
+
+            {writeState === "saving" && (
+              <p className="text-[10px] text-gray-400">Saving…</p>
+            )}
+            {writeState === "success" && <p className="text-[10px] text-emerald-400">Writeback saved.</p>}
+            {writeState === "error" && <p className="text-[10px] text-rose-400">{writeError ?? "Failed to save writeback."}</p>}
+          </div>
+        </div>
+
+        <div>
+          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-0.5">Goal metric</div>
           {primary ? (
             <span className="font-mono text-gray-300">
               {primary.direction === "min" ? "↓" : "↑"} {primary.metric}
@@ -508,13 +836,11 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
         )}
 
         <div className="pt-2 border-t border-gray-800">
-          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">
-            Research bundle
-          </div>
+          <div className="text-[10px] uppercase tracking-wide text-gray-600 mb-1">Research bundle</div>
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={downloadBundle}
+              onClick={downloadResearchBundleJson}
               disabled={exportState === "loading"}
               className="text-[11px] px-2 py-1 rounded border border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700 disabled:opacity-50"
               title="Read-only JSON export: detail + summary + diff + manifest + timeline + decision + artifacts"
@@ -525,12 +851,40 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
                   ? "Downloaded"
                   : "Export JSON"}
             </button>
-            <code className="text-[10px] text-gray-500 truncate">
-              alch experiments bundle {cliRefForShell}
-            </code>
+            <button
+              type="button"
+              onClick={downloadResearchBundleMarkdown}
+              disabled={markdownExportState === "loading"}
+              className="text-[11px] px-2 py-1 rounded border border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700 disabled:opacity-50"
+              title="Markdown handoff-friendly research-bundle export"
+            >
+              {markdownExportState === "loading"
+                ? "Exporting…"
+                : markdownExportState === "done"
+                  ? "Downloaded"
+                  : "Export Markdown"}
+            </button>
+            <div className="flex-1 min-w-0">
+              <code className="text-[10px] text-gray-500 break-all">{bundleCli}</code>
+            </div>
+            <button
+              type="button"
+              onClick={copyResearchBundleCli}
+              aria-label="Copy bundle CLI"
+              className="text-[11px] px-2 py-1 rounded border border-gray-700 bg-gray-800 text-gray-300 hover:bg-gray-700"
+              >
+              Copy CLI
+            </button>
           </div>
-          {exportError && (
-            <div className="mt-1 text-[10px] text-red-400">{exportError}</div>
+          {exportError && <div className="mt-1 text-[10px] text-red-400">{exportError}</div>}
+          {markdownExportError && (
+            <div className="mt-1 text-[10px] text-red-400">{markdownExportError}</div>
+          )}
+          {bundleCopyState === "success" && (
+            <p className="mt-1 text-[11px] text-emerald-400">Bundle CLI copied to clipboard.</p>
+          )}
+          {bundleCopyState === "error" && (
+            <p className="mt-1 text-[11px] text-rose-400">{bundleCopyError ?? "Failed to copy bundle CLI."}</p>
           )}
         </div>
       </div>
