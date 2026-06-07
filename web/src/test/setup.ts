@@ -37,3 +37,15 @@ import { beforeEach } from "vitest";
     shim.clear();
   });
 }
+
+class ResizeObserverShim implements ResizeObserver {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+
+Object.defineProperty(globalThis, "ResizeObserver", {
+  value: ResizeObserverShim,
+  configurable: true,
+  writable: true,
+});

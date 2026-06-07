@@ -1,4 +1,14 @@
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import {
+  Controls,
+  ReactFlow,
+  ReactFlowProvider,
+  type Edge,
+  type Node,
+  type NodeProps,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import type { ExperimentTreeNode, Task } from "../../lib/api";
 import {
   DECISION_BADGE,
@@ -25,10 +35,23 @@ type RailRow = {
   // rails[d] = true iff column d should show a vertical line passing through
   // this row (i.e. ancestor at depth d has a later sibling). Length === depth.
   rails: boolean[];
-  // railOnPath[d] = true iff the ancestor at depth d is on the selected path,
+  // railOnPath[d] = true iff the ancestor at depth d lies on the selected path,
   // so the rail at that column should render with the path-highlight color.
   railOnPath: boolean[];
 };
+
+type LineageViewMode = "canvas" | "rows";
+
+type CanvasNodeData = {
+  node: ExperimentTreeNode;
+  tone: LineageTone;
+  isCurrent: boolean;
+  onPath: boolean;
+  foldedCount?: number;
+  onSelectExperiment: (id: string) => void;
+};
+
+type CanvasNode = Node<CanvasNodeData, "experimentCanvas">;
 
 function taskPriority(status: Task["status"]): number {
   switch (status) {
@@ -427,6 +450,182 @@ function RailRowView({
   );
 }
 
+const CANVAS_NODE_W = 176;
+const CANVAS_NODE_H = 52;
+const CANVAS_X_GAP = 220;
+const CANVAS_Y_GAP = 68;
+const CANVAS_PAD_X = 24;
+const CANVAS_PAD_Y = 28;
+const CANVAS_MIN_HEIGHT = 340;
+const CANVAS_MAX_HEIGHT = 440;
+
+const CANVAS_NODE_TONE: Record<LineageTone, string> = {
+  current: "border-indigo-400/70 bg-indigo-500/12 text-indigo-100 shadow-[0_0_0_1px_rgba(129,140,248,0.25)]",
+  path: "border-indigo-500/45 bg-indigo-500/8 text-gray-100",
+  active: "border-gray-700 bg-gray-950/95 text-gray-200",
+  muted: "border-gray-800 bg-gray-950/70 text-gray-500 opacity-75",
+};
+
+function shortNodeMeta(node: ExperimentTreeNode): string {
+  const decision = decisionLabelForFilter(node.decision) ?? node.decision;
+  if (decision) return decision;
+  return node.status;
+}
+
+function CanvasExperimentNode({ data }: NodeProps<CanvasNode>) {
+  const { node, tone, isCurrent, foldedCount, onSelectExperiment } = data;
+  const body = (
+    <div
+      className={`h-full w-full rounded-sm border px-2 py-1.5 text-left text-[10px] leading-tight ${CANVAS_NODE_TONE[tone]}`}
+      data-lineage-canvas-node
+      data-lineage-tone={tone}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="min-w-0 truncate font-mono text-[11px]" title={node.name}>
+          {node.name}
+        </span>
+        <span className="shrink-0 rounded-sm border border-white/10 px-1 text-[8px] uppercase tracking-wide text-gray-400">
+          {node.status}
+        </span>
+      </div>
+      <div className="mt-1 flex items-center gap-1 text-[9px] text-gray-500">
+        <span className="truncate">{shortNodeMeta(node)}</span>
+        {foldedCount !== undefined && foldedCount > 0 && (
+          <span className="shrink-0 text-gray-500">+{foldedCount} hidden</span>
+        )}
+      </div>
+    </div>
+  );
+
+  if (isCurrent) {
+    return <div style={{ width: CANVAS_NODE_W, height: CANVAS_NODE_H }}>{body}</div>;
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => onSelectExperiment(node.id)}
+      aria-label={`Preview ${node.name}`}
+      className="block hover:brightness-110 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+      style={{ width: CANVAS_NODE_W, height: CANVAS_NODE_H }}
+    >
+      {body}
+    </button>
+  );
+}
+
+const canvasNodeTypes = {
+  experimentCanvas: CanvasExperimentNode,
+};
+
+function buildCanvasElements(
+  rows: RailRow[],
+  onSelectExperiment: (id: string) => void,
+): { nodes: CanvasNode[]; edges: Edge[]; height: number } {
+  const visibleIds = new Set(rows.map((row) => row.node.id));
+  const nodes: CanvasNode[] = rows.map((row, index) => ({
+    id: row.node.id,
+    type: "experimentCanvas",
+    position: {
+      x: CANVAS_PAD_X + row.depth * CANVAS_X_GAP,
+      y: CANVAS_PAD_Y + index * CANVAS_Y_GAP,
+    },
+    data: {
+      node: row.node,
+      tone: row.tone,
+      isCurrent: row.isCurrent,
+      onPath: row.onPath,
+      foldedCount: row.foldedCount,
+      onSelectExperiment,
+    },
+    selected: row.isCurrent,
+    draggable: false,
+    selectable: false,
+  }));
+
+  const edges: Edge[] = rows
+    .filter((row) => row.node.parent_id && visibleIds.has(row.node.parent_id))
+    .map((row) => ({
+      id: `${row.node.parent_id}->${row.node.id}`,
+      source: row.node.parent_id as string,
+      target: row.node.id,
+      type: "smoothstep",
+      animated: row.onPath || row.isCurrent,
+      style: {
+        stroke: row.onPath || row.isCurrent ? "rgba(129,140,248,0.75)" : "rgba(75,85,99,0.65)",
+        strokeWidth: row.onPath || row.isCurrent ? 1.6 : 1,
+      },
+    }));
+
+  return {
+    nodes,
+    edges,
+    height: Math.min(
+      CANVAS_MAX_HEIGHT,
+      Math.max(CANVAS_MIN_HEIGHT, CANVAS_PAD_Y * 2 + rows.length * CANVAS_Y_GAP),
+    ),
+  };
+}
+
+function LineageCanvas({
+  rows,
+  onSelectExperiment,
+}: {
+  rows: RailRow[];
+  onSelectExperiment: (id: string) => void;
+}) {
+  const { nodes, edges, height } = useMemo(
+    () => buildCanvasElements(rows, onSelectExperiment),
+    [rows, onSelectExperiment],
+  );
+
+  return (
+    <ReactFlowProvider>
+      <div
+        className="relative -mx-1 overflow-hidden rounded-sm border border-gray-800 bg-gray-950 bg-[radial-gradient(circle_at_1px_1px,rgba(255,255,255,0.045)_1px,transparent_0)] [background-size:18px_18px]"
+        style={{ height }}
+        data-lineage-canvas
+      >
+        <div className="sr-only" aria-label="Canvas lineage nodes">
+          {rows
+            .filter((row) => !row.isCurrent)
+            .map((row) => (
+              <button
+                key={`canvas-a11y-${row.node.id}`}
+                type="button"
+                aria-label={`Preview ${row.node.name}`}
+                onClick={() => onSelectExperiment(row.node.id)}
+              >
+                {row.node.name}
+              </button>
+            ))}
+        </div>
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={canvasNodeTypes}
+          colorMode="dark"
+          fitView
+          fitViewOptions={{ padding: 0.24 }}
+          minZoom={0.35}
+          maxZoom={1.6}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          edgesFocusable={false}
+          panOnScroll
+          zoomOnPinch
+          panOnDrag
+          selectNodesOnDrag={false}
+          style={{ background: "transparent" }}
+        >
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </div>
+    </ReactFlowProvider>
+  );
+}
+
 function SelectedDetailStrip({
   node,
   pageId,
@@ -490,6 +689,7 @@ function SelectedDetailStrip({
         <span
           className={`text-[9px] px-1 py-px rounded border ${decisionBadge}`}
           aria-label={`Decision: ${decisionLabel}`}
+          data-lineage-decision-chip
         >
           Decision: {decisionLabel}
         </span>
@@ -586,6 +786,8 @@ export function ExperimentLineageGraphCard({
   selectedTasks?: Task[];
   onSelectExperiment: (id: string) => void;
 }) {
+  const [viewMode, setViewMode] = useState<LineageViewMode>("canvas");
+
   if (roots === null) {
     return (
       <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
@@ -613,9 +815,29 @@ export function ExperimentLineageGraphCard({
       : 0;
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-md p-3">
-      <div className="flex items-center justify-between mb-2">
-        <h2 className="text-sm font-medium text-gray-400">Lineage graph</h2>
-        <span className="text-xs text-gray-600">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <h2 className="text-sm font-medium text-gray-400">Lineage graph</h2>
+          <div className="inline-flex rounded-sm border border-gray-800 bg-gray-950 p-0.5 text-[10px]">
+            {(["canvas", "rows"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                data-lineage-mode={mode}
+                aria-pressed={viewMode === mode}
+                onClick={() => setViewMode(mode)}
+                className={`px-2 py-0.5 rounded-sm capitalize ${
+                  viewMode === mode
+                    ? "bg-gray-800 text-gray-200"
+                    : "text-gray-500 hover:text-gray-300"
+                }`}
+              >
+                {mode === "canvas" ? "Canvas" : "Rows"}
+              </button>
+            ))}
+          </div>
+        </div>
+        <span className="shrink-0 text-xs text-gray-600">
           {roots.length} root{roots.length === 1 ? "" : "s"}
           {rows.length > 0 && ` · ${rows.length} shown`}
           {hiddenNodeCount > 0 && ` · ${hiddenNodeCount} hidden`}
@@ -625,15 +847,19 @@ export function ExperimentLineageGraphCard({
         <p className="text-xs text-gray-600">No lineage data for this experiment.</p>
       ) : (
         <>
-          <div className="max-h-72 overflow-y-auto -mx-1 px-1">
-            {rows.map((row) => (
-              <RailRowView
-                key={row.node.id}
-                row={row}
-                onSelectExperiment={onSelectExperiment}
-              />
-            ))}
-          </div>
+          {viewMode === "canvas" ? (
+            <LineageCanvas rows={rows} onSelectExperiment={onSelectExperiment} />
+          ) : (
+            <div className="max-h-72 overflow-y-auto -mx-1 px-1">
+              {rows.map((row) => (
+                <RailRowView
+                  key={row.node.id}
+                  row={row}
+                  onSelectExperiment={onSelectExperiment}
+                />
+              ))}
+            </div>
+          )}
           {selected && (
             <SelectedDetailStrip
               node={selected}

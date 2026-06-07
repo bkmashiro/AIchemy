@@ -108,6 +108,23 @@ function getRowByName(container: HTMLElement, name: string): HTMLElement {
   throw new Error(`Missing lineage row for ${name}`);
 }
 
+function setLineageMode(container: HTMLElement, mode: "Canvas" | "Rows"): void {
+  const targetMode = mode.toLowerCase();
+  const toggle =
+    Array.from(container.querySelectorAll<HTMLButtonElement>("button[data-lineage-mode]"))
+      .find((node) => node.dataset.lineageMode === targetMode);
+  if (!toggle) {
+    throw new Error(`Missing LineageGraphCard mode toggle for ${mode}`);
+  }
+  if (!toggle.getAttribute("aria-pressed") || toggle.getAttribute("aria-pressed") !== "true") {
+    fireEvent.click(toggle);
+  }
+}
+
+function showRowsMode(container: HTMLElement): void {
+  setLineageMode(container, "Rows");
+}
+
 describe("ExperimentLineageGraphCard stress tests", () => {
   const roots: ExperimentTreeNode[] = [
     node({
@@ -232,6 +249,8 @@ describe("ExperimentLineageGraphCard stress tests", () => {
       </MemoryRouter>,
     );
 
+    showRowsMode(container);
+
     expect(consoleErrorSpy).not.toHaveBeenCalled();
     expect(getRowNames(container)).toHaveLength(31);
     consoleErrorSpy.mockRestore();
@@ -250,6 +269,8 @@ describe("ExperimentLineageGraphCard stress tests", () => {
         />
       </MemoryRouter>,
     );
+
+    showRowsMode(container);
 
     const initialRows = getRowNames(container);
     expect(initialRows).toHaveLength(31);
@@ -306,6 +327,8 @@ describe("ExperimentLineageGraphCard stress tests", () => {
         />
       </MemoryRouter>,
     );
+
+    showRowsMode(container);
 
     const baselineRows = getRowNames(container);
     fireEvent.click(screen.getByRole("button", { name: "Preview seed/zen/sweep-fork/late-failed-drop-leaf" }));
