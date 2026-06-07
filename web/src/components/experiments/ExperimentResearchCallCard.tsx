@@ -2,6 +2,7 @@ import { useState } from "react";
 import { experimentsApi } from "../../lib/api";
 import type {
   ExperimentDetail,
+  ExperimentEvent,
   ExperimentRecommendation,
   ExperimentDecision,
   ExperimentSummaryResponse,
@@ -16,7 +17,7 @@ import {
   decisionLabelForFilter,
 } from "./experimentDetailUtils";
 
-function isText(value: string | null | undefined): value is string {
+function isText(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
@@ -106,6 +107,47 @@ const WRITEBACK_MODE_LABEL: Record<WritebackMode, string> = {
   artifact: "Attach artifact",
   checkpoint: "Attach checkpoint",
 };
+const RECENT_WRITEBACK_KINDS: Set<ExperimentEvent["kind"]> = new Set([
+  "note",
+  "decision",
+  "artifact",
+  "checkpoint",
+]);
+
+function normalizeWritebackDecision(decision: unknown): string {
+  if (!isText(decision)) return "";
+  return decisionLabelForFilter(decision) ?? decision;
+}
+
+function normalizeWritebackEvents(recentEvents: ExperimentEvent[] = []): ExperimentEvent[] {
+  return recentEvents
+    .filter((event) => RECENT_WRITEBACK_KINDS.has(event.kind))
+    .slice()
+    .sort((a, b) => {
+      const left = Date.parse(a.created_at);
+      const right = Date.parse(b.created_at);
+      if (Number.isNaN(left) && Number.isNaN(right)) return 0;
+      if (Number.isNaN(left)) return 1;
+      if (Number.isNaN(right)) return -1;
+      if (left === right) return 0;
+      return right - left;
+    })
+    .slice(0, 3);
+}
+
+function writebackDecisionText(decisionEvent: ExperimentEvent): string {
+  const data = asRecord(decisionEvent.data);
+  const dataDecision = isText(data?.decision) ? data.decision : null;
+  if (dataDecision) return normalizeWritebackDecision(dataDecision);
+  if (isText(decisionEvent.message)) return decisionEvent.message;
+  return "Decision recorded";
+}
+
+function writebackLocator(event: ExperimentEvent): string {
+  const data = asRecord(event.data);
+  const locator = data?.locator;
+  return isText(locator) ? locator : "";
+}
 
 function normalizeBundleValue(value: unknown): string {
   if (value === null || value === undefined) return "—";
@@ -230,15 +272,18 @@ function renderResearchBundleMarkdown(
 export function ExperimentResearchCallCard({
   exp,
   summary,
+  recentEvents = [],
   onChanged,
 }: {
   exp: ExperimentDetail;
   summary: ExperimentSummaryResponse | null;
+  recentEvents?: ExperimentEvent[];
   onChanged?: (experimentId: string) => void;
 }) {
   const explicitDecision = summary?.decision ?? exp.decision ?? null;
   const decisionLabel = explicitDecision ? decisionLabelForFilter(explicitDecision) : null;
   const recommendation = summary?.recommendation ?? null;
+  const recentWritebacks = normalizeWritebackEvents(recentEvents);
 
   const action = explicitDecision
     ? NEXT_ACTION[explicitDecision] ?? NEXT_ACTION_DEFAULT
@@ -681,6 +726,30 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
         <p className="mt-3 border-l-2 border-gray-800 pl-3 text-xs italic text-gray-400">
           &ldquo;{decisionReason}&rdquo;
         </p>
+      )}
+
+      {recentWritebacks.length > 0 && (
+        <div>
+          <div className="mt-3 text-[10px] uppercase tracking-wide text-gray-600 mb-1">Recent writebacks</div>
+          <ul className="space-y-1 text-[11px] text-gray-300">
+            {recentWritebacks.map((event) => {
+              const locator = writebackLocator(event);
+              const title = event.kind === "decision" ? writebackDecisionText(event) : event.message;
+              const decisionData = event.kind === "decision" ? asRecord(event.data) : null;
+              const rawDecisionWritebackReason = decisionData?.reason;
+              const decisionWritebackReason = isText(rawDecisionWritebackReason) ? rawDecisionWritebackReason : null;
+              return (
+                <li key={event.id} className="rounded border border-gray-800 bg-gray-900/40 px-2 py-1">
+                  <span>{title}</span>
+                  {decisionWritebackReason && (
+                    <span className="text-gray-400"> — {decisionWritebackReason}</span>
+                  )}
+                  {locator ? <code className="ml-1 font-mono">{locator}</code> : null}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       )}
 
       <div className="mt-3 space-y-2 text-xs">

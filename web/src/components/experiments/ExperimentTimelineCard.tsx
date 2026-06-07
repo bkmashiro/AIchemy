@@ -2,7 +2,12 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ExperimentEvent, experimentsApi } from "../../lib/api";
 import { formatRelTime } from "../../lib/format";
-import { EVENT_BADGE, formatEventData, artifactLocator } from "./experimentDetailUtils";
+import {
+  EVENT_BADGE,
+  formatEventData,
+  artifactLocator,
+  decisionLabelForFilter,
+} from "./experimentDetailUtils";
 
 type TimelineFilter = "all" | "notes" | "decisions" | "artifacts" | "checkpoints" | "tasks";
 type TimelineOrder = "newest" | "oldest";
@@ -25,6 +30,53 @@ const FILTER_LABEL: Record<TimelineFilter, string> = {
   checkpoints: "checkpoints",
   tasks: "tasks",
 };
+
+function normalizeText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function isDecisionLikeMessage(value: unknown): string | null {
+  const normalized = normalizeText(value)?.toLowerCase();
+  if (!normalized) return null;
+  const knownDecisionLike = [
+    "keep",
+    "drop",
+    "fork",
+    "rerun",
+    "needs stronger evidence",
+  ];
+  if (!knownDecisionLike.includes(normalized)) return null;
+  return normalized;
+}
+
+function formatDecisionLabel(raw: string): string {
+  const normalized = decisionLabelForFilter(raw);
+  if (!normalized) return raw;
+  if (normalized === "needs stronger evidence") return "Needs stronger evidence";
+  return normalized;
+}
+
+function getDecisionLabel(event: ExperimentEvent): string | null {
+  if (event.kind !== "decision") return null;
+  const fromData = normalizeText(event.data && event.data.decision);
+  const fromMessage = fromData ? null : isDecisionLikeMessage(event.message);
+  if (!fromData && !fromMessage) return null;
+  const raw = fromData ?? fromMessage;
+  if (!raw) return null;
+  return formatDecisionLabel(raw);
+}
+
+function isHttpLocator(locator: string): boolean {
+  return /^https?:\/\//i.test(locator);
+}
+
+function copyErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  return "Could not copy locator.";
+}
 
 function matchesFilter(event: ExperimentEvent, filter: TimelineFilter): boolean {
   if (filter === "all") return true;
@@ -53,6 +105,8 @@ export function ExperimentTimelineCard({
   const [activeFilter, setActiveFilter] = useState<TimelineFilter>("all");
   const [timelineOrder, setTimelineOrder] = useState<TimelineOrder>("newest");
   const [currentPage, setCurrentPage] = useState(0);
+  const [locatorCopyMessages, setLocatorCopyMessages] = useState<Record<string, string>>({});
+
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -74,6 +128,24 @@ export function ExperimentTimelineCard({
       setError(e?.response?.data?.error ?? "Failed to add note");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function copyLocator(eventId: string, locator: string) {
+    try {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+        throw new Error("Clipboard unavailable in this browser.");
+      }
+      await navigator.clipboard.writeText(locator);
+      setLocatorCopyMessages((current) => ({
+        ...current,
+        [eventId]: "Locator copied to clipboard.",
+      }));
+    } catch (error: unknown) {
+      setLocatorCopyMessages((current) => ({
+        ...current,
+        [eventId]: copyErrorMessage(error),
+      }));
     }
   }
 
@@ -227,7 +299,11 @@ export function ExperimentTimelineCard({
                 EVENT_BADGE[ev.kind] || "bg-gray-800 text-gray-400 border-gray-700";
               const isArtifactKind = ev.kind === "artifact" || ev.kind === "checkpoint";
               const artifact = isArtifactKind ? artifactLocator(ev.data) : null;
+              const decisionLabel = getDecisionLabel(ev);
+              const rawDecisionReason = ev.kind === "decision" ? ev.data?.reason : undefined;
+              const decisionReason = normalizeText(rawDecisionReason);
               const dataStr = !artifact ? formatEventData(ev.data) : null;
+              const locatorCopyMessage = locatorCopyMessages[ev.id];
               return (
                 <li
                   key={ev.id}
@@ -239,11 +315,12 @@ export function ExperimentTimelineCard({
                     >
                       {ev.kind}
                     </span>
-                    <span className="text-gray-300">{ev.message}</span>
+                    <span className="text-gray-300">{decisionLabel ?? ev.message}</span>
                     <span className="text-gray-600 ml-auto">
                       {formatRelTime(ev.created_at)}
                     </span>
                   </div>
+                  {decisionReason && <p className="mt-0.5 text-gray-500 text-[11px]">{decisionReason}</p>}
                   <div className="flex items-center gap-3 mt-0.5 text-gray-600 text-[11px]">
                     {ev.actor && <span>by {ev.actor}</span>}
                     {ev.task_id && (
@@ -257,17 +334,43 @@ export function ExperimentTimelineCard({
                   </div>
                   {artifact && (
                     <div className="mt-1 text-[11px] flex items-center gap-2 flex-wrap">
+                      {artifact.name && <span className="text-gray-400">{artifact.name}</span>}
                       {artifact.type && (
                         <span className="px-1 py-0.5 rounded border text-[10px] bg-gray-800 text-gray-400 border-gray-700">
                           {artifact.type}
                         </span>
                       )}
-                      {artifact.name && <span className="text-gray-400">{artifact.name}</span>}
                       {typeof artifact.step === "number" && (
                         <span className="text-gray-500">step {artifact.step}</span>
                       )}
                       <code className="font-mono text-gray-300 break-all">{artifact.locator}</code>
+                      <button
+                        type="button"
+                        onClick={() => copyLocator(ev.id, artifact.locator)}
+                        className="px-1.5 py-0.5 rounded border border-gray-700 text-gray-400 hover:text-gray-200 hover:bg-gray-800/40"
+                      >
+                        Copy locator
+                      </button>
+                      {isHttpLocator(artifact.locator) && (
+                        <a
+                          href={artifact.locator}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-500 hover:text-blue-400"
+                        >
+                          Open
+                        </a>
+                      )}
                     </div>
+                  )}
+                  {locatorCopyMessage && (
+                    <p
+                      className={`mt-1 text-[11px] ${
+                        locatorCopyMessage === "Locator copied to clipboard." ? "text-green-400" : "text-red-400"
+                      }`}
+                    >
+                      {locatorCopyMessage}
+                    </p>
                   )}
                   {dataStr && (
                     <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/40 rounded px-2 py-1 overflow-x-auto font-mono">

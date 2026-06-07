@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import type {
   ExperimentDetail,
+  ExperimentEvent,
   ExperimentRecommendation,
   ExperimentSummaryResponse,
 } from "../../../lib/api";
@@ -155,6 +156,21 @@ function makeResearchBundle() {
   };
 }
 
+function makeRecentEvent(
+  id: string,
+  kind: ExperimentEvent["kind"],
+  overrides: Partial<ExperimentEvent> = {},
+): ExperimentEvent {
+  return {
+    id,
+    experiment_id: "exp-a",
+    kind,
+    message: `${kind} note`,
+    created_at: "2026-06-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
 function copyToSection(name: string) {
   const heading = screen.getByText(name);
   const container = heading.parentElement?.parentElement ?? heading.closest("div");
@@ -250,6 +266,78 @@ describe("ExperimentResearchCallCard", () => {
 
     expect(screen.getByText("Needs stronger evidence")).toBeInTheDocument();
     expect(screen.getByText("Writeback saved.")).toBeInTheDocument();
+  });
+
+  it("renders recent writebacks from note/decision/artifact/checkpoint events", () => {
+    const recentEvents: ExperimentEvent[] = [
+      makeRecentEvent("evt-1", "note", {
+        created_at: "2026-06-01T09:00:00.000Z",
+        message: "first note",
+      }),
+      makeRecentEvent("evt-2", "created", {
+        created_at: "2026-06-01T09:30:00.000Z",
+        message: "not relevant",
+      }),
+      makeRecentEvent("evt-3", "artifact", {
+        created_at: "2026-06-01T12:00:00.000Z",
+        message: "artifact recorded",
+        data: { locator: "s3://artifacts/run-a" },
+      }),
+      makeRecentEvent("evt-4", "checkpoint", {
+        created_at: "2026-06-01T11:00:00.000Z",
+        message: "checkpoint recorded",
+        data: { locator: "s3://checkpoints/run-a" },
+      }),
+      makeRecentEvent("evt-6", "note", {
+        created_at: "2026-06-01T13:00:00.000Z",
+        message: "new note",
+      }),
+    ];
+
+    render(
+      <ExperimentResearchCallCard
+        exp={makeExperiment()}
+        summary={makeSummary()}
+        recentEvents={recentEvents}
+      />,
+    );
+
+    const writebacks = copyToSection("Recent writebacks");
+    const rows = within(writebacks).getAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(within(writebacks).getByText("artifact recorded")).toBeInTheDocument();
+    expect(within(writebacks).getByText("checkpoint recorded")).toBeInTheDocument();
+    expect(within(writebacks).getByText("new note")).toBeInTheDocument();
+    expect(screen.queryByText("first note")).not.toBeInTheDocument();
+    expect(screen.queryByText("not relevant")).not.toBeInTheDocument();
+
+    const artifactLocator = within(writebacks).getByText("s3://artifacts/run-a");
+    expect(artifactLocator.closest("code")).not.toBeNull();
+    const checkpointLocator = within(writebacks).getByText("s3://checkpoints/run-a");
+    expect(checkpointLocator.closest("code")).not.toBeNull();
+  });
+
+
+  it("renders recent decision rerun as needs stronger evidence in recent writebacks", () => {
+    const recentEvents: ExperimentEvent[] = [
+      makeRecentEvent("evt-rerun", "decision", {
+        created_at: "2026-06-01T10:00:00.000Z",
+        message: "rerun",
+        data: { decision: "rerun", reason: "Need stronger evidence." },
+      }),
+    ];
+
+    render(
+      <ExperimentResearchCallCard
+        exp={makeExperiment()}
+        summary={makeSummary()}
+        recentEvents={recentEvents}
+      />,
+    );
+
+    const writebacks = copyToSection("Recent writebacks");
+    expect(within(writebacks).getAllByText(/needs stronger evidence/i).length).toBeGreaterThan(0);
+    expect(within(writebacks).queryByText(/\brerun\b/i)).not.toBeInTheDocument();
   });
 
   it.each([

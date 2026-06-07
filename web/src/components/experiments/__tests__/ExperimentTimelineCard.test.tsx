@@ -21,6 +21,7 @@ function makeEvent(
   created_at: string,
   message = id,
   kind: ExperimentEvent["kind"] = "note",
+  data: Record<string, unknown> = {},
 ): ExperimentEvent {
   return {
     id,
@@ -29,7 +30,7 @@ function makeEvent(
     message,
     created_at,
     actor: "tester",
-    data: {},
+    data,
   };
 }
 
@@ -150,6 +151,62 @@ describe("ExperimentTimelineCard", () => {
     expect(listItemsAfterTasks[0]).toHaveTextContent("task completed");
     expect(listItemsAfterTasks[1]).toHaveTextContent("task failed");
     expect(listItemsAfterTasks[2]).toHaveTextContent("task started");
+  });
+
+  it("shows user-facing decision labels for decision events", () => {
+    renderCard([
+      makeEvent(
+        "decision",
+        "2026-06-01T00:00:00.000Z",
+        "rerun",
+        "decision",
+        { decision: "rerun", reason: "Need more seeds" },
+      ),
+    ]);
+
+    expect(screen.getByText("Needs stronger evidence")).toBeInTheDocument();
+    expect(screen.getByText("Need more seeds")).toBeInTheDocument();
+    expect(screen.queryByText("rerun")).not.toBeInTheDocument();
+  });
+
+  it("renders a copy locator button and copies artifact locator", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    renderCard([
+      makeEvent(
+        "artifact",
+        "2026-06-01T00:00:00.000Z",
+        "artifact event",
+        "artifact",
+        { path: "s3://bucket/artifact.pt" },
+      ),
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /copy locator/i }));
+
+    expect(writeText).toHaveBeenCalledWith("s3://bucket/artifact.pt");
+    expect(await screen.findByText("Locator copied to clipboard.")).toBeInTheDocument();
+  });
+
+  it("renders an Open link for http(s) locator", () => {
+    renderCard([
+      makeEvent(
+        "checkpoint",
+        "2026-06-01T00:00:00.000Z",
+        "checkpoint saved",
+        "checkpoint",
+        { uri: "https://artifacts.local/models/ckpt.pt" },
+      ),
+    ]);
+
+    const openLink = screen.getByRole("link", { name: /open/i });
+    expect(openLink).toHaveAttribute("href", "https://artifacts.local/models/ckpt.pt");
+    expect(openLink).toHaveAttribute("target", "_blank");
+    expect(openLink).toHaveAttribute("rel", "noopener noreferrer");
   });
 
   it("paginates timeline events and disables controls at bounds", () => {

@@ -26,7 +26,7 @@ should be read as "shipped, not pending":
 Open follow-ups (not started):
 
 - Recommendation wording pass (shipped): `rerun` is preserved as API enum; UI now uses `Needs stronger evidence` for recommendation copy and stronger-evidence decision filters/buttons. Keep `needs replication` compatibility for older payloads only where needed.
-- Research writeback + handoff export (shipped): Research call now has a compact writeback composer for notes, decisions, artifact locators, and checkpoint locators; the same card exports research bundles as JSON or Markdown and can copy the bundle CLI.
+- Research writeback + handoff export (shipped): Research call now has a compact writeback composer for notes, decisions, artifact locators, and checkpoint locators; the same card exports research bundles as JSON or Markdown and can copy the bundle CLI. Phase P also surfaces recent writebacks in the Research call, refreshes selected-lineage timeline context after writeback, and gives artifact/checkpoint timeline locators copy/open affordances.
 - Lineage graph → Research call coupling: clicking a lineage node should update
   the right-side Research call / compare context in-place, without a full page
   navigation. Keep `Open detail` as the explicit route change. This makes the
