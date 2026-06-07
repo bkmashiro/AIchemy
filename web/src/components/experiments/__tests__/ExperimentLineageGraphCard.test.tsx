@@ -313,7 +313,7 @@ describe("ExperimentLineageGraphCard", () => {
     expect(within(strip).getByText("Preview selected")).toBeInTheDocument();
     expect(within(strip).getByText("Status: failed")).toBeInTheDocument();
     expect(within(strip).getByText("Decision: drop")).toBeInTheDocument();
-    expect(within(strip).getByText("Recommendation: Needs replication")).toBeInTheDocument();
+    expect(within(strip).getByText("Recommendation: Needs stronger evidence")).toBeInTheDocument();
 
     const detailChips = strip.querySelectorAll('[data-lineage-diff-chip]');
     expect(Array.from(detailChips).map((chip) => chip.textContent)).toEqual([

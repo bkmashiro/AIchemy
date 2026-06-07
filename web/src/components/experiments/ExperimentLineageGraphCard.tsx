@@ -9,6 +9,7 @@ import {
   recommendationBadgeClass,
   recommendationLabel,
   sortLineageChildren,
+  decisionLabelForFilter,
   type LineageTone,
 } from "./experimentDetailUtils";
 
@@ -287,12 +288,14 @@ function RailRowView({
     hasVisibleChildren,
     foldedCount,
   } = row;
+  const decisionLabel = decisionLabelForFilter(node.decision) ?? node.decision ?? null;
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
   const rawRecommendationText = recommendationLabel(node.recommendation);
   const recommendationText =
-    rawRecommendationText && rawRecommendationText.toLowerCase() !== node.decision?.toLowerCase()
+    rawRecommendationText &&
+    rawRecommendationText.toLowerCase() !== decisionLabel?.toLowerCase()
       ? rawRecommendationText
       : null;
   const recommendationBadge =
@@ -349,7 +352,7 @@ function RailRowView({
             className={`shrink-0 text-[9px] px-1 py-px rounded border ${decisionBadge}`}
             data-lineage-decision-chip
           >
-            {node.decision}
+            {decisionLabel}
           </span>
         )}
         {recommendationText && recommendationBadge && (
@@ -419,12 +422,14 @@ function SelectedDetailStrip({
         : node.status === "failed"
           ? "text-red-400"
           : "text-blue-400";
+  const decisionLabel = decisionLabelForFilter(node.decision) ?? node.decision ?? null;
   const decisionBadge = node.decision
     ? DECISION_BADGE[node.decision] || "bg-gray-800 text-gray-400 border-gray-700"
     : null;
   const rawRecommendationText = recommendationLabel(node.recommendation);
   const recommendationText =
-    rawRecommendationText && rawRecommendationText.toLowerCase() !== node.decision?.toLowerCase()
+    rawRecommendationText &&
+    rawRecommendationText.toLowerCase() !== decisionLabel?.toLowerCase()
       ? rawRecommendationText
       : null;
   const recommendationBadge =
@@ -460,9 +465,9 @@ function SelectedDetailStrip({
       {decisionBadge && (
         <span
           className={`text-[9px] px-1 py-px rounded border ${decisionBadge}`}
-          aria-label={`Decision: ${node.decision}`}
+          aria-label={`Decision: ${decisionLabel}`}
         >
-          Decision: {node.decision}
+          Decision: {decisionLabel}
         </span>
       )}
       {recommendationText && recommendationBadge && (

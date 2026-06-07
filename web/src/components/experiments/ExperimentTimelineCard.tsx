@@ -5,6 +5,7 @@ import { formatRelTime } from "../../lib/format";
 import { EVENT_BADGE, formatEventData, artifactLocator } from "./experimentDetailUtils";
 
 type TimelineFilter = "all" | "notes" | "decisions" | "artifacts" | "checkpoints" | "tasks";
+type TimelineOrder = "newest" | "oldest";
 
 const TASK_EVENT_KINDS = new Set(["task_started", "task_completed", "task_failed"]);
 const FILTER_ORDER: TimelineFilter[] = [
@@ -50,6 +51,7 @@ export function ExperimentTimelineCard({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<TimelineFilter>("all");
+  const [timelineOrder, setTimelineOrder] = useState<TimelineOrder>("newest");
   const [currentPage, setCurrentPage] = useState(0);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -93,8 +95,11 @@ export function ExperimentTimelineCard({
   );
 
   const filteredEvents = useMemo(
-    () => sorted.filter((ev) => matchesFilter(ev, activeFilter)),
-    [sorted, activeFilter],
+    () => {
+      const list = sorted.filter((ev) => matchesFilter(ev, activeFilter));
+      return timelineOrder === "oldest" ? [...list].reverse() : list;
+    },
+    [sorted, activeFilter, timelineOrder],
   );
 
   const safePageSize = Math.max(1, pageSize);
@@ -103,6 +108,10 @@ export function ExperimentTimelineCard({
   useEffect(() => {
     setCurrentPage(0);
   }, [activeFilter]);
+
+  useEffect(() => {
+    setCurrentPage(0);
+  }, [timelineOrder]);
 
   useEffect(() => {
     setCurrentPage((page) => Math.min(page, totalPages - 1));
@@ -168,11 +177,40 @@ export function ExperimentTimelineCard({
                 : "text-gray-500 hover:text-gray-200 hover:bg-gray-800/50 border-gray-700"
             }`}
           >
-            {filter === "all" ? "All" : filter[0].toUpperCase() + filter.slice(1)} ({
-              filterCounts[filter]
-            })
+            {filter === "all" ? "All" : filter[0].toUpperCase() + filter.slice(1)} ({filterCounts[filter]})
           </button>
         ))}
+      </div>
+
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-xs">
+        <span className="text-gray-500">Chronology:</span>
+        <button
+          type="button"
+          onClick={() => setTimelineOrder("newest")}
+          aria-pressed={timelineOrder === "newest"}
+          className={`px-2 py-1 rounded border transition-colors ${
+            timelineOrder === "newest"
+              ? "bg-gray-700 text-gray-100 border-gray-600"
+              : "text-gray-500 hover:text-gray-200 hover:bg-gray-800/50 border-gray-700"
+          }`}
+        >
+          Newest first
+        </button>
+        <button
+          type="button"
+          onClick={() => setTimelineOrder("oldest")}
+          aria-pressed={timelineOrder === "oldest"}
+          className={`px-2 py-1 rounded border transition-colors ${
+            timelineOrder === "oldest"
+              ? "bg-gray-700 text-gray-100 border-gray-600"
+              : "text-gray-500 hover:text-gray-200 hover:bg-gray-800/50 border-gray-700"
+          }`}
+        >
+          Oldest first
+        </button>
+        <span className="text-gray-500">
+          Newest-first is the operational default; use oldest-first to reconstruct the full story.
+        </span>
       </div>
 
       <p className="text-xs text-gray-600 mb-3">Showing {FILTER_LABEL[activeFilter]} evidence</p>

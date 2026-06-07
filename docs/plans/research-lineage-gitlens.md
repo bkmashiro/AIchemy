@@ -25,14 +25,7 @@ should be read as "shipped, not pending":
 
 Open follow-ups (not started):
 
-- Timeline ordering + pagination: show experiment timeline events newest-first
-  by default, with explicit pagination / cursor controls so long-running
-  experiments do not render an unbounded event list. Keep an affordance to read
-  oldest-first only when reconstructing a complete story.
-- Recommendation wording pass: `rerun` is too operational and sounds like
-  blindly repeating a job. For research guidance, test labels such as
-  `Needs stronger evidence`, `Run fuller experiment`, or `Insufficient evidence`
-  while preserving the underlying API enum until a migration is justified.
+- Recommendation wording pass (shipped): `rerun` is preserved as API enum; UI now uses `Needs stronger evidence` for recommendation copy and stronger-evidence decision filters/buttons. Keep `needs replication` compatibility for older payloads only where needed.
 - Lineage graph → Research call coupling: clicking a lineage node should update
   the right-side Research call / compare context in-place, without a full page
   navigation. Keep `Open detail` as the explicit route change. This makes the

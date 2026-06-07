@@ -17,10 +17,10 @@ function experiment(overrides: Partial<ExperimentDetail> = {}): ExperimentDetail
 }
 
 describe("DecisionCard", () => {
-  it("renders rerun decision with replication copy while keeping select value", () => {
+  it("renders rerun decision as stronger-evidence wording while keeping select value", () => {
     render(<DecisionCard exp={experiment({ decision: "rerun" })} onUpdated={() => {}} />);
 
-    expect(screen.getByText("NEEDS REPLICATION")).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "needs replication" })).toHaveValue("rerun");
+    expect(screen.getByText("NEEDS STRONGER EVIDENCE")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "needs stronger evidence" })).toHaveValue("rerun");
   });
 });

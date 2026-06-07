@@ -3,6 +3,8 @@ import type { ExperimentRecommendation, ExperimentTreeNode } from "../../../lib/
 import {
   recommendationBadgeClass,
   recommendationLabel,
+  recommendationLabelValue,
+  decisionLabelForFilter,
   formatMetricDelta,
   diffChipLabels,
   sortLineageChildren,
@@ -195,9 +197,14 @@ describe("recommendationLabel", () => {
     expect(recommendationLabel(rec)).toBe("Fork this run");
   });
 
-  it("maps recommendation rerun to 'Needs replication'", () => {
+  it("maps recommendation rerun to 'Needs stronger evidence'", () => {
     const rec = mkRecommendation({ action: "rerun", verdict: null });
-    expect(recommendationLabel(rec)).toBe("Needs replication");
+    expect(recommendationLabel(rec)).toBe("Needs stronger evidence");
+  });
+
+  it("rewrites rerun-prefixed freeform actions without changing API enums", () => {
+    expect(recommendationLabelValue("Rerun with larger cohort")).toBe("Plan replication with larger cohort");
+    expect(recommendationLabelValue("re-run on another seed")).toBe("Plan replication on another seed");
   });
 
   it("falls back to verdict only when action is absent", () => {
@@ -218,7 +225,19 @@ describe("recommendationLabel", () => {
       action: "   ",
       verdict: "rerun",
     });
-    expect(recommendationLabel(rec)).toBe("Needs replication");
+    expect(recommendationLabel(rec)).toBe("Needs stronger evidence");
+  });
+});
+
+describe("decisionLabelForFilter", () => {
+  it("normalizes rerun to needs stronger evidence", () => {
+    expect(decisionLabelForFilter("rerun")).toBe("needs stronger evidence");
+    expect(decisionLabelForFilter("ReRuN")).toBe("needs stronger evidence");
+  });
+
+  it("preserves known decision labels", () => {
+    expect(decisionLabelForFilter("keep")).toBe("keep");
+    expect(decisionLabelForFilter("drop")).toBe("drop");
   });
 });
 

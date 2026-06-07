@@ -362,7 +362,7 @@ const demoExperiments: DemoExperiment[] = [
     expected: "zN >= 0.874.",
     forkReason: "Seed fan-out for regularization sweep.",
     decision: "rerun",
-    decisionReason: "Close enough to rerun, not enough to promote.",
+    decisionReason: "Close enough to need stronger evidence, not enough to promote.",
     criteria: { zN: ">=0.878", eval_loss: "<=1.78" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, stub: "t4-11", seed: 3 },
     metrics: { zN: 0.875, eval_loss: 1.781, step: 36000 },
@@ -506,7 +506,7 @@ const demoExperiments: DemoExperiment[] = [
     expected: "Visible only when folded branches are expanded.",
     forkReason: "Hard-eval seed fan-out.",
     decision: "drop",
-    decisionReason: "Worker died; rerun later if needed.",
+    decisionReason: "Worker died; replicate later if needed.",
     criteria: { zN: ">=0.882", eval_loss: "<=1.76" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, weight_decay: 0.01, eval_seed: 3, stub: "t4-19" },
     metrics: { zN: 0.0, eval_loss: 9.99, step: 600 },
@@ -520,7 +520,7 @@ const seedEvents: DemoEvent[] = [
   { id: "e4", experimentId: "curiosity-low-lr", kind: "forked", message: "Forked from baseline_a30", actor: "operator", age: "26h ago", data: { lr: "0.0003 -> 0.00018", curiosity: "false -> true" } },
   { id: "e5", experimentId: "curiosity-low-lr", kind: "task_failed", message: "A30 OOM at step 12k", actor: "scheduler", age: "18h ago", data: { stub: "a30-01", exit_code: 137 } },
   { id: "e6", experimentId: "curiosity-low-lr", kind: "resumed", message: "Resumed on t4-02 with batch 48", actor: "operator", age: "16h ago", data: { stub: "t4-02", batch: 48 } },
-  { id: "e7", experimentId: "curiosity-low-lr", kind: "decision", message: "Marked rerun: promising zN, but validate resume branch first", actor: "operator", age: "2h ago", data: { decision: "rerun" } },
+  { id: "e7", experimentId: "curiosity-low-lr", kind: "decision", message: "Marked needs stronger evidence: promising zN, but validate resume branch first", actor: "operator", age: "2h ago", data: { decision: "rerun" } },
   { id: "e8", experimentId: "curiosity-resume-t4", kind: "checkpoint", message: "Checkpoint promoted from resumed run", actor: "eval", age: "90m ago", data: { checkpoint: "step-42000", zN: 0.872 } },
   { id: "e9", experimentId: "curiosity-resume-t4", kind: "decision", message: "Marked keep: best current result", actor: "operator", age: "42m ago", data: { decision: "keep" } },
   { id: "e10", experimentId: "ablate-no-dropout", kind: "forked", message: "Forked from resume_t4 to test dropout=0", actor: "operator", age: "38m ago", data: { dropout: "0.1 -> 0.0" } },
@@ -663,11 +663,11 @@ function nextActionForDecision(exp: DemoExperiment): NextAction {
     case "fork":
       return { label: "Branch from this run", hint: "Open a narrower fork to test the variant.", tone: "violet" };
     case "rerun":
-      return { label: "Re-run for more evidence", hint: "Keep collecting before deciding keep / drop.", tone: "blue" };
+      return { label: "Plan replication", hint: "Collect stronger evidence before deciding keep / drop.", tone: "blue" };
     case "drop":
       return { label: "Fold into background", hint: "Preserve as evidence; do not extend.", tone: "amber" };
     default:
-      return { label: "Awaiting decision", hint: "Select keep / fork / rerun / drop to advance the stage.", tone: "gray" };
+      return { label: "Awaiting decision", hint: "Select keep / fork / needs stronger evidence / drop to advance the stage.", tone: "gray" };
   }
 }
 
@@ -1687,7 +1687,7 @@ export default function ExperimentLineageDemo() {
                   <select value={decision} onChange={(e) => setDecision(e.target.value as DemoDecision)} className="rounded-md border border-white/[0.08] bg-[#191a1b] px-2 py-1.5 text-xs text-gray-200 outline-none">
                     <option value="keep">keep</option>
                     <option value="drop">drop</option>
-                    <option value="rerun">rerun</option>
+                    <option value="rerun">needs stronger evidence</option>
                     <option value="fork">fork</option>
                   </select>
                   <button onClick={setDemoDecision} className="rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 text-xs text-indigo-200 transition hover:bg-indigo-500/25">Set decision</button>
