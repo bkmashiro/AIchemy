@@ -1,8 +1,38 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ExperimentEvent, experimentsApi } from "../../lib/api";
 import { formatRelTime } from "../../lib/format";
 import { EVENT_BADGE, formatEventData, artifactLocator } from "./experimentDetailUtils";
+
+type TimelineFilter = "all" | "notes" | "decisions" | "artifacts" | "checkpoints" | "tasks";
+
+const TASK_EVENT_KINDS = new Set(["task_started", "task_completed", "task_failed"]);
+const FILTER_ORDER: TimelineFilter[] = [
+  "all",
+  "notes",
+  "decisions",
+  "artifacts",
+  "checkpoints",
+  "tasks",
+];
+
+const FILTER_LABEL: Record<TimelineFilter, string> = {
+  all: "all",
+  notes: "notes",
+  decisions: "decisions",
+  artifacts: "artifacts",
+  checkpoints: "checkpoints",
+  tasks: "tasks",
+};
+
+function matchesFilter(event: ExperimentEvent, filter: TimelineFilter): boolean {
+  if (filter === "all") return true;
+  if (filter === "notes") return event.kind === "note";
+  if (filter === "decisions") return event.kind === "decision";
+  if (filter === "artifacts") return event.kind === "artifact";
+  if (filter === "checkpoints") return event.kind === "checkpoint";
+  return TASK_EVENT_KINDS.has(event.kind);
+}
 
 export function ExperimentTimelineCard({
   experimentId,
@@ -19,6 +49,8 @@ export function ExperimentTimelineCard({
   const [taskId, setTaskId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState<TimelineFilter>("all");
+  const [currentPage, setCurrentPage] = useState(0);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -43,20 +75,42 @@ export function ExperimentTimelineCard({
     }
   }
 
-  const sorted = [...events].sort((a, b) =>
-    b.created_at.localeCompare(a.created_at),
+  const sorted = useMemo(
+    () => [...events].sort((a, b) => b.created_at.localeCompare(a.created_at)),
+    [events],
   );
+
+  const filterCounts: Record<TimelineFilter, number> = useMemo(
+    () => ({
+      all: sorted.length,
+      notes: sorted.filter((ev) => ev.kind === "note").length,
+      decisions: sorted.filter((ev) => ev.kind === "decision").length,
+      artifacts: sorted.filter((ev) => ev.kind === "artifact").length,
+      checkpoints: sorted.filter((ev) => ev.kind === "checkpoint").length,
+      tasks: sorted.filter((ev) => TASK_EVENT_KINDS.has(ev.kind)).length,
+    }),
+    [sorted],
+  );
+
+  const filteredEvents = useMemo(
+    () => sorted.filter((ev) => matchesFilter(ev, activeFilter)),
+    [sorted, activeFilter],
+  );
+
   const safePageSize = Math.max(1, pageSize);
-  const totalPages = Math.max(1, Math.ceil(sorted.length / safePageSize));
-  const [currentPage, setCurrentPage] = useState(0);
+  const totalPages = Math.max(1, Math.ceil(filteredEvents.length / safePageSize));
+
+  useEffect(() => {
+    setCurrentPage(0);
+  }, [activeFilter]);
 
   useEffect(() => {
     setCurrentPage((page) => Math.min(page, totalPages - 1));
   }, [totalPages]);
 
   const pageStart = currentPage * safePageSize;
-  const pageEvents = sorted.slice(pageStart, pageStart + safePageSize);
-  const visibleStart = sorted.length === 0 ? 0 : pageStart + 1;
+  const pageEvents = filteredEvents.slice(pageStart, pageStart + safePageSize);
+  const visibleStart = filteredEvents.length === 0 ? 0 : pageStart + 1;
   const visibleEnd = pageStart + pageEvents.length;
 
   return (
@@ -64,9 +118,9 @@ export function ExperimentTimelineCard({
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-medium text-gray-400">Timeline</h2>
         <span className="text-xs text-gray-600">
-          {sorted.length === 0
+          {filteredEvents.length === 0
             ? "0 events"
-            : `${visibleStart}-${visibleEnd} of ${sorted.length} event${sorted.length === 1 ? "" : "s"}`}
+            : `${visibleStart}-${visibleEnd} of ${filteredEvents.length} event${filteredEvents.length === 1 ? "" : "s"}`}
         </span>
       </div>
 
@@ -102,9 +156,30 @@ export function ExperimentTimelineCard({
         {error && <p className="text-red-400 text-xs">{error}</p>}
       </form>
 
-      {sorted.length === 0 ? (
+      <div className="mb-3 flex flex-wrap gap-2 text-xs">
+        {FILTER_ORDER.map((filter) => (
+          <button
+            type="button"
+            key={filter}
+            onClick={() => setActiveFilter(filter)}
+            className={`px-2 py-1 rounded border transition-colors ${
+              activeFilter === filter
+                ? "bg-gray-700 text-gray-100 border-gray-600"
+                : "text-gray-500 hover:text-gray-200 hover:bg-gray-800/50 border-gray-700"
+            }`}
+          >
+            {filter === "all" ? "All" : filter[0].toUpperCase() + filter.slice(1)} ({
+              filterCounts[filter]
+            })
+          </button>
+        ))}
+      </div>
+
+      <p className="text-xs text-gray-600 mb-3">Showing {FILTER_LABEL[activeFilter]} evidence</p>
+
+      {filteredEvents.length === 0 ? (
         <p className="text-xs text-gray-600 text-center py-6">
-          No timeline events yet
+          {sorted.length === 0 ? "No timeline events yet" : "No matching timeline events"}
         </p>
       ) : (
         <>

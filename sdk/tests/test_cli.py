@@ -728,6 +728,138 @@ def test_experiments_bundle_fetches_research_bundle_endpoint(monkeypatch):
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/research-bundle"
 
 
+
+def test_experiments_bundle_markdown_prints_markdown(monkeypatch, capsys):
+    payload = {
+        "experiment": {
+            "id": "exp-1",
+            "name": "alpha",
+            "family": "rl",
+            "status": "passed",
+        },
+        "summary": {
+            "recommendation": {
+                "evidence_quality": "high",
+                "evidence_reason": "strong holdout",
+                "sample_count": 120,
+                "comparable_count": 10,
+                "baseline_source": "leaderboard-v2",
+            },
+            "best_metrics": {"return": 1.23},
+            "validation": {"dataset": "held-out", "coverage": "complete"},
+            "primary_metric": {"name": "return", "value": 1.23},
+        },
+        "diff": {
+            "config_diff_summary": {
+                "learning_rate": {"before": 0.001, "after": 0.002, "op": "set"}
+            }
+        },
+        "manifest": {"enabled": True},
+        "timeline": {
+            "events": [
+                {
+                    "kind": "decision",
+                    "created_at": "2026-06-02T12:00:00Z",
+                    "message": "kept",
+                }
+            ]
+        },
+        "decision": {
+            "decision": "keep",
+            "reason": "best-of-family",
+            "decided_at": "2026-06-02T11:00:00Z",
+        },
+        "artifacts": [
+            {
+                "kind": "artifact",
+                "data": {
+                    "name": "best",
+                    "uri": "s3://bucket/alpha.ckpt",
+                    "step": 10,
+                },
+            }
+        ],
+        "generated_at": "2026-06-02T12:34:56Z",
+    }
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "bundle", "alpha", "--format", "markdown"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            payload,
+        ],
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/research-bundle"
+
+    out = capsys.readouterr().out
+    assert out.startswith("# Research Bundle:")
+    assert "## Decision" in out
+    assert "## Recommendation" in out
+    assert "baseline_source" in out
+    assert "alpha" in out
+
+
+def test_experiments_bundle_default_format_remains_json(monkeypatch, capsys):
+    payload = {
+        "experiment": {"id": "exp-1", "name": "alpha"},
+        "summary": {},
+        "diff": {},
+        "manifest": {},
+        "timeline": {},
+        "decision": {"decision": None, "reason": None},
+        "artifacts": [],
+        "generated_at": "2026-06-02T12:34:56Z",
+    }
+    run_cli(
+        monkeypatch,
+        ["experiments", "bundle", "alpha"],
+        [[{"id": "exp-1", "name": "alpha"}], payload],
+    )
+    out = capsys.readouterr().out
+    assert out.lstrip().startswith("{")
+    parsed = json.loads(out)
+    assert parsed == payload
+    assert "# Research Bundle:" not in out
+
+
+def test_experiments_bundle_output_writes_markdown_to_file(monkeypatch, tmp_path, capsys):
+    payload = {
+        "experiment": {"id": "exp-1", "name": "alpha"},
+        "summary": {"recommendation": {}},
+        "diff": {},
+        "manifest": {},
+        "timeline": {"events": []},
+        "decision": {"decision": "keep", "reason": "good"},
+        "artifacts": [],
+        "generated_at": "2026-06-02T12:34:56Z",
+    }
+    out_path = tmp_path / "bundle.md"
+    run_cli(
+        monkeypatch,
+        [
+            "experiments",
+            "bundle",
+            "alpha",
+            "--format",
+            "markdown",
+            "--output",
+            str(out_path),
+        ],
+        [[{"id": "exp-1", "name": "alpha"}], payload],
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert str(out_path) in captured.err
+    contents = out_path.read_text(encoding="utf-8")
+    assert contents.startswith("# Research Bundle:")
+    assert contents.endswith("\n")
+
+
 def test_experiments_report_sends_get_with_filters(monkeypatch):
     payload = {
         "filters": {"family": "alpha", "decision": "none", "status": None, "limit": 10},

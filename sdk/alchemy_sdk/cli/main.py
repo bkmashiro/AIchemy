@@ -838,7 +838,30 @@ def cmd_experiments_manifest(args: argparse.Namespace, client: ApiClient) -> Non
 
 def cmd_experiments_bundle(args: argparse.Namespace, client: ApiClient) -> None:
     exp = find_experiment(client, args.experiment)
-    print_json(client.get(f"/experiments/{exp['id']}/research-bundle"))
+    payload = client.get(f"/experiments/{exp['id']}/research-bundle")
+    fmt = getattr(args, "format", "json") or "json"
+    if fmt == "markdown":
+        # Import locally to keep the CLI's top-level import surface unchanged.
+        from alchemy_sdk.experiments import render_research_bundle_markdown
+
+        if not isinstance(payload, dict):
+            raise AlchError(
+                "unexpected research-bundle response: expected a JSON object, "
+                f"got {type(payload).__name__}"
+            )
+        rendered = render_research_bundle_markdown(payload)
+    else:
+        rendered = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+    output = getattr(args, "output", None)
+    if output:
+        with open(output, "w", encoding="utf-8") as fh:
+            fh.write(rendered)
+            if not rendered.endswith("\n"):
+                fh.write("\n")
+        print(f"wrote {fmt} bundle to {output}", file=sys.stderr)
+    else:
+        print(rendered)
 
 
 def cmd_experiments_report(args: argparse.Namespace, client: ApiClient) -> None:
@@ -1126,6 +1149,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("experiment", help="experiment name or id")
+    p.add_argument(
+        "--format",
+        choices=["json", "markdown"],
+        default="json",
+        help="output format (default: json). Use 'markdown' for a human handoff.",
+    )
+    p.add_argument(
+        "--output",
+        help="optional local file path to write the rendered bundle to (stdout otherwise)",
+    )
     p.set_defaults(func=cmd_experiments_bundle)
 
     p = exps_sub.add_parser(
