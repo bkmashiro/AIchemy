@@ -745,6 +745,25 @@ class TestHandleShellExec:
             assert "echo hi" in captured_cmd[0]
 
 
+class TestHandleExecRequestEvent:
+    @pytest.mark.asyncio
+    async def test_exec_request_event_returns_result_for_socketio_ack(self, daemon):
+        daemon.config.allow_exec = True
+        payload = {"request_id": "exec-1", "command": "echo ok", "timeout_s": 5}
+        expected = {
+            "request_id": "exec-1",
+            "stdout": "ok\n",
+            "stderr": "",
+            "exit_code": 0,
+            "truncated": False,
+        }
+
+        with patch("alchemy_stub.daemon.handle_exec_request", new=AsyncMock(return_value=expected)):
+            result = await daemon._handle_exec_request_event(payload)
+
+        assert result == expected
+
+
 # ===========================================================================
 # SDK callbacks
 # ===========================================================================

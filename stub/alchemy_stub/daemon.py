@@ -215,26 +215,7 @@ class StubDaemon:
         # ── Spec 3: synchronous exec.request ──────────────────────────────
         @sio.on("exec.request", namespace="/stubs")
         async def on_exec_request(*args):
-            data = _extract_dict(args)
-            ack = _find_ack(args)
-            if not data:
-                if ack:
-                    ack({"request_id": "", "stdout": "", "stderr": "Bad payload\n",
-                         "exit_code": -1, "truncated": False})
-                return
-            try:
-                result = await handle_exec_request(data, self.config, self._emit)
-            except Exception as e:
-                log.error("exec.request unhandled error: %s", e)
-                result = {
-                    "request_id": data.get("request_id", ""),
-                    "stdout": "",
-                    "stderr": f"Internal stub error: {e}\n",
-                    "exit_code": -1,
-                    "truncated": False,
-                }
-            if ack:
-                ack(result)
+            return await self._handle_exec_request_event(*args)
 
         @sio.on("request_sync", namespace="/stubs")
         async def on_request_sync(*args):
@@ -263,6 +244,29 @@ class StubDaemon:
             # Brief delay to allow ack to send before exiting
             await asyncio.sleep(0.5)
             os._exit(0)
+
+    async def _handle_exec_request_event(self, *args):
+        """Return exec.request result so python-socketio sends it as the ack payload."""
+        data = _extract_dict(args)
+        if not data:
+            return {
+                "request_id": "",
+                "stdout": "",
+                "stderr": "Bad payload\n",
+                "exit_code": -1,
+                "truncated": False,
+            }
+        try:
+            return await handle_exec_request(data, self.config, self._emit)
+        except Exception as e:
+            log.error("exec.request unhandled error: %s", e)
+            return {
+                "request_id": data.get("request_id", ""),
+                "stdout": "",
+                "stderr": f"Internal stub error: {e}\n",
+                "exit_code": -1,
+                "truncated": False,
+            }
 
     # ------------------------------------------------------------------ #
     # Resume                                                               #
