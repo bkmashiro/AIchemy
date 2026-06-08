@@ -127,7 +127,7 @@ describe("ExperimentLineageGraphCard", () => {
     expect(container.querySelector("[data-lineage-canvas-node]") != null).toBe(true);
   });
 
-  it("clicking a canvas node selects it without navigating", () => {
+  it("clicking canvas nodes selects them without navigating, including the current node", () => {
     const onSelectExperiment = vi.fn();
     const roots: ExperimentTreeNode[] = [
       node({
@@ -148,8 +148,27 @@ describe("ExperimentLineageGraphCard", () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Preview root/start" }));
     fireEvent.click(screen.getByRole("button", { name: "Preview child/variant" }));
-    expect(onSelectExperiment).toHaveBeenCalledWith("child");
+    expect(onSelectExperiment).toHaveBeenNthCalledWith(1, "root");
+    expect(onSelectExperiment).toHaveBeenNthCalledWith(2, "child");
+  });
+
+  it("hides the React Flow attribution badge in the embedded lineage canvas", () => {
+    const roots: ExperimentTreeNode[] = [node({ id: "root", name: "root/start" })];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="root"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(container.querySelector(".react-flow__attribution")).not.toBeInTheDocument();
   });
 
   it("shows a canvas inspector with recommendation, diff, tasks, and explicit detail link", () => {

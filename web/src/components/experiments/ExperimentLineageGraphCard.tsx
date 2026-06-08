@@ -2,6 +2,8 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Controls,
+  Handle,
+  Position,
   ReactFlow,
   ReactFlowProvider,
   type Edge,
@@ -508,13 +510,25 @@ function shortNodeMeta(node: ExperimentTreeNode): string {
 }
 
 function CanvasExperimentNode({ data }: NodeProps<CanvasNode>) {
-  const { node, tone, isCurrent, foldedCount, onSelectExperiment } = data;
+  const { node, tone, foldedCount, onSelectExperiment } = data;
   const body = (
     <div
-      className={`h-full w-full rounded-sm border px-2 py-1.5 text-left text-[10px] leading-tight ${CANVAS_NODE_TONE[tone]}`}
+      className={`relative h-full w-full rounded-sm border px-2 py-1.5 text-left text-[10px] leading-tight ${CANVAS_NODE_TONE[tone]}`}
       data-lineage-canvas-node
       data-lineage-tone={tone}
     >
+      <Handle
+        type="target"
+        position={Position.Left}
+        className="!h-1.5 !w-1.5 !border-gray-600 !bg-gray-500 !opacity-70"
+        isConnectable={false}
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className="!h-1.5 !w-1.5 !border-gray-600 !bg-gray-500 !opacity-70"
+        isConnectable={false}
+      />
       <div className="flex items-center justify-between gap-2">
         <span className="min-w-0 truncate font-mono text-[11px]" title={node.name}>
           {node.name}
@@ -532,14 +546,13 @@ function CanvasExperimentNode({ data }: NodeProps<CanvasNode>) {
     </div>
   );
 
-  if (isCurrent) {
-    return <div style={{ width: CANVAS_NODE_W, height: CANVAS_NODE_H }}>{body}</div>;
-  }
-
   return (
     <button
       type="button"
-      onClick={() => onSelectExperiment(node.id)}
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelectExperiment(node.id);
+      }}
       aria-label={`Preview ${node.name}`}
       className="block hover:brightness-110 focus:outline-none focus:ring-1 focus:ring-indigo-400"
       style={{ width: CANVAS_NODE_W, height: CANVAS_NODE_H }}
@@ -575,7 +588,7 @@ function buildCanvasElements(
     },
     selected: row.isCurrent,
     draggable: false,
-    selectable: false,
+    selectable: true,
   }));
 
   const edges: Edge[] = rows
@@ -622,9 +635,7 @@ function LineageCanvas({
         data-lineage-canvas
       >
         <div className="sr-only" aria-label="Canvas lineage nodes">
-          {rows
-            .filter((row) => !row.isCurrent)
-            .map((row) => (
+          {rows.map((row) => (
               <button
                 key={`canvas-a11y-${row.node.id}`}
                 type="button"
@@ -646,12 +657,15 @@ function LineageCanvas({
           maxZoom={1.6}
           nodesDraggable={false}
           nodesConnectable={false}
-          elementsSelectable={false}
+          elementsSelectable
           edgesFocusable={false}
-          panOnScroll
+          panOnScroll={false}
+          zoomOnScroll
           zoomOnPinch
-          panOnDrag
+          panOnDrag={[0]}
           selectNodesOnDrag={false}
+          proOptions={{ hideAttribution: true }}
+          onNodeClick={(_, node) => onSelectExperiment(node.id)}
           style={{ background: "transparent" }}
         >
           <Controls showInteractive={false} />
