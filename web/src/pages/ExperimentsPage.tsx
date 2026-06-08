@@ -347,30 +347,37 @@ function ExperimentDetailView() {
         <LineageCard exp={exp} allExperiments={allExperiments} />
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-2 xl:gap-3">
-        <ExperimentLineageGraphCard
-          roots={tree}
-          currentId={selectedLineageId ?? exp.id}
-          pageId={exp.id}
-          selectedTasks={selectedLineageTasks}
-          onSelectExperiment={setSelectedLineageId}
-        />
-        <ExperimentResearchCallCard
-          exp={previewExp}
-          summary={previewSummary}
-          recentEvents={previewEvents}
-          onChanged={refreshResearchCall}
-        />
-        <ExperimentConfigDiffCard diff={previewDiff} summary={previewSummary} />
-      </div>
-
-      <ExperimentTimelineCard
-        experimentId={exp.id}
-        events={events}
-        onNoteAdded={() => load()}
-      />
-
-      <ExperimentMatrixCard exp={exp} />
+      <section
+        aria-label="Research workbench"
+        className="grid grid-cols-1 2xl:grid-cols-[minmax(420px,1.35fr)_minmax(360px,1fr)_minmax(320px,0.9fr)] gap-2 xl:gap-3 items-start"
+      >
+        <section aria-label="Family map" className="min-w-0">
+          <ExperimentLineageGraphCard
+            roots={tree}
+            currentId={selectedLineageId ?? exp.id}
+            pageId={exp.id}
+            selectedTasks={selectedLineageTasks}
+            onSelectExperiment={setSelectedLineageId}
+          />
+        </section>
+        <section aria-label="Research inspector" className="min-w-0 space-y-2">
+          <ExperimentResearchCallCard
+            exp={previewExp}
+            summary={previewSummary}
+            recentEvents={previewEvents}
+            onChanged={refreshResearchCall}
+          />
+          <ExperimentConfigDiffCard diff={previewDiff} summary={previewSummary} />
+        </section>
+        <section aria-label="Experiment evidence" className="min-w-0 space-y-2">
+          <ExperimentTimelineCard
+            experimentId={previewExp.id}
+            events={previewEvents}
+            onNoteAdded={() => load()}
+          />
+          <ExperimentMatrixCard exp={previewExp} />
+        </section>
+      </section>
 
       <ExperimentTaskTable tasks={exp.tasks ?? []} results={exp.results} />
     </div>

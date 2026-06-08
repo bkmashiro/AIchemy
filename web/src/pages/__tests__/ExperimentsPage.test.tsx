@@ -225,6 +225,15 @@ describe("ExperimentsPage lineage preview", () => {
 
   });
 
+  it("renders detail page as a research workbench with map, inspector, and evidence regions", async () => {
+    renderDetailPage();
+
+    expect(await screen.findByLabelText("Research workbench")).toBeInTheDocument();
+    expect(screen.getByLabelText("Family map")).toBeInTheDocument();
+    expect(screen.getByLabelText("Research inspector")).toBeInTheDocument();
+    expect(screen.getByLabelText("Experiment evidence")).toBeInTheDocument();
+  });
+
   it("updates right-side research and diff context on lineage click without route navigation", async () => {
     renderDetailPage();
 
