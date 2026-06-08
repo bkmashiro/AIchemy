@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sqlite3
 from unittest.mock import patch
 
@@ -21,7 +22,7 @@ class FakeResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
-def run_cli(monkeypatch, argv, responses):
+def run_cli_with_exit(monkeypatch, argv, responses):
     calls = []
     queue = list(responses)
 
@@ -39,7 +40,15 @@ def run_cli(monkeypatch, argv, responses):
 
     monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
     with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
-        code = cli.main(argv)
+        try:
+            code = cli.main(argv)
+        except SystemExit as exc:  # pragma: no cover - defensive for odd parser exits
+            code = exc.code if isinstance(exc.code, int) else 1
+    return code, calls
+
+
+def run_cli(monkeypatch, argv, responses):
+    code, calls = run_cli_with_exit(monkeypatch, argv, responses)
     assert code == 0
     return calls
 
@@ -60,6 +69,79 @@ def test_stubs_drain_uses_patch_payload(monkeypatch):
     assert calls[1]["url"] == "http://localhost:3002/api/stubs/stub-1"
     assert calls[1]["body"] == {"max_concurrent": 0}
     assert calls[1]["auth"] == "Bearer secret-token"
+
+
+def test_stubs_exec_posts_exec2_and_prints_output(monkeypatch, capsys):
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["stubs", "exec", "worker-a", "--timeout", "2", "--", "echo", "hello"],
+        [
+            [{"id": "stub-1", "name": "worker-a", "status": "online"}],
+            {"stdout": "stdout\n", "stderr": "stderr\n", "exit_code": 0, "truncated": False},
+        ],
+    )
+
+    assert code == 0
+    assert calls[0] == {
+        "method": "GET",
+        "url": "http://localhost:3002/api/stubs",
+        "body": None,
+        "auth": "Bearer secret-token",
+        "timeout": 20.0,
+    }
+    assert calls[1] == {
+        "method": "POST",
+        "url": "http://localhost:3002/api/stubs/stub-1/exec2",
+        "body": {"command": "echo hello", "timeout": 2000},
+        "auth": "Bearer secret-token",
+        "timeout": 20.0,
+    }
+
+    output = capsys.readouterr()
+    assert output.out == "stdout\n"
+    assert output.err == "stderr\n"
+
+
+def test_stubs_exec_returns_remote_exit_code(monkeypatch):
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["stubs", "exec", "worker-a", "--timeout", "2", "--", "false"],
+        [
+            [{"id": "stub-1", "name": "worker-a", "status": "online"}],
+            {"stdout": "", "stderr": "", "exit_code": 7, "truncated": False},
+        ],
+    )
+
+    assert code == 7
+    assert calls[1]["body"]["command"] == "false"
+
+
+def test_stubs_exec_preserves_quoted_command_arguments(monkeypatch):
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["stubs", "exec", "worker-a", "--", "python", "-c", "print('hello world')"],
+        [
+            [{"id": "stub-1", "name": "worker-a", "status": "online"}],
+            {"stdout": "hello world\n", "stderr": "", "exit_code": 0, "truncated": False},
+        ],
+    )
+
+    assert code == 0
+    assert calls[1]["body"]["command"] == shlex.join(["python", "-c", "print('hello world')"])
+
+
+def test_stubs_exec_preserves_single_shell_command_string(monkeypatch):
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["stubs", "exec", "worker-a", "--", "pwd && hostname"],
+        [
+            [{"id": "stub-1", "name": "worker-a", "status": "online"}],
+            {"stdout": "/work\nnode\n", "stderr": "", "exit_code": 0, "truncated": False},
+        ],
+    )
+
+    assert code == 0
+    assert calls[1]["body"]["command"] == "pwd && hostname"
 
 
 def test_tasks_resubmit_resume_drops_run_dir_and_targets_tags(monkeypatch):

@@ -26,6 +26,58 @@ import { ExecRequestPayload, ExecResponsePayload } from "../types";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 60_000;
 
+function parseExecAckResponse(args: any[], fallbackRequestId: string): ExecResponsePayload {
+  const candidateResponse = args
+    .map((arg) => {
+      if (arg == null) {
+        return undefined;
+      }
+      if (typeof arg === "string") {
+        try {
+          const parsed = JSON.parse(arg);
+          return typeof parsed === "object" && parsed !== null ? parsed : undefined;
+        } catch {
+          return undefined;
+        }
+      }
+      if (typeof arg === "object" && !Array.isArray(arg) && Object.getPrototypeOf(arg) === Object.prototype) {
+        return arg;
+      }
+      return undefined;
+    })
+    .find((value) => {
+      if (!value) {
+        return false;
+      }
+      return (
+        typeof (value as any).stdout === "string" ||
+        typeof (value as any).stderr === "string" ||
+        typeof (value as any).exit_code !== "undefined" ||
+        typeof (value as any).request_id === "string" ||
+        typeof (value as any).truncated === "boolean" ||
+        typeof (value as any).error === "string"
+      );
+    }) as Record<string, any> | undefined;
+
+  if (!candidateResponse) {
+    throw new Error("invalid stub ack payload");
+  }
+
+  const exitCode = Number((candidateResponse as any).exit_code);
+  return {
+    request_id:
+      typeof (candidateResponse as any).request_id === "string" &&
+      (candidateResponse as any).request_id.length > 0
+        ? String((candidateResponse as any).request_id)
+        : fallbackRequestId,
+    stdout: typeof (candidateResponse as any).stdout === "string" ? String((candidateResponse as any).stdout) : "",
+    stderr: typeof (candidateResponse as any).stderr === "string" ? String((candidateResponse as any).stderr) : "",
+    exit_code: Number.isFinite(exitCode) ? exitCode : -1,
+    truncated: typeof (candidateResponse as any).truncated === "boolean" ? Boolean((candidateResponse as any).truncated) : false,
+    ...(typeof (candidateResponse as any).error === "string" ? { error: String((candidateResponse as any).error) } : {}),
+  };
+}
+
 export function createExecRouter(stubNs: Namespace): Router {
   const router = Router({ mergeParams: true });
 
@@ -82,9 +134,14 @@ export function createExecRouter(stubNs: Namespace): Router {
           reject(new Error("timeout"));
         }, serverTimeoutMs);
 
-        socket.emit("exec.request", payload, (response: ExecResponsePayload) => {
+        socket.emit("exec.request", payload, (...ackArgs: any[]) => {
           clearTimeout(timer);
-          resolve(response);
+          try {
+            const response = parseExecAckResponse(ackArgs, requestId);
+            resolve(response);
+          } catch (err) {
+            reject(err);
+          }
         });
       });
 
@@ -108,6 +165,14 @@ export function createExecRouter(stubNs: Namespace): Router {
       if (err.message === "timeout") {
         logger.warn("exec.timeout", { stub: stub.name, request_id: requestId, timeout_ms: serverTimeoutMs });
         res.status(504).json({ error: "Exec timed out" });
+      } else if (String(err.message).toLowerCase().includes("invalid stub ack payload")) {
+        logger.warn("exec.invalid_ack", {
+          stub: stub.name,
+          request_id: requestId,
+          error: String(err),
+          ack_error: true,
+        });
+        res.status(500).json({ error: "Invalid stub ack payload" });
       } else {
         logger.error("exec.error", { stub: stub.name, request_id: requestId, error: String(err) });
         res.status(500).json({ error: "Internal error" });

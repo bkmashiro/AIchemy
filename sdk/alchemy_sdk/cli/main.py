@@ -243,6 +243,39 @@ def cmd_stubs_undrain(args: argparse.Namespace, client: ApiClient) -> None:
     print_json({"ok": True, "stub": result.get("stub", {}).get("name"), "max_concurrent": args.n})
 
 
+def cmd_stubs_exec(args: argparse.Namespace, client: ApiClient) -> int:
+    stub = find_stub(client, args.stub)
+    command = args.command[0].strip() if len(args.command) == 1 else shlex.join(args.command).strip()
+    if not command:
+        raise AlchError("command required")
+
+    timeout_ms = int(float(args.command_timeout) * 1000)
+    if timeout_ms <= 0:
+        raise AlchError("timeout must be greater than 0")
+
+    result = client.post(
+        f"/stubs/{stub['id']}/exec2",
+        {"command": command, "timeout": timeout_ms},
+    )
+
+    stdout = result.get("stdout", "")
+    stderr = result.get("stderr", "")
+    if stdout:
+        sys.stdout.write(str(stdout))
+    if stderr:
+        sys.stderr.write(str(stderr))
+
+    try:
+        exit_code = int(result.get("exit_code", 0))
+    except (TypeError, ValueError):
+        exit_code = 0
+    if exit_code < 0:
+        return 1
+    if exit_code > 255:
+        return 255
+    return exit_code
+
+
 def deploy_connection_body(args: argparse.Namespace, client: ApiClient) -> dict[str, Any]:
     server_url = (
         getattr(args, "stub_server_url", None)
@@ -957,6 +990,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = stubs_sub.add_parser("drain", help="set a stub's max_concurrent to 0"); p.add_argument("stub", help="stub id, name, or hostname"); p.set_defaults(func=cmd_stubs_drain)
     p = stubs_sub.add_parser("undrain", help="restore a stub's max_concurrent"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("--n", type=int, default=1, help="new max_concurrent (default 1)"); p.set_defaults(func=cmd_stubs_undrain)
     p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (defaults to REST server)"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)
+    p = stubs_sub.add_parser("exec", help="run a shell command on a stub"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("command", nargs="+", help="command to run (e.g. alch stubs exec worker -- ls -la)"); p.add_argument("--timeout", dest="command_timeout", type=float, default=30.0, help="command timeout in seconds (float supported; passed to server as milliseconds)"); p.set_defaults(func=cmd_stubs_exec)
     p = stubs_sub.add_parser("canary", help="deploy one managed SLURM stub canary with code sync"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand or full slurm-* name"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="confirm: this submits a real worker"); p.set_defaults(func=cmd_stubs_canary)
 
     slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
@@ -1213,7 +1247,9 @@ def main(argv: list[str] | None = None) -> int:
             args.func(args)
         else:
             client = build_client(args)
-            args.func(args, client)
+            result = args.func(args, client)
+            if isinstance(result, int):
+                return result
         return 0
     except AlchError as exc:
         print(f"alch: error: {exc}", file=sys.stderr)
