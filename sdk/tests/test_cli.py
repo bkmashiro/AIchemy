@@ -176,6 +176,55 @@ def test_tasks_resubmit_resume_drops_run_dir_and_targets_tags(monkeypatch):
     assert body["idempotency_key"].startswith("resubmit:task-1:")
 
 
+def test_tasks_wait_completed_returns_zero(monkeypatch, capsys):
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["tasks", "wait", "task-1", "--interval", "0", "--timeout", "5"],
+        [
+            {"id": "task-1", "status": "running", "seq": 1},
+            {"id": "task-1", "status": "completed", "seq": 1},
+        ],
+    )
+
+    assert code == 0
+    assert [c["url"] for c in calls] == [
+        "http://localhost:3002/api/tasks/task-1",
+        "http://localhost:3002/api/tasks/task-1",
+    ]
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+
+
+def test_tasks_wait_failed_returns_one(monkeypatch, capsys):
+    code, _calls = run_cli_with_exit(
+        monkeypatch,
+        ["tasks", "wait", "task-1", "--interval", "0", "--timeout", "5"],
+        [
+            {"id": "task-1", "status": "assigned", "seq": 1},
+            {"id": "task-1", "status": "failed", "seq": 1, "exit_code": 2},
+        ],
+    )
+
+    assert code == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "failed"
+
+
+def test_tasks_wait_timeout_returns_124(monkeypatch, capsys):
+    ticks = iter([0.0, 2.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["tasks", "wait", "task-1", "--interval", "0", "--timeout", "1"],
+        [{"id": "task-1", "status": "running", "seq": 1}],
+    )
+
+    assert code == 124
+    assert len(calls) == 1
+    err = capsys.readouterr().err
+    assert "timed out waiting for task task-1" in err
+
+
 def test_cancel_running_requires_yes(monkeypatch):
     monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
 

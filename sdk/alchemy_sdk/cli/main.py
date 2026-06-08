@@ -342,6 +342,26 @@ def cmd_tasks_get(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(short_task(task) if args.short else task)
 
 
+def cmd_tasks_wait(args: argparse.Namespace, client: ApiClient) -> int:
+    deadline = None if args.timeout is None else time.monotonic() + args.timeout
+    last_task: dict[str, Any] | None = None
+    while True:
+        task = client.get(f"/tasks/{args.task}")
+        last_task = task if isinstance(task, dict) else {"id": args.task, "status": "unknown"}
+        status = str(last_task.get("status") or "")
+        if status in TERMINAL_STATUSES:
+            print_json(short_task(last_task) if args.short else last_task)
+            return 0 if status == "completed" else 1
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"alch: timed out waiting for task {args.task}", file=sys.stderr)
+            if args.print_last and last_task is not None:
+                print_json(short_task(last_task) if args.short else last_task)
+            return 124
+        if args.status:
+            print(f"{last_task.get('id', args.task)} {status}", file=sys.stderr)
+        time.sleep(max(args.interval, 0.0))
+
+
 def cmd_tasks_cancel(args: argparse.Namespace, client: ApiClient) -> None:
     task = client.get(f"/tasks/{args.task}")
     if task.get("status") in DANGEROUS_STATUSES and not args.yes:
@@ -1001,6 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)
     p = tasks_sub.add_parser("ls", help="list recent tasks (short form)"); p.add_argument("--status", help="filter by status (pending/running/...)"); p.add_argument("--active", action="store_true", help="filter to active statuses (pending/assigned/running/paused/blocked)"); p.add_argument("--stub", help="only tasks bound to this stub"); p.add_argument("--limit", type=int, default=50, help="max tasks to return (default 50)"); p.set_defaults(func=cmd_tasks_ls)
     p = tasks_sub.add_parser("get", help="fetch a single task"); p.add_argument("task", help="task id"); p.add_argument("--short", action="store_true", help="trim to the short summary form"); p.set_defaults(func=cmd_tasks_get)
+    p = tasks_sub.add_parser("wait", help="poll until a task reaches completed/failed/cancelled"); p.add_argument("task", help="task id"); p.add_argument("--interval", type=float, default=5.0, help="poll interval seconds (default 5)"); p.add_argument("--timeout", type=float, default=None, help="max seconds to wait; omit to wait forever"); p.add_argument("--status", action="store_true", help="print each observed non-terminal status to stderr"); p.add_argument("--short", action="store_true", help="trim final task to short summary form"); p.add_argument("--print-last", action="store_true", help="print last observed task JSON on timeout"); p.set_defaults(func=cmd_tasks_wait)
     p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
     p = tasks_sub.add_parser("move", help="resubmit a task targeting a new stub or tag set"); p.add_argument("task", help="task id"); p.add_argument("--to-stub", help="target stub id/name/hostname (exclusive with --to-tags)"); p.add_argument("--to-tags", help="comma-separated target_tags (exclusive with --to-stub)"); p.add_argument("--name", help="override display name of the new task"); p.add_argument("--yes", action="store_true", help="required when cancelling a running/assigned task"); p.set_defaults(func=cmd_tasks_move)
     p = tasks_sub.add_parser("resubmit", help="clone a task as a new submission"); p.add_argument("task", help="task id to clone"); p.add_argument("--resume", action="store_true", help="append --resume to raw_args"); p.add_argument("--to-stub", help="retarget to a specific stub"); p.add_argument("--to-tags", help="retarget to comma-separated tags"); p.add_argument("--name", help="override display name"); p.add_argument("--wait", action="store_true", help="block until task is accepted"); p.add_argument("--wait-timeout", type=int, default=15, help="accept-wait timeout seconds (default 15)"); p.set_defaults(func=cmd_tasks_resubmit)
