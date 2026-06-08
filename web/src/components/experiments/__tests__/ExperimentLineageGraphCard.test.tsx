@@ -438,7 +438,6 @@ describe("ExperimentLineageGraphCard", () => {
     expect(getRowNames(container)).toEqual([
       "root/start",
       "parent-branch",
-      "grand-child",
       "running-leaf",
       "failed-leaf",
     ]);
@@ -460,7 +459,6 @@ describe("ExperimentLineageGraphCard", () => {
     expect(getRowNames(container)).toEqual([
       "root/start",
       "parent-branch",
-      "grand-child",
       "running-leaf",
       "failed-leaf",
     ]);
@@ -640,7 +638,7 @@ describe("ExperimentLineageGraphCard", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText("1 root · 4 shown · 2 hidden")).toBeInTheDocument();
+    expect(screen.getByText("1 root · 3 shown · 3 hidden")).toBeInTheDocument();
   });
 
   it("shows selected-run status and folded-descendant hint in the selected detail strip", () => {
@@ -715,7 +713,7 @@ describe("ExperimentLineageGraphCard", () => {
     expect(within(strip).getByText("Status: running")).toBeInTheDocument();
     expect(within(strip).getByText("Decision: keep")).toBeInTheDocument();
     expect(within(strip).getByText("Recommendation: fork")).toBeInTheDocument();
-    expect(within(strip).getByText("+2 hidden descendants folded")).toBeInTheDocument();
+    expect(within(strip).getByText("+3 hidden descendants folded")).toBeInTheDocument();
     expect(within(strip).getByText("Tasks: 2")).toBeInTheDocument();
   });
 

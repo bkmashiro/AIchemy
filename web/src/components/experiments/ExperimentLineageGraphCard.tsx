@@ -134,6 +134,34 @@ function buildSubtreeCountMap(roots: ExperimentTreeNode[]): Map<string, number> 
 
 const FOLD_DEPTH_LIMIT = 2;
 
+function isImportantLineageBranch(node: ExperimentTreeNode): boolean {
+  return (
+    node.decision === "keep" ||
+    node.decision === "fork" ||
+    node.recommendation?.action === "keep" ||
+    node.recommendation?.action === "fork"
+  );
+}
+
+function shouldRenderLineageChildren({
+  depth,
+  onPath,
+  isCurrent,
+  node,
+  showFoldedBranches,
+}: {
+  depth: number;
+  onPath: boolean;
+  isCurrent: boolean;
+  node: ExperimentTreeNode;
+  showFoldedBranches: boolean;
+}): boolean {
+  if (showFoldedBranches || onPath || isCurrent) return true;
+  if (depth === 0) return true;
+  if (depth < FOLD_DEPTH_LIMIT && isImportantLineageBranch(node)) return true;
+  return false;
+}
+
 function flattenLineage(
   root: ExperimentTreeNode,
   currentId: string,
@@ -156,7 +184,13 @@ function flattenLineage(
     const sortedChildren = sortLineageChildren(node.children, sortPathIds, subtreeCounts);
     const renderChildren =
       sortedChildren.length > 0 &&
-      (showFoldedBranches || depth < FOLD_DEPTH_LIMIT || onPath || isCurrent);
+      shouldRenderLineageChildren({
+        depth,
+        onPath,
+        isCurrent,
+        node,
+        showFoldedBranches,
+      });
 
     let foldedCount: number | undefined;
     if (!renderChildren && sortedChildren.length > 0) {

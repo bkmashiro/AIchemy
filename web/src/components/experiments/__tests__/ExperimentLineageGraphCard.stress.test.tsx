@@ -252,7 +252,9 @@ describe("ExperimentLineageGraphCard stress tests", () => {
     showRowsMode(container);
 
     expect(consoleErrorSpy).not.toHaveBeenCalled();
-    expect(getRowNames(container)).toHaveLength(31);
+    expect(getRowNames(container)).toHaveLength(15);
+    fireEvent.click(screen.getByRole("button", { name: "Show folded branches" }));
+    expect(getRowNames(container)).toHaveLength(52);
     consoleErrorSpy.mockRestore();
   });
 
@@ -273,7 +275,7 @@ describe("ExperimentLineageGraphCard stress tests", () => {
     showRowsMode(container);
 
     const initialRows = getRowNames(container);
-    expect(initialRows).toHaveLength(31);
+    expect(initialRows).toHaveLength(15);
     expect(initialRows).toContain("seed/zen/sweep-keep");
     expect(initialRows).toContain("seed/zen/sweep-fork");
     const promotedCandidates = [
@@ -312,6 +314,28 @@ describe("ExperimentLineageGraphCard stress tests", () => {
     expect(focusedRows.indexOf("seed/zen/sweep-keep/continuation")).toBeLessThan(10);
     expect(focusedRows[focusedRows.indexOf("seed/zen/sweep-keep")]).toBe("seed/zen/sweep-keep");
     expect(screen.getByText("Preview selected")).toBeInTheDocument();
+  });
+
+  it("keeps neutral side branches folded while important branches stay expanded", () => {
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="seed/zen"
+          pageId="seed/zen"
+          selectedTasks={selectedTasks}
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    showRowsMode(container);
+    expect(screen.getByRole("button", { name: "Preview seed/zen/sweep-fork/continue" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Preview seed/zen/sweep-late/seedling" })).not.toBeInTheDocument();
+    expect(getRowByName(container, "seed/zen/sweep-late")).toHaveTextContent("hidden");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show folded branches" }));
+    expect(screen.getByRole("button", { name: "Preview seed/zen/sweep-late/seedling" })).toBeInTheDocument();
   });
 
   it("preserves root/page spine order when previewing failed/drop leaves and exposes task links in selected strip", () => {
