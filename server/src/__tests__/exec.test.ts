@@ -177,6 +177,74 @@ describe("POST /stubs/:id/exec2", () => {
     expect(res.body.request_id).toBeUndefined();
   });
 
+  it("supports legacy ack shape with response as second callback argument", async () => {
+    const stub = makeStub({ status: "online", socket_id: "sock-1" });
+    store.setStub(stub);
+
+    const mockSocket = {
+      id: "sock-1",
+      connected: true,
+      emit: vi.fn((event: string, _payload: any, cb: (..._args: any[]) => void) => {
+        if (event === "exec.request") {
+          cb(
+            undefined,
+            {
+              request_id: "exec_123",
+              stdout: "legacy\n",
+              stderr: "",
+              exit_code: 0,
+              truncated: false,
+            },
+          );
+        }
+      }),
+    };
+
+    const stubNs = {
+      emit: vi.fn(),
+      sockets: { get: (id: string) => (id === "sock-1" ? mockSocket : undefined) },
+    } as any;
+    const app = makeApp(stubNs);
+
+    const res = await request(app)
+      .post(`/stubs/${stub.id}/exec2`)
+      .send({ command: "uname -a" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.stdout).toBe("legacy\n");
+    expect(res.body.stderr).toBe("");
+    expect(res.body.exit_code).toBe(0);
+    expect(res.body.truncated).toBe(false);
+  });
+
+  it("returns 500 for malformed ack payload (e.g., undefined)", async () => {
+    const stub = makeStub({ status: "online", socket_id: "sock-1" });
+    store.setStub(stub);
+
+    const mockSocket = {
+      id: "sock-1",
+      connected: true,
+      emit: vi.fn((event: string, _payload: any, cb: (..._args: any[]) => void) => {
+        if (event === "exec.request") {
+          cb();
+        }
+      }),
+    };
+
+    const stubNs = {
+      emit: vi.fn(),
+      sockets: { get: (id: string) => (id === "sock-1" ? mockSocket : undefined) },
+    } as any;
+    const app = makeApp(stubNs);
+
+    const res = await request(app)
+      .post(`/stubs/${stub.id}/exec2`)
+      .send({ command: "ls" });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toMatch(/invalid stub ack/i);
+  });
+
   it("returns 403 when stub rejects exec (exec_disabled)", async () => {
     const stub = makeStub({ status: "online", socket_id: "sock-1" });
     store.setStub(stub);
