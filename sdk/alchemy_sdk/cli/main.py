@@ -72,6 +72,9 @@ class ApiClient:
     def patch(self, path: str, body: dict[str, Any]) -> Any:
         return self.request("PATCH", path, body)
 
+    def delete(self, path: str) -> Any:
+        return self.request("DELETE", path)
+
 
 def config_path() -> Path:
     override = os.environ.get("ALCHEMY_CLI_CONFIG")
@@ -321,6 +324,39 @@ def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
             body["time"] = args.time
         results.append(client.post(f"/deploy/stubs/{target}/restart", body))
     print_json(results[0] if args.count == 1 else results)
+
+
+def cmd_webhooks_ls(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get("/webhooks"))
+
+
+def parse_webhook_events(raw: str) -> list[str]:
+    return [event.strip() for event in raw.split(",") if event.strip()]
+
+
+def cmd_webhooks_add(args: argparse.Namespace, client: ApiClient) -> None:
+    body: dict[str, Any] = {
+        "name": args.name,
+        "url": args.url,
+        "events": parse_webhook_events(args.events),
+        "enabled": not args.disabled,
+    }
+    if args.secret:
+        body["secret"] = args.secret
+    print_json(client.post("/webhooks", body))
+
+
+def cmd_webhooks_delete(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.delete(f"/webhooks/{args.subscription}"))
+
+
+def cmd_webhooks_test(args: argparse.Namespace, client: ApiClient) -> None:
+    body: dict[str, Any] = {}
+    if args.event:
+        body["event"] = args.event
+    if args.payload:
+        body.update(json.loads(args.payload))
+    print_json(client.post(f"/webhooks/{args.subscription}/test", body))
 
 
 def cmd_tasks_ls(args: argparse.Namespace, client: ApiClient) -> None:
@@ -1012,6 +1048,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (defaults to REST server)"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)
     p = stubs_sub.add_parser("exec", help="run a shell command on a stub"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("command", nargs="+", help="command to run (e.g. alch stubs exec worker -- ls -la)"); p.add_argument("--timeout", dest="command_timeout", type=float, default=30.0, help="command timeout in seconds (float supported; passed to server as milliseconds)"); p.set_defaults(func=cmd_stubs_exec)
     p = stubs_sub.add_parser("canary", help="deploy one managed SLURM stub canary with code sync"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand or full slurm-* name"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="confirm: this submits a real worker"); p.set_defaults(func=cmd_stubs_canary)
+
+    webhooks = sub.add_parser("webhooks", help="manage outbound webhook subscriptions")
+    wh_sub = webhooks.add_subparsers(dest="cmd", required=True)
+    p = wh_sub.add_parser("ls", help="list webhook subscriptions"); p.set_defaults(func=cmd_webhooks_ls)
+    p = wh_sub.add_parser("add", help="create a webhook subscription"); p.add_argument("name", help="subscription name"); p.add_argument("url", help="destination http(s) URL"); p.add_argument("--events", default="task.failed,task.completed", help="comma-separated events (default task.failed,task.completed)"); p.add_argument("--secret", help="HMAC secret for outgoing signatures"); p.add_argument("--disabled", action="store_true", help="create disabled"); p.set_defaults(func=cmd_webhooks_add)
+    p = wh_sub.add_parser("delete", aliases=["rm"], help="delete a webhook subscription"); p.add_argument("subscription", help="subscription id or name"); p.set_defaults(func=cmd_webhooks_delete)
+    p = wh_sub.add_parser("test", help="send a test delivery"); p.add_argument("subscription", help="subscription id or name"); p.add_argument("--event", choices=["task.completed", "task.failed", "task.cancelled", "task.terminal"], help="event to send"); p.add_argument("--payload", help="JSON object merged into the test body"); p.set_defaults(func=cmd_webhooks_test)
 
     slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)

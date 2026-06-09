@@ -38,6 +38,19 @@ export type TaskStatus =
   | "cancelled"    // User cancelled or dependency failed
   | "blocked";     // Waiting for dependency tasks to complete
 
+export type WebhookEvent = "task.completed" | "task.failed" | "task.cancelled" | "task.terminal";
+
+export interface WebhookSubscription {
+  id: string;
+  name: string;
+  url: string;
+  events: WebhookEvent[];
+  enabled: boolean;
+  secret?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Task {
   // === Identity ===
   id: string;
