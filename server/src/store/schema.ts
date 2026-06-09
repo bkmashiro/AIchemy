@@ -40,6 +40,16 @@ export const experiments = sqliteTable("experiments", {
   data: text("data").notNull(),
 });
 
+export const webhookSubscriptions = sqliteTable("webhook_subscriptions", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  url: text("url").notNull(),
+  enabled: integer("enabled").notNull().default(1),
+  data: text("data").notNull(),
+}, (table) => [
+  index("idx_webhook_subscriptions_name").on(table.name),
+]);
+
 export const meta = sqliteTable("meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),

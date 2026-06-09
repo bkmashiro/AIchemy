@@ -23,6 +23,7 @@ import { createExperimentsRouter } from "./api/experiments";
 import { createMetricsRouter } from "./api/metrics";
 import { createSdkRouter } from "./api/sdk";
 import { createClusterRouter } from "./api/cluster";
+import { createWebhooksRouter } from "./api/webhooks";
 import { startScheduler, triggerSchedule } from "./scheduler";
 import { Token } from "./types";
 import { listBackups, restoreFromBackup, pruneBackups } from "./store/backup";
@@ -33,6 +34,7 @@ import { loadDeployConfig } from "./deploy";
 import { createTunnelManager, TunnelManager } from "./tunnel";
 import { createDeployRouter } from "./api/deploy";
 import { ALCHEMY_VERSION } from "./version";
+import { startWebhookDispatcher } from "./webhooks";
 
 const PORT = parseInt(process.env.PORT || "3002", 10);
 
@@ -71,6 +73,7 @@ setupWebNamespace(webNs);
 setupStubNamespace(stubNs, webNs, deployConfig);
 setupControllerNamespace(controllerNs, webNs);
 startScheduler(webNs, stubNs);
+startWebhookDispatcher();
 
 // ─── Startup requeue: on restart, move queued/dispatched tasks off offline stubs ──
 // This prevents tasks from being stuck in stub.tasks for up to 3 minutes until
@@ -260,6 +263,7 @@ api.use("/stubs", createStubsRouter(stubNs, webNs));
 api.use("/grids", createGridsRouter(stubNs, webNs));
 api.use("/experiments", createExperimentsRouter(stubNs, webNs));
 api.use("/cluster", createClusterRouter());
+api.use("/webhooks", createWebhooksRouter());
 api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
 
 // Health check — no auth required

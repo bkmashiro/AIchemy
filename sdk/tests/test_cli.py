@@ -53,6 +53,36 @@ def run_cli(monkeypatch, argv, responses):
     return calls
 
 
+def test_webhooks_add_posts_subscription(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["webhooks", "add", "hermes-terminal", "https://hermes.example/webhook/alchemy", "--events", "task.failed,task.completed", "--secret", "shh"],
+        [{"id": "sub-1", "name": "hermes-terminal", "url": "https://hermes.example/webhook/alchemy", "events": ["task.failed", "task.completed"], "enabled": True}],
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/webhooks"
+    assert calls[0]["body"] == {
+        "name": "hermes-terminal",
+        "url": "https://hermes.example/webhook/alchemy",
+        "events": ["task.failed", "task.completed"],
+        "enabled": True,
+        "secret": "shh",
+    }
+
+
+def test_webhooks_ls_gets_subscriptions(monkeypatch):
+    calls = run_cli(monkeypatch, ["webhooks", "ls"], [[{"id": "sub-1", "name": "terminal"}]])
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/webhooks"
+
+
+def test_webhooks_delete_deletes_subscription(monkeypatch):
+    calls = run_cli(monkeypatch, ["webhooks", "delete", "terminal"], [{"ok": True}])
+    assert calls[0]["method"] == "DELETE"
+    assert calls[0]["url"] == "http://localhost:3002/api/webhooks/terminal"
+
+
 def test_stubs_drain_uses_patch_payload(monkeypatch):
     calls = run_cli(
         monkeypatch,

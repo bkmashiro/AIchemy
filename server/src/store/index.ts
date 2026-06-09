@@ -12,10 +12,12 @@ import fs from "fs";
 import fsp from "fs/promises";
 import path from "path";
 import Database from "better-sqlite3";
+import { randomUUID } from "crypto";
 import { drizzle, BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { eq, sql, and, desc, asc, not, inArray } from "drizzle-orm";
 import * as schema from "./schema";
-import { Stub, Task, Grid, Token, Experiment, ExperimentEvent, ServerState, TaskStatus } from "../types";
+import { Stub, Task, Grid, Token, Experiment, ExperimentEvent, ServerState, TaskStatus, WebhookSubscription, WebhookEvent } from "../types";
+import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
 import { backupState, pruneBackups } from "./backup";
 import { logger } from "../log";
@@ -44,6 +46,7 @@ class Store {
   private tokens: Map<string, Token> = new Map();
   private grids: Map<string, Grid> = new Map();
   private experiments: Map<string, Experiment> = new Map();
+  private webhookSubscriptions: Map<string, WebhookSubscription> = new Map();
   private seqCounter: number = 0;
   private fingerprintIndex: FingerprintIndex = new Map();
   private _taskIndex = new Map<string, { stubId?: string; location: "global" | "stub" | "archive" }>();
@@ -110,6 +113,15 @@ class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_experiment_events_experiment_time
         ON experiment_events(experiment_id, created_at);
+      CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_name
+        ON webhook_subscriptions(name);
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -150,6 +162,12 @@ class Store {
       for (const row of this.db.select({ data: schema.experiments.data }).from(schema.experiments).all()) {
         const exp: Experiment = JSON.parse(row.data);
         this.experiments.set(exp.id, exp);
+      }
+
+      // webhook subscriptions
+      for (const row of this.db.select({ data: schema.webhookSubscriptions.data }).from(schema.webhookSubscriptions).all()) {
+        const sub: WebhookSubscription = JSON.parse(row.data);
+        this.webhookSubscriptions.set(sub.id, sub);
       }
 
       // seq counter
@@ -441,6 +459,59 @@ class Store {
     }
   }
 
+  // ─── Webhook Subscriptions ──────────────────────────────────────────────
+
+  listWebhookSubscriptions(): WebhookSubscription[] {
+    return Array.from(this.webhookSubscriptions.values()).sort((a, b) => a.created_at.localeCompare(b.created_at));
+  }
+
+  getWebhookSubscription(idOrName: string): WebhookSubscription | undefined {
+    return this.webhookSubscriptions.get(idOrName)
+      ?? Array.from(this.webhookSubscriptions.values()).find((s) => s.name === idOrName);
+  }
+
+  addWebhookSubscription(input: {
+    id?: string;
+    name: string;
+    url: string;
+    events: WebhookEvent[];
+    enabled?: boolean;
+    secret?: string;
+  }): WebhookSubscription {
+    const timestamp = new Date().toISOString();
+    const sub: WebhookSubscription = {
+      id: input.id ?? randomUUID(),
+      name: input.name,
+      url: input.url,
+      events: input.events,
+      enabled: input.enabled ?? true,
+      secret: input.secret,
+      created_at: timestamp,
+      updated_at: timestamp,
+    };
+    this.webhookSubscriptions.set(sub.id, sub);
+    this._saveWebhookSubscription(sub);
+    return sub;
+  }
+
+  deleteWebhookSubscription(idOrName: string): boolean {
+    const sub = this.getWebhookSubscription(idOrName);
+    if (!sub) return false;
+    this.webhookSubscriptions.delete(sub.id);
+    this.db.delete(schema.webhookSubscriptions).where(eq(schema.webhookSubscriptions.id, sub.id)).run();
+    return true;
+  }
+
+  private _saveWebhookSubscription(sub: WebhookSubscription): void {
+    this.db.insert(schema.webhookSubscriptions)
+      .values({ id: sub.id, name: sub.name, url: sub.url, enabled: sub.enabled ? 1 : 0, data: JSON.stringify(sub) })
+      .onConflictDoUpdate({
+        target: schema.webhookSubscriptions.id,
+        set: { name: sub.name, url: sub.url, enabled: sub.enabled ? 1 : 0, data: JSON.stringify(sub) },
+      })
+      .run();
+  }
+
   // ─── Tasks ──────────────────────────────────────────────────────────────
 
   getAllTasks(): Task[] {
@@ -660,6 +731,7 @@ class Store {
     }
 
     this._reindexTask(prev, updated);
+    this._emitTaskStatusChange(prev, updated);
     return updated;
   }
 
@@ -746,6 +818,7 @@ class Store {
         this._saveStub(stub);
       });
     }
+    this._emitTaskStatusChange(prev, updated);
     return updated;
   }
 
@@ -825,6 +898,12 @@ class Store {
 
   private _isActive(status: TaskStatus): boolean {
     return this._activeStatuses.has(status);
+  }
+
+  private _emitTaskStatusChange(prev: Task, updated: Task): void {
+    if (prev.status !== updated.status) {
+      alchemyEvents.emitTaskStatusChanged(prev, updated);
+    }
   }
 
   private _indexFingerprint(task: Task): void {
@@ -1151,6 +1230,7 @@ class Store {
     this.tokens.clear();
     this.grids.clear();
     this.experiments.clear();
+    this.webhookSubscriptions.clear();
     this.fingerprintIndex.clear();
     this._taskIndex.clear();
     this.seqCounter = 0;
@@ -1161,6 +1241,7 @@ class Store {
     this.db.delete(schema.tasks).run();
     this.db.delete(schema.grids).run();
     this.db.delete(schema.experiments).run();
+    this.db.delete(schema.webhookSubscriptions).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
 
@@ -1250,6 +1331,7 @@ class Store {
     this.tokens.clear();
     this.grids.clear();
     this.experiments.clear();
+    this.webhookSubscriptions.clear();
     this.fingerprintIndex.clear();
     this._taskIndex.clear();
     this.seqCounter = 0;
@@ -1260,6 +1342,7 @@ class Store {
     this.db.delete(schema.tasks).run();
     this.db.delete(schema.grids).run();
     this.db.delete(schema.experiments).run();
+    this.db.delete(schema.webhookSubscriptions).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
   }
