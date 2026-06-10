@@ -93,6 +93,42 @@ def test_webhooks_deliveries_lists_subscription_delivery_history(monkeypatch):
     assert calls[0]["url"] == "http://localhost:3002/api/webhooks/terminal/deliveries?limit=5"
 
 
+def test_doctor_collects_read_only_health_and_counts(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["doctor"],
+        [
+            {"ok": True, "version": "2.1.0"},
+            [
+                {"id": "stub-1", "name": "worker-a", "status": "online"},
+                {"id": "stub-2", "name": "worker-b", "status": "offline"},
+            ],
+            {"tasks": [
+                {"id": "task-1", "status": "running"},
+                {"id": "task-2", "status": "blocked"},
+            ]},
+            [{"id": "sub-1", "enabled": True}],
+        ],
+    )
+
+    assert [(c["method"], c["url"]) for c in calls] == [
+        ("GET", "http://localhost:3002/health"),
+        ("GET", "http://localhost:3002/api/stubs"),
+        ("GET", "http://localhost:3002/api/tasks?limit=50&logs=false&sort=seq&order=desc&status_group=active"),
+        ("GET", "http://localhost:3002/api/webhooks"),
+    ]
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["counts"] == {
+        "active_tasks": 2,
+        "blocked_tasks": 1,
+        "enabled_webhooks": 1,
+        "online_stubs": 1,
+        "running_tasks": 1,
+        "webhooks": 1,
+    }
+
+
 def test_stubs_drain_uses_patch_payload(monkeypatch):
     calls = run_cli(
         monkeypatch,
