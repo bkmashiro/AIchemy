@@ -62,8 +62,8 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     const conn = resolveDeployConnection(req, res);
     if (!conn) return;
     const { serverUrl, token } = conn;
-    const slurmOverrides = req.body?.mem || req.body?.time
-      ? { mem: req.body.mem, time: req.body.time }
+    const slurmOverrides = req.body?.mem || req.body?.time || req.body?.idle_timeout
+      ? { mem: req.body.mem, time: req.body.time, idle_timeout: req.body.idle_timeout }
       : undefined;
     const result = await deployStub(
       target, serverUrl, token,
@@ -118,8 +118,8 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     const conn = resolveDeployConnection(req, res);
     if (!conn) return;
     const { serverUrl, token } = conn;
-    const slurmOverrides = req.body?.mem || req.body?.time
-      ? { mem: req.body.mem, time: req.body.time }
+    const slurmOverrides = req.body?.mem || req.body?.time || req.body?.idle_timeout
+      ? { mem: req.body.mem, time: req.body.time, idle_timeout: req.body.idle_timeout }
       : undefined;
     const result = await restartStub(
       target, serverUrl, token,

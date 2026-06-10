@@ -169,6 +169,39 @@ async function syncCodeSlurm(
 interface SlurmSubmitOptions {
   mem?: string;
   time?: string;
+  idle_timeout?: number;
+}
+
+export function buildSlurmStubScript(target: StubTarget, serverUrl: string, token: string, overrides?: SlurmSubmitOptions): string {
+  const jobName = `train_stub_${target.name}`;
+  const mem = overrides?.mem ?? target.mem ?? "60G";
+  const time = overrides?.time ?? target.time ?? "24:00:00";
+  const idleTimeout = overrides?.idle_timeout ?? target.idle_timeout;
+  const continuation = " " + "\\";
+  const args = [
+    `--server ${JSON.stringify(serverUrl)}`,
+    `--token ${JSON.stringify(token)}`,
+    `--max-concurrent ${target.max_concurrent}`,
+    ...(target.tags ? [`--tags ${JSON.stringify(target.tags)}`] : []),
+    ...(target.default_cwd ? [`--default-cwd ${JSON.stringify(target.default_cwd)}`] : []),
+    ...(target.env_setup ? [`--env-setup ${JSON.stringify(target.env_setup)}`] : []),
+    ...(idleTimeout !== undefined ? [`--idle-timeout ${idleTimeout}`] : []),
+  ];
+
+  return [
+    "#!/bin/bash",
+    `#SBATCH --job-name=${jobName}`,
+    `#SBATCH --partition=${target.partition ?? "gpgpu"}`,
+    ...(target.gres ? [`#SBATCH --gres=${target.gres}`] : []),
+    `#SBATCH --mem=${mem}`,
+    `#SBATCH --time=${time}`,
+    ...(target.qos ? [`#SBATCH --qos=${target.qos}`] : []),
+    `#SBATCH --output=/tmp/alchemy_stub_${target.name}_%j.log`,
+    `#SBATCH --error=/tmp/alchemy_stub_${target.name}_%j.log`,
+    "",
+    `PYTHONPATH=${target.remote_dir} ${target.python_path} -m alchemy_stub${continuation}`,
+    ...args.map((arg, idx) => `  ${arg}${idx < args.length - 1 ? continuation : ""}`),
+  ].join("\n");
 }
 
 /** Submit sbatch job for a SLURM target. Returns job ID. */
@@ -181,29 +214,7 @@ async function submitSlurmJob(
 ): Promise<string> {
   const sshHost = target.ssh_host ?? "";
   const sshUser = target.ssh_user;
-  const jobName = `train_stub_${target.name}`;
-  const mem = overrides?.mem ?? target.mem ?? "60G";
-  const time = overrides?.time ?? target.time ?? "24:00:00";
-
-  const script = [
-    "#!/bin/bash",
-    `#SBATCH --job-name=${jobName}`,
-    `#SBATCH --partition=${target.partition ?? "gpgpu"}`,
-    ...(target.gres ? [`#SBATCH --gres=${target.gres}`] : []),
-    `#SBATCH --mem=${mem}`,
-    `#SBATCH --time=${time}`,
-    ...(target.qos ? [`#SBATCH --qos=${target.qos}`] : []),
-    `#SBATCH --output=/tmp/alchemy_stub_${target.name}_%j.log`,
-    `#SBATCH --error=/tmp/alchemy_stub_${target.name}_%j.log`,
-    "",
-    `PYTHONPATH=${target.remote_dir} ${target.python_path} -m alchemy_stub \\`,
-    `  --server ${JSON.stringify(serverUrl)} \\`,
-    `  --token ${JSON.stringify(token)} \\`,
-    `  --max-concurrent ${target.max_concurrent}` +
-      (target.tags ? ` \\\n  --tags ${JSON.stringify(target.tags)}` : "") +
-      (target.default_cwd ? ` \\\n  --default-cwd ${JSON.stringify(target.default_cwd)}` : "") +
-      (target.env_setup ? ` \\\n  --env-setup ${JSON.stringify(target.env_setup)}` : ""),
-  ].join("\n");
+  const script = buildSlurmStubScript(target, serverUrl, token, overrides);
 
   const flags = [
     "-o StrictHostKeyChecking=no",
@@ -263,7 +274,7 @@ export async function deployStub(
   token: string,
   sshKeyPath?: string,
   stubLocalPath?: string,
-  slurmOverrides?: { mem?: string; time?: string },
+  slurmOverrides?: SlurmSubmitOptions,
 ): Promise<DeployResult> {
   const localPath = stubLocalPath ?? DEFAULT_STUB_LOCAL_PATH;
   logger.info("deploy.start", { target: target.name, type: target.type ?? "ssh" });
@@ -345,7 +356,7 @@ export async function restartStub(
   serverUrl: string,
   token: string,
   sshKeyPath?: string,
-  slurmOverrides?: { mem?: string; time?: string },
+  slurmOverrides?: SlurmSubmitOptions,
 ): Promise<DeployResult> {
   logger.info("deploy.restart", { target: target.name });
 

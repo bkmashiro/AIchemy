@@ -1242,7 +1242,7 @@ def test_tasks_metrics_reads_task_metric_buffers(monkeypatch, capsys):
 def test_stubs_canary_posts_deploy_with_connection_body(monkeypatch):
     calls = run_cli(
         monkeypatch,
-        ["stubs", "canary", "a30", "--mem", "40G", "--stub-server-url", "https://alchemy-v2.yuzhes.com", "--yes"],
+        ["stubs", "canary", "a30", "--mem", "40G", "--idle-timeout", "600", "--stub-server-url", "https://alchemy-v2.yuzhes.com", "--yes"],
         [{"ok": True, "job_id": "247"}],
     )
     assert calls[0]["method"] == "POST"
@@ -1250,6 +1250,18 @@ def test_stubs_canary_posts_deploy_with_connection_body(monkeypatch):
     assert calls[0]["body"]["server_url"] == "https://alchemy-v2.yuzhes.com"
     assert calls[0]["body"]["token"] == "secret-token"
     assert calls[0]["body"]["mem"] == "40G"
+    assert calls[0]["body"]["idle_timeout"] == 600
+
+
+def test_slurm_submit_posts_idle_timeout_override(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["slurm", "submit", "a30", "--idle-timeout", "600", "--yes"],
+        [{"ok": True, "job_id": "248"}],
+    )
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30/restart"
+    assert calls[0]["body"]["idle_timeout"] == 600
 
 
 def test_tasks_lost_filters_terminal_pretrain_without_active_successor(monkeypatch, capsys):
