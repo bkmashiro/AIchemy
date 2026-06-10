@@ -124,6 +124,167 @@ describe("webhook subscriptions", () => {
     expect(global.fetch).not.toHaveBeenCalled();
   });
 
+  it("includes human-readable summary, commands, and diagnosis for completed terminal task webhooks", async () => {
+    store.addWebhookSubscription({
+      name: "hermes-terminal",
+      url: "https://hermes.example/webhook/alchemy",
+      events: ["task.completed"],
+    });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      makeTask({
+        status: "completed",
+        exit_code: 0,
+        log_buffer: ["training step 1", "training step 2", "done"],
+      }),
+    );
+
+    const fetchMock = vi.mocked(global.fetch);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+
+    expect(body.summary).toBe("✅ Alchemy task completed: train.py (task-1)");
+    expect(body.diagnosis).toEqual({
+      category: "success",
+      severity: "info",
+      reason: expect.any(String),
+    });
+    expect(body.commands).toEqual([
+      "alch tasks get 'task-1'",
+      "alch tasks logs 'task-1' --tail 200",
+    ]);
+    expect(body.task.log_tail).toEqual(["training step 1", "training step 2", "done"]);
+  });
+
+  it("includes code_error diagnosis and useful commands when tracebacks appear", async () => {
+    store.addWebhookSubscription({
+      name: "hermes-terminal",
+      url: "https://hermes.example/webhook/alchemy",
+      events: ["task.failed"],
+    });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      makeTask({
+        status: "failed",
+        exit_code: 1,
+        run_dir: "/cluster/results/task-1",
+        log_buffer: [
+          "Traceback (most recent call last):",
+          "  File \"train.py\", line 10, in <module>",
+          "    raise RuntimeError('bad')",
+        ],
+      }),
+    );
+
+    const fetchMock = vi.mocked(global.fetch);
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+
+    expect(body.summary).toBe("❌ Alchemy task failed: train.py (task-1) exit_code=1");
+    expect(body.diagnosis).toMatchObject({
+      category: "code_error",
+      severity: "error",
+      reason: expect.stringContaining("traceback"),
+    });
+    expect(body.commands).toEqual([
+      "alch tasks get 'task-1'",
+      "alch tasks logs 'task-1' --tail 200",
+      "ls -la '/cluster/results/task-1'",
+    ]);
+  });
+
+  it("shell-quotes task ids and run directories in suggested commands", async () => {
+    store.addWebhookSubscription({
+      name: "hermes-terminal",
+      url: "https://hermes.example/webhook/alchemy",
+      events: ["task.failed"],
+    });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      makeTask({
+        id: "task'$(bad)",
+        status: "failed",
+        exit_code: -15,
+        run_dir: "/cluster/results/a'$(rm -rf x)",
+        log_buffer: ["received SIGTERM"],
+      }),
+    );
+
+    const fetchMock = vi.mocked(global.fetch);
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+
+    expect(body.diagnosis.category).toBe("slurm_or_termination");
+    expect(body.commands).toEqual([
+      "alch tasks get 'task'\"'\"'$(bad)'",
+      "alch tasks logs 'task'\"'\"'$(bad)' --tail 200",
+      "ls -la '/cluster/results/a'\"'\"'$(rm -rf x)'",
+    ]);
+  });
+
+  it("includes summary, commands, and diagnosis in webhook test endpoint deliveries", async () => {
+    const app = makeApp();
+
+    const created = await request(app)
+      .post("/webhooks")
+      .send({ name: "test-delivery", url: "https://hermes.example/webhook/alchemy", events: ["task.completed", "task.failed"], secret: "shh" })
+      .expect(201);
+
+    await request(app)
+      .post(`/webhooks/${created.body.id}/test`)
+      .send({
+        event: "task.failed",
+        task: makeTask({
+          id: "task-1",
+          status: "failed",
+          exit_code: 42,
+          log_buffer: ["Traceback (most recent call last):", "Oops"],
+        }),
+      })
+      .expect(200);
+
+    const fetchMock = vi.mocked(global.fetch);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0];
+    const body = JSON.parse(String(init?.body));
+
+    expect(body.summary).toBe("❌ Alchemy task failed: train.py (task-1) exit_code=42");
+    expect(body.diagnosis).toMatchObject({
+      category: "code_error",
+      severity: "error",
+      reason: expect.stringContaining("traceback"),
+    });
+    expect(body.commands).toEqual([
+      "alch tasks get 'task-1'",
+      "alch tasks logs 'task-1' --tail 200",
+    ]);
+  });
+
+  it("normalizes task.terminal test deliveries to a concrete failed event", async () => {
+    const app = makeApp();
+
+    const created = await request(app)
+      .post("/webhooks")
+      .send({ name: "terminal-test", url: "https://hermes.example/webhook/alchemy", events: ["task.terminal"] })
+      .expect(201);
+
+    await request(app).post(`/webhooks/${created.body.id}/test`).send({}).expect(200);
+
+    const fetchMock = vi.mocked(global.fetch);
+    const [, init] = fetchMock.mock.calls[0];
+    const headers = init?.headers as Record<string, string>;
+    const body = JSON.parse(String(init?.body));
+
+    expect(headers["X-Alchemy-Event"]).toBe("task.failed");
+    expect(body.event).toBe("task.failed");
+    expect(body.task.status).toBe("failed");
+    expect(body.summary).toBe("❌ Alchemy task failed: webhook test (test-task)");
+  });
+
   it("provides CRUD API for subscriptions", async () => {
     const app = makeApp();
 
@@ -145,7 +306,6 @@ describe("webhook subscriptions", () => {
     await request(app).delete(`/webhooks/${created.body.id}`).expect(200);
     expect(store.listWebhookSubscriptions()).toHaveLength(0);
   });
-
   it("rejects invalid webhook events and urls", async () => {
     const app = makeApp();
     await request(app).post("/webhooks").send({ name: "bad", url: "file:///tmp/hook", events: ["task.failed"] }).expect(400);
