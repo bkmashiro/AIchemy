@@ -62,6 +62,25 @@ export const webhookDeliveries = sqliteTable("webhook_deliveries", {
   index("idx_webhook_deliveries_subscription_time").on(table.subscription_id, table.delivered_at),
 ]);
 
+export const webhookDeliveryOutbox = sqliteTable("webhook_delivery_outbox", {
+  id: text("id").primaryKey(),
+  delivery_id: text("delivery_id").notNull(),
+  subscription_id: text("subscription_id").notNull(),
+  event: text("event").notNull(),
+  task_id: text("task_id").notNull(),
+  previous_status: text("previous_status").notNull(),
+  status: text("status").notNull(),
+  attempt_count: integer("attempt_count").notNull().default(0),
+  max_attempts: integer("max_attempts").notNull().default(0),
+  next_retry_at: text("next_retry_at").notNull(),
+  last_error: text("last_error"),
+  created_at: text("created_at").notNull(),
+  updated_at: text("updated_at").notNull(),
+}, (table) => [
+  index("idx_webhook_delivery_outbox_status_next_retry").on(table.status, table.next_retry_at),
+  index("idx_webhook_delivery_outbox_subscription").on(table.subscription_id),
+]);
+
 export const meta = sqliteTable("meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),

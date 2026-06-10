@@ -64,6 +64,24 @@ export interface WebhookDelivery {
   delivered_at: string;
 }
 
+export type WebhookOutboxStatus = "pending" | "in_flight" | "succeeded" | "exhausted";
+
+export interface WebhookDeliveryOutbox {
+  id: string;
+  delivery_id: string;
+  subscription_id: string;
+  event: WebhookEvent;
+  task_id: string;
+  previous_status: TaskStatus;
+  status: WebhookOutboxStatus;
+  attempt_count: number;
+  max_attempts: number;
+  next_retry_at: string;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Task {
   // === Identity ===
   id: string;
