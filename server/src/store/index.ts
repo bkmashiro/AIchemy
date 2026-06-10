@@ -16,7 +16,7 @@ import { randomUUID } from "crypto";
 import { drizzle, BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { eq, sql, and, desc, asc, not, inArray } from "drizzle-orm";
 import * as schema from "./schema";
-import { Stub, Task, Grid, Token, Experiment, ExperimentEvent, ServerState, TaskStatus, WebhookSubscription, WebhookEvent } from "../types";
+import { Stub, Task, Grid, Token, Experiment, ExperimentEvent, ServerState, TaskStatus, WebhookSubscription, WebhookEvent, WebhookDelivery } from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
 import { backupState, pruneBackups } from "./backup";
@@ -122,6 +122,17 @@ class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_webhook_subscriptions_name
         ON webhook_subscriptions(name);
+      CREATE TABLE IF NOT EXISTS webhook_deliveries (
+        id TEXT PRIMARY KEY,
+        subscription_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        task_id TEXT,
+        status TEXT NOT NULL,
+        delivered_at TEXT NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_time
+        ON webhook_deliveries(subscription_id, delivered_at);
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -510,6 +521,44 @@ class Store {
         set: { name: sub.name, url: sub.url, enabled: sub.enabled ? 1 : 0, data: JSON.stringify(sub) },
       })
       .run();
+  }
+
+  recordWebhookDelivery(input: Omit<WebhookDelivery, "id" | "delivered_at"> & { id?: string; delivered_at?: string }): WebhookDelivery {
+    const delivery: WebhookDelivery = {
+      ...input,
+      id: input.id ?? randomUUID(),
+      delivered_at: input.delivered_at ?? new Date().toISOString(),
+    };
+    this.db.insert(schema.webhookDeliveries)
+      .values({
+        id: delivery.id,
+        subscription_id: delivery.subscription_id,
+        event: delivery.event,
+        task_id: delivery.task_id,
+        status: delivery.status,
+        delivered_at: delivery.delivered_at,
+        data: JSON.stringify(delivery),
+      })
+      .run();
+    return delivery;
+  }
+
+  listWebhookDeliveries(subscriptionIdOrName?: string, limit = 20): WebhookDelivery[] {
+    const safeLimit = Math.max(1, Math.min(limit, 200));
+    const sub = subscriptionIdOrName ? this.getWebhookSubscription(subscriptionIdOrName) : undefined;
+    const rows = sub
+      ? this.db.select({ data: schema.webhookDeliveries.data })
+        .from(schema.webhookDeliveries)
+        .where(eq(schema.webhookDeliveries.subscription_id, sub.id))
+        .orderBy(desc(schema.webhookDeliveries.delivered_at))
+        .limit(safeLimit)
+        .all()
+      : this.db.select({ data: schema.webhookDeliveries.data })
+        .from(schema.webhookDeliveries)
+        .orderBy(desc(schema.webhookDeliveries.delivered_at))
+        .limit(safeLimit)
+        .all();
+    return rows.map((row) => JSON.parse(row.data) as WebhookDelivery);
   }
 
   // ─── Tasks ──────────────────────────────────────────────────────────────
@@ -1242,6 +1291,7 @@ class Store {
     this.db.delete(schema.grids).run();
     this.db.delete(schema.experiments).run();
     this.db.delete(schema.webhookSubscriptions).run();
+    this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
 
@@ -1343,6 +1393,7 @@ class Store {
     this.db.delete(schema.grids).run();
     this.db.delete(schema.experiments).run();
     this.db.delete(schema.webhookSubscriptions).run();
+    this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
   }

@@ -50,6 +50,18 @@ export const webhookSubscriptions = sqliteTable("webhook_subscriptions", {
   index("idx_webhook_subscriptions_name").on(table.name),
 ]);
 
+export const webhookDeliveries = sqliteTable("webhook_deliveries", {
+  id: text("id").primaryKey(),
+  subscription_id: text("subscription_id").notNull(),
+  event: text("event").notNull(),
+  task_id: text("task_id"),
+  status: text("status").notNull(),
+  delivered_at: text("delivered_at").notNull(),
+  data: text("data").notNull(),
+}, (table) => [
+  index("idx_webhook_deliveries_subscription_time").on(table.subscription_id, table.delivered_at),
+]);
+
 export const meta = sqliteTable("meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),

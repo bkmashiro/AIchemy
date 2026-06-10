@@ -122,6 +122,14 @@ export function createWebhooksRouter(): Router {
     res.status(201).json(publicSubscription(sub));
   });
 
+  router.get("/:id/deliveries", (req: Request, res: Response) => {
+    const sub = store.getWebhookSubscription(req.params.id);
+    if (!sub) { res.status(404).json({ error: "subscription not found" }); return; }
+    const rawLimit = Number(req.query.limit ?? 20);
+    const limit = Number.isFinite(rawLimit) ? rawLimit : 20;
+    res.json({ deliveries: store.listWebhookDeliveries(sub.id, limit) });
+  });
+
   router.delete("/:id", (req: Request, res: Response) => {
     const ok = store.deleteWebhookSubscription(req.params.id);
     if (!ok) { res.status(404).json({ error: "subscription not found" }); return; }

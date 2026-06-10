@@ -365,6 +365,10 @@ def cmd_webhooks_test(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.post(f"/webhooks/{args.subscription}/test", body))
 
 
+def cmd_webhooks_deliveries(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get(f"/webhooks/{args.subscription}/deliveries?{urlencode({'limit': args.limit})}"))
+
+
 def cmd_tasks_ls(args: argparse.Namespace, client: ApiClient) -> None:
     params: dict[str, Any] = {"limit": args.limit, "logs": "false", "sort": "seq", "order": "desc"}
     if args.status:
@@ -1061,6 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = wh_sub.add_parser("add", help="create a webhook subscription"); p.add_argument("name", help="subscription name"); p.add_argument("url", help="destination http(s) URL"); p.add_argument("--events", default="task.failed,task.completed", help="comma-separated events (default task.failed,task.completed)"); p.add_argument("--secret", help="HMAC secret for outgoing signatures"); p.add_argument("--disabled", action="store_true", help="create disabled"); p.set_defaults(func=cmd_webhooks_add)
     p = wh_sub.add_parser("delete", aliases=["rm"], help="delete a webhook subscription"); p.add_argument("subscription", help="subscription id or name"); p.set_defaults(func=cmd_webhooks_delete)
     p = wh_sub.add_parser("test", help="send a test delivery"); p.add_argument("subscription", help="subscription id or name"); p.add_argument("--event", choices=["task.completed", "task.failed", "task.cancelled", "task.terminal"], help="event to send"); p.add_argument("--payload", help="JSON object merged into the test body"); p.set_defaults(func=cmd_webhooks_test)
+    p = wh_sub.add_parser("deliveries", help="list recent webhook delivery attempts"); p.add_argument("subscription", help="subscription id or name"); p.add_argument("--limit", type=int, default=20, help="max deliveries to return (default 20)"); p.set_defaults(func=cmd_webhooks_deliveries)
 
     slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)
