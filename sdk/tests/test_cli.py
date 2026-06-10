@@ -103,10 +103,18 @@ def test_doctor_collects_read_only_health_and_counts(monkeypatch, capsys):
                 {"id": "stub-1", "name": "worker-a", "status": "online"},
                 {"id": "stub-2", "name": "worker-b", "status": "offline"},
             ],
-            {"tasks": [
-                {"id": "task-1", "status": "running"},
-                {"id": "task-2", "status": "blocked"},
-            ]},
+            {
+                "tasks": [
+                    {"id": "task-1", "status": "running"},
+                    {"id": "task-2", "status": "blocked", "error_message": "Dependency parent-1 failed"},
+                    {"id": "task-3", "status": "pending", "target_stub_id": "stub-bad"},
+                ]
+            },
+            {
+                "tasks": [
+                    {"id": "task-4", "status": "failed", "exit_code": 137, "death_cause": "oom", "error_message": "CUDA out of memory"},
+                ]
+            },
             [{"id": "sub-1", "enabled": True}],
         ],
     )
@@ -115,17 +123,67 @@ def test_doctor_collects_read_only_health_and_counts(monkeypatch, capsys):
         ("GET", "http://localhost:3002/health"),
         ("GET", "http://localhost:3002/api/stubs"),
         ("GET", "http://localhost:3002/api/tasks?limit=50&logs=false&sort=seq&order=desc&status_group=active"),
+        ("GET", "http://localhost:3002/api/tasks?limit=5&logs=false&sort=seq&order=desc&status=failed"),
         ("GET", "http://localhost:3002/api/webhooks"),
     ]
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
     assert out["counts"] == {
-        "active_tasks": 2,
+        "active_tasks": 3,
         "blocked_tasks": 1,
         "enabled_webhooks": 1,
         "online_stubs": 1,
         "running_tasks": 1,
         "webhooks": 1,
+    }
+    assert out["task_triage"]["counts"] == {
+        "active": 3,
+        "running": 1,
+        "blocked": 1,
+        "pending": 1,
+        "assigned": 0,
+        "paused": 0,
+        "failed_recent": 1,
+    }
+
+
+def test_doctor_includes_task_triage_diagnostics(monkeypatch, capsys):
+    run_cli(
+        monkeypatch,
+        ["doctor"],
+        [
+            {"ok": True},
+            [{"id": "stub-1", "status": "online"}],
+            {
+                "tasks": [
+                    {"id": "blocked-1", "status": "blocked", "error_message": "Dependency parent-1 failed"},
+                    {"id": "pending-1", "status": "pending", "target_tags": ["a30", "slurm"]},
+                ]
+            },
+            {
+                "tasks": [
+                    {"id": "fail-oom", "status": "failed", "exit_code": 137, "death_cause": "oom", "error_message": "CUDA out of memory"},
+                ]
+            },
+            [{"id": "sub-1", "enabled": True}],
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["task_triage"]["blocked"][0]["diagnosis"] == {
+        "kind": "dependency_failed",
+        "detail": "Dependency parent-1 failed",
+        "next": "inspect the failed dependency, then resubmit or cancel this blocked task",
+    }
+    assert out["task_triage"]["pending"][0]["diagnosis"] == {
+        "kind": "waiting_for_matching_stub",
+        "detail": "target_tags=a30,slurm",
+        "next": "start a matching stub or move the task to a live stub",
+    }
+    assert out["task_triage"]["failed_recent"][0]["diagnosis"] == {
+        "kind": "oom",
+        "detail": "exit_code=137 death_cause=oom",
+        "next": "reduce memory use or resubmit on a larger-memory stub",
     }
 
 
@@ -300,6 +358,65 @@ def test_tasks_top_adds_actionable_task_diagnostics(monkeypatch, capsys):
         "alch tasks logs oom-1 --tail 200",
         "ls -la /runs/oom",
     ]
+
+
+def test_tasks_repair_dry_run_emits_compact_recommendations(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "repair", "--limit", "5"],
+        [
+            {"tasks": [
+                {"id": "blocked-1", "seq": 4, "status": "blocked", "error_message": "Dependency dep-1 failed"},
+                {"id": "pending-stub", "seq": 3, "status": "pending", "target_stub_id": "stub-123"},
+                {"id": "pending-tags", "seq": 2, "status": "pending", "target_tags": ["a30", "slurm"]},
+                {"id": "ok-1", "seq": 1, "status": "running"},
+            ]},
+        ],
+    )
+
+    assert calls == [{
+        "method": "GET",
+        "url": "http://localhost:3002/api/tasks?limit=5&logs=false&sort=seq&order=desc&status_group=active",
+        "body": None,
+        "auth": "Bearer secret-token",
+        "timeout": 20.0,
+    }]
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["dry_run"] is True
+    assert len(out["recommendations"]) == 3
+
+    by_id = {row["task_id"]: row for row in out["recommendations"]}
+    assert by_id["blocked-1"]["action"] == "inspect_dependency"
+    assert by_id["blocked-1"]["commands"] == [
+        "alch tasks get blocked-1",
+        "alch tasks logs blocked-1 --tail 200",
+        "alch tasks cancel blocked-1",
+        "alch tasks resubmit blocked-1",
+    ]
+
+    assert by_id["pending-stub"]["action"] == "move_to_live_stub_or_start_stub"
+    assert by_id["pending-stub"]["detail"] == {"target_stub_id": "stub-123"}
+    assert by_id["pending-stub"]["commands"] == [
+        "alch tasks get pending-stub",
+        "alch tasks logs pending-stub --tail 200",
+        "alch tasks move pending-stub --to-stub stub-123",
+    ]
+
+    assert by_id["pending-tags"]["action"] == "start_matching_stub_or_move"
+    assert by_id["pending-tags"]["detail"] == {"target_tags": ["a30", "slurm"]}
+    assert by_id["pending-tags"]["commands"][2] == "alch tasks move pending-tags --to-tags a30,slurm"
+
+
+def test_tasks_repair_no_mutations(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "repair"],
+        [{"tasks": []}],
+    )
+
+    assert [call["method"] for call in calls] == ["GET"]
 
 
 def test_tasks_resubmit_resume_drops_run_dir_and_targets_tags(monkeypatch):

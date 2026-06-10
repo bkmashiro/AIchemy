@@ -14,9 +14,23 @@ import path from "path";
 import Database from "better-sqlite3";
 import { randomUUID } from "crypto";
 import { drizzle, BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { eq, sql, and, desc, asc, not, inArray } from "drizzle-orm";
+import { eq, sql, and, desc, asc, not, inArray, lte, or, type SQLWrapper } from "drizzle-orm";
 import * as schema from "./schema";
-import { Stub, Task, Grid, Token, Experiment, ExperimentEvent, ServerState, TaskStatus, WebhookSubscription, WebhookEvent, WebhookDelivery } from "../types";
+import {
+  Stub,
+  Task,
+  Grid,
+  Token,
+  Experiment,
+  ExperimentEvent,
+  ServerState,
+  TaskStatus,
+  WebhookSubscription,
+  WebhookEvent,
+  WebhookDelivery,
+  WebhookDeliveryOutbox,
+  WebhookOutboxStatus,
+} from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
 import { backupState, pruneBackups } from "./backup";
@@ -133,6 +147,25 @@ class Store {
       );
       CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_subscription_time
         ON webhook_deliveries(subscription_id, delivered_at);
+      CREATE TABLE IF NOT EXISTS webhook_delivery_outbox (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL,
+        subscription_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        previous_status TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 0,
+        next_retry_at TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_webhook_delivery_outbox_status_next_retry
+        ON webhook_delivery_outbox(status, next_retry_at);
+      CREATE INDEX IF NOT EXISTS idx_webhook_delivery_outbox_subscription
+        ON webhook_delivery_outbox(subscription_id);
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -559,6 +592,158 @@ class Store {
         .limit(safeLimit)
         .all();
     return rows.map((row) => JSON.parse(row.data) as WebhookDelivery);
+  }
+
+  private _coerceOutboxStatus(value: string): WebhookOutboxStatus {
+    if (value === "pending" || value === "in_flight" || value === "succeeded" || value === "exhausted") {
+      return value;
+    }
+    return "exhausted";
+  }
+
+  private _rowToWebhookOutbox(row: typeof schema.webhookDeliveryOutbox.$inferSelect): WebhookDeliveryOutbox {
+    return {
+      id: row.id,
+      delivery_id: row.delivery_id,
+      subscription_id: row.subscription_id,
+      event: row.event as WebhookEvent,
+      task_id: row.task_id,
+      previous_status: row.previous_status as TaskStatus,
+      status: this._coerceOutboxStatus(row.status),
+      attempt_count: row.attempt_count,
+      max_attempts: row.max_attempts,
+      next_retry_at: row.next_retry_at,
+      last_error: row.last_error ?? undefined,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  private _parseOutboxRows(rows: Array<typeof schema.webhookDeliveryOutbox.$inferSelect>): WebhookDeliveryOutbox[] {
+    return rows.map((row) => this._rowToWebhookOutbox(row));
+  }
+
+  getWebhookDeliveryOutboxById(id: string): WebhookDeliveryOutbox | undefined {
+    const row = this.db
+      .select()
+      .from(schema.webhookDeliveryOutbox)
+      .where(eq(schema.webhookDeliveryOutbox.id, id))
+      .get();
+    if (!row) return undefined;
+    return this._rowToWebhookOutbox(row);
+  }
+
+  listWebhookDeliveryOutbox(options: {
+    subscriptionId?: string;
+    status?: WebhookOutboxStatus | WebhookOutboxStatus[];
+    dueBefore?: string;
+    limit?: number;
+  } = {}): WebhookDeliveryOutbox[] {
+    const safeLimit = Math.max(1, Math.min(options.limit ?? 100, 500));
+    const predicates: SQLWrapper[] = [];
+    if (options.subscriptionId) {
+      predicates.push(eq(schema.webhookDeliveryOutbox.subscription_id, options.subscriptionId));
+    }
+    if (options.dueBefore) {
+      predicates.push(lte(schema.webhookDeliveryOutbox.next_retry_at, options.dueBefore));
+    }
+    if (options.status) {
+      if (Array.isArray(options.status)) {
+        const statusPredicates = options.status.map((status) => eq(schema.webhookDeliveryOutbox.status, status));
+        const statusFilter = or(...statusPredicates);
+        if (statusFilter) predicates.push(statusFilter);
+      } else {
+        predicates.push(eq(schema.webhookDeliveryOutbox.status, options.status));
+      }
+    }
+
+    const whereClause = and(...predicates);
+    const rows = !whereClause
+      ? this.db
+        .select()
+        .from(schema.webhookDeliveryOutbox)
+        .orderBy(asc(schema.webhookDeliveryOutbox.next_retry_at))
+        .limit(safeLimit)
+        .all()
+      : this.db
+        .select()
+        .from(schema.webhookDeliveryOutbox)
+        .where(whereClause)
+        .orderBy(asc(schema.webhookDeliveryOutbox.next_retry_at))
+        .limit(safeLimit)
+        .all();
+    return this._parseOutboxRows(rows);
+  }
+
+  createWebhookDeliveryOutbox(input: Omit<WebhookDeliveryOutbox, "id" | "created_at" | "updated_at"> & { id?: string }): WebhookDeliveryOutbox {
+    const now = new Date().toISOString();
+    const outbox: WebhookDeliveryOutbox = {
+      ...input,
+      id: input.id ?? randomUUID(),
+      created_at: now,
+      updated_at: now,
+    };
+
+    this.db.insert(schema.webhookDeliveryOutbox)
+      .values({
+        id: outbox.id,
+        delivery_id: outbox.delivery_id,
+        subscription_id: outbox.subscription_id,
+        event: outbox.event,
+        task_id: outbox.task_id,
+        previous_status: outbox.previous_status,
+        status: outbox.status,
+        attempt_count: outbox.attempt_count,
+        max_attempts: outbox.max_attempts,
+        next_retry_at: outbox.next_retry_at,
+        last_error: outbox.last_error ?? null,
+        created_at: outbox.created_at,
+        updated_at: outbox.updated_at,
+      })
+      .onConflictDoUpdate({
+        target: schema.webhookDeliveryOutbox.id,
+        set: {
+          delivery_id: outbox.delivery_id,
+          subscription_id: outbox.subscription_id,
+          event: outbox.event,
+          task_id: outbox.task_id,
+          previous_status: outbox.previous_status,
+          status: outbox.status,
+          attempt_count: outbox.attempt_count,
+          max_attempts: outbox.max_attempts,
+          next_retry_at: outbox.next_retry_at,
+          last_error: outbox.last_error ?? null,
+          updated_at: outbox.updated_at,
+        },
+      })
+      .run();
+
+    return outbox;
+  }
+
+  updateWebhookDeliveryOutbox(
+    id: string,
+    updates: Partial<Pick<WebhookDeliveryOutbox, "status" | "attempt_count" | "next_retry_at" | "last_error">>,
+  ): WebhookDeliveryOutbox | undefined {
+    const now = new Date().toISOString();
+    const values: Record<string, unknown> = { updated_at: now };
+    if (updates.status !== undefined) values.status = updates.status;
+    if (updates.attempt_count !== undefined) values.attempt_count = updates.attempt_count;
+    if (updates.next_retry_at !== undefined) values.next_retry_at = updates.next_retry_at;
+    if (updates.last_error !== undefined) values.last_error = updates.last_error;
+
+    if (Object.keys(values).length > 1) {
+      this.db.update(schema.webhookDeliveryOutbox)
+        .set(values)
+        .where(eq(schema.webhookDeliveryOutbox.id, id))
+        .run();
+    }
+
+    return this.getWebhookDeliveryOutboxById(id);
+  }
+
+  deleteWebhookDeliveryOutbox(id: string): void {
+    this.db.delete(schema.webhookDeliveryOutbox).where(eq(schema.webhookDeliveryOutbox.id, id)).run();
   }
 
   // ─── Tasks ──────────────────────────────────────────────────────────────
@@ -1292,6 +1477,7 @@ class Store {
     this.db.delete(schema.experiments).run();
     this.db.delete(schema.webhookSubscriptions).run();
     this.db.delete(schema.webhookDeliveries).run();
+    this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
 
@@ -1394,6 +1580,7 @@ class Store {
     this.db.delete(schema.experiments).run();
     this.db.delete(schema.webhookSubscriptions).run();
     this.db.delete(schema.webhookDeliveries).run();
+    this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
   }

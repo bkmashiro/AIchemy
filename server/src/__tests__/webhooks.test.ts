@@ -5,7 +5,7 @@ import { store } from "../store";
 import { Task } from "../types";
 import { createWebhooksRouter } from "../api/webhooks";
 import { completeTask } from "../task-actions";
-import { deliverTaskStatusWebhooks, startWebhookDispatcher } from "../webhooks";
+import { deliverTaskStatusWebhooks, processWebhookOutbox, startWebhookDispatcher } from "../webhooks";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -133,7 +133,12 @@ describe("webhook subscriptions", () => {
   });
 
   it("records failed webhook deliveries without leaking payloads", async () => {
-    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 500, text: vi.fn().mockResolvedValue("bad token secret-ish body") } as any);
+    const leakedBody = "bad token secret-ish body";
+    vi.mocked(global.fetch).mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      text: vi.fn().mockResolvedValue(leakedBody),
+    } as any);
     const sub = store.addWebhookSubscription({
       name: "broken",
       url: "https://hermes.example/webhook/alchemy",
@@ -154,17 +159,66 @@ describe("webhook subscriptions", () => {
       status: "failed",
       http_status: 500,
     });
-    expect(deliveries[0].error).toContain("HTTP 500");
+    expect(deliveries[0].error).toBe("HTTP 500");
     expect(JSON.stringify(deliveries[0])).not.toContain("Traceback");
+    expect(JSON.stringify(deliveries[0])).not.toContain(leakedBody);
+
+    const outboxEntries = store.listWebhookDeliveryOutbox();
+    expect(outboxEntries).toHaveLength(1);
+    expect(outboxEntries[0]).toMatchObject({
+      subscription_id: sub.id,
+      event: "task.failed",
+      task_id: "task-1",
+      attempt_count: 1,
+      status: "pending",
+    });
+    expect(outboxEntries[0].last_error).toBe("HTTP 500");
+    expect(JSON.stringify(outboxEntries[0])).not.toContain("Traceback");
+    expect(JSON.stringify(outboxEntries[0])).not.toContain(leakedBody);
   });
 
-  it("posts task.terminal subscriptions for failed and cancelled tasks", async () => {
-    store.addWebhookSubscription({ name: "terminal", url: "https://example.test/hook", events: ["task.terminal"] });
+  it("enqueues failed webhook deliveries for retry and clears on success", async () => {
+    startWebhookDispatcher();
+    vi.mocked(global.fetch)
+      .mockResolvedValueOnce({ ok: false, status: 503, text: vi.fn().mockResolvedValue("temporary outage") } as any)
+      .mockResolvedValueOnce({ ok: true, status: 200, text: vi.fn().mockResolvedValue("ok") } as any);
 
-    await deliverTaskStatusWebhooks(makeTask({ status: "running" }), makeTask({ status: "failed", exit_code: 2 }));
-    await deliverTaskStatusWebhooks(makeTask({ status: "running" }), makeTask({ status: "cancelled" }));
+    const sub = store.addWebhookSubscription({
+      name: "flaky",
+      url: "https://hermes.example/webhook/alchemy",
+      events: ["task.failed"],
+    });
+
+    const failedTask = makeTask({ status: "failed", exit_code: 1, stub_id: "stub-1" });
+    store.setStub({ ...makeStub(), tasks: [failedTask] });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      failedTask,
+    );
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    const queued = store.listWebhookDeliveryOutbox();
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({
+      subscription_id: sub.id,
+      event: "task.failed",
+      task_id: "task-1",
+      status: "pending",
+      attempt_count: 1,
+    });
+
+    vi.advanceTimersByTime(700);
+    await processWebhookOutbox();
 
     expect(global.fetch).toHaveBeenCalledTimes(2);
+
+    const deliveries = store.listWebhookDeliveries(sub.id);
+    expect(deliveries).toHaveLength(2);
+    const latest = deliveries.find((delivery) => delivery.status === "success");
+    expect(latest).toMatchObject({ status: "success", event: "task.failed", task_id: "task-1" });
+
+    await vi.waitFor(() => expect(store.listWebhookDeliveryOutbox()).toHaveLength(0));
   });
 
   it("does not post for non-terminal or disabled subscriptions", async () => {

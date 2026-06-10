@@ -1,11 +1,15 @@
 import { createHmac, randomUUID } from "crypto";
 import { store } from "./store";
-import { Task, TaskStatus, WebhookEvent, WebhookSubscription } from "./types";
+import { Task, TaskStatus, WebhookEvent, WebhookSubscription, WebhookDeliveryOutbox } from "./types";
 import { logger } from "./log";
 import { alchemyEvents, TaskStatusChangedEvent } from "./events";
 
 const TERMINAL_STATUSES = new Set<TaskStatus>(["completed", "failed", "cancelled"]);
 const VALID_EVENTS = new Set<WebhookEvent>(["task.completed", "task.failed", "task.cancelled", "task.terminal"]);
+const OUTBOX_MAX_ATTEMPTS = 5;
+const OUTBOX_RETRY_BASE_MS = 500;
+const OUTBOX_MAX_DELAY_MS = 8_000;
+const OUTBOX_RETRY_POLL_MS = 250;
 
 const SUMMARY_TEMPLATES = {
   completed: (taskName: string, taskId: string) => `✅ Alchemy task completed: ${taskName} (${taskId})`,
@@ -193,9 +197,13 @@ function signedHeaders(sub: WebhookSubscription, payload: string, event: Webhook
   return headers;
 }
 
-export async function postWebhook(sub: WebhookSubscription, payload: unknown, event: WebhookEvent): Promise<{ deliveryId: string; httpStatus: number }> {
+export async function postWebhook(
+  sub: WebhookSubscription,
+  payload: unknown,
+  event: WebhookEvent,
+  deliveryId = `${sub.id}:${(payload as any).task?.id ?? "manual"}:${event}:${randomUUID()}`,
+): Promise<{ deliveryId: string; httpStatus: number }> {
   const body = JSON.stringify(payload);
-  const deliveryId = `${sub.id}:${(payload as any).task?.id ?? "manual"}:${event}:${randomUUID()}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   let httpStatus = 0;
@@ -208,8 +216,7 @@ export async function postWebhook(sub: WebhookSubscription, payload: unknown, ev
     });
     httpStatus = response.status;
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      const err = new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`) as Error & { http_status?: number };
+      const err = new Error(`HTTP ${response.status}`) as Error & { http_status?: number };
       err.http_status = response.status;
       throw err;
     }
@@ -217,6 +224,133 @@ export async function postWebhook(sub: WebhookSubscription, payload: unknown, ev
     return { deliveryId, httpStatus };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function webhookErrorMessage(error: unknown): string {
+  const maybeHttp = error as { http_status?: number };
+  if (typeof maybeHttp.http_status === "number") {
+    return `HTTP ${maybeHttp.http_status}`;
+  }
+  return String(error).slice(0, 300);
+}
+
+function webhookRetryDelayMs(attempt: number): number {
+  const safeAttempt = Math.max(attempt, 1);
+  const delay = OUTBOX_RETRY_BASE_MS * Math.pow(2, Math.min(safeAttempt - 1, 8));
+  return Math.min(delay, OUTBOX_MAX_DELAY_MS);
+}
+
+async function retryOutboxDelivery(entry: WebhookDeliveryOutbox): Promise<void> {
+  const sub = store.getWebhookSubscription(entry.subscription_id);
+  if (!sub) {
+    await store.updateWebhookDeliveryOutbox(entry.id, {
+      status: "exhausted",
+      attempt_count: entry.attempt_count,
+      last_error: "subscription_deleted",
+      next_retry_at: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const located = store.findTask(entry.task_id);
+  if (!located?.task) {
+    await store.updateWebhookDeliveryOutbox(entry.id, {
+      status: "exhausted",
+      attempt_count: entry.attempt_count,
+      last_error: "task_missing",
+      next_retry_at: new Date().toISOString(),
+    });
+    return;
+  }
+
+  const payload = {
+    ...buildTaskWebhookPayload(
+      { status: entry.previous_status },
+      located.task,
+      entry.event,
+    ),
+    subscription: { id: sub.id, name: sub.name },
+  };
+
+  await store.updateWebhookDeliveryOutbox(entry.id, {
+    status: "in_flight",
+    attempt_count: entry.attempt_count,
+    next_retry_at: entry.next_retry_at,
+  });
+
+  const nextAttempt = entry.attempt_count + 1;
+  try {
+    const result = await postWebhook(sub, payload, entry.event, entry.delivery_id);
+    store.recordWebhookDelivery({
+      delivery_id: result.deliveryId,
+      subscription_id: sub.id,
+      subscription_name: sub.name,
+      event: entry.event,
+      task_id: located.task.id,
+      status: "success",
+      http_status: result.httpStatus,
+    });
+    await store.deleteWebhookDeliveryOutbox(entry.id);
+  } catch (err) {
+    const errorMessage = webhookErrorMessage(err);
+    if (nextAttempt >= entry.max_attempts) {
+      await store.updateWebhookDeliveryOutbox(entry.id, {
+        status: "exhausted",
+        attempt_count: nextAttempt,
+        next_retry_at: new Date().toISOString(),
+        last_error: errorMessage,
+      });
+    } else {
+      const nextRetryAt = new Date(Date.now() + webhookRetryDelayMs(nextAttempt)).toISOString();
+      await store.updateWebhookDeliveryOutbox(entry.id, {
+        status: "pending",
+        attempt_count: nextAttempt,
+        next_retry_at: nextRetryAt,
+        last_error: errorMessage,
+      });
+    }
+
+    store.recordWebhookDelivery({
+      delivery_id: entry.delivery_id,
+      subscription_id: sub.id,
+      subscription_name: sub.name,
+      event: entry.event,
+      task_id: located.task.id,
+      status: "failed",
+      error: errorMessage,
+    });
+
+    logger.warn("webhook.delivery_failed", {
+      subscription_id: sub.id,
+      event: entry.event,
+      task_id: located.task.id,
+      error: errorMessage,
+      attempt: nextAttempt,
+    });
+  }
+}
+
+let outboxProcessorRunning = false;
+export async function processWebhookOutbox(): Promise<void> {
+  if (outboxProcessorRunning) return;
+  outboxProcessorRunning = true;
+  try {
+    const now = new Date().toISOString();
+    const outbox = store.listWebhookDeliveryOutbox({
+      status: ["pending", "in_flight"],
+      dueBefore: now,
+      limit: 100,
+    });
+    for (const entry of outbox) {
+      try {
+        await retryOutboxDelivery(entry);
+      } catch (err) {
+        logger.error("webhook.outbox_retry_failed", { outbox_id: entry.id, error: String(err) });
+      }
+    }
+  } finally {
+    outboxProcessorRunning = false;
   }
 }
 
@@ -231,8 +365,9 @@ export async function deliverTaskStatusWebhooks(previous: Task, task: Task): Pro
     .filter((sub) => subscriptionMatches(sub, event))
     .map(async (sub) => {
       const deliveryPayload = { ...payload, subscription: { id: sub.id, name: sub.name } };
+      const deliveryId = `${sub.id}:${task.id}:${event}:${randomUUID()}`;
       try {
-        const result = await postWebhook(sub, deliveryPayload, event);
+        const result = await postWebhook(sub, deliveryPayload, event, deliveryId);
         store.recordWebhookDelivery({
           delivery_id: result.deliveryId,
           subscription_id: sub.id,
@@ -243,18 +378,35 @@ export async function deliverTaskStatusWebhooks(previous: Task, task: Task): Pro
           http_status: result.httpStatus,
         });
       } catch (err) {
-        const maybeHttp = err as { http_status?: number };
+        const errorMessage = webhookErrorMessage(err);
+        const status = (err as { http_status?: number }).http_status;
+
         store.recordWebhookDelivery({
-          delivery_id: `${sub.id}:${task.id}:${event}:failed`,
+          delivery_id: deliveryId,
           subscription_id: sub.id,
           subscription_name: sub.name,
           event,
           task_id: task.id,
           status: "failed",
-          http_status: maybeHttp.http_status,
-          error: String(err).slice(0, 300),
+          error: errorMessage,
+          http_status: status,
         });
-        logger.warn("webhook.delivery_failed", { subscription_id: sub.id, event, task_id: task.id, error: String(err) });
+
+        const nextRetryAt = new Date(Date.now() + webhookRetryDelayMs(1)).toISOString();
+        store.createWebhookDeliveryOutbox({
+          delivery_id: deliveryId,
+          subscription_id: sub.id,
+          event,
+          task_id: task.id,
+          previous_status: previous.status,
+          status: "pending",
+          attempt_count: 1,
+          max_attempts: OUTBOX_MAX_ATTEMPTS,
+          next_retry_at: nextRetryAt,
+          last_error: errorMessage,
+        });
+
+        logger.warn("webhook.delivery_failed", { subscription_id: sub.id, event, task_id: task.id, error: errorMessage });
       }
     });
 
@@ -262,10 +414,20 @@ export async function deliverTaskStatusWebhooks(previous: Task, task: Task): Pro
 }
 
 let dispatcherStarted = false;
+let outboxIntervalStarted = false;
 export function startWebhookDispatcher(): void {
-  if (dispatcherStarted) return;
-  dispatcherStarted = true;
-  alchemyEvents.onTaskStatusChanged((event: TaskStatusChangedEvent) => {
-    void deliverTaskStatusWebhooks(event.previous, event.task);
-  });
+  if (!dispatcherStarted) {
+    dispatcherStarted = true;
+    alchemyEvents.onTaskStatusChanged((event: TaskStatusChangedEvent) => {
+      void deliverTaskStatusWebhooks(event.previous, event.task);
+    });
+  }
+
+  if (!outboxIntervalStarted) {
+    outboxIntervalStarted = true;
+    setInterval(() => {
+      void processWebhookOutbox();
+    }, OUTBOX_RETRY_POLL_MS);
+    void processWebhookOutbox();
+  }
 }

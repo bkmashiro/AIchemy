@@ -388,14 +388,13 @@ def cmd_webhooks_deliveries(args: argparse.Namespace, client: ApiClient) -> None
 def cmd_doctor(_args: argparse.Namespace, client: ApiClient) -> None:
     health = client.raw_get("/health")
     stubs = client.get("/stubs")
-    tasks_payload = client.get(f"/tasks?{urlencode({'limit': 50, 'logs': 'false', 'sort': 'seq', 'order': 'desc', 'status_group': 'active'})}")
+    task_triage = build_task_top_payload(client, active_limit=50, failed_limit=5)
     webhooks = client.get("/webhooks")
-    tasks = tasks_payload.get("tasks", []) if isinstance(tasks_payload, dict) else []
     counts = {
         "online_stubs": sum(1 for stub in stubs if stub.get("status") == "online"),
-        "active_tasks": len(tasks),
-        "running_tasks": sum(1 for task in tasks if task.get("status") == "running"),
-        "blocked_tasks": sum(1 for task in tasks if task.get("status") == "blocked"),
+        "active_tasks": task_triage["counts"]["active"],
+        "running_tasks": task_triage["counts"]["running"],
+        "blocked_tasks": task_triage["counts"]["blocked"],
         "webhooks": len(webhooks),
         "enabled_webhooks": sum(1 for webhook in webhooks if webhook.get("enabled", True)),
     }
@@ -410,6 +409,7 @@ def cmd_doctor(_args: argparse.Namespace, client: ApiClient) -> None:
         "server": client.server,
         "health": health,
         "counts": counts,
+        "task_triage": task_triage,
         "checks": checks,
     })
 
@@ -521,6 +521,60 @@ def task_diagnosis(task: dict[str, Any]) -> dict[str, str] | None:
     return None
 
 
+def recommendation_commands(task: dict[str, Any]) -> list[str]:
+    task_id = task.get("id")
+    if not task_id:
+        return []
+    return [f"alch tasks get {task_id}", f"alch tasks logs {task_id} --tail 200"]
+
+
+def build_task_repair_recommendation(task: dict[str, Any]) -> dict[str, Any] | None:
+    task_id = task.get("id")
+    if not task_id:
+        return None
+
+    status = str(task.get("status") or "")
+    diagnosis = task_diagnosis(task)
+
+    if status == "blocked" and diagnosis and diagnosis.get("kind") == "dependency_failed":
+        commands = recommendation_commands(task)
+        return {
+            "task_id": task_id,
+            "status": status,
+            "action": "inspect_dependency",
+            "detail": diagnosis["detail"],
+            "commands": commands + [
+                f"alch tasks cancel {task_id}",
+                f"alch tasks resubmit {task_id}",
+            ],
+        }
+
+    if status == "pending" and task.get("target_stub_id"):
+        target_stub = str(task.get("target_stub_id"))
+        commands = recommendation_commands(task)
+        return {
+            "task_id": task_id,
+            "status": status,
+            "action": "move_to_live_stub_or_start_stub",
+            "detail": {"target_stub_id": target_stub},
+            "commands": commands + [f"alch tasks move {task_id} --to-stub {target_stub}"],
+        }
+
+    if status == "pending" and task.get("target_tags"):
+        tags = [str(tag) for tag in task.get("target_tags") or []]
+        if tags:
+            commands = recommendation_commands(task)
+            return {
+                "task_id": task_id,
+                "status": status,
+                "action": "start_matching_stub_or_move",
+                "detail": {"target_tags": tags},
+                "commands": commands + [f"alch tasks move {task_id} --to-tags {','.join(tags)}"],
+            }
+
+    return None
+
+
 def top_task(task: dict[str, Any]) -> dict[str, Any]:
     row = short_task(task)
     row["target"] = task_target(task)
@@ -538,16 +592,33 @@ def top_task(task: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
-def cmd_tasks_top(args: argparse.Namespace, client: ApiClient) -> None:
-    active_params = {"limit": args.limit, "logs": "false", "sort": "seq", "order": "desc", "status_group": "active"}
-    failed_params = {"limit": args.failed_limit, "logs": "false", "sort": "seq", "order": "desc", "status": "failed"}
+def build_task_top_payload(
+    client: ApiClient,
+    *,
+    active_limit: int,
+    failed_limit: int,
+) -> dict[str, Any]:
+    active_params = {
+        "limit": active_limit,
+        "logs": "false",
+        "sort": "seq",
+        "order": "desc",
+        "status_group": "active",
+    }
+    failed_params = {
+        "limit": failed_limit,
+        "logs": "false",
+        "sort": "seq",
+        "order": "desc",
+        "status": "failed",
+    }
     active_payload = client.get(f"/tasks?{urlencode(active_params)}")
     failed_payload = client.get(f"/tasks?{urlencode(failed_params)}")
     active_tasks = active_payload.get("tasks", []) if isinstance(active_payload, dict) else []
     failed_tasks = failed_payload.get("tasks", []) if isinstance(failed_payload, dict) else []
 
     by_status = {status: [task for task in active_tasks if task.get("status") == status] for status in ACTIVE_STATUSES}
-    print_json({
+    return {
         "counts": {
             "active": len(active_tasks),
             "running": len(by_status["running"]),
@@ -563,7 +634,36 @@ def cmd_tasks_top(args: argparse.Namespace, client: ApiClient) -> None:
         "assigned": [top_task(task) for task in by_status["assigned"]],
         "paused": [top_task(task) for task in by_status["paused"]],
         "failed_recent": [top_task(task) for task in failed_tasks],
-    })
+    }
+
+
+def build_task_repair_payload(client: ApiClient, *, active_limit: int) -> dict[str, Any]:
+    active_params = {
+        "limit": active_limit,
+        "logs": "false",
+        "sort": "seq",
+        "order": "desc",
+        "status_group": "active",
+    }
+    active_payload = client.get(f"/tasks?{urlencode(active_params)}")
+    active_tasks = active_payload.get("tasks", []) if isinstance(active_payload, dict) else []
+    return {
+        "ok": True,
+        "dry_run": True,
+        "recommendations": [
+            recommendation
+            for task in active_tasks
+            if (recommendation := build_task_repair_recommendation(task)) is not None
+        ],
+    }
+
+
+def cmd_tasks_top(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(build_task_top_payload(client, active_limit=args.limit, failed_limit=args.failed_limit))
+
+
+def cmd_tasks_repair(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(build_task_repair_payload(client, active_limit=args.limit))
 
 
 def cmd_tasks_get(args: argparse.Namespace, client: ApiClient) -> None:
@@ -1261,6 +1361,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)
     p = tasks_sub.add_parser("ls", help="list recent tasks (short form)"); p.add_argument("--status", help="filter by status (pending/running/...)"); p.add_argument("--active", action="store_true", help="filter to active statuses (pending/assigned/running/paused/blocked)"); p.add_argument("--stub", help="only tasks bound to this stub"); p.add_argument("--limit", type=int, default=50, help="max tasks to return (default 50)"); p.set_defaults(func=cmd_tasks_ls)
     p = tasks_sub.add_parser("top", help="summarize active tasks and recent failures"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.add_argument("--failed-limit", type=int, default=10, help="recent failed tasks to include (default 10)"); p.set_defaults(func=cmd_tasks_top)
+    p = tasks_sub.add_parser("repair", help="dry-run recommendations for risky active tasks"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.set_defaults(func=cmd_tasks_repair)
     p = tasks_sub.add_parser("get", help="fetch a single task"); p.add_argument("task", help="task id"); p.add_argument("--short", action="store_true", help="trim to the short summary form"); p.set_defaults(func=cmd_tasks_get)
     p = tasks_sub.add_parser("wait", help="poll until a task reaches completed/failed/cancelled"); p.add_argument("task", help="task id"); p.add_argument("--interval", type=float, default=5.0, help="poll interval seconds (default 5)"); p.add_argument("--timeout", type=float, default=None, help="max seconds to wait; omit to wait forever"); p.add_argument("--status", action="store_true", help="print each observed non-terminal status to stderr"); p.add_argument("--short", action="store_true", help="trim final task to short summary form"); p.add_argument("--print-last", action="store_true", help="print last observed task JSON on timeout"); p.set_defaults(func=cmd_tasks_wait)
     p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
