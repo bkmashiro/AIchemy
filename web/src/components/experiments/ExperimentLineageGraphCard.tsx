@@ -62,13 +62,12 @@ function taskPriority(status: Task["status"]): number {
     case "completed":
       return 1;
     case "pending":
-    case "queued":
-    case "dispatched":
+    case "assigned":
+    case "blocked":
     case "paused":
       return 2;
     case "failed":
-    case "killed":
-    case "lost":
+    case "cancelled":
       return 3;
     default:
       return 2;
@@ -92,8 +91,7 @@ function taskStatusChipClass(status: Task["status"]): string {
     case "completed":
       return "text-green-400 border-green-700/60";
     case "failed":
-    case "killed":
-    case "lost":
+    case "cancelled":
       return "text-red-400 border-red-700/60";
     default:
       return "text-gray-500 border-gray-700/60";

@@ -1,5 +1,6 @@
 import { Stub, Task } from "../lib/api";
 import { formatBytes, formatRelTime, formatDuration } from "../lib/format";
+import { isActiveTaskStatus } from "../lib/taskStatus";
 
 interface Props {
   stubs: Stub[];
@@ -38,7 +39,7 @@ function StubResourceRow({ stub }: { stub: Stub }) {
     : null;
 
   const running = stub.tasks.filter((t) => t.status === "running").length;
-  const queued = stub.tasks.filter((t) => ["queued", "dispatched"].includes(t.status)).length;
+  const assigned = stub.tasks.filter((t) => t.status === "assigned").length;
 
   const utilColor = avgUtil > 80 ? "bg-green-500" : avgUtil > 40 ? "bg-blue-500" : "bg-gray-600";
   const vramColor = vramPct > 90 ? "bg-red-500" : vramPct > 70 ? "bg-yellow-500" : "bg-purple-500";
@@ -53,7 +54,7 @@ function StubResourceRow({ stub }: { stub: Stub }) {
         </div>
         <div className="flex items-center gap-2 shrink-0 text-xs text-gray-600">
           {running > 0 && <span className="text-blue-400">{running}r</span>}
-          {queued > 0 && <span className="text-yellow-400">{queued}q</span>}
+          {assigned > 0 && <span className="text-indigo-400">{assigned}a</span>}
           <span className="text-gray-700">/{stub.max_concurrent}</span>
         </div>
       </div>
@@ -201,7 +202,7 @@ export default function Resources({ stubs, globalQueue, connected }: Props) {
   const avgUtil = totalGpu > 0 ? Math.round(weightedUtil / totalGpu) : 0;
   const vramPct = totalVram > 0 ? Math.round((usedVram / totalVram) * 100) : 0;
 
-  const globalPending = globalQueue.filter((t) => ["pending", "queued"].includes(t.status));
+  const globalPending = globalQueue.filter((t) => isActiveTaskStatus(t.status));
   const totalRunning = stubs.reduce((n, s) => n + s.tasks.filter((t) => t.status === "running").length, 0);
   const totalSlots = stubs.reduce((n, s) => n + s.max_concurrent, 0);
 

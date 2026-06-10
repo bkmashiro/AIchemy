@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, lazy, Suspense } from "react";
 import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
 import { useSocket } from "./hooks/useSocket";
 import { hasToken, setOnAuthFail, clearToken } from "./lib/api";
+import { isActiveTaskStatus } from "./lib/taskStatus";
 import LoginPage from "./pages/LoginPage";
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
@@ -62,9 +63,7 @@ function AppInner(_props: { onLogout: () => void }) {
     (n, s) => n + s.tasks.filter((t) => t.status === "running").length,
     0
   );
-  const pendingCount = globalQueue.filter((t) =>
-    ["pending", "queued"].includes(t.status)
-  ).length;
+  const pendingCount = globalQueue.filter((t) => isActiveTaskStatus(t.status)).length;
   const onlineCount = stubs.filter((s) => s.status === "online").length;
 
   return (

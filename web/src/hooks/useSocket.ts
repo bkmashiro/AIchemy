@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { Stub, Task, GpuStats, SystemStats, getStoredToken, clearToken } from "../lib/api";
+import { isActiveTaskStatus, isTerminalTaskStatus } from "../lib/taskStatus";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "";
 const MAX_LOSS_POINTS = 200;
@@ -118,11 +119,9 @@ export function useSocket() {
         appendLoss(task.id, task.progress.loss);
       }
 
-      const TERMINAL = ["completed", "failed", "killed", "lost", "cancelled"];
-
       if (!task.stub_id || task.stub_id === "") {
         // No stub — belongs to global queue (or is terminal, remove it)
-        if (TERMINAL.includes(task.status)) {
+        if (isTerminalTaskStatus(task.status)) {
           setGlobalQueue((prev) => prev.filter((t) => t.id !== task.id));
         } else {
           setGlobalQueue((prev) => {
@@ -138,7 +137,7 @@ export function useSocket() {
       setStubs((prev) =>
         prev.map((s) => {
           if (s.id !== task.stub_id) return s;
-          if (TERMINAL.includes(task.status)) {
+          if (isTerminalTaskStatus(task.status)) {
             return { ...s, tasks: s.tasks.filter((t) => t.id !== task.id) };
           }
           const exists = s.tasks.find((t) => t.id === task.id);
@@ -195,7 +194,7 @@ export function useSocket() {
 
     // Periodic re-fetch of global queue to correct WS incremental drift.
     // Stubs are fully updated via WS events; only globalQueue needs correction
-    // because tasks moving between pending/queued/dispatched may be missed.
+    // because tasks moving between pending/assigned/blocked may be missed.
     const countRefreshInterval = setInterval(() => {
       fetch("/api/tasks?status_group=active&limit=500", {
         headers: { Authorization: `Bearer ${token}` },
@@ -210,7 +209,7 @@ export function useSocket() {
             // Preserve any tasks in prev that are missing from the API response
             // (could be very new tasks submitted after this fetch)
             const freshIds = new Set(unassigned.map((t) => t.id));
-            const keptPrev = prev.filter((t) => !freshIds.has(t.id) && ["pending", "queued", "blocked"].includes(t.status));
+            const keptPrev = prev.filter((t) => !freshIds.has(t.id) && isActiveTaskStatus(t.status));
             return [...unassigned, ...keptPrev];
           });
         })

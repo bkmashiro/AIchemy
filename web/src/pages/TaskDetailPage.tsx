@@ -5,6 +5,12 @@ import { taskDuration, taskEta, formatRelTime, generateDisplayName } from "../li
 import LogViewer from "../components/LogViewer";
 import ConfirmDialog from "../components/ConfirmDialog";
 import PhaseBadge from "../components/PhaseBadge";
+import {
+  TASK_STATUS_BADGE_CLASS,
+  isActiveTaskStatus,
+  isRetryableTaskStatus,
+  taskStatusLabel,
+} from "../lib/taskStatus";
 
 const MetricsChart = lazy(() => import("../components/MetricsChart"));
 
@@ -18,18 +24,6 @@ function MetricsChartFallback({ height = 220 }: { height?: number }) {
     </div>
   );
 }
-
-const STATUS_COLORS: Record<string, string> = {
-  running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
-  completed: "bg-green-900/30 text-green-400 border-green-700/40",
-  failed: "bg-red-900/40 text-red-400 border-red-700/50",
-  killed: "bg-gray-800/60 text-gray-500 border-gray-700/40",
-  lost: "bg-orange-900/30 text-orange-400 border-orange-700/40",
-  pending: "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
-  queued: "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
-  dispatched: "bg-indigo-900/30 text-indigo-400 border-indigo-700/40",
-  paused: "bg-orange-900/30 text-orange-300 border-orange-700/40",
-};
 
 function MetaRow({ label, value }: { label: string; value: React.ReactNode }) {
   if (!value) return null;
@@ -85,8 +79,8 @@ export default function TaskDetailPage() {
   if (loading && !task) return <div className="text-gray-500 text-center py-20">Loading...</div>;
   if (!task) return <div className="text-gray-500 text-center py-20">Task not found</div>;
 
-  const isActive = ["running", "paused", "queued", "dispatched", "pending"].includes(task.status);
-  const canRetry = ["failed", "killed", "lost"].includes(task.status);
+  const isActive = isActiveTaskStatus(task.status);
+  const canRetry = isRetryableTaskStatus(task.status);
   const displayName = generateDisplayName(task);
   const pct = task.progress ? Math.round((task.progress.step / task.progress.total) * 100) : null;
   const eta = task.status === "running" ? taskEta(task) : null;
@@ -105,8 +99,8 @@ export default function TaskDetailPage() {
         <div>
           <h1 className="text-xl font-bold text-white">{displayName}</h1>
           <div className="flex items-center gap-3 mt-2">
-            <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold border ${STATUS_COLORS[task.status] || ""}`}>
-              {task.status.toUpperCase()}
+            <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold border ${TASK_STATUS_BADGE_CLASS[task.status] || ""}`}>
+              {taskStatusLabel(task)}
             </span>
             {task.phase && <PhaseBadge phase={task.phase} />}
             <span className="text-sm text-gray-500 font-mono">#{task.seq}</span>
@@ -132,14 +126,14 @@ export default function TaskDetailPage() {
           )}
           {isActive && (
             <button onClick={() => setConfirmAction({
-              action: () => doAction(() => tasksApi.patch(task.id, { status: "killed" })),
-              title: "Kill Task",
-              message: `Kill task #${task.seq} "${displayName}"?`,
+              action: () => doAction(() => tasksApi.patch(task.id, { status: "cancelled" })),
+              title: "Cancel Task",
+              message: `Cancel task #${task.seq} "${displayName}"?`,
               variant: "danger",
-              confirmLabel: "Kill",
+              confirmLabel: "Cancel",
             })} disabled={acting}
               className="px-3 py-1.5 text-sm bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-50 transition-colors">
-              Kill
+              Cancel
             </button>
           )}
           {canRetry && (

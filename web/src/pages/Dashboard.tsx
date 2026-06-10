@@ -4,6 +4,7 @@ import { Stub, Task, overviewApi, OverviewData, costApi, CostSummary, deployApi,
 import { formatRelTime, generateDisplayName } from "../lib/format";
 import StubCard from "../components/StubCard";
 import TaskForm from "../components/TaskForm";
+import { TASK_STATUS_TEXT_CLASS, isTerminalTaskStatus, taskStatusLabel } from "../lib/taskStatus";
 
 interface Props {
   stubs: Stub[];
@@ -27,13 +28,13 @@ function PendingTaskRow({ task, onClick }: { task: Task; onClick: () => void }) 
   const displayName = generateDisplayName(task);
   const statusColor: Record<string, string> = {
     pending: "text-yellow-400",
-    queued: "text-yellow-400",
-    dispatched: "text-indigo-400",
+    assigned: "text-indigo-400",
+    blocked: "text-purple-300",
   };
   return (
     <div className="flex items-center gap-3 py-1.5 border-b border-gray-800/50 last:border-0 cursor-pointer hover:bg-gray-800/30 transition-colors rounded px-1" onClick={onClick}>
       <span className={`text-xs font-semibold ${statusColor[task.status] || "text-gray-400"}`}>
-        {task.status.toUpperCase()}
+        {taskStatusLabel(task)}
       </span>
       <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq}</span>
       <span className="text-sm text-gray-300 truncate flex-1" title={displayName}>{displayName}</span>
@@ -47,16 +48,11 @@ function PendingTaskRow({ task, onClick }: { task: Task; onClick: () => void }) 
 
 function RecentTaskRow({ task, onClick }: { task: Task; onClick: () => void }) {
   const displayName = generateDisplayName(task);
-  const statusColors: Record<string, string> = {
-    completed: "text-green-400",
-    failed: "text-red-400",
-    killed: "text-gray-500",
-    lost: "text-orange-400",
-  };
+  const statusColors = TASK_STATUS_TEXT_CLASS;
   return (
     <div className="flex items-center gap-3 py-1.5 border-b border-gray-800/50 last:border-0 cursor-pointer hover:bg-gray-800/30 transition-colors rounded px-1" onClick={onClick}>
       <span className={`text-xs font-semibold ${statusColors[task.status] || "text-gray-400"}`}>
-        {task.status.toUpperCase()}
+        {taskStatusLabel(task)}
       </span>
       <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq}</span>
       <span className="text-sm text-gray-300 truncate flex-1" title={displayName}>{displayName}</span>
@@ -162,9 +158,9 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
   const offlineStubs = stubs.filter((s) => s.status !== "online");
 
   const totalRunning = stubs.reduce((n, s) => n + s.tasks.filter((t) => t.status === "running").length, 0);
-  const totalQueued = stubs.reduce((n, s) => n + s.tasks.filter((t) => ["queued", "dispatched"].includes(t.status)).length, 0);
+  const totalAssigned = stubs.reduce((n, s) => n + s.tasks.filter((t) => t.status === "assigned").length, 0);
   const totalPaused = stubs.reduce((n, s) => n + s.tasks.filter((t) => t.status === "paused").length, 0);
-  const globalPending = globalQueue.filter((t) => ["pending", "queued"].includes(t.status));
+  const globalPending = globalQueue.filter((t) => t.status === "pending" || t.status === "blocked");
 
   let totalVram = 0, usedVram = 0;
   for (const s of onlineStubs) {
@@ -178,7 +174,7 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
 
   // Recent terminal tasks from stubs
   const recentTasks = stubs
-    .flatMap((s) => s.tasks.filter((t) => ["completed", "failed", "killed", "lost"].includes(t.status)))
+    .flatMap((s) => s.tasks.filter((t) => isTerminalTaskStatus(t.status)))
     .sort((a, b) => {
       const aTime = a.finished_at || a.created_at;
       const bTime = b.finished_at || b.created_at;
@@ -203,7 +199,7 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
         />
         <StatTile
           label="Queued"
-          value={totalQueued + globalPending.length}
+          value={totalAssigned + globalPending.length}
           sub={globalPending.length > 0 ? `${globalPending.length} global` : undefined}
           color="text-yellow-400"
         />

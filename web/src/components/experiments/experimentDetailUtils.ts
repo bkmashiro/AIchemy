@@ -208,7 +208,7 @@ export function getCellStatus(
   if (!task) return "pending";
   const validation = exp.results[task.id];
   if (validation) return validation.passed ? "passed" : "failed";
-  if (["running", "dispatched"].includes(task.status)) return "running";
+  if (task.status === "running" || task.status === "assigned") return "running";
   if (task.status === "completed") return "running"; // completed but no eval yet
   return "pending";
 }

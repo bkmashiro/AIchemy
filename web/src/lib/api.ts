@@ -54,14 +54,13 @@ export interface PaginatedTasks {
 
 export type TaskStatus =
   | "pending"
-  | "queued"
-  | "dispatched"
+  | "assigned"
   | "running"
   | "paused"
   | "completed"
   | "failed"
-  | "killed"
-  | "lost";
+  | "cancelled"
+  | "blocked";
 
 export interface TaskProgress {
   step: number;
@@ -140,6 +139,12 @@ export interface Task {
   // Dispatch tracking
   dispatch_attempts?: number;
   target_stub_id?: string;
+
+  // Disconnect / death classification
+  disconnected_at?: string;
+  stub_offline?: boolean;
+  death_cause?: string;
+  has_checkpoint?: boolean;
 }
 
 export interface GpuStatEntry {
