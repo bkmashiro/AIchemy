@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { store } from "../store";
-import { WebhookEvent, WebhookSubscription } from "../types";
-import { isWebhookEvent, postWebhook } from "../webhooks";
+import { Task, TaskStatus, WebhookEvent, WebhookSubscription } from "../types";
+import { buildTaskWebhookPayload, isWebhookEvent, postWebhook } from "../webhooks";
 
 function publicSubscription(sub: WebhookSubscription): Omit<WebhookSubscription, "secret"> & { has_secret: boolean } {
   const { secret: _secret, ...rest } = sub;
@@ -32,6 +32,66 @@ function validateUrl(value: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function buildTestTask(event: WebhookEvent, taskPayload: unknown): Task {
+  const bodyTask = typeof taskPayload === "object" && taskPayload !== null ? taskPayload as Partial<Task> : {};
+  const safeLogBuffer = Array.isArray(bodyTask.log_buffer)
+    ? bodyTask.log_buffer.filter((line): line is string => typeof line === "string")
+    : [];
+
+  const now = new Date().toISOString();
+  const defaultTask: Task = {
+    id: "test-task",
+    seq: 1,
+    fingerprint: "test-fingerprint",
+    display_name: "webhook test",
+    script: "",
+    command: "",
+    status: "running",
+    priority: 0,
+    created_at: now,
+    log_buffer: safeLogBuffer,
+    retry_count: 0,
+    max_retries: 0,
+    should_stop: false,
+    should_checkpoint: false,
+    exit_code: undefined,
+    name: undefined,
+  };
+
+  const baseTask = {
+    ...defaultTask,
+    ...bodyTask,
+    status: event.replace("task.", "") as TaskStatus,
+    log_buffer: safeLogBuffer,
+  };
+
+  return {
+    ...baseTask,
+    id: typeof baseTask.id === "string" ? baseTask.id : "test-task",
+    seq: typeof baseTask.seq === "number" ? baseTask.seq : 1,
+    fingerprint: typeof baseTask.fingerprint === "string" ? baseTask.fingerprint : "test-fingerprint",
+    display_name: typeof baseTask.display_name === "string" && baseTask.display_name.trim().length > 0
+      ? baseTask.display_name
+      : "webhook test",
+    script: typeof baseTask.script === "string" ? baseTask.script : "",
+    command: typeof baseTask.command === "string" ? baseTask.command : "",
+    priority: typeof baseTask.priority === "number" ? baseTask.priority : 0,
+    created_at: typeof baseTask.created_at === "string" && baseTask.created_at.trim().length > 0
+      ? baseTask.created_at
+      : now,
+    retry_count: typeof baseTask.retry_count === "number" ? baseTask.retry_count : 0,
+    max_retries: typeof baseTask.max_retries === "number" ? baseTask.max_retries : 0,
+    should_stop: Boolean(baseTask.should_stop),
+    should_checkpoint: Boolean(baseTask.should_checkpoint),
+    exit_code: typeof baseTask.exit_code === "number" ? baseTask.exit_code : undefined,
+    run_dir: typeof baseTask.run_dir === "string" ? baseTask.run_dir : undefined,
+  };
+}
+
+function concreteTestEvent(event: WebhookEvent): WebhookEvent {
+  return event === "task.terminal" ? "task.failed" : event;
 }
 
 export function createWebhooksRouter(): Router {
@@ -71,15 +131,14 @@ export function createWebhooksRouter(): Router {
   router.post("/:id/test", async (req: Request, res: Response) => {
     const sub = store.getWebhookSubscription(req.params.id);
     if (!sub) { res.status(404).json({ error: "subscription not found" }); return; }
-    const task = req.body?.task;
-    const event = parseEvents(req.body?.event ? [req.body.event] : sub.events)?.[0] ?? "task.failed";
+    const taskBody = req.body?.task;
+    const event = concreteTestEvent(parseEvents(req.body?.event ? [req.body.event] : sub.events)?.[0] ?? "task.failed");
+    const task = buildTestTask(event, taskBody);
     const payload = {
+      ...buildTaskWebhookPayload({ status: "running" as TaskStatus }, task, event),
       event,
-      previous_status: "running",
-      occurred_at: new Date().toISOString(),
-      task: task ?? { id: "test-task", status: event.replace("task.", ""), display_name: "webhook test" },
-      subscription: { id: sub.id, name: sub.name },
       test: true,
+      subscription: { id: sub.id, name: sub.name },
     };
     try {
       await postWebhook(sub, payload, event);
