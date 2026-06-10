@@ -220,6 +220,45 @@ def test_stubs_exec_preserves_single_shell_command_string(monkeypatch):
     assert calls[1]["body"]["command"] == "pwd && hostname"
 
 
+def test_tasks_top_summarizes_active_and_recent_failed(monkeypatch, capsys):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "top", "--limit", "3", "--failed-limit", "2"],
+        [
+            {"tasks": [
+                {"id": "run-1", "seq": 11, "display_name": "train", "status": "running", "stub_name": "a30", "started_at": "2026-06-10T10:00:00Z", "pid": 123, "run_dir": "/runs/train"},
+                {"id": "block-1", "seq": 10, "name": "eval", "status": "blocked", "error_message": "Dependency dep-1 failed", "target_stub_id": "stub-a"},
+                {"id": "pend-1", "seq": 9, "name": "queued", "status": "pending", "target_tags": ["a30", "slurm"]},
+            ]},
+            {"tasks": [
+                {"id": "fail-1", "seq": 8, "name": "bad", "status": "failed", "exit_code": 137, "death_cause": "oom", "error_message": "CUDA out of memory"},
+            ]},
+        ],
+    )
+
+    assert [(c["method"], c["url"]) for c in calls] == [
+        ("GET", "http://localhost:3002/api/tasks?limit=3&logs=false&sort=seq&order=desc&status_group=active"),
+        ("GET", "http://localhost:3002/api/tasks?limit=2&logs=false&sort=seq&order=desc&status=failed"),
+    ]
+    out = json.loads(capsys.readouterr().out)
+    assert out["counts"] == {"active": 3, "running": 1, "blocked": 1, "pending": 1, "assigned": 0, "paused": 0, "failed_recent": 1}
+    assert out["running"][0] == {
+        "seq": 11,
+        "id": "run-1",
+        "name": "train",
+        "status": "running",
+        "stub_id": None,
+        "stub_name": "a30",
+        "started_at": "2026-06-10T10:00:00Z",
+        "pid": 123,
+        "run_dir": "/runs/train",
+        "target": {"target_stub_id": None, "target_tags": None},
+    }
+    assert out["blocked"][0]["reason"] == "Dependency dep-1 failed"
+    assert out["pending"][0]["target"] == {"target_stub_id": None, "target_tags": ["a30", "slurm"]}
+    assert out["failed_recent"][0]["failure"] == {"exit_code": 137, "death_cause": "oom", "error_message": "CUDA out of memory"}
+
+
 def test_tasks_resubmit_resume_drops_run_dir_and_targets_tags(monkeypatch):
     source = {
         "id": "task-1",
