@@ -494,6 +494,7 @@ export interface StubTarget {
   tags?: string;
   default_cwd?: string;
   env_setup?: string;
+  idle_timeout?: number;
   default_env?: Record<string, string>;
   allow_exec?: boolean;
   // SLURM-specific fields
