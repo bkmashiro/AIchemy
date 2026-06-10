@@ -66,6 +66,22 @@ class ApiClient:
     def get(self, path: str) -> Any:
         return self.request("GET", path)
 
+    def raw_get(self, path: str) -> Any:
+        req = Request(f"{self.server}{path}", method="GET")
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:  # noqa: S310 - operator-supplied URL
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw else None
+        except HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                detail = json.loads(raw)
+            except json.JSONDecodeError:
+                detail = raw
+            raise AlchError(f"HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise AlchError(f"request failed: {exc.reason}") from exc
+
     def post(self, path: str, body: dict[str, Any] | None = None) -> Any:
         return self.request("POST", path, body or {})
 
@@ -367,6 +383,35 @@ def cmd_webhooks_test(args: argparse.Namespace, client: ApiClient) -> None:
 
 def cmd_webhooks_deliveries(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.get(f"/webhooks/{args.subscription}/deliveries?{urlencode({'limit': args.limit})}"))
+
+
+def cmd_doctor(_args: argparse.Namespace, client: ApiClient) -> None:
+    health = client.raw_get("/health")
+    stubs = client.get("/stubs")
+    tasks_payload = client.get(f"/tasks?{urlencode({'limit': 50, 'logs': 'false', 'sort': 'seq', 'order': 'desc', 'status_group': 'active'})}")
+    webhooks = client.get("/webhooks")
+    tasks = tasks_payload.get("tasks", []) if isinstance(tasks_payload, dict) else []
+    counts = {
+        "online_stubs": sum(1 for stub in stubs if stub.get("status") == "online"),
+        "active_tasks": len(tasks),
+        "running_tasks": sum(1 for task in tasks if task.get("status") == "running"),
+        "blocked_tasks": sum(1 for task in tasks if task.get("status") == "blocked"),
+        "webhooks": len(webhooks),
+        "enabled_webhooks": sum(1 for webhook in webhooks if webhook.get("enabled", True)),
+    }
+    checks = [
+        {"name": "server", "ok": bool(isinstance(health, dict) and health.get("ok", True))},
+        {"name": "stubs", "ok": counts["online_stubs"] > 0},
+        {"name": "tasks", "ok": True},
+        {"name": "webhooks", "ok": True},
+    ]
+    print_json({
+        "ok": all(check["ok"] for check in checks),
+        "server": client.server,
+        "health": health,
+        "counts": counts,
+        "checks": checks,
+    })
 
 
 def cmd_tasks_ls(args: argparse.Namespace, client: ApiClient) -> None:
@@ -1049,6 +1094,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_config_set, no_client=True)
     p = config_sub.add_parser("show", help="show persisted CLI config (never prints tokens)")
     p.set_defaults(func=cmd_config_show, no_client=True)
+
+    p = sub.add_parser("doctor", help="read-only health summary for server, stubs, tasks, and webhooks")
+    p.set_defaults(func=cmd_doctor)
 
     stubs = sub.add_parser("stubs", help="list, drain, or restart stubs")
     stubs_sub = stubs.add_subparsers(dest="cmd", required=True)
