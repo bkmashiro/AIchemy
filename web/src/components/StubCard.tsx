@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Stub } from "../lib/api";
 import { formatBytes, formatDuration } from "../lib/format";
 import TaskRow from "./TaskRow";
+import { isActiveTaskStatus, isTerminalTaskStatus } from "../lib/taskStatus";
 
 function formatWalltime(seconds: number): string {
   return formatDuration(seconds * 1000);
@@ -20,7 +21,7 @@ export default memo(function StubCard({ stub, lossHistory, logBuffers, onTaskUpd
   const navigate = useNavigate();
 
   const running = stub.tasks.filter((t) => t.status === "running").length;
-  const queued = stub.tasks.filter((t) => t.status === "queued" || t.status === "dispatched").length;
+  const assigned = stub.tasks.filter((t) => t.status === "assigned").length;
   const paused = stub.tasks.filter((t) => t.status === "paused").length;
   const failed = stub.tasks.filter((t) => t.status === "failed").length;
 
@@ -45,11 +46,9 @@ export default memo(function StubCard({ stub, lossHistory, logBuffers, onTaskUpd
   const utilColor = utilPct > 80 ? "bg-green-500" : utilPct > 40 ? "bg-blue-500" : "bg-gray-600";
   const vramColor = vramPct > 90 ? "bg-red-500" : vramPct > 70 ? "bg-yellow-500" : "bg-purple-500";
 
-  const activeTasks = stub.tasks.filter(
-    (t) => !["completed", "failed", "killed", "lost"].includes(t.status)
-  );
+  const activeTasks = stub.tasks.filter((t) => isActiveTaskStatus(t.status));
   const recentTasks = stub.tasks
-    .filter((t) => ["completed", "failed", "killed", "lost"].includes(t.status))
+    .filter((t) => isTerminalTaskStatus(t.status))
     .slice(-5)
     .reverse();
 
@@ -249,10 +248,10 @@ export default memo(function StubCard({ stub, lossHistory, logBuffers, onTaskUpd
           onClick={() => setExpanded((v) => !v)}
         >
           {running > 0 && <span className="text-blue-400">{running} running</span>}
-          {queued > 0 && <span className="text-yellow-400">{queued} queued</span>}
+          {assigned > 0 && <span className="text-indigo-400">{assigned} assigned</span>}
           {paused > 0 && <span className="text-orange-400">{paused} paused</span>}
           {failed > 0 && <span className="text-red-400">{failed} failed</span>}
-          {running === 0 && queued === 0 && paused === 0 && failed === 0 && (
+          {running === 0 && assigned === 0 && paused === 0 && failed === 0 && (
             <span className="text-gray-600">idle</span>
           )}
           <span className="ml-auto text-gray-600">{stub.max_concurrent} slots</span>

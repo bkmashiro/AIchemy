@@ -4,6 +4,12 @@ import { taskDuration, taskEta, generateDisplayName } from "../lib/format";
 import LogViewer from "./LogViewer";
 import ConfirmDialog from "./ConfirmDialog";
 import PhaseBadge from "./PhaseBadge";
+import {
+  TASK_STATUS_BADGE_CLASS,
+  isActiveTaskStatus,
+  isRetryableTaskStatus,
+  taskStatusLabel,
+} from "../lib/taskStatus";
 
 const LossChart = lazy(() =>
   import("./LossChart").then((m) => ({ default: m.LossChart })),
@@ -29,37 +35,22 @@ interface Props {
   compact?: boolean;
 }
 
-// Status badge colors per spec §10
-const STATUS_BADGE: Record<string, { bg: string; text: string; border: string }> = {
-  running:    { bg: "bg-blue-900/40",   text: "text-blue-300",   border: "border-blue-700/50" },
-  completed:  { bg: "bg-green-900/30",  text: "text-green-400",  border: "border-green-700/40" },
-  failed:     { bg: "bg-red-900/40",    text: "text-red-400",    border: "border-red-700/50" },
-  killed:     { bg: "bg-gray-800/60",   text: "text-gray-500",   border: "border-gray-700/40" },
-  lost:       { bg: "bg-orange-900/30", text: "text-orange-400", border: "border-orange-700/40" },
-  pending:    { bg: "bg-yellow-900/30", text: "text-yellow-400", border: "border-yellow-700/40" },
-  queued:     { bg: "bg-yellow-900/30", text: "text-yellow-400", border: "border-yellow-700/40" },
-  dispatched: { bg: "bg-indigo-900/30", text: "text-indigo-400", border: "border-indigo-700/40" },
-  paused:     { bg: "bg-orange-900/30", text: "text-orange-300", border: "border-orange-700/40" },
-};
-
 // Row background per status
 const ROW_BG: Record<string, string> = {
   running:    "bg-blue-950/20 border-blue-900/30",
   completed:  "bg-green-950/10 border-green-900/20",
   failed:     "bg-red-950/20 border-red-900/30",
-  killed:     "bg-gray-900/30 border-gray-800/30",
-  lost:       "bg-orange-950/20 border-orange-900/30",
+  cancelled:  "bg-gray-900/30 border-gray-800/30",
   pending:    "bg-yellow-950/10 border-yellow-900/20",
-  queued:     "bg-yellow-950/10 border-yellow-900/20",
-  dispatched: "bg-indigo-950/10 border-indigo-900/20",
+  assigned:   "bg-indigo-950/10 border-indigo-900/20",
+  blocked:    "bg-purple-950/10 border-purple-900/20",
   paused:     "bg-orange-950/10 border-orange-900/20",
 };
 
-function StatusBadge({ status }: { status: string }) {
-  const cfg = STATUS_BADGE[status] || { bg: "bg-gray-800", text: "text-gray-400", border: "border-gray-700" };
+function StatusBadge({ task }: { task: Task }) {
   return (
-    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold tracking-wide border ${cfg.bg} ${cfg.text} ${cfg.border}`}>
-      {status.toUpperCase()}
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-semibold tracking-wide border ${TASK_STATUS_BADGE_CLASS[task.status]}`}>
+      {taskStatusLabel(task)}
     </span>
   );
 }
@@ -82,8 +73,8 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
   const eta = task.status === "running" ? taskEta(task) : null;
   const duration = taskDuration(task);
 
-  const isActive = ["running", "paused", "queued", "dispatched", "pending"].includes(task.status);
-  const canRetry = ["failed", "killed", "lost"].includes(task.status);
+  const isActive = isActiveTaskStatus(task.status);
+  const canRetry = isRetryableTaskStatus(task.status);
 
   const doAction = async (action: () => Promise<any>) => {
     setActing(true);
@@ -97,14 +88,14 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
     }
   };
 
-  const handleKill = (e: React.MouseEvent) => {
+  const handleCancelTask = (e: React.MouseEvent) => {
     e.stopPropagation();
     setConfirmAction({
-      action: () => doAction(() => tasksApi.patch(task.id, { status: "killed" })),
-      title: "Kill Task",
-      message: `Kill task #${task.seq} "${displayName}"?${stubName ? ` (on ${stubName})` : ""} Status: ${task.status}`,
+      action: () => doAction(() => tasksApi.patch(task.id, { status: "cancelled" })),
+      title: "Cancel Task",
+      message: `Cancel task #${task.seq} "${displayName}"?${stubName ? ` (on ${stubName})` : ""} Status: ${task.status}`,
       variant: "danger",
-      confirmLabel: "Kill",
+      confirmLabel: "Cancel",
     });
   };
 
@@ -181,11 +172,11 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
                 )}
                 {isActive && (
                   <button
-                    onClick={handleKill}
+                    onClick={handleCancelTask}
                     disabled={acting}
                     className="px-2 py-1 text-xs bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-50 transition-colors"
                   >
-                    Kill
+                    Cancel
                   </button>
                 )}
                 {canRetry && (
@@ -202,7 +193,7 @@ export default memo(function TaskRow({ task, stubName, lossHistory, liveLogLines
 
             {/* Sub line: status, phase, duration, progress, loss, ETA */}
             <div className="flex items-center gap-2 mt-1 flex-wrap">
-              <StatusBadge status={task.status} />
+              <StatusBadge task={task} />
               {task.phase && <PhaseBadge phase={task.phase} />}
               <span className="text-xs text-gray-500 font-mono">{duration}</span>
               {task.progress && (

@@ -5,18 +5,7 @@ import { formatRelTime, formatBytes, formatDuration } from "../lib/format";
 import { Socket } from "socket.io-client";
 import RemoteShell from "../components/RemoteShell";
 import ConfirmDialog from "../components/ConfirmDialog";
-
-const STATUS_COLORS: Record<string, string> = {
-  running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
-  completed: "bg-green-900/30 text-green-400 border-green-700/40",
-  failed: "bg-red-900/40 text-red-400 border-red-700/50",
-  killed: "bg-gray-800/60 text-gray-500 border-gray-700/40",
-  lost: "bg-orange-900/30 text-orange-400 border-orange-700/40",
-  pending: "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
-  queued: "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
-  dispatched: "bg-indigo-900/30 text-indigo-400 border-indigo-700/40",
-  paused: "bg-orange-900/30 text-orange-300 border-orange-700/40",
-};
+import { TASK_STATUS_BADGE_CLASS, isActiveTaskStatus, taskStatusLabel } from "../lib/taskStatus";
 
 function MetaRow({ label, value }: { label: string; value: React.ReactNode }) {
   if (value === null || value === undefined || value === "") return null;
@@ -109,9 +98,7 @@ export default function StubDetailPage({ socket }: { socket: Socket | null }) {
 
   const isOnline = stub.status === "online";
   const gpus = stub.gpu_stats?.gpus || [];
-  const activeTasks = stub.tasks.filter(
-    (t) => !["completed", "failed", "killed", "lost"].includes(t.status)
-  );
+  const activeTasks = stub.tasks.filter((t) => isActiveTaskStatus(t.status));
   const hasRunningTasks = stub.tasks.some((t) => t.status === "running");
 
   return (
@@ -344,8 +331,8 @@ export default function StubDetailPage({ socket }: { socket: Socket | null }) {
                   onClick={() => navigate(`/tasks/${task.id}`)}
                   className="flex items-center gap-3 py-1.5 px-2 rounded border border-transparent hover:border-gray-700 hover:bg-gray-800/40 cursor-pointer transition-colors"
                 >
-                  <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold border ${STATUS_COLORS[task.status] || ""}`}>
-                    {task.status.toUpperCase()}
+                  <span className={`inline-flex px-2 py-0.5 rounded text-xs font-semibold border ${TASK_STATUS_BADGE_CLASS[task.status] || ""}`}>
+                    {taskStatusLabel(task)}
                   </span>
                   <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq}</span>
                   <span className="text-sm text-gray-300 truncate flex-1">{displayName}</span>

@@ -3,6 +3,7 @@ import { useParams, Link } from "react-router-dom";
 import { Grid, Task, Stub, gridsApi, stubsApi } from "../lib/api";
 import { formatRelTime } from "../lib/format";
 import ConfirmDialog from "../components/ConfirmDialog";
+import { TASK_STATUS_TEXT_CLASS } from "../lib/taskStatus";
 
 type GridDetail = Grid & { tasks: Task[] };
 
@@ -14,17 +15,7 @@ const STATUS_BADGE: Record<string, string> = {
   failed:    "bg-red-900/30 text-red-400 border-red-700/40",
 };
 
-const TASK_STATUS_COLOR: Record<string, string> = {
-  pending:   "text-yellow-400",
-  queued:    "text-yellow-400",
-  dispatched:"text-indigo-400",
-  running:   "text-blue-400",
-  paused:    "text-orange-400",
-  completed: "text-green-400",
-  failed:    "text-red-400",
-  killed:    "text-gray-500",
-  lost:      "text-orange-500",
-};
+const TASK_STATUS_COLOR = TASK_STATUS_TEXT_CLASS;
 
 function MetricCell({ value }: { value?: number }) {
   if (value === undefined) return <td className="px-3 py-2 text-gray-700">—</td>;
@@ -208,7 +199,7 @@ export default function GridView() {
         <div className="flex items-center gap-6 flex-wrap">
           {Object.entries(statusCounts).map(([status, count]) => (
             <div key={status} className="flex items-center gap-1.5">
-              <span className={`text-xs font-semibold ${TASK_STATUS_COLOR[status] || "text-gray-400"}`}>
+              <span className={`text-xs font-semibold ${TASK_STATUS_COLOR[status as Task["status"]] || "text-gray-400"}`}>
                 {count}
               </span>
               <span className="text-xs text-gray-500">{status}</span>

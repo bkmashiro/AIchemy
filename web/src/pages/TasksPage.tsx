@@ -1,23 +1,16 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { Task, TaskStatus, tasksApi } from "../lib/api";
+import { Task, tasksApi } from "../lib/api";
 import { formatRelTime, taskDuration, generateDisplayName } from "../lib/format";
 import ConfirmDialog from "../components/ConfirmDialog";
 import PhaseBadge from "../components/PhaseBadge";
-
-const STATUS_ORDER: TaskStatus[] = ["running", "dispatched", "queued", "pending", "paused", "completed", "failed", "killed", "lost"];
-
-const STATUS_COLORS: Record<string, string> = {
-  running: "bg-blue-900/40 text-blue-300 border-blue-700/50",
-  completed: "bg-green-900/30 text-green-400 border-green-700/40",
-  failed: "bg-red-900/40 text-red-400 border-red-700/50",
-  killed: "bg-gray-800/60 text-gray-500 border-gray-700/40",
-  lost: "bg-orange-900/30 text-orange-400 border-orange-700/40",
-  pending: "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
-  queued: "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
-  dispatched: "bg-indigo-900/30 text-indigo-400 border-indigo-700/40",
-  paused: "bg-orange-900/30 text-orange-300 border-orange-700/40",
-};
+import {
+  TASK_STATUS_BADGE_CLASS,
+  TASK_STATUS_ORDER,
+  isActiveTaskStatus,
+  isRetryableTaskStatus,
+  taskStatusLabel,
+} from "../lib/taskStatus";
 
 type Filter = "all" | "active" | "terminal";
 
@@ -68,7 +61,7 @@ export default function TasksPage() {
     finally { setActing((s) => { const n = new Set(s); n.delete(id); return n; }); }
   };
 
-  const batchKillPending = () => {
+  const batchCancelPending = () => {
     const pendingTasks = tasks.filter((t) => t.status === "pending");
     if (pendingTasks.length === 0) return;
     setConfirmAction({
@@ -76,11 +69,11 @@ export default function TasksPage() {
         await tasksApi.batch("kill", pendingTasks.map((t) => t.id));
         fetchTasks();
       },
-      title: "Kill Pending Tasks",
-      message: `Kill ${pendingTasks.length} pending task${pendingTasks.length > 1 ? "s" : ""}?`,
+      title: "Cancel Pending Tasks",
+      message: `Cancel ${pendingTasks.length} pending task${pendingTasks.length > 1 ? "s" : ""}?`,
       items: pendingTasks.map((t) => `#${t.seq} ${generateDisplayName(t)}`),
       variant: "danger",
-      confirmLabel: "Kill All",
+      confirmLabel: "Cancel All",
     });
   };
 
@@ -93,8 +86,8 @@ export default function TasksPage() {
         <h1 className="text-lg font-bold text-white">Tasks</h1>
         <div className="flex items-center gap-2">
           {(counts["pending"] || 0) > 0 && (
-            <button onClick={batchKillPending} className="px-3 py-1 text-xs bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 transition-colors">
-              Kill {counts["pending"]} pending
+            <button onClick={batchCancelPending} className="px-3 py-1 text-xs bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 transition-colors">
+              Cancel {counts["pending"]} pending
             </button>
           )}
         </div>
@@ -102,8 +95,8 @@ export default function TasksPage() {
 
       {/* Status summary */}
       <div className="flex items-center gap-2 flex-wrap">
-        {STATUS_ORDER.map((s) => counts[s] ? (
-          <span key={s} className={`text-xs px-2 py-0.5 rounded border ${STATUS_COLORS[s]}`}>
+        {TASK_STATUS_ORDER.map((s) => counts[s] ? (
+          <span key={s} className={`text-xs px-2 py-0.5 rounded border ${TASK_STATUS_BADGE_CLASS[s]}`}>
             {s} {counts[s]}
           </span>
         ) : null)}
@@ -140,8 +133,8 @@ export default function TasksPage() {
           </thead>
           <tbody>
             {tasks.map((t) => {
-              const isActive = ["running", "paused", "queued", "dispatched", "pending"].includes(t.status);
-              const canRetry = ["failed", "killed", "lost"].includes(t.status);
+              const isActive = isActiveTaskStatus(t.status);
+              const canRetry = isRetryableTaskStatus(t.status);
               const displayName = generateDisplayName(t);
               const pct = t.progress ? Math.round((t.progress.step / t.progress.total) * 100) : null;
               return (
@@ -158,8 +151,8 @@ export default function TasksPage() {
                     )}
                   </td>
                   <td className="px-4 py-2">
-                    <span className={`inline-flex px-1.5 py-0.5 rounded text-xs font-semibold border ${STATUS_COLORS[t.status] || ""}`}>
-                      {t.status.toUpperCase()}
+                    <span className={`inline-flex px-1.5 py-0.5 rounded text-xs font-semibold border ${TASK_STATUS_BADGE_CLASS[t.status] || ""}`}>
+                      {taskStatusLabel(t)}
                     </span>
                     {t.phase && <span className="ml-1.5"><PhaseBadge phase={t.phase} /></span>}
                   </td>
@@ -173,10 +166,10 @@ export default function TasksPage() {
                     <div className="flex items-center justify-end gap-1">
                       {isActive && (
                         <button
-                          onClick={(e) => doAction(t.id, () => tasksApi.patch(t.id, { status: "killed" }), e)}
+                          onClick={(e) => doAction(t.id, () => tasksApi.patch(t.id, { status: "cancelled" }), e)}
                           disabled={acting.has(t.id)}
                           className="px-2 py-0.5 text-xs bg-red-900/50 hover:bg-red-800 border border-red-800/50 rounded text-red-300 disabled:opacity-50"
-                        >Kill</button>
+                        >Cancel</button>
                       )}
                       {canRetry && (
                         <button
