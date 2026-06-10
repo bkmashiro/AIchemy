@@ -428,6 +428,71 @@ def cmd_tasks_ls(args: argparse.Namespace, client: ApiClient) -> None:
     print_json([short_task(t) for t in tasks])
 
 
+def task_reason(task: dict[str, Any]) -> str | None:
+    for key in ("error_message", "death_cause", "reason"):
+        value = task.get(key)
+        if value:
+            return str(value)
+    exit_code = task.get("exit_code")
+    if exit_code is not None:
+        return f"exit_code={exit_code}"
+    return None
+
+
+def task_failure(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "exit_code": task.get("exit_code"),
+        "death_cause": task.get("death_cause"),
+        "error_message": task.get("error_message"),
+    }
+
+
+def task_target(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target_stub_id": task.get("target_stub_id"),
+        "target_tags": task.get("target_tags"),
+    }
+
+
+def top_task(task: dict[str, Any]) -> dict[str, Any]:
+    row = short_task(task)
+    row["target"] = task_target(task)
+    reason = task_reason(task)
+    if reason:
+        row["reason"] = reason
+    if task.get("status") in TERMINAL_STATUSES or task.get("exit_code") is not None or task.get("death_cause") or task.get("error_message"):
+        row["failure"] = task_failure(task)
+    return row
+
+
+def cmd_tasks_top(args: argparse.Namespace, client: ApiClient) -> None:
+    active_params = {"limit": args.limit, "logs": "false", "sort": "seq", "order": "desc", "status_group": "active"}
+    failed_params = {"limit": args.failed_limit, "logs": "false", "sort": "seq", "order": "desc", "status": "failed"}
+    active_payload = client.get(f"/tasks?{urlencode(active_params)}")
+    failed_payload = client.get(f"/tasks?{urlencode(failed_params)}")
+    active_tasks = active_payload.get("tasks", []) if isinstance(active_payload, dict) else []
+    failed_tasks = failed_payload.get("tasks", []) if isinstance(failed_payload, dict) else []
+
+    by_status = {status: [task for task in active_tasks if task.get("status") == status] for status in ACTIVE_STATUSES}
+    print_json({
+        "counts": {
+            "active": len(active_tasks),
+            "running": len(by_status["running"]),
+            "blocked": len(by_status["blocked"]),
+            "pending": len(by_status["pending"]),
+            "assigned": len(by_status["assigned"]),
+            "paused": len(by_status["paused"]),
+            "failed_recent": len(failed_tasks),
+        },
+        "running": [top_task(task) for task in by_status["running"]],
+        "blocked": [top_task(task) for task in by_status["blocked"]],
+        "pending": [top_task(task) for task in by_status["pending"]],
+        "assigned": [top_task(task) for task in by_status["assigned"]],
+        "paused": [top_task(task) for task in by_status["paused"]],
+        "failed_recent": [top_task(task) for task in failed_tasks],
+    })
+
+
 def cmd_tasks_get(args: argparse.Namespace, client: ApiClient) -> None:
     task = client.get(f"/tasks/{args.task}")
     print_json(short_task(task) if args.short else task)
@@ -1122,6 +1187,7 @@ def build_parser() -> argparse.ArgumentParser:
     tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)
     p = tasks_sub.add_parser("ls", help="list recent tasks (short form)"); p.add_argument("--status", help="filter by status (pending/running/...)"); p.add_argument("--active", action="store_true", help="filter to active statuses (pending/assigned/running/paused/blocked)"); p.add_argument("--stub", help="only tasks bound to this stub"); p.add_argument("--limit", type=int, default=50, help="max tasks to return (default 50)"); p.set_defaults(func=cmd_tasks_ls)
+    p = tasks_sub.add_parser("top", help="summarize active tasks and recent failures"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.add_argument("--failed-limit", type=int, default=10, help="recent failed tasks to include (default 10)"); p.set_defaults(func=cmd_tasks_top)
     p = tasks_sub.add_parser("get", help="fetch a single task"); p.add_argument("task", help="task id"); p.add_argument("--short", action="store_true", help="trim to the short summary form"); p.set_defaults(func=cmd_tasks_get)
     p = tasks_sub.add_parser("wait", help="poll until a task reaches completed/failed/cancelled"); p.add_argument("task", help="task id"); p.add_argument("--interval", type=float, default=5.0, help="poll interval seconds (default 5)"); p.add_argument("--timeout", type=float, default=None, help="max seconds to wait; omit to wait forever"); p.add_argument("--status", action="store_true", help="print each observed non-terminal status to stderr"); p.add_argument("--short", action="store_true", help="trim final task to short summary form"); p.add_argument("--print-last", action="store_true", help="print last observed task JSON on timeout"); p.set_defaults(func=cmd_tasks_wait)
     p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
