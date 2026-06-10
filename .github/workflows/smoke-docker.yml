@@ -1,27 +1,13 @@
 name: Smoke Docker
 
 on:
-  push:
-    paths:
-      - "server/**"
-      - "stub/**"
-      - "smoke-tests/docker/**"
-      - "smoke-tests/harness/**"
-      - "smoke-tests/tests/test_heterogeneous.py"
-      - "smoke-tests/requirements.txt"
-      - ".github/workflows/smoke-docker.yml"
-  pull_request:
-    paths:
-      - "server/**"
-      - "stub/**"
-      - "smoke-tests/docker/**"
-      - "smoke-tests/harness/**"
-      - "smoke-tests/tests/test_heterogeneous.py"
-      - "smoke-tests/requirements.txt"
-      - ".github/workflows/smoke-docker.yml"
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   smoke-docker:

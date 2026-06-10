@@ -1,21 +1,13 @@
 name: Smoke Tests
 
 on:
-  push:
-    paths:
-      - "server/**"
-      - "stub/**"
-      - "sdk/**"
-      - "smoke-tests/**"
-      - ".github/workflows/smoke-tests.yml"
-  pull_request:
-    paths:
-      - "server/**"
-      - "stub/**"
-      - "sdk/**"
-      - "smoke-tests/**"
-      - ".github/workflows/smoke-tests.yml"
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   smoke-basic:
