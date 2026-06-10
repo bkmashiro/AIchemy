@@ -454,12 +454,85 @@ def task_target(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def task_commands(task: dict[str, Any]) -> list[str]:
+    task_id = task.get("id")
+    if not task_id:
+        return []
+    commands = [f"alch tasks get {task_id}", f"alch tasks logs {task_id} --tail 200"]
+    run_dir = task.get("run_dir")
+    if run_dir:
+        commands.append(f"ls -la {run_dir}")
+    return commands
+
+
+def task_diagnosis(task: dict[str, Any]) -> dict[str, str] | None:
+    status = str(task.get("status") or "")
+    error = str(task.get("error_message") or "")
+    death_cause = task.get("death_cause")
+    exit_code = task.get("exit_code")
+    if status == "blocked" and error.lower().startswith("dependency "):
+        return {
+            "kind": "dependency_failed",
+            "detail": error,
+            "next": "inspect the failed dependency, then resubmit or cancel this blocked task",
+        }
+    if status == "blocked":
+        return {
+            "kind": "blocked",
+            "detail": task_reason(task) or "task is blocked",
+            "next": "inspect task details and unblock the dependency or cancel/resubmit",
+        }
+    if status == "pending" and task.get("target_stub_id"):
+        return {
+            "kind": "waiting_for_target_stub",
+            "detail": f"target_stub_id={task.get('target_stub_id')}",
+            "next": "bring that stub online or move the task to a live stub",
+        }
+    if status == "pending" and task.get("target_tags"):
+        return {
+            "kind": "waiting_for_matching_stub",
+            "detail": f"target_tags={','.join(str(tag) for tag in task.get('target_tags') or [])}",
+            "next": "start a matching stub or move the task to a live stub",
+        }
+    if status == "pending":
+        return {
+            "kind": "queued",
+            "detail": "task is pending without an explicit target",
+            "next": "check online stubs and queue capacity",
+        }
+    if status == "failed" and (death_cause == "oom" or exit_code == 137):
+        return {
+            "kind": "oom",
+            "detail": f"exit_code={exit_code} death_cause={death_cause}",
+            "next": "reduce memory use or resubmit on a larger-memory stub",
+        }
+    if status == "failed" and (death_cause == "killed" or exit_code in {-15, 143}):
+        return {
+            "kind": "terminated",
+            "detail": f"exit_code={exit_code} death_cause={death_cause}",
+            "next": "check SLURM walltime/preemption, then resume if the run supports it",
+        }
+    if status == "failed":
+        return {
+            "kind": str(death_cause or "failed"),
+            "detail": task_reason(task) or "task failed",
+            "next": "inspect logs, fix the root cause, then resubmit if appropriate",
+        }
+    return None
+
+
 def top_task(task: dict[str, Any]) -> dict[str, Any]:
     row = short_task(task)
     row["target"] = task_target(task)
     reason = task_reason(task)
     if reason:
         row["reason"] = reason
+    diagnosis = task_diagnosis(task)
+    if diagnosis:
+        row["diagnosis"] = diagnosis
+    commands = task_commands(task)
+    if commands:
+        row["commands"] = commands
     if task.get("status") in TERMINAL_STATUSES or task.get("exit_code") is not None or task.get("death_cause") or task.get("error_message"):
         row["failure"] = task_failure(task)
     return row

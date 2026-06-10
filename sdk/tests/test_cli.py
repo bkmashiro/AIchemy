@@ -253,10 +253,53 @@ def test_tasks_top_summarizes_active_and_recent_failed(monkeypatch, capsys):
         "pid": 123,
         "run_dir": "/runs/train",
         "target": {"target_stub_id": None, "target_tags": None},
+        "commands": [
+            "alch tasks get run-1",
+            "alch tasks logs run-1 --tail 200",
+            "ls -la /runs/train",
+        ],
     }
     assert out["blocked"][0]["reason"] == "Dependency dep-1 failed"
     assert out["pending"][0]["target"] == {"target_stub_id": None, "target_tags": ["a30", "slurm"]}
     assert out["failed_recent"][0]["failure"] == {"exit_code": 137, "death_cause": "oom", "error_message": "CUDA out of memory"}
+
+
+def test_tasks_top_adds_actionable_task_diagnostics(monkeypatch, capsys):
+    run_cli(
+        monkeypatch,
+        ["tasks", "top"],
+        [
+            {"tasks": [
+                {"id": "blocked-1", "seq": 3, "name": "blocked", "status": "blocked", "error_message": "Dependency parent-1 failed"},
+                {"id": "pending-1", "seq": 2, "name": "pending", "status": "pending", "target_stub_id": "stub-dead"},
+            ]},
+            {"tasks": [
+                {"id": "oom-1", "seq": 1, "name": "oom", "status": "failed", "exit_code": 137, "death_cause": "oom", "error_message": "CUDA out of memory", "run_dir": "/runs/oom"},
+            ]},
+        ],
+    )
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["blocked"][0]["diagnosis"] == {
+        "kind": "dependency_failed",
+        "detail": "Dependency parent-1 failed",
+        "next": "inspect the failed dependency, then resubmit or cancel this blocked task",
+    }
+    assert out["pending"][0]["diagnosis"] == {
+        "kind": "waiting_for_target_stub",
+        "detail": "target_stub_id=stub-dead",
+        "next": "bring that stub online or move the task to a live stub",
+    }
+    assert out["failed_recent"][0]["diagnosis"] == {
+        "kind": "oom",
+        "detail": "exit_code=137 death_cause=oom",
+        "next": "reduce memory use or resubmit on a larger-memory stub",
+    }
+    assert out["failed_recent"][0]["commands"] == [
+        "alch tasks get oom-1",
+        "alch tasks logs oom-1 --tail 200",
+        "ls -la /runs/oom",
+    ]
 
 
 def test_tasks_resubmit_resume_drops_run_dir_and_targets_tags(monkeypatch):
