@@ -83,6 +83,16 @@ def test_webhooks_delete_deletes_subscription(monkeypatch):
     assert calls[0]["url"] == "http://localhost:3002/api/webhooks/terminal"
 
 
+def test_webhooks_deliveries_lists_subscription_delivery_history(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["webhooks", "deliveries", "terminal", "--limit", "5"],
+        [{"deliveries": [{"id": "delivery-1", "status": "success"}]}],
+    )
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/webhooks/terminal/deliveries?limit=5"
+
+
 def test_stubs_drain_uses_patch_payload(monkeypatch):
     calls = run_cli(
         monkeypatch,

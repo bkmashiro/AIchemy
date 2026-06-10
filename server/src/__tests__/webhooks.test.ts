@@ -105,6 +105,59 @@ describe("webhook subscriptions", () => {
     expect(body.task.log_buffer).toBeUndefined();
   });
 
+  it("records successful webhook deliveries for later inspection", async () => {
+    const sub = store.addWebhookSubscription({
+      name: "hermes-terminal",
+      url: "https://hermes.example/webhook/alchemy",
+      events: ["task.completed"],
+    });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      makeTask({ status: "completed", exit_code: 0 }),
+    );
+
+    const deliveries = store.listWebhookDeliveries(sub.id);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toMatchObject({
+      subscription_id: sub.id,
+      subscription_name: "hermes-terminal",
+      event: "task.completed",
+      task_id: "task-1",
+      status: "success",
+      http_status: 200,
+    });
+    expect(deliveries[0].error).toBeUndefined();
+    expect(deliveries[0].delivery_id).toMatch(new RegExp(`^${sub.id}:task-1:task.completed:`));
+    expect(deliveries[0].delivered_at).toBe("2026-06-08T12:00:00.000Z");
+  });
+
+  it("records failed webhook deliveries without leaking payloads", async () => {
+    vi.mocked(global.fetch).mockResolvedValueOnce({ ok: false, status: 500, text: vi.fn().mockResolvedValue("bad token secret-ish body") } as any);
+    const sub = store.addWebhookSubscription({
+      name: "broken",
+      url: "https://hermes.example/webhook/alchemy",
+      events: ["task.failed"],
+    });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      makeTask({ status: "failed", exit_code: 1, log_buffer: ["Traceback"] }),
+    );
+
+    const deliveries = store.listWebhookDeliveries(sub.id);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]).toMatchObject({
+      subscription_id: sub.id,
+      event: "task.failed",
+      task_id: "task-1",
+      status: "failed",
+      http_status: 500,
+    });
+    expect(deliveries[0].error).toContain("HTTP 500");
+    expect(JSON.stringify(deliveries[0])).not.toContain("Traceback");
+  });
+
   it("posts task.terminal subscriptions for failed and cancelled tasks", async () => {
     store.addWebhookSubscription({ name: "terminal", url: "https://example.test/hook", events: ["task.terminal"] });
 
@@ -262,6 +315,29 @@ describe("webhook subscriptions", () => {
       "alch tasks get 'task-1'",
       "alch tasks logs 'task-1' --tail 200",
     ]);
+  });
+
+  it("lists delivery history through the API", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/webhooks")
+      .send({ name: "history", url: "https://hermes.example/webhook/alchemy", events: ["task.completed"] })
+      .expect(201);
+
+    await deliverTaskStatusWebhooks(makeTask({ status: "running" }), makeTask({ status: "completed", exit_code: 0 }));
+
+    const res = await request(app)
+      .get(`/webhooks/${created.body.id}/deliveries?limit=5`)
+      .expect(200);
+
+    expect(res.body.deliveries).toHaveLength(1);
+    expect(res.body.deliveries[0]).toMatchObject({
+      subscription_id: created.body.id,
+      subscription_name: "history",
+      event: "task.completed",
+      task_id: "task-1",
+      status: "success",
+    });
   });
 
   it("normalizes task.terminal test deliveries to a concrete failed event", async () => {

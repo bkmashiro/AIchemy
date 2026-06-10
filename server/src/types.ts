@@ -51,6 +51,19 @@ export interface WebhookSubscription {
   updated_at: string;
 }
 
+export interface WebhookDelivery {
+  id: string;
+  delivery_id: string;
+  subscription_id: string;
+  subscription_name: string;
+  event: WebhookEvent;
+  task_id?: string;
+  status: "success" | "failed";
+  http_status?: number;
+  error?: string;
+  delivered_at: string;
+}
+
 export interface Task {
   // === Identity ===
   id: string;

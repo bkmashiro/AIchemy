@@ -193,11 +193,12 @@ function signedHeaders(sub: WebhookSubscription, payload: string, event: Webhook
   return headers;
 }
 
-export async function postWebhook(sub: WebhookSubscription, payload: unknown, event: WebhookEvent): Promise<void> {
+export async function postWebhook(sub: WebhookSubscription, payload: unknown, event: WebhookEvent): Promise<{ deliveryId: string; httpStatus: number }> {
   const body = JSON.stringify(payload);
   const deliveryId = `${sub.id}:${(payload as any).task?.id ?? "manual"}:${event}:${randomUUID()}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
+  let httpStatus = 0;
   try {
     const response = await fetch(sub.url, {
       method: "POST",
@@ -205,11 +206,15 @@ export async function postWebhook(sub: WebhookSubscription, payload: unknown, ev
       body,
       signal: controller.signal,
     });
+    httpStatus = response.status;
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`);
+      const err = new Error(`HTTP ${response.status}: ${text.slice(0, 200)}`) as Error & { http_status?: number };
+      err.http_status = response.status;
+      throw err;
     }
     logger.info("webhook.delivered", { subscription_id: sub.id, webhook_event: event });
+    return { deliveryId, httpStatus };
   } finally {
     clearTimeout(timeout);
   }
@@ -225,9 +230,30 @@ export async function deliverTaskStatusWebhooks(previous: Task, task: Task): Pro
   const deliveries = store.listWebhookSubscriptions()
     .filter((sub) => subscriptionMatches(sub, event))
     .map(async (sub) => {
+      const deliveryPayload = { ...payload, subscription: { id: sub.id, name: sub.name } };
       try {
-        await postWebhook(sub, { ...payload, subscription: { id: sub.id, name: sub.name } }, event);
+        const result = await postWebhook(sub, deliveryPayload, event);
+        store.recordWebhookDelivery({
+          delivery_id: result.deliveryId,
+          subscription_id: sub.id,
+          subscription_name: sub.name,
+          event,
+          task_id: task.id,
+          status: "success",
+          http_status: result.httpStatus,
+        });
       } catch (err) {
+        const maybeHttp = err as { http_status?: number };
+        store.recordWebhookDelivery({
+          delivery_id: `${sub.id}:${task.id}:${event}:failed`,
+          subscription_id: sub.id,
+          subscription_name: sub.name,
+          event,
+          task_id: task.id,
+          status: "failed",
+          http_status: maybeHttp.http_status,
+          error: String(err).slice(0, 300),
+        });
         logger.warn("webhook.delivery_failed", { subscription_id: sub.id, event, task_id: task.id, error: String(err) });
       }
     });
