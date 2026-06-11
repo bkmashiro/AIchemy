@@ -3,6 +3,7 @@ import axios from "axios";
 const BASE = "/api";
 
 export const api = axios.create({ baseURL: BASE });
+const rootApi = axios.create({ baseURL: "" });
 
 export function setApiToken(token: string) {
   api.defaults.headers.common["Authorization"] = `Bearer ${token}`;
@@ -39,6 +40,13 @@ api.interceptors.response.use(
     return Promise.reject(err);
   }
 );
+rootApi.interceptors.response.use(
+  (r) => r,
+  (err) => {
+    if (err.response?.status === 401 && _onAuthFail) _onAuthFail();
+    return Promise.reject(err);
+  }
+);
 
 // ─── Paginated response ────────────────────────────────────────────────────────
 
@@ -48,6 +56,13 @@ export interface PaginatedTasks {
   page: number;
   limit: number;
   counts?: Record<string, number>;
+}
+
+export interface HealthStatus {
+  ok: boolean;
+  version?: string;
+  uptime_s?: number;
+  [key: string]: unknown;
 }
 
 // ─── Data Models (spec §1) ────────────────────────────────────────────────────
@@ -222,6 +237,36 @@ export interface OverviewData {
   cached_at: string;
 }
 
+export type WebhookEvent = "task.completed" | "task.failed" | "task.cancelled" | "task.terminal";
+
+export interface WebhookSubscription {
+  id: string;
+  name: string;
+  url: string;
+  events: WebhookEvent[];
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  has_secret: boolean;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  subscription_id: string;
+  subscription_name?: string;
+  event: WebhookEvent;
+  task_id?: string;
+  task_seq?: number;
+  success: boolean;
+  http_status?: number;
+  error?: string;
+  attempted_at: string;
+}
+
+export interface WebhookDeliveriesResponse {
+  deliveries: WebhookDelivery[];
+}
+
 // ─── Task submit payload ───────────────────────────────────────────────────────
 
 export interface TaskSubmitPayload {
@@ -257,6 +302,10 @@ export const tasksApi = {
   metrics: (id: string) => api.get(`/tasks/${id}/metrics`).then((r) => r.data),
 };
 
+export const healthApi = {
+  get: () => rootApi.get<HealthStatus>("/health").then((r) => r.data),
+};
+
 export const stubsApi = {
   list: () => api.get<Stub[]>("/stubs").then((r) => r.data),
   get: (id: string) => api.get<Stub>(`/stubs/${id}`).then((r) => r.data),
@@ -287,6 +336,12 @@ export const gridsApi = {
 
 export const overviewApi = {
   get: () => api.get<OverviewData>("/overview").then((r) => r.data),
+};
+
+export const webhooksApi = {
+  list: () => api.get<WebhookSubscription[]>("/webhooks").then((r) => r.data),
+  deliveries: (id: string, limit = 20) =>
+    api.get<WebhookDeliveriesResponse>(`/webhooks/${id}/deliveries`, { params: { limit } }).then((r) => r.data),
 };
 
 export const metricsApi = {
