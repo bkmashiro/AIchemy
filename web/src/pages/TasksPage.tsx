@@ -11,6 +11,7 @@ import {
   isRetryableTaskStatus,
   taskStatusLabel,
 } from "../lib/taskStatus";
+import { diagnosisToneClass, taskDiagnosis } from "../lib/taskDiagnostics";
 
 type Filter = "all" | "active" | "terminal";
 
@@ -136,6 +137,7 @@ export default function TasksPage() {
               const isActive = isActiveTaskStatus(t.status);
               const canRetry = isRetryableTaskStatus(t.status);
               const displayName = generateDisplayName(t);
+              const diagnosis = taskDiagnosis(t);
               const pct = t.progress ? Math.round((t.progress.step / t.progress.total) * 100) : null;
               return (
                 <tr
@@ -155,6 +157,11 @@ export default function TasksPage() {
                       {taskStatusLabel(t)}
                     </span>
                     {t.phase && <span className="ml-1.5"><PhaseBadge phase={t.phase} /></span>}
+                    {(t.status === "blocked" || t.status === "failed") && (
+                      <span className={`mt-1 inline-flex px-1.5 py-0.5 rounded text-[10px] border ${diagnosisToneClass(diagnosis.tone)}`}>
+                        {diagnosis.label}
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-2 text-gray-500 text-xs font-mono hidden sm:table-cell">{taskDuration(t)}</td>
                   <td className="px-4 py-2 text-gray-500 text-xs font-mono hidden md:table-cell">

@@ -5,6 +5,7 @@ import { formatRelTime, generateDisplayName } from "../lib/format";
 import StubCard from "../components/StubCard";
 import TaskForm from "../components/TaskForm";
 import { TASK_STATUS_TEXT_CLASS, isTerminalTaskStatus, taskStatusLabel } from "../lib/taskStatus";
+import { taskDiagnosis } from "../lib/taskDiagnostics";
 
 interface Props {
   stubs: Stub[];
@@ -66,21 +67,6 @@ function RecentTaskRow({ task, onClick }: { task: Task; onClick: () => void }) {
   );
 }
 
-function taskTriageReason(task: Task): string {
-  if (task.status === "blocked") {
-    if (task.target_stub_id) return "waiting for target stub";
-    if (task.requirements?.gpu_mem_mb || task.requirements?.gpu_type?.length) return "waiting for matching capacity";
-    if ((task.dispatch_attempts ?? 0) > 0) return "dispatch attempts exhausted";
-    return "scheduler blocked";
-  }
-  if (task.status === "failed") {
-    if (task.death_cause === "oom" || task.exit_code === 137) return "oom";
-    if (task.death_cause) return task.death_cause;
-    return "failed";
-  }
-  return task.status;
-}
-
 function TaskTriageCard({ tasks, onTaskClick }: { tasks: Task[]; onTaskClick: (task: Task) => void }) {
   const running = tasks.filter((t) => t.status === "running").length;
   const assigned = tasks.filter((t) => t.status === "assigned").length;
@@ -120,7 +106,7 @@ function TaskTriageCard({ tasks, onTaskClick }: { tasks: Task[]; onTaskClick: (t
             >
               <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq} {generateDisplayName(task)}</span>
               <span className="text-xs text-gray-500 shrink-0">{task.status}</span>
-              <span className="text-xs text-purple-300 truncate">{taskTriageReason(task)}</span>
+              <span className="text-xs text-purple-300 truncate">{taskDiagnosis(task).label}</span>
             </button>
           ))}
         </div>
