@@ -15,6 +15,7 @@ import { reliableEmitToStub } from "./reliable";
 import { logger } from "./log";
 import { assignTask, failTask } from "./task-actions";
 import { notifyDispatched } from "./discord";
+import { buildCommandArgv } from "./command";
 
 // ─── GPU name normalization ───────────────────────────────────────────────────
 
@@ -203,6 +204,7 @@ export function buildRunPayload(task: Task, stub: Stub): object {
   const payload: Record<string, any> = {
     task_id: task.id,
     command: task.command,
+    command_argv: buildCommandArgv(task),
     cwd,
     env,
     env_overrides: task.env_overrides,

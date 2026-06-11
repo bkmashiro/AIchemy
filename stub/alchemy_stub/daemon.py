@@ -426,15 +426,17 @@ class StubDaemon:
             await self._handle_task_run(task)
 
     def _resolve_command(self, command: str, cwd: str) -> str:
-        """Resolve relative paths in command to absolute using cwd.
+        """Resolve relative paths only for simple commands.
 
-        Shell operators (&&, ||, ;, |) are preserved verbatim — shlex.split
-        treats them as regular tokens and shlex.join would quote them, breaking
-        the shell semantics.  We split around these operators first, resolve
-        each segment independently, and stitch back together.
+        Complex shell syntax (pipes, heredocs, substitutions, redirects, etc.)
+        is already a shell string. Re-tokenizing and re-quoting it changes
+        semantics, so preserve it verbatim.
         """
         import shlex
         import re
+
+        if re.search(r"[\n|&;<>`$()]", command):
+            return command
 
         # Shell operators that must stay unquoted
         _SHELL_OPS = {'&&', '||', ';', '|', '>', '>>', '<', '2>', '2>>'}
@@ -493,6 +495,7 @@ class StubDaemon:
     async def _handle_task_run_inner(self, data: dict) -> None:
         task_id: str = data["task_id"]
         command: str = data["command"]
+        command_argv = data.get("command_argv")
 
         log.info("Task %s received: command=%s", task_id, command[:200])
 
@@ -573,6 +576,7 @@ class StubDaemon:
             pid = await self.process_mgr.start(
                 task_id=task_id,
                 command=command,
+                command_argv=command_argv,
                 cwd=cwd,
                 env=env,
                 task_env_setup=task_env_setup,

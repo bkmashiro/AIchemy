@@ -171,7 +171,7 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
 
     const {
-      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, target_tags, python_env,
       submitted_by,
@@ -189,7 +189,7 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     }
 
     // Fingerprint dedup
-    const fingerprint = computeFingerprint({ script, args, raw_args, param_overrides, cwd });
+    const fingerprint = computeFingerprint({ script, argv, args, raw_args, param_overrides, cwd });
     const existingId = store.findActiveByFingerprint(fingerprint);
     if (existingId) {
       const found = store.findTask(existingId);
@@ -216,7 +216,7 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     }
 
     const task = createTask({
-      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides,
       stub_id: stub.id, target_tags, python_env, submitted_by,
     });

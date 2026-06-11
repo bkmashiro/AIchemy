@@ -92,6 +92,7 @@ export interface Task {
 
   // === Structured Command ===
   script: string;
+  argv?: string[];                 // Structured argv appended after script; preferred over raw_args for new tasks
   args?: Record<string, string> | string;
   raw_args?: string;
 

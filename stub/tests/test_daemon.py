@@ -178,6 +178,14 @@ class TestResolveCommand:
         cmd = daemon._resolve_command("", "/tmp")
         assert cmd == ""
 
+    def test_multiline_heredoc_command_is_not_rewritten(self, daemon):
+        command = "python - <<'PY'\nfrom pathlib import Path\nPath('/tmp/cfg').write_text('a: 1\\n')\nPY"
+        assert daemon._resolve_command(command, "/workspace") == command
+
+    def test_complex_shell_command_is_not_requoted(self, daemon):
+        command = "printf '%s\n' hello | tee out.txt && cat out.txt"
+        assert daemon._resolve_command(command, "/workspace") == command
+
 
 # ===========================================================================
 # _is_blocked_command

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from alchemy_sdk.experiment import Experiment
+from alchemy_sdk.experiment import Experiment, ExperimentResult
 from alchemy_sdk.experiments import ExperimentClient, render_research_bundle_markdown
 
 
@@ -21,6 +21,22 @@ class FakeResponse:
 
     def read(self):
         return json.dumps(self.payload).encode("utf-8")
+
+
+def test_experiment_task_preserves_structured_argv(monkeypatch):
+    captured = {}
+
+    def fake_submit_experiment(**kwargs):
+        captured.update(kwargs)
+        return ExperimentResult(experiment_id="exp-1", task_refs={"train": "task-1"}, already_exists=False, url="")
+
+    monkeypatch.setattr("alchemy_sdk.submit.submit_experiment", fake_submit_experiment)
+
+    exp = Experiment("argv-exp", server="http://server")
+    exp.task("train", script="/workspace/train.py", argv=["--name", "$(whoami)", "--message", "hello world"])
+    exp.submit()
+
+    assert captured["task_specs"][0]["argv"] == ["--name", "$(whoami)", "--message", "hello world"]
 
 
 def _patched_urlopen(queue, calls):

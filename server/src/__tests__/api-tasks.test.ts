@@ -171,6 +171,19 @@ describe("assembleCommand", () => {
     expect(cmd).toBe("python train.py --extra foo");
   });
 
+  it("preserves multiline raw_args without collapsing whitespace", () => {
+    const raw = "- <<'PY'\nfrom pathlib import Path\nPath('/tmp/cfg.yaml').write_text('a: 1\\nb: 2\\n')\nPY\ncat /tmp/cfg.yaml";
+    const cmd = assembleCommand({ script: "python", raw_args: raw });
+    expect(cmd).toBe(`python ${raw}`);
+    expect(cmd).toContain("\nfrom pathlib import Path\n");
+    expect(cmd).toContain("\nPY\ncat /tmp/cfg.yaml");
+  });
+
+  it("quotes structured argv values instead of shell-expanding them", () => {
+    const cmd = assembleCommand({ script: "train.py", argv: ["--name", "$(whoami)", "--message", "hello world"] } as any);
+    expect(cmd).toBe("python train.py --name '$(whoami)' --message 'hello world'");
+  });
+
   it("combines all parts in correct order", () => {
     const cmd = assembleCommand({
       script: "train.py",
@@ -203,11 +216,9 @@ describe("assembleCommand", () => {
     expect(cmd).toContain("echo INJECTED");
   });
 
-  // BUG DOCUMENTATION: args values are not quoted — shell injection via arg value
-  it("BUG: args values are not quoted (shell injection vector)", () => {
+  it("quotes record args values to avoid shell expansion", () => {
     const cmd = assembleCommand({ script: "train.py", args: { "--name": "$(whoami)" } });
-    // Value appears verbatim — no quoting applied
-    expect(cmd).toContain("$(whoami)");
+    expect(cmd).toBe("python train.py --name '$(whoami)'");
   });
 
   // BUG DOCUMENTATION: raw_args is verbatim

@@ -118,6 +118,7 @@ class Experiment:
         ref: str,
         *,
         script: str,
+        argv: Optional[list[str]] = None,
         args: Optional[dict[str, str]] = None,
         raw_args: Optional[str] = None,
         args_template: Optional[dict[str, str]] = None,
@@ -139,6 +140,7 @@ class Experiment:
         self._refs.add(ref)
 
         spec: dict[str, Any] = {"ref": ref, "script": script}
+        if argv:               spec["argv"] = argv
         if args:               spec["args"] = args
         if raw_args:           spec["raw_args"] = raw_args
         if args_template:      spec["args_template"] = args_template

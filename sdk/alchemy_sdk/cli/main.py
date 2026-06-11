@@ -21,7 +21,7 @@ TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 DANGEROUS_STATUSES = {"running", "assigned"}
 COMPARE_MAX_REFS = 6  # server caps `/experiments/compare?ids=...` at 6
 TASK_FIELDS = [
-    "script", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
+    "script", "argv", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
     "requirements", "priority", "max_retries", "param_overrides", "target_tags",
     "python_env", "submitted_by", "depends_on", "ref", "args_template", "experiment_id",
     "outputs", "auto_retry_on",

@@ -21,6 +21,7 @@ function sortKeys(obj: Record<string, any>): Record<string, any> {
 
 export interface FingerprintInput {
   script: string;
+  argv?: string[];
   args?: Record<string, string> | string;
   raw_args?: string;
   param_overrides?: Record<string, any>;
@@ -30,6 +31,7 @@ export interface FingerprintInput {
 export function computeFingerprint(input: FingerprintInput): string {
   const parts = [
     input.script,
+    JSON.stringify(input.argv || []),
     typeof input.args === "string" ? input.args : JSON.stringify(sortKeys(input.args || {})),
     input.raw_args || "",
     JSON.stringify(sortKeys(input.param_overrides || {})),
