@@ -66,6 +66,71 @@ function RecentTaskRow({ task, onClick }: { task: Task; onClick: () => void }) {
   );
 }
 
+function taskTriageReason(task: Task): string {
+  if (task.status === "blocked") {
+    if (task.target_stub_id) return "waiting for target stub";
+    if (task.requirements?.gpu_mem_mb || task.requirements?.gpu_type?.length) return "waiting for matching capacity";
+    if ((task.dispatch_attempts ?? 0) > 0) return "dispatch attempts exhausted";
+    return "scheduler blocked";
+  }
+  if (task.status === "failed") {
+    if (task.death_cause === "oom" || task.exit_code === 137) return "oom";
+    if (task.death_cause) return task.death_cause;
+    return "failed";
+  }
+  return task.status;
+}
+
+function TaskTriageCard({ tasks, onTaskClick }: { tasks: Task[]; onTaskClick: (task: Task) => void }) {
+  const running = tasks.filter((t) => t.status === "running").length;
+  const assigned = tasks.filter((t) => t.status === "assigned").length;
+  const pending = tasks.filter((t) => t.status === "pending").length;
+  const blocked = tasks.filter((t) => t.status === "blocked").length;
+  const failedRecent = tasks.filter((t) => t.status === "failed").length;
+  const attentionTasks = tasks
+    .filter((t) => t.status === "blocked" || t.status === "failed")
+    .sort((a, b) => {
+      const aTime = a.finished_at || a.created_at;
+      const bTime = b.finished_at || b.created_at;
+      return new Date(bTime).getTime() - new Date(aTime).getTime();
+    })
+    .slice(0, 4);
+
+  return (
+    <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-gray-300">Task Triage</h3>
+        <span className="text-xs text-gray-600">active + recent failures</span>
+      </div>
+      <div className="flex flex-wrap gap-2 mb-3">
+        <span className="text-xs px-2 py-0.5 rounded border border-blue-700/50 bg-blue-900/30 text-blue-300">running {running}</span>
+        <span className="text-xs px-2 py-0.5 rounded border border-indigo-700/50 bg-indigo-900/30 text-indigo-300">assigned {assigned}</span>
+        <span className="text-xs px-2 py-0.5 rounded border border-yellow-700/50 bg-yellow-900/30 text-yellow-300">pending {pending}</span>
+        <span className="text-xs px-2 py-0.5 rounded border border-purple-700/50 bg-purple-900/30 text-purple-300">blocked {blocked}</span>
+        <span className="text-xs px-2 py-0.5 rounded border border-red-700/50 bg-red-900/30 text-red-300">failed recent {failedRecent}</span>
+      </div>
+      {attentionTasks.length > 0 ? (
+        <div className="divide-y divide-gray-800/50">
+          {attentionTasks.map((task) => (
+            <button
+              key={task.id}
+              type="button"
+              onClick={() => onTaskClick(task)}
+              className="w-full flex items-center gap-3 py-1.5 text-left hover:bg-gray-800/30 rounded px-1 transition-colors"
+            >
+              <span className="text-gray-500 text-xs font-mono shrink-0">#{task.seq} {generateDisplayName(task)}</span>
+              <span className="text-xs text-gray-500 shrink-0">{task.status}</span>
+              <span className="text-xs text-purple-300 truncate">{taskTriageReason(task)}</span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="text-xs text-gray-600">No blocked or failed tasks need attention.</p>
+      )}
+    </div>
+  );
+}
+
 type CostRange = "7d" | "30d" | "all";
 
 function CostWidget() {
@@ -181,6 +246,7 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
       return new Date(bTime).getTime() - new Date(aTime).getTime();
     })
     .slice(0, 20);
+  const triageTasks = [...globalQueue, ...stubs.flatMap((s) => s.tasks)];
 
   return (
     <div className="space-y-6">
@@ -240,6 +306,8 @@ export default function Dashboard({ stubs, globalQueue, lossHistory, logBuffers,
 
       {/* Cost widget */}
       <CostWidget />
+
+      <TaskTriageCard tasks={triageTasks} onTaskClick={(task) => navigate(`/tasks/${task.id}`)} />
 
       {/* Top actions */}
       <div className="flex items-center justify-between">
