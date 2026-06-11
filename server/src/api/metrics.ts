@@ -15,7 +15,11 @@ import { aggregateCosts, computeTaskCost, matchGpuType, getGpuRate } from "../co
 let overviewCache: { data: any; ts: number } | null = null;
 const OVERVIEW_CACHE_TTL = 10_000;
 
-export function createMetricsRouter(): Router {
+export interface MetricsRouterOptions {
+  publicOnly?: boolean;
+}
+
+export function createMetricsRouter(options: MetricsRouterOptions = {}): Router {
   const router = Router();
 
   // GET /overview
@@ -74,6 +78,10 @@ export function createMetricsRouter(): Router {
     overviewCache = { data, ts: now };
     res.json(data);
   });
+
+  if (options.publicOnly) {
+    return router;
+  }
 
   // GET /stubs/:id/metrics
   router.get("/stubs/:id/metrics", (req: Request, res: Response) => {

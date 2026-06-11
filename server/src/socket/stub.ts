@@ -566,8 +566,10 @@ function handleResume(
   deployConfig?: DeployFileConfig | null,
 ): void {
   const { hostname, gpu, slurm_job_id, max_concurrent, token, env_setup, default_cwd,
-    tags, running_tasks, local_queue, available_envs, user, slurm_constraints,
+    tags, running_tasks: rawRunningTasks, local_queue: rawLocalQueue, available_envs, user, slurm_constraints,
     cuda_visible_devices } = payload;
+  const running_tasks = Array.isArray(rawRunningTasks) ? rawRunningTasks : [];
+  const local_queue = Array.isArray(rawLocalQueue) ? rawLocalQueue : [];
 
   // Auth check
   const tokenRecord = store.getToken(token);
