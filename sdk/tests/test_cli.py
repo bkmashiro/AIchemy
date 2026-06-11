@@ -53,6 +53,18 @@ def run_cli(monkeypatch, argv, responses):
     return calls
 
 
+def test_clone_task_body_preserves_structured_argv():
+    body = cli.clone_task_body({
+        "script": "/workspace/train.py",
+        "argv": ["--name", "$(whoami)", "--message", "hello world"],
+        "raw_args": None,
+    })
+    assert body == {
+        "script": "/workspace/train.py",
+        "argv": ["--name", "$(whoami)", "--message", "hello world"],
+    }
+
+
 def test_webhooks_add_posts_subscription(monkeypatch):
     calls = run_cli(
         monkeypatch,

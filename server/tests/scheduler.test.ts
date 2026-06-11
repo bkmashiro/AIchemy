@@ -389,6 +389,21 @@ describe("buildRunPayload", () => {
     expect(payload.run_dir).toBe("/out/fp0123456789");
   });
 
+  it("includes structured command_argv when task is safe to exec without shell", () => {
+    const task = makeTask({
+      id: "t-argv",
+      script: "train.py",
+      argv: ["--name", "$(whoami)", "--message", "hello world"],
+      command: "python train.py --name '$(whoami)' --message 'hello world'",
+      fingerprint: "fpabcdef1234",
+    });
+    const stub = makeStub({ default_output_dir: "/out" });
+    const payload = buildRunPayload(task, stub) as any;
+
+    expect(payload.command).toBe("python train.py --name '$(whoami)' --message 'hello world'");
+    expect(payload.command_argv).toEqual(["python", "train.py", "--name", "$(whoami)", "--message", "hello world"]);
+  });
+
   it("resolves python_env to activate command", () => {
     const task = makeTask({ python_env: "jema" });
     const stub = makeStub({

@@ -23,6 +23,8 @@ import { initiateKillChain } from "../socket/stub";
 import { cancelTask, cancelGlobalTask, pauseTask, resumeTask, createRetryTask } from "../task-actions";
 import { reliableEmitToStub } from "../reliable";
 import { logger } from "../log";
+import { assembleCommand } from "../command";
+export { assembleCommand, buildCommandArgv } from "../command";
 
 // ─── Display name generation ──────────────────────────────────────────────────
 
@@ -56,61 +58,11 @@ export function generateDisplayName(task: Partial<Task>): string {
   return "task";
 }
 
-// ─── Command assembly ─────────────────────────────────────────────────────────
-
-export function assembleCommand(task: Partial<Task>): string {
-  const parts: string[] = [];
-  const envSetup = task.env_setup;
-  const cwd = task.cwd;
-  const env = task.env;
-  const script = task.script || "";
-  const args = task.args;
-  const rawArgs = task.raw_args;
-
-  if (envSetup) {
-    parts.push(`${envSetup} &&`);
-  }
-  if (cwd) {
-    parts.push(`cd '${cwd.replace(/'/g, "'\\''")}' &&`);
-  }
-  if (env && Object.keys(env).length > 0) {
-    const envStr = Object.entries(env)
-      .filter(([k]) => !k.startsWith("ALCHEMY_"))
-      .map(([k, v]) => `export ${k}='${String(v).replace(/'/g, "'\\''")}'`) // keys validated at submission
-      .join(" && ");
-    if (envStr) parts.push(`${envStr} &&`);
-  }
-  // If script looks like a Python file and has no shebang prefix, prepend python
-  if (script.endsWith(".py") && !script.startsWith("python")) {
-    parts.push(`python ${script}`);
-  } else {
-    parts.push(script);
-  }
-  if (args) {
-    if (typeof args === "string") {
-      const trimmed = args.trim();
-      if (trimmed) parts.push(trimmed);
-    } else if (Array.isArray(args)) {
-      // Array of positional args — join with spaces, quote if needed
-      const argsStr = args.map((v: string) => String(v)).join(" ");
-      if (argsStr) parts.push(argsStr);
-    } else if (Object.keys(args).length > 0) {
-      const argsStr = Object.entries(args)
-        .map(([k, v]) => `${k} ${v}`)
-        .join(" ");
-      parts.push(argsStr);
-    }
-  }
-  if (rawArgs) {
-    parts.push(rawArgs);
-  }
-  return parts.join(" ").replace(/\s+/g, " ").trim();
-}
-
 // ─── Task creation helper ─────────────────────────────────────────────────────
 
 export interface TaskInput {
   script: string;
+  argv?: string[];
   args?: Record<string, string> | string;
   raw_args?: string;
   name?: string;
@@ -142,6 +94,7 @@ export interface TaskInput {
 export function createTask(input: TaskInput): Task {
   const fingerprint = computeFingerprint({
     script: input.script,
+    argv: input.argv,
     args: input.args,
     raw_args: input.raw_args,
     param_overrides: input.param_overrides,
@@ -152,6 +105,7 @@ export function createTask(input: TaskInput): Task {
 
   const partial: Partial<Task> = {
     script: input.script,
+    argv: input.argv,
     args: input.args,
     raw_args: input.raw_args,
     name: input.name,
@@ -170,6 +124,7 @@ export function createTask(input: TaskInput): Task {
     name: input.name,
     display_name,
     script: input.script,
+    argv: input.argv,
     args: input.args,
     raw_args: input.raw_args,
     cwd: input.cwd,
@@ -401,7 +356,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
   // POST /tasks
   router.post("/", (req: Request, res: Response) => {
     const {
-      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs,
@@ -463,7 +418,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     // Fingerprint dedup
-    const fingerprint = computeFingerprint({ script, args, raw_args, param_overrides, cwd });
+    const fingerprint = computeFingerprint({ script, argv, args, raw_args, param_overrides, cwd });
     const existingId = store.findActiveByFingerprint(fingerprint);
     if (existingId) {
       const found = store.findTask(existingId);
@@ -491,7 +446,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     const task = createTask({
-      script, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs, auto_retry_on,
       stub_id, target_stub_id,
@@ -687,6 +642,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     // Create a new task preserving original config, with optional overrides
     const newTask = createTask({
       script: task.script,
+      argv: task.argv,
       args: task.args,
       raw_args: task.raw_args,
       name: task.name,

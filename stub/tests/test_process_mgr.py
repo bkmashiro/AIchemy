@@ -690,6 +690,30 @@ class TestStart:
         assert popen_args[0][0] == "/bin/bash"
 
     @pytest.mark.asyncio
+    async def test_start_with_command_argv_execs_without_shell_wrapper(self, mgr, log_dir):
+        mock_proc = MagicMock()
+        mock_proc.pid = 45
+        captured_args = []
+        captured_env = {}
+
+        def capture_popen(*args, **kwargs):
+            captured_args.append(args[0])
+            captured_env.update(kwargs.get("env", {}))
+            return mock_proc
+
+        with patch("subprocess.Popen", side_effect=capture_popen):
+            await mgr.start(
+                task_id="task-argv",
+                command="python train.py --name '$(whoami)'",
+                command_argv=["python", "train.py", "--name", "$(whoami)"],
+                env={"MSG": "hello world"},
+            )
+
+        assert captured_args[0] == ["python", "train.py", "--name", "$(whoami)"]
+        assert captured_env["MSG"] == "hello world"
+        assert captured_env["ALCHEMY_TASK_ID"] == "task-argv"
+
+    @pytest.mark.asyncio
     async def test_start_falls_back_to_sh_when_bash_missing(self, mgr, log_dir):
         mock_proc = MagicMock()
         mock_proc.pid = 44

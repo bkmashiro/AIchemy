@@ -359,6 +359,7 @@ class ProcessManager:
         self,
         task_id: str,
         command: str,
+        command_argv: list[str] | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         task_env_setup: str = "",
@@ -379,7 +380,7 @@ class ProcessManager:
         # Only used when: pool is configured, task has no custom          #
         # env_setup, and command is a plain Python script path.           #
         # -------------------------------------------------------------- #
-        if self.warm_pool and not task_env_setup and _is_runpy_compatible(command):
+        if self.warm_pool and not command_argv and not task_env_setup and _is_runpy_compatible(command):
             script_path = _extract_script_path(command)
             if script_path:
                 task_start_time = time.time()
@@ -428,8 +429,8 @@ class ProcessManager:
                     await self.on_started(task_id, pid)
                 return pid
 
-        # Build wrapper shell script
-        script = self._build_script(task_id, task_env_setup, env or {}, command)
+        exec_argv = list(command_argv) if command_argv and not task_env_setup else None
+        script = "" if exec_argv else self._build_script(task_id, task_env_setup, env or {}, command)
 
         # Build ALCHEMY_* vars
         alchemy_vars: dict[str, str] = {"ALCHEMY_TASK_ID": task_id}
@@ -478,8 +479,9 @@ class ProcessManager:
         log_path = _log_path(task_id)
         log_file = open(log_path, "w")
         try:
+            popen_args = exec_argv if exec_argv else [_task_shell(), "-c", script]
             proc = subprocess.Popen(
-                [_task_shell(), "-c", script],
+                popen_args,
                 cwd=effective_cwd,
                 env=proc_env,
                 stdout=log_file,
