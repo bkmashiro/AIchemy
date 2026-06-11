@@ -11,6 +11,7 @@ import {
   isRetryableTaskStatus,
   taskStatusLabel,
 } from "../lib/taskStatus";
+import { diagnosisToneClass, operatorCommandsForTask, taskDiagnosis } from "../lib/taskDiagnostics";
 
 const MetricsChart = lazy(() => import("../components/MetricsChart"));
 
@@ -82,6 +83,8 @@ export default function TaskDetailPage() {
   const isActive = isActiveTaskStatus(task.status);
   const canRetry = isRetryableTaskStatus(task.status);
   const displayName = generateDisplayName(task);
+  const diagnosis = taskDiagnosis(task);
+  const operatorCommands = operatorCommandsForTask(task);
   const pct = task.progress ? Math.round((task.progress.step / task.progress.total) * 100) : null;
   const eta = task.status === "running" ? taskEta(task) : null;
 
@@ -175,6 +178,23 @@ export default function TaskDetailPage() {
         <pre className="text-sm font-mono text-gray-300 bg-gray-950 rounded px-3 py-2 overflow-x-auto select-all whitespace-pre-wrap break-all">
           {task.command}
         </pre>
+      </div>
+
+      {/* Operator diagnostics */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-4">
+        <div className="flex items-center justify-between mb-2">
+          <p className="text-xs text-gray-500 uppercase tracking-wider">Operator Diagnostics</p>
+          <span className={`inline-flex px-2 py-0.5 rounded text-xs border ${diagnosisToneClass(diagnosis.tone)}`}>
+            {diagnosis.label}
+          </span>
+        </div>
+        <div className="space-y-1">
+          {operatorCommands.map((command) => (
+            <pre key={command} className="text-xs font-mono text-gray-300 bg-gray-950 rounded px-3 py-2 overflow-x-auto select-all whitespace-pre-wrap break-all">
+              {command}
+            </pre>
+          ))}
+        </div>
       </div>
 
       {/* Metadata */}

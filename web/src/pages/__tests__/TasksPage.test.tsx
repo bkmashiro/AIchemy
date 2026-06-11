@@ -77,6 +77,24 @@ describe("TasksPage server task statuses", () => {
     expect(screen.getByText("BLOCKED")).toBeInTheDocument();
   });
 
+  it("shows diagnosis reasons for blocked and failed tasks", async () => {
+    vi.mocked(tasksApi.list).mockResolvedValue({
+      tasks: [
+        task({ id: "blocked-task", seq: 12, display_name: "blocked task", status: "blocked", target_stub_id: "stub-dead" }),
+        task({ id: "failed-task", seq: 13, display_name: "failed task", status: "failed", exit_code: 137, death_cause: "oom" }),
+      ],
+      total: 2,
+      page: 1,
+      limit: 50,
+      counts: { blocked: 1, failed: 1 },
+    });
+
+    renderTasksPage();
+
+    expect(await screen.findByText("waiting for target stub")).toBeInTheDocument();
+    expect(screen.getByText("oom")).toBeInTheDocument();
+  });
+
   it("cancels active server-status tasks with cancelled status", async () => {
     vi.mocked(tasksApi.list).mockResolvedValue({
       tasks: [task({ id: "assigned-task", seq: 11, display_name: "assigned task", status: "assigned" as Task["status"] })],
