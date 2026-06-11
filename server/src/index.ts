@@ -283,12 +283,14 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-// Public routes (no auth) — overview is read-only stats, SDK uses task_id as credential
-const metricsRouter = createMetricsRouter();
+// Public routes (no auth) — overview is read-only stats, SDK uses task_id as credential.
+// Task/stub metrics, logs, and cost metadata are mounted below the auth middleware.
+const metricsRouter = createMetricsRouter({ publicOnly: true });
 app.use("/api", metricsRouter);
 app.use("/api/sdk", createSdkRouter(webNs));
 
 // Authenticated API
+api.use(createMetricsRouter());
 app.use("/api", api);
 
 // Health check

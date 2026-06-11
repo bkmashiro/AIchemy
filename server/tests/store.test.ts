@@ -573,6 +573,30 @@ describe("moveToStubQueue", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// requeueStubTasks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("requeueStubTasks", () => {
+  it("requeues only assigned tasks and leaves running and paused work on the stub", () => {
+    const assigned = makeTask({ id: "assigned-task", status: "assigned", stub_id: "requeue-stub" });
+    const running = makeTask({ id: "running-task", status: "running", stub_id: "requeue-stub" });
+    const paused = makeTask({ id: "paused-task", status: "paused", stub_id: "requeue-stub" });
+    const stub = makeStub({ id: "requeue-stub", tasks: [assigned, running, paused] });
+    store.setStub(stub);
+
+    const requeued = store.requeueStubTasks(stub.id);
+
+    expect(requeued.map((t) => t.id)).toEqual(["assigned-task"]);
+    expect(store.getGlobalQueue().map((t) => t.id)).toContain("assigned-task");
+    expect(store.getGlobalQueue().map((t) => t.id)).not.toContain("running-task");
+    expect(store.getGlobalQueue().map((t) => t.id)).not.toContain("paused-task");
+    expect(store.getArchive().map((t) => t.id)).not.toContain("running-task");
+    expect(store.getArchive().map((t) => t.id)).not.toContain("paused-task");
+    expect(store.getStub(stub.id)?.tasks.map((t) => t.id).sort()).toEqual(["paused-task", "running-task"]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Grid task queries
 // ═══════════════════════════════════════════════════════════════════════════════
 

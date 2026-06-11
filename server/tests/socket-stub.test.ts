@@ -821,6 +821,37 @@ describe("resume reconciliation", () => {
     );
   });
 
+  it("accepts old stub resumes that omit local_queue while reusing legacy identity", () => {
+    const legacyId = computeLegacyExpectedStubId(BASE_HOSTNAME, BASE_GPU, "0", "ys25");
+    const task = makeTask({ status: "running", stub_id: legacyId });
+    const legacyStub = makeStub({ id: legacyId, user: "ys25", tasks: [task] });
+    _stubs.set(legacyId, legacyStub);
+
+    const { local_queue, stub_version, ...oldPayload } = {
+      ...BASE_RESUME_PAYLOAD,
+      stub_version: undefined,
+      user: "ys25",
+      cuda_visible_devices: "0",
+      running_tasks: [{ task_id: task.id, pid: 2222 }],
+    };
+    void local_queue;
+    void stub_version;
+
+    const { socketHandlers, webNs } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.(oldPayload);
+
+    expect(webNs.emit).toHaveBeenCalledWith("stub.online", expect.objectContaining({ id: legacyId }));
+    expect(reliableEmitToStub).toHaveBeenCalledWith(
+      legacyId,
+      "resume_response",
+      expect.objectContaining({
+        stub_id: legacyId,
+        kill_tasks: [],
+      }),
+    );
+    expect(failTask).not.toHaveBeenCalledWith(legacyId, task.id, expect.anything(), expect.anything());
+  });
+
   it("emits stub.online on successful first resume", () => {
     const { socketHandlers, webNs } = buildHarness({ skipResume: true });
     socketHandlers["resume"]?.(BASE_RESUME_PAYLOAD);
