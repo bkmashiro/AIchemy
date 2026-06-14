@@ -105,6 +105,35 @@ describe("webhook subscriptions", () => {
     expect(body.task.log_buffer).toBeUndefined();
   });
 
+  it("formats Discord webhook deliveries with Discord-compatible content and embeds", async () => {
+    store.addWebhookSubscription({
+      name: "discord-task-events",
+      url: "https://discord.com/api/webhooks/123/token",
+      events: ["task.terminal"],
+    });
+
+    await deliverTaskStatusWebhooks(
+      makeTask({ status: "running" }),
+      makeTask({ status: "failed", exit_code: 1, run_dir: "/runs/task-1", log_buffer: ["Traceback"] }),
+    );
+
+    const fetchMock = vi.mocked(global.fetch);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("https://discord.com/api/webhooks/123/token");
+    const body = JSON.parse(String(init?.body));
+    expect(body.event).toBeUndefined();
+    expect(body.content).toBe("❌ Alchemy task failed: train.py (task-1) exit_code=1");
+    expect(body.embeds[0].title).toBe("❌ Alchemy task failed: train.py (task-1) exit_code=1");
+    expect(body.embeds[0].color).toBe(0xed4245);
+    expect(body.embeds[0].fields).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "Event", value: "task.failed" }),
+      expect.objectContaining({ name: "Status", value: "failed" }),
+      expect.objectContaining({ name: "Task", value: "task-1" }),
+      expect.objectContaining({ name: "Commands", value: expect.stringContaining("alch tasks logs 'task-1' --tail 200") }),
+    ]));
+  });
+
   it("records successful webhook deliveries for later inspection", async () => {
     const sub = store.addWebhookSubscription({
       name: "hermes-terminal",
