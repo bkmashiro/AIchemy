@@ -173,6 +173,58 @@ export function buildTaskWebhookPayload(previous: Pick<Task, "status">, task: Ta
   };
 }
 
+function isDiscordWebhookUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return ["discord.com", "discordapp.com"].includes(parsed.hostname) && parsed.pathname.startsWith("/api/webhooks/");
+  } catch {
+    return false;
+  }
+}
+
+function truncateDiscord(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function discordColorForSeverity(severity: NotificationSeverity): number {
+  if (severity === "error") return 0xed4245;
+  if (severity === "warning") return 0xfee75c;
+  return 0x57f287;
+}
+
+function formatDiscordWebhookPayload(payload: any): unknown {
+  const summary = String(payload?.summary ?? `Alchemy event: ${payload?.event ?? "unknown"}`);
+  const diagnosis = payload?.diagnosis as NotificationDiagnosis | undefined;
+  const task = payload?.task ?? {};
+  const commands = Array.isArray(payload?.commands) ? payload.commands.map((command: unknown) => String(command)) : [];
+  const commandBlock = commands.length > 0 ? `\`\`\`bash\n${commands.join("\n")}\n\`\`\`` : "n/a";
+
+  return {
+    content: truncateDiscord(summary, 2000),
+    embeds: [
+      {
+        title: truncateDiscord(summary, 256),
+        color: discordColorForSeverity(diagnosis?.severity ?? "info"),
+        timestamp: payload?.occurred_at ?? new Date().toISOString(),
+        fields: [
+          { name: "Event", value: truncateDiscord(String(payload?.event ?? "unknown"), 1024), inline: true },
+          { name: "Status", value: truncateDiscord(String(task?.status ?? "unknown"), 1024), inline: true },
+          { name: "Task", value: truncateDiscord(String(task?.id ?? "unknown"), 1024), inline: true },
+          { name: "Name", value: truncateDiscord(String(task?.display_name ?? task?.name ?? task?.script ?? "unknown"), 1024), inline: false },
+          { name: "Diagnosis", value: truncateDiscord(diagnosis?.reason ?? "n/a", 1024), inline: false },
+          { name: "Commands", value: truncateDiscord(commandBlock, 1024), inline: false },
+        ],
+      },
+    ],
+  };
+}
+
+function formatWebhookRequestBody(sub: WebhookSubscription, payload: unknown): unknown {
+  if (isDiscordWebhookUrl(sub.url)) return formatDiscordWebhookPayload(payload);
+  return payload;
+}
+
 function sanitizeTask(task: Task): Omit<Task, "log_buffer" | "metrics_buffer"> & { log_tail: string[] } {
   const { log_buffer, metrics_buffer: _metricsBuffer, ...rest } = task;
   return { ...rest, log_tail: log_buffer?.slice(-10) ?? [] };
@@ -203,7 +255,7 @@ export async function postWebhook(
   event: WebhookEvent,
   deliveryId = `${sub.id}:${(payload as any).task?.id ?? "manual"}:${event}:${randomUUID()}`,
 ): Promise<{ deliveryId: string; httpStatus: number }> {
-  const body = JSON.stringify(payload);
+  const body = JSON.stringify(formatWebhookRequestBody(sub, payload));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   let httpStatus = 0;
