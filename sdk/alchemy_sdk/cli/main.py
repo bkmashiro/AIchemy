@@ -165,6 +165,44 @@ def print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+def _summarize_inbox_payload(payload: dict[str, Any]) -> None:
+    actor = str(payload.get("actor") or "akashi")
+    items = payload.get("items")
+    if not isinstance(items, list):
+        items = []
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        summary = {}
+
+    print(f"Inbox for actor: {actor}")
+    if payload.get("generated_at"):
+        print(f"Generated: {payload['generated_at']}")
+    if summary:
+        print("Summary:")
+        for name in sorted(summary):
+            print(f"  {name}: {summary[name]}")
+    else:
+        print("Summary: empty")
+
+    print(f"Items ({len(items)}):")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        seq = item.get("seq")
+        status = str(item.get("status") or "")
+        buckets = ",".join(item.get("buckets") or [])
+        name = item.get("name")
+        task_id = item.get("task_id")
+        action = item.get("suggested_next_action")
+        print(f"  {seq}\t{status}\t{buckets}\t{name}\t{task_id}\t{action}")
+
+        commands = item.get("commands")
+        if isinstance(commands, list) and len(commands) <= 2 and all(isinstance(cmd, str) for cmd in commands):
+            total_len = sum(len(cmd) for cmd in commands)
+            if total_len <= 120:
+                print(f"    commands: {', '.join(commands)}")
+
+
 def short_task(task: dict[str, Any]) -> dict[str, Any]:
     return {
         "seq": task.get("seq"),
@@ -426,6 +464,55 @@ def cmd_tasks_ls(args: argparse.Namespace, client: ApiClient) -> None:
         stub = find_stub(client, args.stub)
         tasks = [t for t in tasks if t.get("stub_id") == stub["id"] or t.get("target_stub_id") == stub["id"]]
     print_json([short_task(t) for t in tasks])
+
+
+def cmd_tasks_inbox(args: argparse.Namespace, client: ApiClient) -> None:
+    params: dict[str, Any] = {"actor": args.actor, "limit": args.limit}
+    if args.bucket:
+        params["bucket"] = args.bucket
+    payload = client.get(f"/tasks/inbox?{urlencode(params)}")
+    if args.json:
+        print_json(payload)
+        return
+    if isinstance(payload, dict):
+        _summarize_inbox_payload(payload)
+        return
+    print_json(payload)
+
+
+def _task_mark_body(actor: str, *, pinned: bool | None = None, watched: bool | None = None, note: str | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {"actor": actor}
+    if pinned is not None:
+        body["pinned"] = pinned
+    if watched is not None:
+        body["watched"] = watched
+    if note is not None:
+        body["note"] = note
+    return body
+
+
+def cmd_tasks_mark_read(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/tasks/{args.task}/read", {"actor": args.actor}))
+
+
+def cmd_tasks_mark_ack(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/tasks/{args.task}/ack", {"actor": args.actor}))
+
+
+def cmd_tasks_pin(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/tasks/{args.task}/pin", _task_mark_body(args.actor, pinned=True, note=args.note)))
+
+
+def cmd_tasks_unpin(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/tasks/{args.task}/pin", _task_mark_body(args.actor, pinned=False)))
+
+
+def cmd_tasks_watch(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/tasks/{args.task}/watch", _task_mark_body(args.actor, watched=True, note=args.note)))
+
+
+def cmd_tasks_unwatch(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/tasks/{args.task}/watch", _task_mark_body(args.actor, watched=False)))
 
 
 def task_reason(task: dict[str, Any]) -> str | None:
@@ -1360,6 +1447,38 @@ def build_parser() -> argparse.ArgumentParser:
     tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)
     p = tasks_sub.add_parser("ls", help="list recent tasks (short form)"); p.add_argument("--status", help="filter by status (pending/running/...)"); p.add_argument("--active", action="store_true", help="filter to active statuses (pending/assigned/running/paused/blocked)"); p.add_argument("--stub", help="only tasks bound to this stub"); p.add_argument("--limit", type=int, default=50, help="max tasks to return (default 50)"); p.set_defaults(func=cmd_tasks_ls)
+    p = tasks_sub.add_parser("inbox", help="fetch actor-scoped inbox items")
+    p.add_argument("--actor", default="akashi", help="actor to scope marks (default akashi)")
+    p.add_argument("--limit", type=int, default=50, help="max items to return (default 50)")
+    p.add_argument("--bucket", help="filter by inbox bucket")
+    p.add_argument("--json", action="store_true", help="print raw JSON inbox payload")
+    p.set_defaults(func=cmd_tasks_inbox)
+    p = tasks_sub.add_parser("mark-read", help="mark a task as read for an actor")
+    p.add_argument("task", help="task id")
+    p.add_argument("--actor", default="akashi", help="actor to apply mark (default akashi)")
+    p.set_defaults(func=cmd_tasks_mark_read)
+    p = tasks_sub.add_parser("ack", help="acknowledge a task for an actor")
+    p.add_argument("task", help="task id")
+    p.add_argument("--actor", default="akashi", help="actor to apply mark (default akashi)")
+    p.set_defaults(func=cmd_tasks_mark_ack)
+    p = tasks_sub.add_parser("pin", help="pin a task for follow-up")
+    p.add_argument("task", help="task id")
+    p.add_argument("--actor", default="akashi", help="actor to apply mark (default akashi)")
+    p.add_argument("--note", help="optional note")
+    p.set_defaults(func=cmd_tasks_pin)
+    p = tasks_sub.add_parser("unpin", help="unpin a task")
+    p.add_argument("task", help="task id")
+    p.add_argument("--actor", default="akashi", help="actor to apply mark (default akashi)")
+    p.set_defaults(func=cmd_tasks_unpin)
+    p = tasks_sub.add_parser("watch", help="watch a task for follow-up")
+    p.add_argument("task", help="task id")
+    p.add_argument("--actor", default="akashi", help="actor to apply mark (default akashi)")
+    p.add_argument("--note", help="optional note")
+    p.set_defaults(func=cmd_tasks_watch)
+    p = tasks_sub.add_parser("unwatch", help="unwatch a task")
+    p.add_argument("task", help="task id")
+    p.add_argument("--actor", default="akashi", help="actor to apply mark (default akashi)")
+    p.set_defaults(func=cmd_tasks_unwatch)
     p = tasks_sub.add_parser("top", help="summarize active tasks and recent failures"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.add_argument("--failed-limit", type=int, default=10, help="recent failed tasks to include (default 10)"); p.set_defaults(func=cmd_tasks_top)
     p = tasks_sub.add_parser("repair", help="dry-run recommendations for risky active tasks"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.set_defaults(func=cmd_tasks_repair)
     p = tasks_sub.add_parser("get", help="fetch a single task"); p.add_argument("task", help="task id"); p.add_argument("--short", action="store_true", help="trim to the short summary form"); p.set_defaults(func=cmd_tasks_get)

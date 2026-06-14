@@ -82,6 +82,17 @@ export interface WebhookDeliveryOutbox {
   updated_at: string;
 }
 
+export interface TaskMark {
+  task_id: string;
+  actor: string;
+  pinned: boolean;
+  watched: boolean;
+  read_at?: string;
+  acked_at?: string;
+  note?: string;
+  updated_at: string;
+}
+
 export interface Task {
   // === Identity ===
   id: string;

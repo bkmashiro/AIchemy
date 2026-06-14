@@ -30,6 +30,7 @@ import {
   WebhookDelivery,
   WebhookDeliveryOutbox,
   WebhookOutboxStatus,
+  TaskMark,
 } from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
@@ -106,6 +107,18 @@ class Store {
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
       CREATE INDEX IF NOT EXISTS idx_tasks_stub_id ON tasks(stub_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_location ON tasks(location);
+      CREATE TABLE IF NOT EXISTS task_marks (
+        task_id TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        watched INTEGER NOT NULL DEFAULT 0,
+        read_at TEXT,
+        acked_at TEXT,
+        note TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(task_id, actor)
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_marks_actor ON task_marks(actor);
       CREATE TABLE IF NOT EXISTS grids (
         id TEXT PRIMARY KEY,
         data TEXT NOT NULL
@@ -744,6 +757,126 @@ class Store {
 
   deleteWebhookDeliveryOutbox(id: string): void {
     this.db.delete(schema.webhookDeliveryOutbox).where(eq(schema.webhookDeliveryOutbox.id, id)).run();
+  }
+
+  // ─── Task Marks ────────────────────────────────────────────────────────
+
+  private _rowToTaskMark(row: typeof schema.taskMarks.$inferSelect): TaskMark {
+    return {
+      task_id: row.task_id,
+      actor: row.actor,
+      pinned: row.pinned === 1,
+      watched: row.watched === 1,
+      read_at: row.read_at ?? undefined,
+      acked_at: row.acked_at ?? undefined,
+      note: row.note ?? undefined,
+      updated_at: row.updated_at,
+    };
+  }
+
+  private _findTaskMark(taskId: string, actor: string): TaskMark | undefined {
+    const row = this.db.select()
+      .from(schema.taskMarks)
+      .where(and(eq(schema.taskMarks.task_id, taskId), eq(schema.taskMarks.actor, actor)))
+      .get();
+    if (!row) return undefined;
+    return this._rowToTaskMark(row);
+  }
+
+  getTaskMark(taskId: string, actor: string): TaskMark | undefined {
+    const normalizedActor = this._normalizeTaskMarkActor(actor);
+    this._validateTaskMarkInputs(taskId, normalizedActor);
+    return this._findTaskMark(taskId, normalizedActor);
+  }
+
+  listTaskMarks(actor?: string): TaskMark[] {
+    const rows: Array<typeof schema.taskMarks.$inferSelect> = actor
+      ? this.db
+        .select()
+        .from(schema.taskMarks)
+        .where(eq(schema.taskMarks.actor, this._normalizeTaskMarkActor(actor)))
+        .all()
+      : this.db.select().from(schema.taskMarks).all();
+
+    return rows.map((row) => this._rowToTaskMark(row));
+  }
+
+  setTaskMark(taskId: string, actor: string, patch: Partial<Omit<TaskMark, "task_id" | "actor" | "updated_at">> & { updated_at?: string }): TaskMark {
+    const normalizedActor = this._normalizeTaskMarkActor(actor);
+    this._validateTaskMarkInputs(taskId, normalizedActor);
+
+    const now = patch.updated_at ?? new Date().toISOString();
+    const existing = this._findTaskMark(taskId, normalizedActor);
+    const next: TaskMark = {
+      task_id: taskId,
+      actor: normalizedActor,
+      pinned: existing?.pinned ?? false,
+      watched: existing?.watched ?? false,
+      read_at: existing?.read_at,
+      acked_at: existing?.acked_at,
+      note: existing?.note,
+      updated_at: now,
+    };
+
+    if (patch.pinned !== undefined) next.pinned = patch.pinned;
+    if (patch.watched !== undefined) next.watched = patch.watched;
+    if (patch.read_at !== undefined) next.read_at = patch.read_at;
+    if (patch.acked_at !== undefined) next.acked_at = patch.acked_at;
+
+    if (Object.prototype.hasOwnProperty.call(patch, "note")) {
+      const patchAny = patch as { note?: string | null | undefined };
+      if (patchAny.note === null) {
+        next.note = undefined;
+      } else if (patchAny.note !== undefined) {
+        next.note = patchAny.note;
+      }
+    }
+
+    this.db.insert(schema.taskMarks)
+      .values({
+        task_id: next.task_id,
+        actor: next.actor,
+        pinned: next.pinned ? 1 : 0,
+        watched: next.watched ? 1 : 0,
+        read_at: next.read_at ?? null,
+        acked_at: next.acked_at ?? null,
+        note: next.note ?? null,
+        updated_at: next.updated_at,
+      })
+      .onConflictDoUpdate({
+        target: [schema.taskMarks.task_id, schema.taskMarks.actor],
+        set: {
+          pinned: next.pinned ? 1 : 0,
+          watched: next.watched ? 1 : 0,
+          read_at: next.read_at ?? null,
+          acked_at: next.acked_at ?? null,
+          note: next.note ?? null,
+          updated_at: next.updated_at,
+        },
+      })
+      .run();
+
+    return next;
+  }
+
+  private _normalizeTaskMarkActor(actor: string): string {
+    if (typeof actor !== "string") {
+      throw new Error("Invalid task mark actor");
+    }
+    const normalized = actor.trim();
+    if (!normalized) {
+      throw new Error("Invalid task mark actor");
+    }
+    return normalized;
+  }
+
+  private _validateTaskMarkInputs(taskId: string, actor: string): void {
+    if (typeof taskId !== "string" || taskId.trim() === "") {
+      throw new Error("Invalid task mark task_id");
+    }
+    if (!actor) {
+      throw new Error("Invalid task mark actor");
+    }
   }
 
   // ─── Tasks ──────────────────────────────────────────────────────────────
@@ -1480,6 +1613,7 @@ class Store {
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
+    this.db.delete(schema.taskMarks).run();
 
     this._applyState(state);
     logger.info("state.restore", { stubs: this.stubs.size });
@@ -1583,6 +1717,7 @@ class Store {
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.meta).run();
+    this.db.delete(schema.taskMarks).run();
   }
 }
 

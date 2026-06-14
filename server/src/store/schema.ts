@@ -2,7 +2,7 @@
  * store/schema.ts — Drizzle ORM table definitions for Alchemy v2.
  */
 
-import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, primaryKey } from "drizzle-orm/sqlite-core";
 
 export const stubs = sqliteTable("stubs", {
   id: text("id").primaryKey(),
@@ -28,6 +28,20 @@ export const tasks = sqliteTable("tasks", {
   index("idx_tasks_status").on(table.status),
   index("idx_tasks_stub_id").on(table.stub_id),
   index("idx_tasks_location").on(table.location),
+]);
+
+export const taskMarks = sqliteTable("task_marks", {
+  task_id: text("task_id").notNull(),
+  actor: text("actor").notNull(),
+  pinned: integer("pinned").notNull().default(0),
+  watched: integer("watched").notNull().default(0),
+  read_at: text("read_at"),
+  acked_at: text("acked_at"),
+  note: text("note"),
+  updated_at: text("updated_at").notNull(),
+}, (table) => [
+  primaryKey({ columns: [table.task_id, table.actor] }),
+  index("idx_task_marks_actor").on(table.actor),
 ]);
 
 export const grids = sqliteTable("grids", {
