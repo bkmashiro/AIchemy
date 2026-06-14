@@ -431,7 +431,71 @@ def test_tasks_repair_no_mutations(monkeypatch):
     assert [call["method"] for call in calls] == ["GET"]
 
 
-def test_tasks_resubmit_resume_drops_run_dir_and_targets_tags(monkeypatch):
+def test_tasks_inbox_json_uses_actor_limit_bucket_and_prints_json(monkeypatch, capsys):
+    payload = {
+        "actor": "akashi",
+        "generated_at": "2026-06-14T00:00:00Z",
+        "summary": {"unread_terminal": 1},
+        "items": [
+            {
+                "seq": 7,
+                "status": "completed",
+                "buckets": ["unread_terminal"],
+                "name": "train",
+                "task_id": "task-1",
+                "suggested_next_action": "Read task result",
+            }
+        ],
+    }
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "inbox", "--json", "--actor", "akashi", "--limit", "10", "--bucket", "unread_terminal"],
+        [payload],
+    )
+
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/inbox?actor=akashi&limit=10&bucket=unread_terminal"
+    out = json.loads(capsys.readouterr().out)
+    assert out == payload
+
+
+def test_tasks_mark_read_posts_actor_payload(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "mark-read", "task-1", "--actor", "akashi"],
+        [{"ok": True, "task_id": "task-1"}],
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1/read"
+    assert calls[0]["body"] == {"actor": "akashi"}
+
+
+def test_tasks_pin_posts_note_and_pinned_true(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "pin", "task-1", "--actor", "akashi", "--note", "important"],
+        [{"ok": True, "task_id": "task-1", "pinned": True, "note": "important"}],
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1/pin"
+    assert calls[0]["body"] == {"actor": "akashi", "pinned": True, "note": "important"}
+
+
+def test_tasks_unwatch_posts_unwatch_payload(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "unwatch", "task-1", "--actor", "akashi"],
+        [{"ok": True, "task_id": "task-1", "watched": False}],
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1/watch"
+    assert calls[0]["body"] == {"actor": "akashi", "watched": False}
+
+
+def test_tasks_resubmit_clone_preserves_run_dir_and_targets_tags(monkeypatch):
     source = {
         "id": "task-1",
         "script": "/work/train.py",

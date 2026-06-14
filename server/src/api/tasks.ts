@@ -11,11 +11,10 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { store } from "../store";
-import { Task } from "../types";
+import { Task, TaskMark } from "../types";
 import { Namespace } from "socket.io";
 import {
   computeFingerprint, writeLockTable, idempotencyCache,
-  isActiveStatus,
 } from "../dedup";
 import { triggerSchedule, maybeDispatch } from "../scheduler";
 import { notifySubmitted } from "../discord";
@@ -165,6 +164,85 @@ export function createTask(input: TaskInput): Task {
 
 const TERMINAL_STATUSES = ["completed", "failed", "cancelled"];
 
+const ACTIVE_STATUS_FOR_INBOX_ATTENTION: Task["status"][] = ["pending", "assigned", "running", "paused", "blocked"];
+
+function shellQuoteForCommands(value: string): string {
+  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
+}
+
+function buildInboxCommands(taskId: string, runDir?: string): string[] {
+  const quotedTaskId = shellQuoteForCommands(taskId);
+  const commands = [
+    `alch tasks get ${quotedTaskId}`,
+    `alch tasks logs ${quotedTaskId} --tail 200`,
+  ];
+  if (runDir) {
+    commands.push(`ls -la ${shellQuoteForCommands(runDir)}`);
+  }
+  return commands;
+}
+
+function normalizeActor(rawActor: unknown): string {
+  const actor = typeof rawActor === "string" ? rawActor.trim() : "akashi";
+  return actor || "akashi";
+}
+
+function buildSuggestedNextAction(status: Task["status"], reasons: string[]): string {
+  if (reasons.includes("blocked")) return "Inspect dependency / unblock";
+  if (reasons.includes("disconnected")) return "Check stub and resume/inspect task";
+  if (reasons.includes("failed")) return "Inspect failure logs and decide retry";
+  if (reasons.includes("pinned")) return "Review when convenient";
+  if (reasons.includes("watched")) return "Keep this task in follow-up queue";
+  if (reasons.includes("terminal_unread")) return "Read task result";
+  if (status === "failed") return "Investigate failure";
+  return "Monitor progress";
+}
+
+function buildInboxBuckets(task: Task, mark: TaskMark | undefined): { buckets: string[]; reasons: string[] } {
+  const buckets: string[] = [];
+  const reasons: string[] = [];
+
+  if (TERMINAL_STATUSES.includes(task.status) && !mark?.read_at) {
+    buckets.push("unread_terminal");
+    reasons.push("terminal_unread");
+  }
+
+  if (mark?.pinned) {
+    buckets.push("pinned");
+    reasons.push("pinned");
+  }
+
+  if (mark?.watched) {
+    buckets.push("watched");
+    reasons.push("watched");
+  }
+
+  if (task.status === "blocked") {
+    buckets.push("blocked_needs_decision");
+    reasons.push("blocked");
+  }
+
+  if (task.status === "failed") {
+    buckets.push("failed_recent");
+    reasons.push("failed");
+  }
+
+  if (ACTIVE_STATUS_FOR_INBOX_ATTENTION.includes(task.status) && !!task.disconnected_at) {
+    buckets.push("active_attention");
+    reasons.push("disconnected");
+  }
+
+  return { buckets: Array.from(new Set(buckets)), reasons: Array.from(new Set(reasons)) };
+}
+
+function getActorFromBody(req: Request): string {
+  return normalizeActor((req.body as { actor?: unknown }).actor);
+}
+
+function getActorFromQuery(req: Request): string {
+  return normalizeActor(req.query.actor);
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): Router {
@@ -239,6 +317,95 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     // Compute current page for backward compat
     const page = Math.floor(offset / limit) + 1;
     res.json({ tasks: enriched, total, page, limit, offset, counts });
+  });
+
+  // GET /tasks/inbox — actor-scoped inbox with bucket/attention grouping
+  router.get("/inbox", (req: Request, res: Response) => {
+    const actor = getActorFromQuery(req);
+    const limit = Math.max(1, parseInt(String(req.query.limit || "50"), 10) || 50);
+    const requestedBucket = req.query.bucket ? String(req.query.bucket) : undefined;
+
+    const allTasks = store.getAllTasks();
+    type InboxItemWithSort = {
+      task_id: string;
+      seq: number;
+      name: string;
+      status: string;
+      buckets: string[];
+      why_interesting: string[];
+      run_dir?: string;
+      stub_id?: string;
+      stub_name?: string;
+      created_at?: string;
+      started_at?: string;
+      finished_at?: string;
+      commands: string[];
+      suggested_next_action: string;
+      _sortSeq: number;
+      _sortCreatedAt: string;
+    };
+
+    const deduped = new Map<string, InboxItemWithSort>();
+
+    for (const task of allTasks) {
+      const mark = store.getTaskMark(task.id, actor);
+      const { buckets, reasons } = buildInboxBuckets(task, mark);
+      if (requestedBucket) {
+        if (!buckets.includes(requestedBucket)) continue;
+      } else if (buckets.length === 0) {
+        continue;
+      }
+
+      const stub = task.stub_id ? store.getStub(task.stub_id) : undefined;
+      const stub_name = stub ? (stub.name || stub.hostname) : undefined;
+      const item = {
+        task_id: task.id,
+        seq: task.seq,
+        name: task.display_name || task.name || task.script,
+        status: task.status,
+        buckets,
+        why_interesting: reasons,
+        run_dir: task.run_dir,
+        stub_id: task.stub_id,
+        stub_name,
+        created_at: task.created_at,
+        started_at: task.started_at,
+        finished_at: task.finished_at,
+        commands: buildInboxCommands(task.id, task.run_dir),
+        suggested_next_action: buildSuggestedNextAction(task.status, reasons),
+        _sortSeq: task.seq ?? 0,
+        _sortCreatedAt: task.created_at,
+      };
+
+      if (!deduped.has(task.id)) {
+        deduped.set(task.id, item);
+      }
+    }
+
+    type InboxItem = Omit<InboxItemWithSort, "_sortSeq" | "_sortCreatedAt">;
+
+    let itemsWithSort = Array.from(deduped.values());
+    itemsWithSort = itemsWithSort.sort((a, b) => {
+      const diff = (b._sortSeq ?? 0) - (a._sortSeq ?? 0);
+      if (diff !== 0) return diff;
+      return (b._sortCreatedAt || "").localeCompare(a._sortCreatedAt || "");
+    }).slice(0, limit);
+
+    const items: InboxItem[] = itemsWithSort.map(({ _sortSeq, _sortCreatedAt, ...rest }) => rest);
+
+    const summary: Record<string, number> = {};
+    for (const item of items) {
+      for (const bucket of item.buckets) {
+        summary[bucket] = (summary[bucket] ?? 0) + 1;
+      }
+    }
+
+    res.json({
+      actor,
+      generated_at: new Date().toISOString(),
+      summary,
+      items,
+    });
   });
 
   // POST /tasks/batch — must be before /:id routes
@@ -515,6 +682,70 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     res.status(201).json(task);
+  });
+
+  // POST /tasks/:id/read — mark task as read for actor
+  router.post("/:id/read", (req: Request, res: Response) => {
+    const actor = getActorFromBody(req);
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+
+    const mark = store.setTaskMark(req.params.id, actor, { read_at: new Date().toISOString() });
+    res.json(mark);
+  });
+
+  // POST /tasks/:id/ack — acknowledge terminal task for actor
+  router.post("/:id/ack", (req: Request, res: Response) => {
+    const actor = getActorFromBody(req);
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+
+    const mark = store.setTaskMark(req.params.id, actor, { acked_at: new Date().toISOString() });
+    res.json(mark);
+  });
+
+  // POST /tasks/:id/pin — pin/unpin task for actor
+  router.post("/:id/pin", (req: Request, res: Response) => {
+    const actor = getActorFromBody(req);
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+
+    const body = req.body as { pinned?: unknown; note?: unknown };
+    const patch: Partial<Pick<TaskMark, "pinned" | "note">> = {};
+
+    if (typeof body.pinned === "boolean") {
+      patch.pinned = body.pinned;
+    } else {
+      patch.pinned = true;
+    }
+    if (typeof body.note === "string") {
+      patch.note = body.note;
+    }
+
+    const mark = store.setTaskMark(req.params.id, actor, patch);
+    res.json(mark);
+  });
+
+  // POST /tasks/:id/watch — watch/unwatch task for actor
+  router.post("/:id/watch", (req: Request, res: Response) => {
+    const actor = getActorFromBody(req);
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+
+    const body = req.body as { watched?: unknown; note?: unknown };
+    const patch: Partial<Pick<TaskMark, "watched" | "note">> = {};
+
+    if (typeof body.watched === "boolean") {
+      patch.watched = body.watched;
+    } else {
+      patch.watched = true;
+    }
+    if (typeof body.note === "string") {
+      patch.note = body.note;
+    }
+
+    const mark = store.setTaskMark(req.params.id, actor, patch);
+    res.json(mark);
   });
 
   // GET /tasks/:id
