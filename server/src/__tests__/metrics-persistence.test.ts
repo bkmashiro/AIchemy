@@ -47,4 +47,27 @@ describe("task metric persistence", () => {
       points: [],
     });
   });
+
+  it("labels task log tails as bounded persistent snapshots", async () => {
+    const task = createTask({ script: "train.py" });
+    store.addToGlobalQueue({ ...task, log_buffer: ["a", "b", "c"] });
+
+    const res = await request(makeApp()).get(`/tasks/${task.id}/logs?tail=2`).expect(200);
+
+    expect(res.body).toEqual({
+      task_id: task.id,
+      source: "persistent_task_snapshot",
+      truncated: true,
+      tail: 2,
+      lines: ["b", "c"],
+    });
+  });
+
+  it("rejects invalid log tail requests instead of returning unbounded blobs", async () => {
+    const task = createTask({ script: "train.py" });
+    store.addToGlobalQueue(task);
+
+    await request(makeApp()).get(`/tasks/${task.id}/logs?tail=99999`).expect(400);
+    await request(makeApp()).get(`/tasks/${task.id}/logs?tail=0`).expect(400);
+  });
 });

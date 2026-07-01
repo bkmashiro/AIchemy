@@ -109,9 +109,21 @@ export function createMetricsRouter(options: MetricsRouterOptions = {}): Router 
     const found = store.findTask(req.params.id);
     if (!found) { res.status(404).json({ error: "Task not found" }); return; }
     const { task } = found;
-    const tail = req.query.tail ? parseInt(req.query.tail as string, 10) : undefined;
-    const lines = tail ? task.log_buffer.slice(-tail) : task.log_buffer;
-    res.json({ task_id: task.id, lines });
+    const rawTail = req.query.tail;
+    const requestedTail = rawTail !== undefined ? parseInt(rawTail as string, 10) : undefined;
+    if (requestedTail !== undefined && (!Number.isFinite(requestedTail) || requestedTail < 1 || requestedTail > 500)) {
+      res.status(400).json({ error: "tail must be an integer between 1 and 500" });
+      return;
+    }
+    const tail = requestedTail ?? Math.min(task.log_buffer.length, 500);
+    const lines = tail > 0 ? task.log_buffer.slice(-tail) : [];
+    res.json({
+      task_id: task.id,
+      source: task.log_buffer.length > 0 ? "persistent_task_snapshot" : "empty",
+      truncated: task.log_buffer.length > lines.length,
+      tail,
+      lines,
+    });
   });
 
   // GET /tasks/:id/cost — cost for a single task

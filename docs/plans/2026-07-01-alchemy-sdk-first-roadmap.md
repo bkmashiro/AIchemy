@@ -637,7 +637,15 @@ Files:
 - Modify: `sdk/alchemy_sdk/cli/main.py`
 - Test: `sdk/tests/test_cli.py`
 
-### G4. Log and metric tail evidence on server
+### G4. Log and metric tail evidence on server — DONE 2026-07-01
+
+Implemented explicit source semantics for task log tails: `GET /tasks/:id/logs` returns `source`, `truncated`, `tail`, and bounded `lines`. Tail requests must be `1..500`; no endpoint returns unbounded logs. Metrics already return `source="ring_buffer" | "persistent_task_snapshot" | "empty"`.
+
+Verified:
+```bash
+cd server && npm test -- --run src/__tests__/metrics-persistence.test.ts
+# 3 passed
+```
 
 Yuzhe clarified the durability rule:
 - Full logs do not belong in SQLite.
