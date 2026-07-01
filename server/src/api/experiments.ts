@@ -1934,7 +1934,14 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       const existing = store.getExperimentEvents(exp.id).find((event) =>
         !event.deleted_at && event.kind === kind && event.data?.source === "code-ledger" && event.data?.source_id === data.source_id
       );
-      if (existing) { res.status(200).json(existing); return; }
+      if (existing) {
+        if (typeof data.content_hash === "string" && typeof existing.data?.content_hash === "string" && data.content_hash !== existing.data.content_hash) {
+          res.status(409).json({ error: "code-ledger source_id conflict", existing_event_id: existing.id });
+          return;
+        }
+        res.status(200).json(existing);
+        return;
+      }
     }
 
     const event: ExperimentEvent = {

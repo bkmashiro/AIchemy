@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -1036,19 +1037,35 @@ def cmd_experiments_scaffold(args: argparse.Namespace) -> int:
 
 def cmd_experiments_inject_ledger(args: argparse.Namespace) -> int:
     from alchemy_sdk.experiments import normalize_decision
-    from alchemy_sdk.ledger import append_decision, ledger_hash, parse_ledger, replace_ledger
+    from alchemy_sdk.ledger import append_comment, append_decision, ledger_hash, parse_ledger, replace_ledger
 
     path = Path(args.file)
     text = path.read_text(encoding="utf-8")
     ledger = parse_ledger(text)
     evidence = list(args.evidence or [])
-    updated = append_decision(
-        ledger,
-        decision_id=args.decision_id,
-        decision=normalize_decision(args.decision),
-        reason=args.reason,
-        evidence=evidence,
-    )
+    decision_mode = bool(args.decision_id or args.decision)
+    comment_mode = bool(args.comment_id or args.comment)
+    if decision_mode == comment_mode:
+        raise AlchError("pass exactly one of --decision-id/--decision or --comment-id/--comment")
+    if decision_mode and not (args.decision_id and args.decision):
+        raise AlchError("decision ledger entries require --decision-id and --decision")
+    if comment_mode and not (args.comment_id and args.comment):
+        raise AlchError("comment ledger entries require --comment-id and --comment")
+    if args.decision_id:
+        updated = append_decision(
+            ledger,
+            decision_id=args.decision_id,
+            decision=normalize_decision(args.decision),
+            reason=args.reason,
+            evidence=evidence,
+        )
+    else:
+        updated = append_comment(
+            ledger,
+            comment_id=args.comment_id,
+            comment=args.comment,
+            evidence=evidence,
+        )
     path.write_text(replace_ledger(text, updated), encoding="utf-8")
     print_json({"path": str(path), "ledger_hash": ledger_hash(updated), "decisions": len(updated["decisions"])})
     return 0
@@ -1063,26 +1080,42 @@ def cmd_experiments_sync_ledger(args: argparse.Namespace, client: ApiClient) -> 
     timeline = client.get(f"/experiments/{exp['id']}/timeline")
     events = timeline.get("events", []) if isinstance(timeline, dict) else []
     existing = {
-        event.get("data", {}).get("source_id")
+        (event.get("kind"), event.get("data", {}).get("source_id"))
         for event in events
-        if event.get("kind") == "decision" and event.get("data", {}).get("source") == "code-ledger"
+        if event.get("data", {}).get("source") == "code-ledger"
     }
     created: list[dict[str, Any]] = []
+
+    def content_hash(entry: dict[str, Any]) -> str:
+        payload = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     for decision in ledger.get("decisions", []):
         if not isinstance(decision, dict):
             continue
         source_id = decision.get("id")
         verdict = decision.get("decision")
-        if not source_id or source_id in existing:
+        if not source_id or ("decision", source_id) in existing:
             continue
         reason = decision.get("reason")
         message = f"{verdict}: {reason}" if reason else str(verdict)
-        data = {"source": "code-ledger", "source_id": source_id, "decision": verdict}
+        data = {"source": "code-ledger", "source_id": source_id, "content_hash": content_hash(decision), "decision": verdict}
         if reason:
             data["reason"] = reason
         if decision.get("evidence"):
             data["evidence"] = decision.get("evidence")
         created.append(client.post(f"/experiments/{exp['id']}/events", {"kind": "decision", "message": message, "data": data}))
+    for note in ledger.get("notes", []):
+        if not isinstance(note, dict):
+            continue
+        source_id = note.get("id")
+        comment = note.get("comment")
+        if not source_id or not comment or ("note", source_id) in existing:
+            continue
+        data = {"source": "code-ledger", "source_id": source_id, "content_hash": content_hash(note)}
+        if note.get("evidence"):
+            data["evidence"] = note.get("evidence")
+        created.append(client.post(f"/experiments/{exp['id']}/events", {"kind": "note", "message": str(comment), "data": data}))
     print_json({"experiment_id": exp["id"], "ledger_hash": ledger_hash(ledger), "created": len(created), "events": created})
 
 
@@ -1603,10 +1636,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = exps_sub.add_parser("inject-ledger", help="idempotently update a code-first managed ledger block")
     p.add_argument("file", help="Python experiment file containing an alchemy-ledger block")
-    p.add_argument("--decision-id", required=True, help="stable decision id inside this file")
-    p.add_argument("--decision", required=True, choices=["keep", "try_more", "try-more", "discard", "drop", "rerun", "fork"])
+    p.add_argument("--decision-id", help="stable decision id inside this file")
+    p.add_argument("--decision", choices=["keep", "try_more", "try-more", "discard", "drop", "rerun", "fork"])
     p.add_argument("--reason", help="decision rationale")
-    p.add_argument("--evidence", action="append", help="experiment code_id or artifact ref backing the decision; repeatable")
+    p.add_argument("--comment-id", help="stable comment id inside this file")
+    p.add_argument("--comment", help="neutral comment text")
+    p.add_argument("--evidence", action="append", help="experiment code_id or artifact ref backing the entry; repeatable")
     p.set_defaults(func=cmd_experiments_inject_ledger, no_client=True)
 
     p = exps_sub.add_parser("sync-ledger", help="sync missing code-ledger decisions to the experiment timeline")

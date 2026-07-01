@@ -310,12 +310,16 @@ describe("experiment lineage API", () => {
     const body = {
       kind: "decision",
       message: "keep: best",
-      data: { source: "code-ledger", source_id: "keep-baseline", decision: "keep" },
+      data: { source: "code-ledger", source_id: "keep-baseline", content_hash: "h1", decision: "keep" },
     };
     const first = await request(app).post(`/experiments/${created.body.id}/events`).send(body).expect(201);
     const second = await request(app).post(`/experiments/${created.body.id}/events`).send(body).expect(200);
 
     expect(second.body.id).toBe(first.body.id);
+    await request(app)
+      .post(`/experiments/${created.body.id}/events`)
+      .send({ ...body, message: "keep: tampered", data: { ...body.data, content_hash: "h2" } })
+      .expect(409);
     const timeline = await request(app).get(`/experiments/${created.body.id}/timeline`).expect(200);
     expect(timeline.body.events.filter((event: any) => event.data?.source_id === "keep-baseline")).toHaveLength(1);
   });

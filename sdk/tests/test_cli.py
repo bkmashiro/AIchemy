@@ -134,11 +134,14 @@ def test_experiments_sync_ledger_posts_missing_decision_events(monkeypatch, tmp_
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/timeline"
     assert calls[2]["method"] == "POST"
     assert calls[2]["url"] == "http://localhost:3002/api/experiments/exp-1/events"
-    assert calls[2]["body"] == {
-        "kind": "decision",
-        "message": "keep: best",
-        "data": {"source": "code-ledger", "source_id": "keep-baseline", "decision": "keep", "reason": "best"},
-    }
+    payload = calls[2]["body"]
+    assert payload["kind"] == "decision"
+    assert payload["message"] == "keep: best"
+    assert payload["data"]["source"] == "code-ledger"
+    assert payload["data"]["source_id"] == "keep-baseline"
+    assert payload["data"]["decision"] == "keep"
+    assert payload["data"]["reason"] == "best"
+    assert isinstance(payload["data"]["content_hash"], str)
 
 
 def test_experiments_sync_ledger_skips_existing_source_ids(monkeypatch, tmp_path):
@@ -156,6 +159,39 @@ def test_experiments_sync_ledger_skips_existing_source_ids(monkeypatch, tmp_path
     )
 
     assert len(calls) == 2
+
+
+def test_experiments_inject_and_sync_ledger_comment(monkeypatch, tmp_path):
+    output = tmp_path / "exp.py"
+    cli.main(["experiments", "scaffold", "--code-id", "jema.comment.v1", "--name", "Comment", "--output", str(output)])
+
+    code = cli.main([
+        "experiments", "inject-ledger", str(output),
+        "--comment-id", "freeway-coverage",
+        "--comment", "Freeway coverage still zero",
+        "--evidence", "task:abc",
+    ])
+
+    assert code == 0
+    assert "Freeway coverage still zero" in output.read_text()
+
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "sync-ledger", str(output), "jema.comment.v1"],
+        [
+            [{"id": "exp-1", "name": "Comment", "code_id": "jema.comment.v1"}],
+            {"events": []},
+            {"id": "evt-1", "kind": "note"},
+        ],
+    )
+
+    payload = calls[2]["body"]
+    assert payload["kind"] == "note"
+    assert payload["message"] == "Freeway coverage still zero"
+    assert payload["data"]["source"] == "code-ledger"
+    assert payload["data"]["source_id"] == "freeway-coverage"
+    assert payload["data"]["evidence"] == ["task:abc"]
+    assert isinstance(payload["data"]["content_hash"], str)
 
 
 def test_experiments_decide_normalizes_try_more_alias(monkeypatch):

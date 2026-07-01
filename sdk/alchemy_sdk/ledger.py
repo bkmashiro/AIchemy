@@ -75,8 +75,8 @@ def append_decision(
 ) -> dict[str, Any]:
     if not decision_id.strip():
         raise ValueError("decision_id must be non-empty")
-    if decision not in {"keep", "drop", "rerun", "fork"}:
-        raise ValueError("decision must be one of: keep, drop, rerun, fork")
+    if decision not in {"keep", "try_more", "discard"}:
+        raise ValueError("decision must be one of: keep, try_more, discard")
     next_ledger = _canonical(ledger)
     decisions = next_ledger["decisions"]
     if not any(item.get("id") == decision_id for item in decisions if isinstance(item, dict)):
@@ -86,6 +86,33 @@ def append_decision(
         if evidence:
             item["evidence"] = list(evidence)
         decisions.append(item)
+    evidence_rows = next_ledger["evidence"]
+    known_refs = {row.get("ref") for row in evidence_rows if isinstance(row, dict)}
+    for ref in evidence or []:
+        if ref not in known_refs:
+            evidence_rows.append({"ref": ref, "kind": "experiment"})
+            known_refs.add(ref)
+    return next_ledger
+
+
+def append_comment(
+    ledger: Mapping[str, Any],
+    *,
+    comment_id: str,
+    comment: str,
+    evidence: list[str] | None = None,
+) -> dict[str, Any]:
+    if not comment_id.strip():
+        raise ValueError("comment_id must be non-empty")
+    if not comment.strip():
+        raise ValueError("comment must be non-empty")
+    next_ledger = _canonical(ledger)
+    notes = next_ledger["notes"]
+    if not any(item.get("id") == comment_id for item in notes if isinstance(item, dict)):
+        item: dict[str, Any] = {"id": comment_id, "comment": comment}
+        if evidence:
+            item["evidence"] = list(evidence)
+        notes.append(item)
     evidence_rows = next_ledger["evidence"]
     known_refs = {row.get("ref") for row in evidence_rows if isinstance(row, dict)}
     for ref in evidence or []:

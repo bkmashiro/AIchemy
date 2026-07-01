@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from alchemy_sdk.ledger import append_decision, ledger_hash, parse_ledger, render_ledger_block, replace_ledger
+from alchemy_sdk.ledger import append_comment, append_decision, ledger_hash, parse_ledger, render_ledger_block, replace_ledger
 
 
 def test_ledger_block_roundtrips_and_hash_is_stable():
@@ -35,3 +35,25 @@ def test_append_decision_is_idempotent_by_id():
     twice = append_decision(once, decision_id="d1", decision="keep", reason="good")
 
     assert twice["decisions"] == [{"id": "d1", "decision": "keep", "reason": "good"}]
+
+
+def test_append_comment_is_idempotent_by_id_and_tracks_evidence():
+    ledger = {"decisions": [], "notes": [], "evidence": []}
+
+    once = append_comment(
+        ledger,
+        comment_id="freeway-coverage",
+        comment="Freeway coverage still zero",
+        evidence=["task:abc"],
+    )
+    twice = append_comment(
+        once,
+        comment_id="freeway-coverage",
+        comment="changed text should not duplicate",
+        evidence=["task:abc"],
+    )
+
+    assert twice["notes"] == [
+        {"id": "freeway-coverage", "comment": "Freeway coverage still zero", "evidence": ["task:abc"]}
+    ]
+    assert twice["evidence"] == [{"ref": "task:abc", "kind": "experiment"}]

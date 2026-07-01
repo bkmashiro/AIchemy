@@ -882,9 +882,17 @@ Files:
 - Modify: `sdk/alchemy_sdk/experiment.py`
 - Test: `sdk/tests/test_experiment_spec.py`
 
-### I6. SDK and CLI decision/comment recording with idempotent ledger sync — PARTIAL 2026-07-01
+### I6. SDK and CLI decision/comment recording with idempotent ledger sync — DONE 2026-07-01
 
-Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing `kind="decision"` events with `data.source="code-ledger"` and stable `data.source_id`. Rerunning the command skips already-synced entries. Server event POST also deduplicates repeated code-ledger `source_id` for the same experiment/kind and returns the existing event. SDK/CLI comment support exists through `ExperimentClient.comment()` and `alch experiments comment`; ledger comment sync remains TODO.
+Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing decision and comment entries with `data.source="code-ledger"`, stable `data.source_id`, `content_hash`, and optional `evidence`. Rerunning the command skips already-synced entries. Server event POST deduplicates repeated code-ledger `source_id` for the same experiment/kind, returns the existing event when `content_hash` matches, and returns 409 conflict when the same source id has a different hash. SDK/CLI comment support exists through `ExperimentClient.comment()` and `alch experiments comment`.
+
+Verified:
+```bash
+cd sdk && uv run pytest tests/test_ledger.py::test_append_comment_is_idempotent_by_id_and_tracks_evidence tests/test_cli.py::test_experiments_inject_and_sync_ledger_comment -q
+# 2 passed
+cd server && npm test -- --run src/__tests__/experiments-lineage.test.ts -t "deduplicates code-ledger"
+# 1 passed
+```
 
 Desired API:
 ```python
