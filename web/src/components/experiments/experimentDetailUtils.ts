@@ -378,6 +378,7 @@ export function lineageNodeTone(
   if (onPath) return "path";
   if (
     node.status === "failed" ||
+    node.decision === "discard" ||
     node.decision === "drop" ||
     (node.children.length === 0 && node.decision === null && node.status !== "running")
   ) {
@@ -393,29 +394,39 @@ export const NEXT_ACTION: Record<
   { label: string; hint: string; tone: string }
 > = {
   keep: {
-    label: "Promote → fork next stage",
-    hint: "Use this checkpoint as a parent for the next sweep.",
+    label: "Keep as parent",
+    hint: "Promote this run as evidence and use it as a parent for the next branch.",
     tone: "border-green-400/30 bg-green-500/10 text-green-200",
   },
-  fork: {
-    label: "Branch from this run",
-    hint: "Open a narrower fork to test the variant.",
-    tone: "border-purple-400/30 bg-purple-500/10 text-purple-200",
-  },
-  rerun: {
-    label: "Plan replication",
-    hint: "Collect stronger evidence before deciding keep / drop.",
+  try_more: {
+    label: "Try more evidence",
+    hint: "Collect stronger evidence before deciding keep or discard.",
     tone: "border-blue-400/30 bg-blue-500/10 text-blue-200",
   },
+  rerun: {
+    label: "Try more evidence",
+    hint: "Collect stronger evidence before deciding keep or discard.",
+    tone: "border-blue-400/30 bg-blue-500/10 text-blue-200",
+  },
+  fork: {
+    label: "Try more evidence",
+    hint: "Collect stronger evidence before deciding keep or discard.",
+    tone: "border-blue-400/30 bg-blue-500/10 text-blue-200",
+  },
+  discard: {
+    label: "Discard branch",
+    hint: "Preserve as evidence; do not extend this branch.",
+    tone: "border-amber-400/30 bg-amber-500/10 text-amber-200",
+  },
   drop: {
-    label: "Fold into background",
-    hint: "Preserve as evidence; do not extend.",
+    label: "Discard branch",
+    hint: "Preserve as evidence; do not extend this branch.",
     tone: "border-amber-400/30 bg-amber-500/10 text-amber-200",
   },
 };
 
 export const NEXT_ACTION_DEFAULT = {
   label: "Awaiting decision",
-  hint: "Choose keep / fork / needs stronger evidence / drop to advance.",
+  hint: "Choose keep / try_more / discard to advance.",
   tone: "border-white/[0.08] bg-white/[0.04] text-gray-300",
 };

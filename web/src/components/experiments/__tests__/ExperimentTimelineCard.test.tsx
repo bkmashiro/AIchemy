@@ -169,6 +169,25 @@ describe("ExperimentTimelineCard", () => {
     expect(screen.queryByText("rerun")).not.toBeInTheDocument();
   });
 
+  it("wraps long JSON event payloads instead of forcing a horizontal scrollbar", () => {
+    const longValue = "x".repeat(180);
+    const { container } = renderCard([
+      makeEvent(
+        "decision-with-data",
+        "2026-06-01T00:00:00.000Z",
+        "try_more",
+        "decision",
+        { decision: "try_more", evidence: { long_token: longValue } },
+      ),
+    ]);
+
+    const payload = container.querySelector("pre[data-timeline-event-data]");
+    expect(payload).toBeInTheDocument();
+    expect(payload).toHaveClass("whitespace-pre-wrap");
+    expect(payload).toHaveClass("break-words");
+    expect(payload).not.toHaveClass("overflow-x-auto");
+  });
+
   it("renders a copy locator button and copies artifact locator", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {

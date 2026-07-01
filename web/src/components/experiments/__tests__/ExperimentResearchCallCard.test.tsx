@@ -320,7 +320,7 @@ describe("ExperimentResearchCallCard", () => {
   });
 
 
-  it("renders recent decision rerun as needs stronger evidence in recent writebacks", () => {
+  it("renders recent decision rerun as try more in recent writebacks", () => {
     const recentEvents: ExperimentEvent[] = [
       makeRecentEvent("evt-rerun", "decision", {
         created_at: "2026-06-01T10:00:00.000Z",
@@ -338,7 +338,7 @@ describe("ExperimentResearchCallCard", () => {
     );
 
     const writebacks = copyToSection("Recent writebacks");
-    expect(within(writebacks).getAllByText(/needs stronger evidence/i).length).toBeGreaterThan(0);
+    expect(within(writebacks).getAllByText(/try more/i).length).toBeGreaterThan(0);
     expect(within(writebacks).queryByText(/\brerun\b/i)).not.toBeInTheDocument();
   });
 
@@ -409,11 +409,11 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    expect(screen.getByText("Fold into background")).toBeInTheDocument();
+    expect(screen.getByText("Discard branch")).toBeInTheDocument();
     expect(screen.getByText("Plan replication with larger cohort")).toBeInTheDocument();
   });
 
-  it("uses user-facing copy for rerun decisions", () => {
+  it("uses canonical user-facing copy for rerun decisions", () => {
     const exp = makeExperiment({ decision: "rerun" });
     const summary = makeSummary({
       decision: "rerun",
@@ -421,7 +421,7 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    expect(screen.getByText("Plan replication")).toBeInTheDocument();
+    expect(screen.getByText("Try more evidence")).toBeInTheDocument();
     expect(screen.getByText("try more")).toBeInTheDocument();
   });
 

@@ -26,11 +26,22 @@ vi.mock("../../components/experiments", async () => {
     ExperimentTimelineCard: () => null,
     ExperimentReviewWorkspace: () => null,
     filterExperimentEntryPoints: (items: unknown[]) => items,
-    ExperimentLineageGraphCard: ({ onSelectExperiment }: { onSelectExperiment: (id: string) => void }) => (
-      React.createElement("button", {
-        type: "button",
-        onClick: () => onSelectExperiment("child"),
-      }, "select child")
+    ExperimentLineageGraphCard: ({
+      currentId,
+      onSelectExperiment,
+    }: {
+      currentId: string;
+      onSelectExperiment: (id: string) => void;
+    }) => (
+      React.createElement(
+        "section",
+        { "aria-label": "lineage-graph" },
+        React.createElement("span", { "data-testid": "lineage-current-id" }, currentId),
+        React.createElement("button", {
+          type: "button",
+          onClick: () => onSelectExperiment("child"),
+        }, "select child"),
+      )
     ),
     ExperimentResearchCallCard: ({
       exp,
@@ -283,6 +294,35 @@ describe("ExperimentsPage lineage preview", () => {
       expect(screen.getByLabelText("config-diff")).toHaveTextContent("child diff");
     });
     expect(screen.getByTestId("location")).toHaveTextContent("/experiments/root");
+  });
+
+  it("keeps the current preview stable while a lineage selection is loading", async () => {
+    let resolveChild!: (value: ExperimentDetail) => void;
+    vi.mocked(experimentsApi.get).mockImplementation((id: string) => {
+      if (id === "child") {
+        return new Promise((resolve) => {
+          resolveChild = resolve;
+        });
+      }
+      return Promise.resolve(detail("root", "root experiment"));
+    });
+
+    renderDetailPage();
+
+    expect(await screen.findByLabelText("research-call")).toHaveTextContent("root experiment / root summary / events:0");
+    expect(screen.getByTestId("lineage-current-id")).toHaveTextContent("root");
+
+    fireEvent.click(screen.getByRole("button", { name: "select child" }));
+
+    expect(screen.getByLabelText("research-call")).toHaveTextContent("root experiment / root summary / events:0");
+    expect(screen.getByTestId("lineage-current-id")).toHaveTextContent("root");
+
+    resolveChild(detail("child", "child experiment"));
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("research-call")).toHaveTextContent("child experiment / child summary / events:2");
+      expect(screen.getByTestId("lineage-current-id")).toHaveTextContent("child");
+    });
   });
 
   it("refreshes selected-lineage research context after writeback", async () => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Experiment,
@@ -157,6 +157,7 @@ function ExperimentDetailView() {
   const [selectedLineageSummary, setSelectedLineageSummary] = useState<ExperimentSummaryResponse | null>(null);
   const [selectedLineageDiff, setSelectedLineageDiff] = useState<ExperimentDiffResponse | null>(null);
   const [selectedLineageEvents, setSelectedLineageEvents] = useState<ExperimentEvent[]>([]);
+  const lineageSelectionSeq = useRef(0);
 
   const load = () => {
     if (!id) return;
@@ -205,6 +206,7 @@ function ExperimentDetailView() {
       setSelectedLineageEvents([]);
       return;
     }
+    if (selectedLineageExp?.id === selectedLineageId) return;
 
     let cancelled = false;
     setSelectedLineageTasks([]);
@@ -240,7 +242,7 @@ function ExperimentDetailView() {
     return () => {
       cancelled = true;
     };
-  }, [selectedLineageId, id, exp?.id]);
+  }, [selectedLineageId, id, exp?.id, selectedLineageExp?.id]);
 
   useEffect(() => {
     load();
@@ -317,6 +319,47 @@ function ExperimentDetailView() {
       });
   };
 
+  const handleSelectLineageExperiment = (nextId: string) => {
+    if (!id || !exp) return;
+    if (nextId === selectedLineageId) return;
+    if (nextId === id) {
+      lineageSelectionSeq.current += 1;
+      setSelectedLineageId(id);
+      setSelectedLineageExp(null);
+      setSelectedLineageSummary(null);
+      setSelectedLineageDiff(null);
+      setSelectedLineageEvents([]);
+      setSelectedLineageTasks(exp.tasks ?? []);
+      return;
+    }
+
+    const seq = ++lineageSelectionSeq.current;
+    Promise.all([
+      experimentsApi.get(nextId),
+      experimentsApi.getSummary(nextId).catch(() => null),
+      experimentsApi.getDiff(nextId).catch(() => null),
+      experimentsApi.getTimeline(nextId).catch(() => ({ experiment_id: nextId, events: [] })),
+    ])
+      .then(([selectedExp, selectedSummary, selectedDiff, selectedTimeline]) => {
+        if (lineageSelectionSeq.current !== seq) return;
+        setSelectedLineageExp(selectedExp);
+        setSelectedLineageTasks(selectedExp.tasks ?? []);
+        setSelectedLineageSummary(selectedSummary);
+        setSelectedLineageDiff(selectedDiff);
+        setSelectedLineageEvents(selectedTimeline.events);
+        setSelectedLineageId(nextId);
+      })
+      .catch(() => {
+        if (lineageSelectionSeq.current !== seq) return;
+        setSelectedLineageId(id);
+        setSelectedLineageTasks(exp.tasks ?? []);
+        setSelectedLineageExp(null);
+        setSelectedLineageSummary(null);
+        setSelectedLineageDiff(null);
+        setSelectedLineageEvents([]);
+      });
+  };
+
   const previewExp = selectedLineageId && selectedLineageId !== exp.id && selectedLineageExp
     ? selectedLineageExp
     : exp;
@@ -356,7 +399,7 @@ function ExperimentDetailView() {
             currentId={selectedLineageId ?? exp.id}
             pageId={exp.id}
             selectedTasks={selectedLineageTasks}
-            onSelectExperiment={setSelectedLineageId}
+            onSelectExperiment={handleSelectLineageExperiment}
           />
         </section>
         <section aria-label="Research inspector" className="min-w-0 space-y-2">

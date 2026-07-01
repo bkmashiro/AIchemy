@@ -501,14 +501,32 @@ const CANVAS_NODE_TONE: Record<LineageTone, string> = {
   muted: "border-gray-800 bg-gray-950/70 text-gray-500 opacity-75",
 };
 
-function shortNodeMeta(node: ExperimentTreeNode): string {
+function canvasNodeMeta(node: ExperimentTreeNode): {
+  text: string;
+  className: string;
+  title?: string;
+  kind: "decision" | "status";
+} {
   const decision = decisionLabelForFilter(node.decision) ?? node.decision;
-  if (decision) return decision;
-  return node.status;
+  if (decision) {
+    return {
+      text: decision,
+      className: DECISION_BADGE[node.decision ?? ""] || "border-white/10 text-gray-400",
+      title: `Decision: ${decision}`,
+      kind: "decision",
+    };
+  }
+  return {
+    text: node.status,
+    className: "border-white/10 text-gray-400",
+    title: `Run state: ${node.status}`,
+    kind: "status",
+  };
 }
 
 function CanvasExperimentNode({ data }: NodeProps<CanvasNode>) {
   const { node, tone, foldedCount, onSelectExperiment } = data;
+  const meta = canvasNodeMeta(node);
   const body = (
     <div
       className={`relative h-full w-full rounded-sm border px-2 py-1.5 text-left text-[10px] leading-tight ${CANVAS_NODE_TONE[tone]}`}
@@ -531,12 +549,17 @@ function CanvasExperimentNode({ data }: NodeProps<CanvasNode>) {
         <span className="min-w-0 truncate font-mono text-[11px]" title={node.name}>
           {node.name}
         </span>
-        <span className="shrink-0 rounded-sm border border-white/10 px-1 text-[8px] uppercase tracking-wide text-gray-400">
-          {node.status}
+        <span
+          className={`shrink-0 rounded-sm border px-1 text-[8px] uppercase tracking-wide ${meta.className}`}
+          title={meta.title}
+          data-lineage-canvas-node-meta={meta.kind}
+          data-lineage-canvas-status-chip={meta.kind === "status" ? "true" : undefined}
+        >
+          {meta.text}
         </span>
       </div>
       <div className="mt-1 flex items-center gap-1 text-[9px] text-gray-500">
-        <span className="truncate">{shortNodeMeta(node)}</span>
+        <span className="truncate">{meta.title}</span>
         {foldedCount !== undefined && foldedCount > 0 && (
           <span className="shrink-0 text-gray-500">+{foldedCount} hidden</span>
         )}
@@ -735,7 +758,7 @@ function SelectedDetailStrip({
       </span>
       <span className="font-mono text-indigo-200 truncate max-w-[14rem]">{node.name}</span>
       <span className="text-gray-600 font-mono truncate max-w-[10rem]">{node.id}</span>
-      <span className={`font-mono ${statusClass}`}>Status: {node.status}</span>
+      <span className={`font-mono ${statusClass}`}>Run state: {node.status}</span>
       {decisionBadge && (
         <span
           className={`text-[9px] px-1 py-px rounded border ${decisionBadge}`}

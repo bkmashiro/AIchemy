@@ -375,7 +375,10 @@ export function ExperimentTimelineCard({
                     </p>
                   )}
                   {dataStr && (
-                    <pre className="mt-1 text-[10px] text-gray-600 bg-gray-950/40 rounded px-2 py-1 overflow-x-auto font-mono">
+                    <pre
+                      data-timeline-event-data
+                      className="mt-1 text-[10px] text-gray-500 bg-gray-950/40 rounded px-2 py-1 whitespace-pre-wrap break-words font-mono"
+                    >
                       {dataStr}
                     </pre>
                   )}

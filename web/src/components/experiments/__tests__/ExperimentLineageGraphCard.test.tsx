@@ -184,7 +184,7 @@ describe("ExperimentLineageGraphCard", () => {
             status: "passed",
             decision: "keep",
             recommendation: {
-              action: "fork",
+              action: "try_more",
               verdict: "candidate",
               reason: "beats parent",
               metric: "loss",
@@ -223,13 +223,50 @@ describe("ExperimentLineageGraphCard", () => {
     expect(within(inspector).getByText("Canvas inspector")).toBeInTheDocument();
     expect(within(inspector).getByText("child/variant")).toBeInTheDocument();
     expect(within(inspector).getByText("Decision: keep")).toBeInTheDocument();
-    expect(within(inspector).getByText("Recommendation: fork")).toBeInTheDocument();
+    expect(within(inspector).getByLabelText("Recommendation: Try more")).toBeInTheDocument();
     expect(within(inspector).getByText("loss: ↓ -0.2000")).toBeInTheDocument();
     expect(within(inspector).getByText("child-task")).toBeInTheDocument();
+    expect(within(inspector).getByText("Run state: passed")).toBeInTheDocument();
+    expect(within(inspector).queryByText(/Status:/)).not.toBeInTheDocument();
     expect(within(inspector).getByRole("link", { name: /open detail/i })).toHaveAttribute(
       "href",
       "/experiments/child",
     );
+  });
+
+  it("uses decision metadata as the compact canvas node label instead of duplicating run status", () => {
+    const roots: ExperimentTreeNode[] = [
+      node({
+        id: "root",
+        name: "root/start",
+        children: [
+          node({
+            id: "child",
+            name: "child/variant",
+            parent_id: "root",
+            status: "running",
+            decision: "try_more",
+          }),
+        ],
+      }),
+    ];
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+        <ExperimentLineageGraphCard
+          roots={roots}
+          currentId="child"
+          pageId="root"
+          onSelectExperiment={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    const canvasNode = container.querySelector('[data-testid="rf__node-child"] [data-lineage-canvas-node]');
+    expect(canvasNode).toBeInTheDocument();
+    expect(within(canvasNode as HTMLElement).getByText("try more")).toBeInTheDocument();
+    expect(within(canvasNode as HTMLElement).queryByText("running")).not.toBeInTheDocument();
+    expect((canvasNode as HTMLElement).querySelector("[data-lineage-canvas-status-chip]")).toBeNull();
   });
 
   it("focuses the selected path and can reveal folded canvas branches", () => {
@@ -597,9 +634,9 @@ describe("ExperimentLineageGraphCard", () => {
     }
 
     expect(within(strip).getByText("Preview selected")).toBeInTheDocument();
-    expect(within(strip).getByText("Status: failed")).toBeInTheDocument();
-    expect(within(strip).getByText("Decision: drop")).toBeInTheDocument();
-    expect(within(strip).getByText("Recommendation: Needs stronger evidence")).toBeInTheDocument();
+    expect(within(strip).getByText("Run state: failed")).toBeInTheDocument();
+    expect(within(strip).getByLabelText("Decision: discard")).toBeInTheDocument();
+    expect(within(strip).getByLabelText("Recommendation: Try more")).toBeInTheDocument();
 
     const detailChips = strip.querySelectorAll('[data-lineage-diff-chip]');
     expect(Array.from(detailChips).map((chip) => chip.textContent)).toEqual([
@@ -729,9 +766,9 @@ describe("ExperimentLineageGraphCard", () => {
     }
 
     expect(within(strip).getByText("Preview selected")).toBeInTheDocument();
-    expect(within(strip).getByText("Status: running")).toBeInTheDocument();
+    expect(within(strip).getByText("Run state: running")).toBeInTheDocument();
     expect(within(strip).getByText("Decision: keep")).toBeInTheDocument();
-    expect(within(strip).getByText("Recommendation: fork")).toBeInTheDocument();
+    expect(within(strip).getByLabelText("Recommendation: Try more")).toBeInTheDocument();
     expect(within(strip).getByText("+3 hidden descendants folded")).toBeInTheDocument();
     expect(within(strip).getByText("Tasks: 2")).toBeInTheDocument();
   });
