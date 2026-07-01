@@ -1513,6 +1513,21 @@ def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.patch(f"/experiments/{exp['id']}/decision", body))
 
 
+def cmd_experiments_series_decision(args: argparse.Namespace, client: ApiClient) -> None:
+    from alchemy_sdk.experiments import normalize_decision
+
+    reason = args.reason_flag or args.reason
+    if not reason:
+        raise AlchError("series decision reason required: pass --reason <text>")
+    body = {"kind": "decision", "decision": normalize_decision(args.decision), "reason": reason}
+    print_json(client.post(f"/experiments/series/{args.family}/events", body))
+
+
+def cmd_experiments_series_comment(args: argparse.Namespace, client: ApiClient) -> None:
+    body = {"kind": "note", "message": args.message}
+    print_json(client.post(f"/experiments/series/{args.family}/events", body))
+
+
 def add_global(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server", help=f"Alchemy server URL (default {DEFAULT_SERVER})")
     parser.add_argument("--token", help=argparse.SUPPRESS)
@@ -1779,6 +1794,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("reason", nargs="?", help="rationale (positional). Alternative: --reason TEXT")
     p.add_argument("--reason", dest="reason_flag", help="rationale (flag form, takes precedence over positional)")
     p.set_defaults(func=cmd_experiments_decide)
+
+    p = exps_sub.add_parser(
+        "series-decision",
+        help="append a series-scoped decision to every experiment in a family",
+        description="POST /experiments/series/<family>/events with kind=decision. Appends metadata only; does not reschedule tasks.",
+    )
+    p.add_argument("family", help="experiment family/series")
+    p.add_argument("decision", choices=["keep", "try_more", "try-more", "discard", "drop", "rerun", "fork"], help="decision verdict")
+    p.add_argument("reason", nargs="?", help="rationale (positional). Alternative: --reason TEXT")
+    p.add_argument("--reason", dest="reason_flag", help="rationale (flag form, takes precedence over positional)")
+    p.set_defaults(func=cmd_experiments_series_decision)
+
+    p = exps_sub.add_parser(
+        "series-comment",
+        help="append a series-scoped comment to every experiment in a family",
+        description="POST /experiments/series/<family>/events with kind=note. Appends metadata only; does not reschedule tasks.",
+    )
+    p.add_argument("family", help="experiment family/series")
+    p.add_argument("message", help="comment text")
+    p.set_defaults(func=cmd_experiments_series_comment)
 
     p = exps_sub.add_parser("tree", help="print the lineage forest", description="GET /experiments/tree — full lineage forest via frozen parent_id edges.")
     p.set_defaults(func=cmd_experiments_tree)

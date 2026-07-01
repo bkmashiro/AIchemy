@@ -215,6 +215,28 @@ def test_experiments_comment_posts_note_event(monkeypatch):
     assert calls[1]["body"] == {"kind": "note", "message": "coverage too low"}
 
 
+def test_experiments_series_decision_posts_series_event(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "series-decision", "world-rule", "try-more", "--reason", "need seeds"],
+        [{"created": 2, "events": []}],
+    )
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/series/world-rule/events"
+    assert calls[0]["body"] == {"kind": "decision", "decision": "try_more", "reason": "need seeds"}
+
+
+def test_experiments_series_comment_posts_series_event(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "series-comment", "world-rule", "random500 improved Pong"],
+        [{"created": 2, "events": []}],
+    )
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/series/world-rule/events"
+    assert calls[0]["body"] == {"kind": "note", "message": "random500 improved Pong"}
+
+
 def test_clone_task_body_preserves_structured_argv():
     body = cli.clone_task_body({
         "script": "/workspace/train.py",

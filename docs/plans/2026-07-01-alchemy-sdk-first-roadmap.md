@@ -923,7 +923,24 @@ Files:
 - Modify: `server/src/api/experiments.ts` if needed.
 - Tests: `sdk/tests/test_cli.py`, `server/src/__tests__/experiments-lineage.test.ts`.
 
-### I7. Series-level decisions
+### I7. Series-level decisions — DONE 2026-07-01
+
+Implemented `POST /experiments/series/:series/events` to append series-scoped decision/comment events to all experiments matching `family == series` or `name == series`. Implemented CLI:
+
+```bash
+alch experiments series-decision <family> try-more --reason "need seeds 1234/4242/7777"
+alch experiments series-comment <family> "random500 improved Pong but not Freeway"
+```
+
+Events are regular experiment timeline events with `data.scope="series"` and `data.family=<series>`. This avoids adding a premature separate series-event store.
+
+Verified:
+```bash
+cd sdk && uv run pytest tests/test_cli.py::test_experiments_series_decision_posts_series_event tests/test_cli.py::test_experiments_series_comment_posts_series_event -q
+# 2 passed
+cd server && npm test -- --run src/__tests__/experiments-lineage.test.ts -t "series-scoped"
+# 1 passed
+```
 
 Behavior:
 - Allow decisions/comments on a series/family, not just one experiment.

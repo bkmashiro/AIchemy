@@ -1815,6 +1815,49 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     });
   });
 
+  // POST /experiments/series/:series/events — append a series-scoped decision/comment to all family members.
+  router.post("/series/:series/events", (req: Request, res: Response) => {
+    const series = req.params.series;
+    const experiments = store.getAllExperiments()
+      .filter((exp) => exp.family === series || exp.name === series)
+      .sort(compareExperiments);
+    if (experiments.length === 0) { res.status(404).json({ error: "Experiment series not found" }); return; }
+
+    const { kind } = req.body;
+    if (kind !== "decision" && kind !== "note") { res.status(400).json({ error: "kind must be decision or note" }); return; }
+    let message: string;
+    const data: Record<string, any> = { scope: "series", family: series };
+    if (kind === "decision") {
+      const decision = normalizeDecision(req.body.decision);
+      if (!decision) { res.status(400).json({ error: "invalid decision" }); return; }
+      const reasonError = validateMessage(req.body.reason, "reason");
+      if (reasonError) { res.status(400).json({ error: reasonError }); return; }
+      data.decision = decision;
+      data.reason = req.body.reason;
+      message = `Series decision ${decision}: ${req.body.reason}`;
+    } else {
+      const messageError = validateMessage(req.body.message);
+      if (messageError) { res.status(400).json({ error: messageError }); return; }
+      message = req.body.message;
+    }
+
+    const createdAt = new Date().toISOString();
+    const events = experiments.map((exp) => {
+      const event: ExperimentEvent = {
+        id: uuidv4(),
+        experiment_id: exp.id,
+        kind,
+        message,
+        actor: operatorActor(req),
+        data: { ...data },
+        created_at: createdAt,
+      };
+      store.addExperimentEvent(event);
+      return event;
+    });
+    res.status(201).json({ series, created: events.length, events });
+  });
+
   // GET /experiments/by-code/:code_id — stable human-authored code reference lookup.
   router.get("/by-code/:code_id", (req: Request, res: Response) => {
     const exp = store.getAllExperiments().find((candidate) => candidate.code_id === req.params.code_id);

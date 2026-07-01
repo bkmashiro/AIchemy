@@ -104,6 +104,41 @@ describe("experiment lineage API", () => {
     ]);
   });
 
+  it("appends series-scoped decisions and comments to family members", async () => {
+    const app = makeApp();
+    const one = await request(app)
+      .post("/experiments")
+      .send({ name: "series-decision-a", family: "series-decide", task_specs: [{ ref: "train", script: "train.py" }] })
+      .expect(201);
+    const two = await request(app)
+      .post("/experiments")
+      .send({ name: "series-decision-b", family: "series-decide", task_specs: [{ ref: "train", script: "train.py" }] })
+      .expect(201);
+
+    const decision = await request(app)
+      .post("/experiments/series/series-decide/events")
+      .send({ kind: "decision", decision: "try-more", reason: "need seeds 1234/4242/7777" })
+      .expect(201);
+
+    expect(decision.body.created).toBe(2);
+    expect(decision.body.events).toHaveLength(2);
+    expect(decision.body.events[0].data).toEqual(expect.objectContaining({ scope: "series", family: "series-decide", decision: "try_more" }));
+
+    await request(app)
+      .post("/experiments/series/series-decide/events")
+      .send({ kind: "note", message: "random500 improved Pong but not Freeway" })
+      .expect(201);
+
+    const firstTimeline = await request(app).get(`/experiments/${one.body.id}/timeline`).expect(200);
+    const secondTimeline = await request(app).get(`/experiments/${two.body.id}/timeline`).expect(200);
+    for (const timeline of [firstTimeline, secondTimeline]) {
+      expect(timeline.body.events).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "decision", message: "Series decision try_more: need seeds 1234/4242/7777" }),
+        expect.objectContaining({ kind: "note", message: "random500 improved Pong but not Freeway" }),
+      ]));
+    }
+  });
+
   it("roundtrips SDK-authored spec fields through create, list, detail, and store reload", async () => {
     const app = makeApp();
     const sdkSpec = {
