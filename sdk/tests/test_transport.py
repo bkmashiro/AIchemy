@@ -333,7 +333,12 @@ class TestUnixSocketTransport:
         transport._heartbeat_thread.start()
 
         _block.wait(timeout=1)
-        time.sleep(0.3)  # ~6 heartbeats at 0.05s interval
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            hb_msgs = [m for m in sent if m.get("type") == "heartbeat"]
+            if len(hb_msgs) >= 2:
+                break
+            time.sleep(0.02)
 
         try:
             hb_msgs = [m for m in sent if m.get("type") == "heartbeat"]

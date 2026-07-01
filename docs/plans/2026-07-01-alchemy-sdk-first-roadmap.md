@@ -85,7 +85,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
-| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
+| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1 done |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
@@ -365,7 +365,16 @@ ctx.write_result(
 )
 ```
 
-### D1. Add local `TrainingContext.write_result()`
+### D1. Add local `TrainingContext.write_result()` — DONE 2026-07-01
+
+Implemented local atomic JSON result writing under `run_dir`, with relative custom paths and fail-loud protection against absolute paths outside the run directory.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_context.py::TestReportHelpers -q
+# 7 passed
+```
 
 Behavior:
 - Writes JSON atomically under `run_dir/results.json` by default.

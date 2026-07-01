@@ -1,6 +1,7 @@
 """Unit tests for alchemy_sdk/context.py — TrainingContext."""
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -468,3 +469,29 @@ class TestReportHelpers:
         ctx, al = _make_ctx(tmp_path)
         ctx.log_eval({"reward": 42.0})
         al.log_eval.assert_called_once_with({"reward": 42.0})
+
+    def test_write_result_writes_json_atomically(self, tmp_path):
+        ctx, _ = _make_ctx(tmp_path)
+
+        path = ctx.write_result({"retrieval_at5": 0.71, "coverage": {"reward_rate": 0.12}})
+
+        assert path == ctx.run_dir / "results.json"
+        assert json.loads(path.read_text()) == {
+            "retrieval_at5": 0.71,
+            "coverage": {"reward_rate": 0.12},
+        }
+        assert not list(ctx.run_dir.glob("*.tmp"))
+
+    def test_write_result_supports_custom_relative_path(self, tmp_path):
+        ctx, _ = _make_ctx(tmp_path)
+
+        path = ctx.write_result({"ok": True}, path="eval/results.json")
+
+        assert path == ctx.run_dir / "eval" / "results.json"
+        assert json.loads(path.read_text()) == {"ok": True}
+
+    def test_write_result_rejects_absolute_path_outside_run_dir(self, tmp_path):
+        ctx, _ = _make_ctx(tmp_path)
+
+        with pytest.raises(ValueError, match="run_dir"):
+            ctx.write_result({"ok": True}, path=tmp_path / "outside.json")

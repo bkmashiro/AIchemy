@@ -1,6 +1,7 @@
 """TrainingContext — AOP training runtime."""
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -282,6 +283,47 @@ class TrainingContext:
     def log_eval(self, metrics: dict[str, Any]) -> None:
         """Report evaluation metrics."""
         self._al.log_eval(metrics)
+
+    def write_result(self, result: dict[str, Any], path: str | Path = "results.json") -> Path:
+        """Write a typed result artifact as JSON under run_dir, atomically."""
+        output_path = self._resolve_result_path(path)
+        _makedirs_002(output_path.parent)
+
+        tmp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=output_path.parent,
+                prefix=f".{output_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_name = f.name
+                json.dump(result, f, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            Path(tmp_name).replace(output_path)
+        except Exception:
+            if tmp_name is not None:
+                try:
+                    Path(tmp_name).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            raise
+        return output_path
+
+    def _resolve_result_path(self, path: str | Path) -> Path:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self._run_dir / candidate
+
+        run_dir = self._run_dir.resolve(strict=False)
+        resolved = candidate.resolve(strict=False)
+        if not resolved.is_relative_to(run_dir):
+            raise ValueError("result path must stay under run_dir")
+        return candidate
 
 
 # ---------------------------------------------------------------------------
