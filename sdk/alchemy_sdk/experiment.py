@@ -149,6 +149,7 @@ class Experiment:
         self._parent_config: Optional[dict[str, Any]] = None  # snapshot for diff
         self._storage: dict[str, str] = {}
         self._param_space: dict[str, list[Any]] = {}
+        self._decision_policy: dict[str, Any] = {}
 
     def storage(self, *, root: str, artifact_root: Optional[str] = None) -> "Experiment":
         """Declare experiment storage roots in the SDK-authored spec."""
@@ -177,6 +178,32 @@ class Experiment:
                 raise ValueError(f"param {key!r} must be non-empty")
             copied[key] = list(copy.deepcopy(values))
         self._param_space = copied
+        return self
+
+    def decision_policy(
+        self,
+        *,
+        primary_metric: str,
+        direction: str,
+        keep_if: Optional[str] = None,
+        try_more_if: Optional[str] = None,
+        discard_if: Optional[str] = None,
+        min_seeds: Optional[int] = None,
+    ) -> "Experiment":
+        """Declare how humans/agents should judge this experiment after results land."""
+        if not primary_metric or not isinstance(primary_metric, str):
+            raise ValueError("decision_policy primary_metric must be a non-empty string")
+        if direction not in {"min", "max"}:
+            raise ValueError("decision_policy direction must be 'min' or 'max'")
+        policy: dict[str, Any] = {"primary_metric": primary_metric, "direction": direction}
+        if keep_if:        policy["keep_if"] = keep_if
+        if try_more_if:    policy["try_more_if"] = try_more_if
+        if discard_if:     policy["discard_if"] = discard_if
+        if min_seeds is not None:
+            if min_seeds < 1:
+                raise ValueError("decision_policy min_seeds must be >= 1")
+            policy["min_seeds"] = min_seeds
+        self._decision_policy = copy.deepcopy(policy)
         return self
 
     def _param_points(self) -> list[dict[str, Any]]:
@@ -274,6 +301,8 @@ class Experiment:
         if self._param_space:
             spec["param_space"] = copy.deepcopy(self._param_space)
             spec["param_points"] = copy.deepcopy(self._param_points())
+        if self._decision_policy:
+            spec["decision_policy"] = copy.deepcopy(self._decision_policy)
         if self.config:
             spec["config"] = copy.deepcopy(self.config)
         return spec
@@ -282,6 +311,7 @@ class Experiment:
         """Validate locally and return the SDK-authored spec without network I/O."""
         self._validate_dag()
         spec = self.to_spec()
+        self._validate_decision_policy(spec)
         spec["warnings"] = self._preflight_warnings(spec)
         return spec
 
@@ -399,6 +429,8 @@ class Experiment:
                     _set_nested(resolved, dotpath, value)
                 spec["resolved_config"] = resolved
             specs.append(spec)
+        submit_spec = self.to_spec()
+        self._validate_decision_policy({**submit_spec, "tasks": specs})
 
         result = submit_experiment(
             server=self._server,
@@ -410,7 +442,7 @@ class Experiment:
             config=self.config if self.config else None,
             config_diff=self._compute_config_diff(),
             storage=copy.deepcopy(self._storage) if self._storage else None,
-            sdk_spec=self.to_spec(),
+            sdk_spec=submit_spec,
             parent_name=self._parent_name,
             family=self.family,
             hypothesis=self.hypothesis,
@@ -496,6 +528,21 @@ class Experiment:
         return _deep_diff(self._parent_config, self.config) or None
 
     # ── Validation ──
+
+    def _validate_decision_policy(self, spec: Mapping[str, Any]) -> None:
+        policy = spec.get("decision_policy")
+        if not policy:
+            return
+        primary_metric = policy.get("primary_metric")
+        declared_metrics = {
+            metric
+            for task in spec.get("tasks", [])
+            for metric in (task.get("metric_schema") or {}).keys()
+        }
+        if primary_metric not in declared_metrics:
+            raise ValueError(
+                f"decision_policy primary_metric {primary_metric!r} is not declared in any task metric schema"
+            )
 
     def _validate_dag(self) -> None:
         if not self._tasks:

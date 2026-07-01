@@ -836,7 +836,15 @@ Files:
 - Modify only if current fields do not support the vocabulary.
 - Tests in `server/src/__tests__/experiments-lineage.test.ts`.
 
-### I5. SDK decision policy declarations
+### I5. SDK decision policy declarations — DONE 2026-07-01
+
+Implemented `Experiment.decision_policy(...)`, `to_spec()["decision_policy"]`, and dry-run/submit validation that `primary_metric` is declared in at least one task metric schema. Policy remains advisory/spec-only; it does not auto-submit or auto-decide.
+
+Verified:
+```bash
+cd sdk && uv run pytest tests/test_experiment_spec.py::test_decision_policy_is_declared_in_spec_and_chainable tests/test_experiment_spec.py::test_dry_run_validates_decision_policy_metric_is_declared tests/test_experiment_spec.py::test_dry_run_accepts_decision_policy_metric_from_task_schema -q
+# 3 passed
+```
 
 Research code can declare decision intent, but this is a policy/spec, not an immediate final judgement.
 

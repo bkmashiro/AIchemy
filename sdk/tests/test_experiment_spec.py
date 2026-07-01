@@ -24,6 +24,44 @@ def test_experiment_code_id_rejects_empty_values():
         Experiment(code_id=" ", name="bad")
 
 
+def test_decision_policy_is_declared_in_spec_and_chainable():
+    exp = Experiment("policy")
+
+    returned = exp.decision_policy(
+        primary_metric="score",
+        direction="max",
+        keep_if="mean(score) >= 0.8",
+        try_more_if="0.6 <= mean(score) < 0.8",
+        discard_if="mean(score) < 0.6",
+        min_seeds=3,
+    )
+
+    assert returned is exp
+    assert exp.to_spec()["decision_policy"] == {
+        "primary_metric": "score",
+        "direction": "max",
+        "keep_if": "mean(score) >= 0.8",
+        "try_more_if": "0.6 <= mean(score) < 0.8",
+        "discard_if": "mean(score) < 0.6",
+        "min_seeds": 3,
+    }
+
+
+def test_dry_run_validates_decision_policy_metric_is_declared():
+    exp = Experiment("policy").decision_policy(primary_metric="score", direction="max")
+    exp.task("train", script="train.py", metrics={"loss": "min"})
+
+    with pytest.raises(ValueError, match="decision_policy primary_metric"):
+        exp.dry_run()
+
+
+def test_dry_run_accepts_decision_policy_metric_from_task_schema():
+    exp = Experiment("policy").decision_policy(primary_metric="score", direction="max")
+    exp.task("eval", script="eval.py", metrics={"score": "max"})
+
+    assert exp.dry_run()["decision_policy"]["primary_metric"] == "score"
+
+
 def test_storage_root_is_in_experiment_spec():
     spec = Experiment("x").storage(root="/runs").to_spec()
 
