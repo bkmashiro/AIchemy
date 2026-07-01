@@ -38,3 +38,26 @@ def test_log_filters_non_numeric_metrics(monkeypatch):
     payload = transport.send.call_args.args[0]
     assert payload["loss"] == 0.25
     assert payload["metrics"] == {"mse": 0.1, "count": 2.0, "flag": 1.0}
+
+
+def test_result_artifact_reports_path_result_and_schema(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TASK_ID", "task-1")
+    monkeypatch.delenv("ALCHEMY_STUB_SOCKET", raising=False)
+    monkeypatch.delenv("ALCHEMY_SERVER", raising=False)
+
+    with patch("alchemy_sdk.client.make_transport") as make_transport:
+        transport = MagicMock()
+        make_transport.return_value = transport
+        al = Alchemy()
+        al.result_artifact(
+            path="/tmp/run/results.json",
+            result={"score": 0.7},
+            schema={"score": "float"},
+        )
+
+    assert transport.send.call_args.args[0] == {
+        "type": "result",
+        "path": "/tmp/run/results.json",
+        "result": {"score": 0.7},
+        "schema": {"score": "float"},
+    }

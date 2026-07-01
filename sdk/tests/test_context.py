@@ -520,3 +520,14 @@ class TestReportHelpers:
 
         with pytest.raises(TypeError, match="retrieval_at5"):
             ctx.write_result({"retrieval_at5": True}, schema={"retrieval_at5": float})
+
+    def test_write_result_reports_artifact_after_local_write(self, tmp_path):
+        ctx, al = _make_ctx(tmp_path)
+
+        path = ctx.write_result({"score": 0.7}, schema={"score": "float"})
+
+        al.result_artifact.assert_called_once_with(
+            path=str(path),
+            result={"score": 0.7},
+            schema={"score": "float"},
+        )

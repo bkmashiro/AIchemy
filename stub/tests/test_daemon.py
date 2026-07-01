@@ -842,6 +842,23 @@ class TestSdkCallbacks:
         assert ckpt_calls[0][0][1]["path"] == "/checkpoints/step100.pt"
 
     @pytest.mark.asyncio
+    async def test_on_sdk_result_emits_event(self, daemon):
+        await daemon._on_sdk_result(
+            "task-1",
+            "/runs/task-1/results.json",
+            {"score": 0.7},
+            {"score": "float"},
+        )
+        result_calls = [c for c in daemon.sio.emit.call_args_list if c[0][0] == "task.result"]
+        assert len(result_calls) == 1
+        assert result_calls[0][0][1] == {
+            "task_id": "task-1",
+            "path": "/runs/task-1/results.json",
+            "result": {"score": 0.7},
+            "schema": {"score": "float"},
+        }
+
+    @pytest.mark.asyncio
     async def test_on_sdk_notify_emits_event(self, daemon):
         await daemon._on_sdk_notify("task-1", "training started", "info")
         notify_calls = [c for c in daemon.sio.emit.call_args_list if c[0][0] == "task.notify"]

@@ -610,6 +610,7 @@ class StubDaemon:
                 on_eval=self._on_sdk_eval,
                 on_checkpoint=self._on_sdk_checkpoint,
                 on_config=self._on_sdk_config,
+                on_result=self._on_sdk_result,
                 on_done=self._on_sdk_done,
                 on_notify=self._on_sdk_notify,
                 on_phase=self._on_sdk_phase,
@@ -881,6 +882,12 @@ class StubDaemon:
 
     async def _on_sdk_config(self, task_id: str, config: dict) -> None:
         await self._emit("task.config", {"task_id": task_id, "config": config})
+
+    async def _on_sdk_result(self, task_id: str, path: str, result: dict, schema: dict) -> None:
+        await self._emit(
+            "task.result",
+            {"task_id": task_id, "path": path, "result": result, "schema": schema},
+        )
 
     async def _on_sdk_done(self, task_id: str, metrics: dict) -> None:
         log.info("SDK done for task %s", task_id)

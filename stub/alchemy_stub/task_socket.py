@@ -8,6 +8,7 @@ SDK → Stub messages:
   { "type": "eval",     "metrics": {} }
   { "type": "checkpoint", "path": "..." }
   { "type": "config",   "config": {} }
+  { "type": "result",   "path": "...", "result": {}, "schema": {} }
   { "type": "done",     "metrics": {} }
   { "type": "notify",   "message": "...", "level": "info" }
   { "type": "phase",    "phase": "training" }
@@ -42,6 +43,7 @@ class TaskSocket:
         on_eval(task_id, metrics)
         on_checkpoint(task_id, path)
         on_config(task_id, config)
+        on_result(task_id, path, result, schema)
         on_done(task_id, metrics)
         on_notify(task_id, message, level)
         on_phase(task_id, phase)
@@ -56,6 +58,7 @@ class TaskSocket:
         on_eval: Callable[..., Awaitable[None]] | None = None,
         on_checkpoint: Callable[..., Awaitable[None]] | None = None,
         on_config: Callable[..., Awaitable[None]] | None = None,
+        on_result: Callable[..., Awaitable[None]] | None = None,
         on_done: Callable[..., Awaitable[None]] | None = None,
         on_notify: Callable[..., Awaitable[None]] | None = None,
         on_phase: Callable[..., Awaitable[None]] | None = None,
@@ -67,6 +70,7 @@ class TaskSocket:
         self._on_eval = on_eval
         self._on_checkpoint = on_checkpoint
         self._on_config = on_config
+        self._on_result = on_result
         self._on_done = on_done
         self._on_notify = on_notify
         self._on_phase = on_phase
@@ -182,6 +186,14 @@ class TaskSocket:
         elif mtype == "config":
             if self._on_config:
                 await self._on_config(self.task_id, msg.get("config") or {})
+        elif mtype == "result":
+            if self._on_result:
+                await self._on_result(
+                    self.task_id,
+                    msg.get("path", ""),
+                    msg.get("result") or {},
+                    msg.get("schema") or {},
+                )
         elif mtype == "done":
             if self._on_done:
                 await self._on_done(self.task_id, msg.get("metrics") or {})

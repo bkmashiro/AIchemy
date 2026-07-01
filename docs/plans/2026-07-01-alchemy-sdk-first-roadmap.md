@@ -85,7 +85,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
-| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1-D2 done |
+| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1-D3 done |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
@@ -409,13 +409,22 @@ Tests:
 - Wrong float/string type fails.
 - Bool does not count as number unless explicitly bool.
 
-### D3. Attach result as experiment artifact/event when context has enough identity
+### D3. Attach result as experiment artifact/event when context has enough identity — DONE 2026-07-01
+
+Implemented result reporting through the existing runtime identity path without inventing new IDs: `TrainingContext.write_result()` writes locally first, then reports the result artifact through `Alchemy.result_artifact()` over the per-task SDK socket. Stub forwards `task.result`; server stores `result_path`, `result`, and `result_schema` in task exports and emits `task.result` to web clients.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_client.py::test_result_artifact_reports_path_result_and_schema tests/test_context.py::TestReportHelpers::test_write_result_reports_artifact_after_local_write -q
+cd stub && uv run pytest tests/test_task_socket.py tests/test_daemon.py::TestSdkCallbacks::test_on_sdk_result_emits_event -q
+cd server && npm test -- --run tests/socket-stub.test.ts -t "task.result"
+```
 
 Behavior:
-- If `ALCHEMY_EXPERIMENT_ID` or equivalent exists, attach event through SDK/server path.
-- If not available, write locally and log a non-fatal warning or no-op. Do not invent IDs.
-
-Need to inspect stub/server env injection before implementing.
+- Uses existing `ALCHEMY_TASK_ID` / task socket runtime identity; no experiment ID guessing.
+- If running outside Alchemy, the no-op transport keeps reporting non-fatal while local JSON still exists.
+- Server task exports become the canonical first retrieval point for result artifacts.
 
 Stop condition for Stage D:
 - Evaluation scripts can use one SDK call to produce standard result artifacts.

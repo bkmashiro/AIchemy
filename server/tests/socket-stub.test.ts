@@ -389,6 +389,48 @@ afterEach(() => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SDK result reports
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("task.result", () => {
+  it("stores SDK result artifact on task exports and notifies web clients", () => {
+    const task = makeTask({ id: "task-1", exports: { existing: "keep" } });
+    const stub = makeStub({ tasks: [task] });
+    const { socketHandlers, webNs } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+    });
+    const ack = vi.fn();
+
+    socketHandlers["task.result"](
+      {
+        task_id: "task-1",
+        path: "/runs/task-1/results.json",
+        result: { score: 0.7 },
+        schema: { score: "float" },
+      },
+      ack,
+    );
+
+    const updated = _stubs.get(STUB_ID).tasks[0];
+    expect(updated.exports).toEqual({
+      existing: "keep",
+      result_path: "/runs/task-1/results.json",
+      result: { score: 0.7 },
+      result_schema: { score: "float" },
+    });
+    expect(webNs.emit).toHaveBeenCalledWith("task.result", {
+      stub_id: STUB_ID,
+      task_id: "task-1",
+      path: "/runs/task-1/results.json",
+      result: { score: 0.7 },
+      schema: { score: "float" },
+    });
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // markTasksDisconnected — exercised via the disconnect event
 // ═══════════════════════════════════════════════════════════════════════════════
 

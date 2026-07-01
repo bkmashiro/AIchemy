@@ -166,6 +166,19 @@ class Alchemy:
         """
         self._transport.send({"type": "checkpoint", "path": path})
 
+    def result_artifact(
+        self,
+        *,
+        path: str,
+        result: dict[str, Any],
+        schema: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Declare that a standard result artifact has been written."""
+        msg: dict[str, Any] = {"type": "result", "path": path, "result": result}
+        if schema is not None:
+            msg["schema"] = schema
+        self._transport.send(msg)
+
     def done(self, metrics: Optional[dict[str, Any]] = None) -> None:
         """Signal that training is complete. Sends final metrics if provided."""
         msg: dict[str, Any] = {"type": "done"}

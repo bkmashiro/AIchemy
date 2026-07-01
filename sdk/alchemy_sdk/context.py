@@ -320,6 +320,11 @@ class TrainingContext:
                 except Exception:
                     pass
             raise
+        self._al.result_artifact(
+            path=str(output_path),
+            result=result,
+            schema={k: _schema_type_name(v) for k, v in schema.items()} if schema else None,
+        )
         return output_path
 
     def _resolve_result_path(self, path: str | Path) -> Path:
@@ -381,6 +386,16 @@ def _schema_type(expected: type | str) -> type:
         return _SCHEMA_TYPES[expected]
     except KeyError as exc:
         raise ValueError(f"Unknown result schema type: {expected!r}") from exc
+
+
+def _schema_type_name(expected: type | str) -> str:
+    if isinstance(expected, str):
+        _schema_type(expected)
+        return expected
+    for name, typ in _SCHEMA_TYPES.items():
+        if typ is expected:
+            return name
+    return expected.__name__
 
 
 def _makedirs_002(path: Path) -> None:

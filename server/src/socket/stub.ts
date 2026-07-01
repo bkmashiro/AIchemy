@@ -488,6 +488,31 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       if (ack) ack({ ok: true });
     });
 
+    socket.on("task.result", (payload: { task_id: string; path: string; result?: Record<string, unknown>; schema?: Record<string, unknown> }, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      if (!stubId) { if (ack) ack({ ok: false }); return; }
+
+      const task = store.getTask(stubId, payload.task_id);
+      if (!task) { if (ack) ack({ ok: false }); return; }
+
+      const exports = {
+        ...(task.exports || {}),
+        result_path: payload.path,
+        result: payload.result || {},
+        result_schema: payload.schema || {},
+      };
+      const updated = store.updateTask(stubId, payload.task_id, { exports });
+      if (updated) webNs.emit("task.update", updated);
+      webNs.emit("task.result", {
+        stub_id: stubId,
+        task_id: payload.task_id,
+        path: payload.path,
+        result: payload.result || {},
+        schema: payload.schema || {},
+      });
+      if (ack) ack({ ok: true });
+    });
+
     // ─── Shell relay: stub → web ────────────────────────────────────────────
 
     socket.on("shell.output", (data: { request_id: string; chunk: string; stream: string }) => {
