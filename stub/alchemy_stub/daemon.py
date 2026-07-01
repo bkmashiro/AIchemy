@@ -553,6 +553,7 @@ class StubDaemon:
         env_overrides: dict[str, str] | None = data.get("env_overrides")
         outputs: list[str] | None = data.get("outputs") or None
         resolved_config: dict[str, Any] | None = data.get("resolved_config")
+        metric_schema: dict[str, Any] | None = data.get("metric_schema")
 
         # Write resolved_config to temp file for ALCHEMY_CONFIG injection
         config_path: str | None = None
@@ -586,6 +587,7 @@ class StubDaemon:
                 env_overrides=env_overrides,
                 outputs=outputs,
                 config_path=config_path,
+                metric_schema=metric_schema,
             )
         except Exception as e:
             error_msg = f"Failed to start process: {e}"

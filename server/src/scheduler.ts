@@ -212,6 +212,7 @@ export function buildRunPayload(task: Task, stub: Stub): object {
     run_dir,
     params: task.param_overrides,
     outputs: task.outputs,
+    metric_schema: task.metric_schema,
   };
 
   // Include resolved_config so stub can inject ALCHEMY_CONFIG

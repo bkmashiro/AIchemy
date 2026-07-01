@@ -139,6 +139,7 @@ export interface Task {
   args_template?: Record<string, string>; // Template strings resolved at promotion time
   experiment_id?: string;              // Owning experiment ID
   outputs?: string[];                  // Declared output file paths for artifact rollback
+  metric_schema?: Record<string, string>; // SDK-declared metric directions
 
   // === Grid ===
   grid_id?: string;
@@ -292,6 +293,7 @@ export interface TaskSpec {
   max_retries?: number;
   priority?: number;
   outputs?: string[];     // Declared output file paths for artifact rollback
+  metric_schema?: Record<string, string>; // SDK-declared metric directions
   config_overrides?: Record<string, any>;   // Per-task config overrides (dot-path → value)
   resolved_config?: Record<string, any>;    // Merged experiment config + task overrides (computed by SDK)
 }

@@ -368,6 +368,7 @@ class ProcessManager:
         env_overrides: dict[str, str] | None = None,
         outputs: list[str] | None = None,
         config_path: str | None = None,
+        metric_schema: dict[str, Any] | None = None,
     ) -> int:
         """Spawn subprocess. Returns PID."""
         if task_id in self._procs:
@@ -386,6 +387,8 @@ class ProcessManager:
                 task_start_time = time.time()
                 combined_env = dict(env or {})
                 combined_env.update(env_overrides or {})
+                if metric_schema:
+                    combined_env["ALCHEMY_METRIC_SCHEMA"] = json.dumps(metric_schema)
                 # Force unbuffered Python output for log streaming
                 combined_env["PYTHONUNBUFFERED"] = "1"
                 # Auto-inject SDK into PYTHONPATH for warm pool tasks too
@@ -443,6 +446,8 @@ class ProcessManager:
             alchemy_vars["ALCHEMY_RUN_DIR"] = run_dir
         if config_path:
             alchemy_vars["ALCHEMY_CONFIG"] = config_path
+        if metric_schema:
+            alchemy_vars["ALCHEMY_METRIC_SCHEMA"] = json.dumps(metric_schema)
 
         # Merge env layers: process env → default_env → task env + env_overrides → ALCHEMY_*
         # Combine task env and env_overrides into one layer (overrides win)

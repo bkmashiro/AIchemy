@@ -61,3 +61,33 @@ def test_result_artifact_reports_path_result_and_schema(monkeypatch):
         "result": {"score": 0.7},
         "schema": {"score": "float"},
     }
+
+
+def test_log_allows_undeclared_metrics_by_default(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TASK_ID", "task-1")
+    monkeypatch.setenv("ALCHEMY_METRIC_SCHEMA", '{"loss":"min"}')
+
+    with patch("alchemy_sdk.client.make_transport") as make_transport:
+        transport = MagicMock()
+        make_transport.return_value = transport
+        al = Alchemy()
+        al.log(step=1, total=2, metrics={"new_metric": 1.0})
+
+    assert transport.send.call_args.args[0]["metrics"] == {"new_metric": 1.0}
+
+
+def test_log_rejects_undeclared_metrics_when_strict(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TASK_ID", "task-1")
+    monkeypatch.setenv("ALCHEMY_METRIC_SCHEMA", '{"loss":"min"}')
+    monkeypatch.setenv("ALCHEMY_STRICT_METRICS", "1")
+
+    with patch("alchemy_sdk.client.make_transport") as make_transport:
+        make_transport.return_value = MagicMock()
+        al = Alchemy()
+
+    try:
+        al.log(step=1, total=2, metrics={"new_metric": 1.0})
+    except KeyError as exc:
+        assert "undeclared metric" in str(exc)
+    else:
+        raise AssertionError("strict metrics should reject undeclared metric keys")

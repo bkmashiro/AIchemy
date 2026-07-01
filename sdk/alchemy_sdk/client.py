@@ -61,6 +61,16 @@ class Alchemy:
                 raise RuntimeError("ALCHEMY_PARAMS is set but not valid JSON")
             self._params = {}
 
+        raw_metric_schema = os.environ.get("ALCHEMY_METRIC_SCHEMA", "{}")
+        try:
+            loaded_schema = json.loads(raw_metric_schema)
+        except Exception:
+            if self._managed:
+                raise RuntimeError("ALCHEMY_METRIC_SCHEMA is set but not valid JSON")
+            loaded_schema = {}
+        self._metric_schema: dict[str, Any] = loaded_schema if isinstance(loaded_schema, dict) else {}
+        self._strict_metrics = os.environ.get("ALCHEMY_STRICT_METRICS") in {"1", "true", "TRUE", "yes"}
+
         # Build transport (no-op if nothing available)
         self._transport = make_transport(self._task_id, stub_socket, server)
 
@@ -141,6 +151,10 @@ class Alchemy:
         if loss is not None:
             msg["loss"] = float(loss)
         if metrics:
+            if self._strict_metrics and self._metric_schema:
+                undeclared = sorted(set(metrics) - set(self._metric_schema))
+                if undeclared:
+                    raise KeyError(f"undeclared metric(s): {undeclared}")
             clean_metrics: dict[str, float] = {}
             for key, value in metrics.items():
                 if isinstance(value, bool):

@@ -86,7 +86,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1-D3 done |
-| E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | IN PROGRESS — E1 done |
+| E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | IN PROGRESS — E1-E2 done |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
@@ -462,13 +462,18 @@ Tests:
 - Valid schema appears in dry-run spec.
 - Invalid direction raises.
 
-### E2. Runtime metric key validation in managed mode
+### E2. Runtime metric key validation in managed mode — DONE 2026-07-01
 
 Behavior:
-- If task declares metric schema and runtime reports undeclared metric, decide whether to warn or fail.
-- Start practical: dry-run/server can expose schema; runtime strictness can be opt-in (`strict_metrics=True`).
+- Runtime strictness is opt-in via `ALCHEMY_STRICT_METRICS=1`; existing scripts remain compatible by default.
+- `Alchemy` reads `ALCHEMY_METRIC_SCHEMA` and rejects undeclared runtime metric keys only when strict mode is enabled.
+- Server/stub dispatch path propagates `metric_schema` into `ALCHEMY_METRIC_SCHEMA` for managed tasks.
 
-Do not block existing scripts by default.
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_client.py::test_log_allows_undeclared_metrics_by_default tests/test_client.py::test_log_rejects_undeclared_metrics_when_strict -q
+```
 
 ### E3. Curves by experiment ref and param filter
 

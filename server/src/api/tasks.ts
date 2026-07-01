@@ -86,6 +86,7 @@ export interface TaskInput {
   args_template?: Record<string, string>;
   experiment_id?: string;
   outputs?: string[];
+  metric_schema?: Record<string, string>;
   resolved_config?: Record<string, any>;
   auto_retry_on?: number[];
 }
@@ -154,6 +155,7 @@ export function createTask(input: TaskInput): Task {
     args_template: input.args_template,
     experiment_id: input.experiment_id,
     outputs: input.outputs,
+    metric_schema: input.metric_schema,
     resolved_config: input.resolved_config,
   };
 
@@ -526,7 +528,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir,
       idempotency_key, param_overrides, python_env,
-      submitted_by, depends_on, ref, args_template, experiment_id, outputs,
+      submitted_by, depends_on, ref, args_template, experiment_id, outputs, metric_schema,
       auto_retry_on, stub_id,
       target_stub_id: _target_stub_id,
       target_tags: _target_tags,
@@ -615,7 +617,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const task = createTask({
       script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
-      submitted_by, depends_on, ref, args_template, experiment_id, outputs, auto_retry_on,
+      submitted_by, depends_on, ref, args_template, experiment_id, outputs, metric_schema, auto_retry_on,
       stub_id, target_stub_id,
     });
 
