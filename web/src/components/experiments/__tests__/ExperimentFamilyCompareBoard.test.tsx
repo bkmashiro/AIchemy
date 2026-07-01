@@ -147,10 +147,10 @@ describe("ExperimentFamilyCompareBoard", () => {
     const regressionRow = screen.getByRole("button", { name: /Select exp\/regression for family compare/i });
 
     expect(screen.getByTestId("recommendation-exp-baseline")).toHaveTextContent("keep");
-    expect(screen.getByTestId("recommendation-exp-regression")).toHaveTextContent("Needs stronger evidence");
+    expect(screen.getByTestId("recommendation-exp-regression")).toHaveTextContent("Try more");
 
     expect(screen.getByTestId("recommendation-exp-baseline")).toHaveClass("bg-green-900/30");
-    expect(screen.getByTestId("recommendation-exp-regression")).toHaveClass("bg-blue-900/30");
+    expect(screen.getByTestId("recommendation-exp-regression")).toHaveClass("bg-cyan-900/30");
 
     expect(within(winnerRow).getByText("0.2")).toBeInTheDocument();
     expect(within(regressionRow).getByText("0.55")).toBeInTheDocument();

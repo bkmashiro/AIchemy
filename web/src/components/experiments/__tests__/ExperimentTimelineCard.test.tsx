@@ -164,7 +164,7 @@ describe("ExperimentTimelineCard", () => {
       ),
     ]);
 
-    expect(screen.getByText("Needs stronger evidence")).toBeInTheDocument();
+    expect(screen.getByText("try more")).toBeInTheDocument();
     expect(screen.getByText("Need more seeds")).toBeInTheDocument();
     expect(screen.queryByText("rerun")).not.toBeInTheDocument();
   });

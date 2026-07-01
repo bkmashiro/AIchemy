@@ -985,10 +985,12 @@ Implemented the third Web cleanup slice: the legacy `DecisionCard` selector now 
 
 Implemented the fourth cleanup slice: the standalone lineage demo data/control panel now uses canonical decision actions (`keep`, `try_more`, `discard`) instead of teaching the retired `drop` / `rerun` / `fork` action set.
 
+Implemented the fifth cleanup slice: timeline and family-compare surfaces now render legacy event/report decisions through canonical labels, and family compare rows expose canonical decision text.
+
 Verified:
 ```bash
-cd web && npm run build
-# build passed
+cd web && npm test -- --run src/components/experiments/__tests__/ExperimentTimelineCard.test.tsx src/components/experiments/__tests__/ExperimentFamilyCompareBoard.test.tsx src/components/experiments/__tests__/DecisionCard.test.tsx && npm run build
+# 17 passed; build passed
 ```
 
 Behavior:

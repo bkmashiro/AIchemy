@@ -5,7 +5,7 @@ import type {
   ExperimentResearchReportLeaderEntry,
   ExperimentResearchReportResponse,
 } from "../../lib/api";
-import { formatMetricDelta, recommendationBadgeClass, recommendationLabel } from "./experimentDetailUtils";
+import { decisionLabelForFilter, formatMetricDelta, recommendationBadgeClass, recommendationLabel } from "./experimentDetailUtils";
 
 export type FamilyCompareDirection = "min" | "max";
 
@@ -34,7 +34,7 @@ export interface FamilyCompareBoardRow {
   configDiffCount: number | null;
   configCount: number | null;
   taskCount: number;
-  decision: ExperimentResearchReportBlock["decision"];
+  decision: string | null;
   isWinner: boolean;
   isRegression: boolean;
 }
@@ -202,7 +202,7 @@ export function buildFamilyCompareRows(
       configDiffCount: cfg,
       configCount: cfg,
       taskCount: taskCount(exp.task_counts),
-      decision: exp.decision,
+      decision: decisionLabelForFilter(exp.decision ?? null) ?? exp.decision,
       isWinner:
         winnerId != null
           ? exp.id === winnerId
