@@ -12,7 +12,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-type DemoDecision = "keep" | "drop" | "rerun" | "fork";
+type DemoDecision = "keep" | "try_more" | "discard";
 type DemoEventKind = "created" | "forked" | "note" | "decision" | "task_failed" | "resumed" | "metric_best" | "checkpoint";
 type DemoStatus = "running" | "passed" | "partial" | "failed";
 
@@ -79,9 +79,8 @@ const BADGE: Record<string, string> = {
   partial: "bg-amber-500/10 text-amber-300 border-amber-400/20",
   failed: "bg-red-500/10 text-red-300 border-red-400/20",
   keep: "bg-emerald-500/10 text-emerald-300 border-emerald-400/20",
-  drop: "bg-red-500/10 text-red-300 border-red-400/20",
-  rerun: "bg-blue-500/10 text-blue-300 border-blue-400/20",
-  fork: "bg-violet-500/10 text-violet-300 border-violet-400/20",
+  discard: "bg-red-500/10 text-red-300 border-red-400/20",
+  try_more: "bg-blue-500/10 text-blue-300 border-blue-400/20",
   created: "bg-blue-500/10 text-blue-300 border-blue-400/20",
   forked: "bg-violet-500/10 text-violet-300 border-violet-400/20",
   note: "bg-white/[0.04] text-gray-300 border-white/[0.08]",
@@ -109,7 +108,7 @@ const demoExperiments: DemoExperiment[] = [
     branch: "baseline",
     hypothesis: "Stable pretraining should hold zN above 0.82 without loss spikes.",
     expected: "zN >= 0.82, eval loss <= 1.9, no OOM on A30.",
-    decision: "fork",
+    decision: "try_more",
     decisionReason: "Good enough signal, but A30 memory pressure needs narrower forks.",
     criteria: { zN: ">=0.82", eval_loss: "<=1.90" },
     config: { lr: 0.0003, batch: 64, curiosity: false, dropout: 0.1, stub: "a30-01" },
@@ -127,7 +126,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Curiosity objective improves zN if LR is reduced enough to avoid collapse.",
     expected: "zN >= 0.86 and smoother loss curve than baseline.",
     forkReason: "Baseline showed usable zN but loss instability after 18k steps.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Promising zN, but resume on T4 before keeping it.",
     criteria: { zN: ">=0.86", eval_loss: "<=1.80" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-02" },
@@ -163,7 +162,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "A second seed should keep the zN gain without the checkpoint-specific spike.",
     expected: "zN within 0.005 of resume_t4 and smoother eval loss.",
     forkReason: "Validate the kept branch before promoting it as the new default.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Still running; keep as a live sibling branch.",
     criteria: { zN: ">=0.867", eval_loss: "<=1.79" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-04", seed: 2 },
@@ -181,7 +180,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "If the kept checkpoint is real, zN should hold or improve under 2x training horizon without drift.",
     expected: "zN holds within +/-0.003 of resume_t4 through step 80k.",
     forkReason: "Need long-horizon evidence before promoting curiosity branch as the new default.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Still extending the horizon; checkpoint stability is the gate.",
     criteria: { zN: ">=0.870", eval_loss: "<=1.78" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-06", max_steps: 80000 },
@@ -199,7 +198,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Lower dropout improves representation quality without the full instability of dropout=0.",
     expected: "zN +0.006, eval loss regression <= 0.015.",
     forkReason: "Ablation ladder from the kept resume checkpoint.",
-    decision: "fork",
+    decision: "try_more",
     decisionReason: "Promising but behind the live seed branch.",
     criteria: { zN: ">=0.878", eval_loss: "<=1.78" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, stub: "t4-05" },
@@ -217,7 +216,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Removing dropout improves zN but may hurt eval loss stability.",
     expected: "zN +0.01 with eval_loss regression <= 0.03.",
     forkReason: "Resume branch became the best checkpoint; isolate regularization next.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Early signal positive; needs another seed.",
     criteria: { zN: ">=0.88", eval_loss: "<=1.79" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.0, stub: "t4-03" },
@@ -235,7 +234,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Higher batch reduces variance without hurting zN.",
     expected: "Lower loss variance and no OOM.",
     forkReason: "Baseline variance looked optimizer-related.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "OOM twice; not worth more cluster time.",
     criteria: { zN: ">=0.84", eval_loss: "<=1.85" },
     config: { lr: 0.0003, batch: 96, curiosity: true, dropout: 0.1, stub: "a30-03" },
@@ -253,7 +252,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Batch 64 keeps the variance gain without OOM.",
     expected: "No OOM and zN recovers to baseline + curiosity levels.",
     forkReason: "High batch failed for memory, not necessarily for model quality.",
-    decision: "fork",
+    decision: "try_more",
     decisionReason: "Worth one narrower run, but not the mainline.",
     criteria: { zN: ">=0.85", eval_loss: "<=1.83" },
     config: { lr: 0.00024, batch: 64, curiosity: true, dropout: 0.1, stub: "a30-04" },
@@ -289,7 +288,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "A weak seed should still stay above baseline if the recipe is robust.",
     expected: "zN >= 0.860 with no collapse.",
     forkReason: "Seed fan-out for robustness testing.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "Below the keep threshold; preserve as evidence but mute it.",
     criteria: { zN: ">=0.867", eval_loss: "<=1.79" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-08", seed: 4 },
@@ -307,7 +306,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "More seed pressure should not destroy the graph layout.",
     expected: "zN tracks seed_b/seed_c after 30k steps.",
     forkReason: "Stress-test real seed batches.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Running; not promoted yet.",
     criteria: { zN: ">=0.867", eval_loss: "<=1.79" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-09", seed: 5 },
@@ -325,7 +324,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Maybe the low LR was too conservative.",
     expected: "Faster zN rise without loss explosion.",
     forkReason: "Optimizer sensitivity probe from the first curiosity fork.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "Collapsed by step 7k; not useful except as negative evidence.",
     criteria: { zN: ">=0.86", eval_loss: "<=1.80" },
     config: { lr: 0.00026, batch: 48, curiosity: true, dropout: 0.1, stub: "a30-05", seed: 9 },
@@ -361,7 +360,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Dropout 0.05 should stay above resume_t4 even in weaker seeds.",
     expected: "zN >= 0.874.",
     forkReason: "Seed fan-out for regularization sweep.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Close enough to need stronger evidence, not enough to promote.",
     criteria: { zN: ">=0.878", eval_loss: "<=1.78" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, stub: "t4-11", seed: 3 },
@@ -379,7 +378,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Original dropout may be slightly too conservative but stable.",
     expected: "zN around resume_t4 with lower variance.",
     forkReason: "Control point for the dropout sweep.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "Stable but dominated by dropout=0.05.",
     criteria: { zN: ">=0.872", eval_loss: "<=1.78" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.1, stub: "t4-12", seed: 6 },
@@ -397,7 +396,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "No dropout might improve zN but risks loss spikes.",
     expected: "No divergence before 30k steps.",
     forkReason: "Validate whether the no-dropout win survives another seed.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "Diverged; keep only as negative evidence.",
     criteria: { zN: ">=0.88", eval_loss: "<=1.79" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.0, stub: "t4-13", seed: 2 },
@@ -433,7 +432,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "More decay may improve loss at some zN cost.",
     expected: "eval loss improves without zN dropping below 0.878.",
     forkReason: "Optimizer sweep sibling.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "Loss improved but zN fell too much.",
     criteria: { zN: ">=0.878", eval_loss: "<=1.74" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, weight_decay: 0.03, stub: "t4-15" },
@@ -451,7 +450,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Lower beta2 reacts faster after curiosity spikes.",
     expected: "Faster recovery after spike without worse eval loss.",
     forkReason: "Optimizer sweep sibling.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Still running; possible backup branch.",
     criteria: { zN: ">=0.884", eval_loss: "<=1.75" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, beta2: 0.95, stub: "t4-16" },
@@ -487,7 +486,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Hard eval should not be seed-specific.",
     expected: "zN >= 0.882 on hard eval.",
     forkReason: "Hard-eval seed fan-out.",
-    decision: "rerun",
+    decision: "try_more",
     decisionReason: "Close but wants one more checkpoint.",
     criteria: { zN: ">=0.882", eval_loss: "<=1.76" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, weight_decay: 0.01, eval_seed: 2, stub: "t4-18" },
@@ -505,7 +504,7 @@ const demoExperiments: DemoExperiment[] = [
     hypothesis: "Infra failures should not dominate the lineage view.",
     expected: "Visible only when folded branches are expanded.",
     forkReason: "Hard-eval seed fan-out.",
-    decision: "drop",
+    decision: "discard",
     decisionReason: "Worker died; replicate later if needed.",
     criteria: { zN: ">=0.882", eval_loss: "<=1.76" },
     config: { lr: 0.00018, batch: 48, curiosity: true, dropout: 0.05, weight_decay: 0.01, eval_seed: 3, stub: "t4-19" },
@@ -516,17 +515,17 @@ const demoExperiments: DemoExperiment[] = [
 const seedEvents: DemoEvent[] = [
   { id: "e1", experimentId: "baseline", kind: "created", message: "Created baseline experiment", actor: "operator", age: "2d ago" },
   { id: "e2", experimentId: "baseline", kind: "metric_best", message: "Best zN reached 0.821 at step 18k", actor: "eval", age: "31h ago", data: { zN: 0.821, step: 18000 } },
-  { id: "e3", experimentId: "baseline", kind: "decision", message: "Marked fork: usable signal, but memory pressure needs narrower branches", actor: "operator", age: "30h ago", data: { decision: "fork" } },
+  { id: "e3", experimentId: "baseline", kind: "decision", message: "Marked try_more: usable signal, but memory pressure needs narrower branches", actor: "operator", age: "30h ago", data: { decision: "try_more" } },
   { id: "e4", experimentId: "curiosity-low-lr", kind: "forked", message: "Forked from baseline_a30", actor: "operator", age: "26h ago", data: { lr: "0.0003 -> 0.00018", curiosity: "false -> true" } },
   { id: "e5", experimentId: "curiosity-low-lr", kind: "task_failed", message: "A30 OOM at step 12k", actor: "scheduler", age: "18h ago", data: { stub: "a30-01", exit_code: 137 } },
   { id: "e6", experimentId: "curiosity-low-lr", kind: "resumed", message: "Resumed on t4-02 with batch 48", actor: "operator", age: "16h ago", data: { stub: "t4-02", batch: 48 } },
-  { id: "e7", experimentId: "curiosity-low-lr", kind: "decision", message: "Marked needs stronger evidence: promising zN, but validate resume branch first", actor: "operator", age: "2h ago", data: { decision: "rerun" } },
+  { id: "e7", experimentId: "curiosity-low-lr", kind: "decision", message: "Marked try_more: promising zN, but validate resume branch first", actor: "operator", age: "2h ago", data: { decision: "try_more" } },
   { id: "e8", experimentId: "curiosity-resume-t4", kind: "checkpoint", message: "Checkpoint promoted from resumed run", actor: "eval", age: "90m ago", data: { checkpoint: "step-42000", zN: 0.872 } },
   { id: "e9", experimentId: "curiosity-resume-t4", kind: "decision", message: "Marked keep: best current result", actor: "operator", age: "42m ago", data: { decision: "keep" } },
   { id: "e10", experimentId: "ablate-no-dropout", kind: "forked", message: "Forked from resume_t4 to test dropout=0", actor: "operator", age: "38m ago", data: { dropout: "0.1 -> 0.0" } },
   { id: "e11", experimentId: "ablate-no-dropout", kind: "metric_best", message: "Early zN reached 0.879", actor: "eval", age: "12m ago", data: { zN: 0.879, step: 16000 } },
   { id: "e12", experimentId: "curiosity-higher-batch", kind: "forked", message: "Forked from baseline_a30", actor: "operator", age: "25h ago", data: { batch: "64 -> 96" } },
-  { id: "e13", experimentId: "curiosity-higher-batch", kind: "decision", message: "Marked drop: OOM twice; not worth more cluster time", actor: "operator", age: "20h ago", data: { decision: "drop" } },
+  { id: "e13", experimentId: "curiosity-higher-batch", kind: "decision", message: "Marked discard: OOM twice; not worth more cluster time", actor: "operator", age: "20h ago", data: { decision: "discard" } },
   { id: "e14", experimentId: "batch-64-retry", kind: "forked", message: "Forked from higher_batch with safer memory envelope", actor: "operator", age: "9h ago", data: { batch: "96 -> 64", lr: "0.0003 -> 0.00024" } },
 ];
 
@@ -660,14 +659,12 @@ function nextActionForDecision(exp: DemoExperiment): NextAction {
   switch (exp.decision) {
     case "keep":
       return { label: "Promote → fork next stage", hint: "Use this checkpoint as parent for the next sweep.", tone: "emerald" };
-    case "fork":
-      return { label: "Branch from this run", hint: "Open a narrower fork to test the variant.", tone: "violet" };
-    case "rerun":
-      return { label: "Plan replication", hint: "Collect stronger evidence before deciding keep / drop.", tone: "blue" };
-    case "drop":
+    case "try_more":
+      return { label: "Plan next evidence", hint: "Collect stronger evidence before deciding keep / discard.", tone: "blue" };
+    case "discard":
       return { label: "Fold into background", hint: "Preserve as evidence; do not extend.", tone: "amber" };
     default:
-      return { label: "Awaiting decision", hint: "Select keep / fork / needs stronger evidence / drop to advance the stage.", tone: "gray" };
+      return { label: "Awaiting decision", hint: "Select keep / try_more / discard to advance the stage.", tone: "gray" };
   }
 }
 
@@ -692,7 +689,7 @@ const RUN_GAP_X = 58;
 const CANVAS_PAD_Y = 10;
 
 function isFoldedRun(exp: DemoExperiment) {
-  return exp.status === "failed" || exp.decision === "drop";
+  return exp.status === "failed" || exp.decision === "discard";
 }
 
 function sortRunsForRail(
@@ -1342,7 +1339,7 @@ export default function ExperimentLineageDemo() {
         message: `Marked ${decision}: ${reason.trim()}`,
         actor: "demo-user",
         age: "now",
-        data: { decision },
+        data: { decision: "discard" }
       },
     ]);
     setReason("");
@@ -1686,9 +1683,8 @@ export default function ExperimentLineageDemo() {
                 <div className="flex items-center gap-2">
                   <select value={decision} onChange={(e) => setDecision(e.target.value as DemoDecision)} className="rounded-md border border-white/[0.08] bg-[#191a1b] px-2 py-1.5 text-xs text-gray-200 outline-none">
                     <option value="keep">keep</option>
-                    <option value="drop">drop</option>
-                    <option value="rerun">needs stronger evidence</option>
-                    <option value="fork">fork</option>
+                    <option value="try_more">try_more</option>
+                    <option value="discard">discard</option>
                   </select>
                   <button onClick={setDemoDecision} className="rounded-md border border-indigo-400/25 bg-indigo-500/15 px-3 py-1.5 text-xs text-indigo-200 transition hover:bg-indigo-500/25">Set decision</button>
                 </div>

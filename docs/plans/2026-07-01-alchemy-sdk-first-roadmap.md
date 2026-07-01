@@ -983,10 +983,12 @@ Implemented the second Web cleanup slice: the experiments list decision filter n
 
 Implemented the third Web cleanup slice: the legacy `DecisionCard` selector now also exposes only canonical actions and keeps the existing reason-required guard. Timeline rendering accepts old event labels but displays canonical `try more` / `discard` wording.
 
+Implemented the fourth cleanup slice: the standalone lineage demo data/control panel now uses canonical decision actions (`keep`, `try_more`, `discard`) instead of teaching the retired `drop` / `rerun` / `fork` action set.
+
 Verified:
 ```bash
-cd web && npm test -- --run src/components/experiments/__tests__/DecisionCard.test.tsx src/pages/__tests__/ExperimentsPage.test.tsx src/components/experiments/__tests__/ExperimentResearchCallCard.test.tsx src/components/experiments/__tests__/experimentDetailUtils.test.ts && npm run build
-# 48 passed; build passed
+cd web && npm run build
+# build passed
 ```
 
 Behavior:
