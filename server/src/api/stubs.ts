@@ -6,6 +6,7 @@
  */
 
 import { Router, Request, Response } from "express";
+import { v4 as uuidv4 } from "uuid";
 import { store } from "../store";
 import { Task } from "../types";
 import { Namespace } from "socket.io";
@@ -22,6 +23,44 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
   router.get("/", (_req: Request, res: Response) => {
     const stubs = store.getAllStubs().map(({ socket_id, ...rest }) => rest);
     res.json(stubs);
+  });
+
+  // POST /stubs/:id/files — synchronous small file RPC via connected stub socket.
+  router.post("/:id/files", async (req: Request, res: Response) => {
+    const stub = store.getStub(req.params.id);
+    if (!stub) { res.status(404).json({ error: "Stub not found" }); return; }
+    if (stub.status !== "online" || !stub.socket_id) { res.status(503).json({ error: "Stub offline" }); return; }
+
+    const op = req.body.op;
+    const filePath = req.body.path;
+    if (!["stat", "list", "read"].includes(op)) { res.status(400).json({ error: "op must be stat, list, or read" }); return; }
+    if (typeof filePath !== "string" || filePath.length === 0) { res.status(400).json({ error: "path required" }); return; }
+    if (filePath.startsWith("/") || filePath.includes("..") || filePath.includes("\0")) { res.status(400).json({ error: "path must be relative and stay within stub file roots" }); return; }
+
+    const socket = stubNs.sockets.get(stub.socket_id);
+    if (!socket || !socket.connected) { res.status(503).json({ error: "Stub socket not connected" }); return; }
+
+    const maxBytes = Math.min(Math.max(Number(req.body.max_bytes) || 64 * 1024, 1), 1024 * 1024);
+    const requestId = `file_${stub.id}_${uuidv4().slice(0, 8)}`;
+    const payload = { request_id: requestId, op, path: filePath, max_bytes: maxBytes };
+
+    try {
+      const result = await new Promise<Record<string, any>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("timeout")), 35_000);
+        socket.emit("file.request", payload, (response: any) => {
+          clearTimeout(timer);
+          if (!response || typeof response !== "object") reject(new Error("invalid stub file ack payload"));
+          else resolve(response);
+        });
+      });
+      if (result.ok === false) {
+        res.status(result.error === "not_found" ? 404 : 400).json(result);
+        return;
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(err.message === "timeout" ? 504 : 500).json({ error: err.message === "timeout" ? "File RPC timed out" : "Invalid stub file ack payload" });
+    }
   });
 
   // GET /stubs/:id

@@ -115,6 +115,41 @@ afterEach(() => {
   writeLockTable.clear();
 });
 
+describe("POST /stubs/:id/files", () => {
+  it("relays safe small file read requests over the connected stub socket", async () => {
+    const stub = makeStub({ id: "stub-file", socket_id: "socket-file" });
+    store.setStub(stub);
+    const socket = {
+      connected: true,
+      emit: vi.fn((event: string, payload: any, ack: (...args: any[]) => void) => {
+        expect(event).toBe("file.request");
+        expect(payload).toMatchObject({ op: "read", path: "runs/result.json", max_bytes: 4096 });
+        ack({ ok: true, op: "read", path: "runs/result.json", content_b64: Buffer.from("{\"score\":0.9}\n").toString("base64"), size: 14, sha256: "abc" });
+      }),
+    };
+
+    const res = await request(makeApp(makeStubNamespace(new Map([["socket-file", socket]]))))
+      .post("/stubs/stub-file/files")
+      .send({ op: "read", path: "runs/result.json", max_bytes: 4096 })
+      .expect(200);
+
+    expect(res.body).toEqual({ ok: true, op: "read", path: "runs/result.json", content_b64: Buffer.from("{\"score\":0.9}\n").toString("base64"), size: 14, sha256: "abc" });
+  });
+
+  it("rejects absolute paths before touching the stub", async () => {
+    const stub = makeStub({ id: "stub-file", socket_id: "socket-file" });
+    store.setStub(stub);
+    const socket = { connected: true, emit: vi.fn() };
+
+    await request(makeApp(makeStubNamespace(new Map([["socket-file", socket]]))))
+      .post("/stubs/stub-file/files")
+      .send({ op: "read", path: "/etc/passwd" })
+      .expect(400);
+
+    expect(socket.emit).not.toHaveBeenCalled();
+  });
+});
+
 // ─── GET /stubs ───────────────────────────────────────────────────────────────
 
 describe("GET /stubs", () => {

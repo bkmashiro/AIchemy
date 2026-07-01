@@ -801,6 +801,18 @@ class TestHandleExecRequestEvent:
         assert result == expected
 
 
+class TestHandleFileRequestEvent:
+    @pytest.mark.asyncio
+    async def test_file_request_event_returns_result_for_socketio_ack(self, daemon):
+        payload = {"request_id": "file-1", "op": "stat", "path": "runs/result.json"}
+        expected = {"ok": True, "request_id": "file-1", "op": "stat", "path": "runs/result.json", "type": "file", "size": 12}
+
+        with patch("alchemy_stub.daemon.handle_file_request", new=AsyncMock(return_value=expected)):
+            result = await daemon._handle_file_request_event(payload)
+
+        assert result == expected
+
+
 # ===========================================================================
 # SDK callbacks
 # ===========================================================================

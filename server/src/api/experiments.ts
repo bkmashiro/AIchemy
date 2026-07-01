@@ -655,6 +655,28 @@ interface BestResultMetricSummary {
   ref: string | null;
 }
 
+interface SeriesResultRow {
+  experiment_id: string;
+  experiment_name: string;
+  family: string | null;
+  status: Experiment["status"];
+  task_id: string;
+  task_ref: string | null;
+  params: Record<string, any>;
+  result_path: string;
+  result: Record<string, any>;
+  schema: Record<string, any>;
+  created_at: string;
+}
+
+interface SeriesBestMetricSummary {
+  value: number;
+  direction: "min" | "max" | "latest";
+  experiment_id: string;
+  experiment_name: string;
+  task_ref: string | null;
+}
+
 function resultArtifactsForExperiment(exp: Experiment): ResultArtifactSummary[] {
   const grid = store.getGrid(exp.grid_id);
   if (!grid) return [];
@@ -706,6 +728,62 @@ function bestResultMetricsForExperiment(exp: Experiment): Record<string, BestRes
       }
       if ((direction === "min" && value < current.value) || (direction === "max" && value > current.value) || direction === "latest") {
         out[metric] = { value, direction, task_id: artifact.task_id, ref: artifact.ref };
+      }
+    }
+  }
+  return out;
+}
+
+function seriesRowsForExperiments(experiments: Experiment[]): SeriesResultRow[] {
+  const rows: SeriesResultRow[] = [];
+  for (const exp of experiments) {
+    const grid = store.getGrid(exp.grid_id);
+    if (!grid) continue;
+    for (const task of store.getGridTasks(exp.grid_id)) {
+      const exports = task.exports;
+      if (!exports || typeof exports.result_path !== "string") continue;
+      rows.push({
+        experiment_id: exp.id,
+        experiment_name: exp.name,
+        family: exp.family ?? null,
+        status: deriveExperimentStatus(exp),
+        task_id: task.id,
+        task_ref: task.ref ?? null,
+        params: isPlainObject(task.param_point) ? task.param_point : (Array.isArray(exp.param_points) && isPlainObject(exp.param_points[0]) ? exp.param_points[0] : {}),
+        result_path: exports.result_path,
+        result: isPlainObject(exports.result) ? exports.result : {},
+        schema: isPlainObject(exports.result_schema) ? exports.result_schema : {},
+        created_at: exp.created_at,
+      });
+    }
+  }
+  return rows.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.experiment_name.localeCompare(b.experiment_name) || String(a.task_ref ?? "").localeCompare(String(b.task_ref ?? "")));
+}
+
+function schemaSummaryForSeries(experiments: Experiment[], rows: SeriesResultRow[]): { metrics: Record<string, string>; results: Record<string, string> } {
+  const metrics: Record<string, string> = {};
+  const results: Record<string, string> = {};
+  for (const exp of experiments) {
+    Object.assign(metrics, metricDirectionsForExperiment(exp));
+    for (const spec of exp.task_specs ?? []) {
+      if (isPlainObject(spec.result_schema)) Object.assign(results, spec.result_schema);
+    }
+  }
+  for (const row of rows) Object.assign(results, row.schema);
+  return { metrics, results };
+}
+
+function bestMetricsForSeries(rows: SeriesResultRow[], directions: Record<string, string>): Record<string, SeriesBestMetricSummary> {
+  const out: Record<string, SeriesBestMetricSummary> = {};
+  for (const row of rows) {
+    for (const [metric, rawDirection] of Object.entries(directions)) {
+      if (!["min", "max", "latest"].includes(rawDirection)) continue;
+      const direction = rawDirection as "min" | "max" | "latest";
+      const value = row.result[metric];
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      const current = out[metric];
+      if (!current || (direction === "min" && value < current.value) || (direction === "max" && value > current.value) || direction === "latest") {
+        out[metric] = { value, direction, experiment_id: row.experiment_id, experiment_name: row.experiment_name, task_ref: row.task_ref };
       }
     }
   }
@@ -1684,6 +1762,37 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       metric: reportMetric,
       leaderboard,
       experiments: blocks,
+    });
+  });
+
+  // GET /experiments/series/:series/summary — aggregate SDK result artifacts across a family/series.
+  router.get("/series/:series/summary", (req: Request, res: Response) => {
+    const series = req.params.series;
+    const experiments = store.getAllExperiments()
+      .filter((exp) => exp.family === series || exp.name === series)
+      .sort(compareExperiments);
+    if (experiments.length === 0) {
+      res.status(404).json({ error: "Experiment series not found" });
+      return;
+    }
+    const rows = seriesRowsForExperiments(experiments);
+    const schema = schemaSummaryForSeries(experiments, rows);
+    res.json({
+      series,
+      generated_at: new Date().toISOString(),
+      counts: { experiments: experiments.length, result_rows: rows.length },
+      schema,
+      best_metrics: bestMetricsForSeries(rows, schema.metrics),
+      experiments: experiments.map((exp) => ({
+        id: exp.id,
+        name: exp.name,
+        family: exp.family ?? null,
+        status: deriveExperimentStatus(exp),
+        created_at: exp.created_at,
+        task_counts: taskCountsByStatus(exp),
+        primary_metric: primaryMetricFor(exp),
+      })),
+      rows,
     });
   });
 

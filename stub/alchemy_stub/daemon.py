@@ -27,6 +27,7 @@ import socketio
 from .config import Config
 from .env_discover import discover_python_envs
 from .exec import handle_exec_request
+from .file_rpc import handle_file_request
 from .gpu_monitor import GpuMonitor
 from .log_setup import jlog
 from .preflight import run_preflight
@@ -217,6 +218,10 @@ class StubDaemon:
         async def on_exec_request(*args):
             return await self._handle_exec_request_event(*args)
 
+        @sio.on("file.request", namespace="/stubs")
+        async def on_file_request(*args):
+            return await self._handle_file_request_event(*args)
+
         @sio.on("request_sync", namespace="/stubs")
         async def on_request_sync(*args):
             log.debug("request_sync received — re-sending resume")
@@ -267,6 +272,17 @@ class StubDaemon:
                 "exit_code": -1,
                 "truncated": False,
             }
+
+    async def _handle_file_request_event(self, *args):
+        """Return file.request result so python-socketio sends it as the ack payload."""
+        data = _extract_dict(args)
+        if not data:
+            return {"ok": False, "request_id": "", "error": "bad_payload"}
+        try:
+            return await handle_file_request(data, self.config)
+        except Exception as e:
+            log.error("file.request unhandled error: %s", e)
+            return {"ok": False, "request_id": data.get("request_id", ""), "error": "internal_error", "message": str(e)}
 
     # ------------------------------------------------------------------ #
     # Resume                                                               #

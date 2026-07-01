@@ -88,7 +88,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | DONE |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | DONE |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | DONE |
-| G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
+| G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | IN PROGRESS |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
 
 ---
@@ -546,6 +546,37 @@ Stop condition for Stage F:
 ## Stage G — CLI/Web inspection
 
 **User value:** use CLI/Web to decide next experiments, not to reverse-engineer state.
+
+### G0. Series summary API — DONE 2026-07-01
+
+Yuzhe pointed out that experiments in a series usually emit similar structured results, so Alchemy should extract useful fields instead of forcing operators to open each task/run dir.
+
+Implemented:
+- `GET /experiments/series/:series/summary` aggregates experiments by `family` or exact experiment name.
+- Returns normalized result rows with `experiment_id`, `experiment_name`, `task_ref`, `params`, `result_path`, and typed `result`.
+- Computes `best_metrics` using declared `metric_schema` directions.
+- Includes merged `metric_schema` and `result_schema` for the series.
+
+Verification:
+```bash
+cd server && npm test -- --run src/__tests__/experiments-lineage.test.ts -t "aggregates an experiment series"
+```
+
+### G0.5. Stub small-file RPC over Socket.IO — DONE 2026-07-01
+
+Yuzhe pointed out that many SSH/file-copy operations can reuse the online stub Socket.IO control channel.
+
+Implemented practical first slice:
+- Server `POST /stubs/:id/files` relays `stat`, `list`, and bounded `read` to the online stub.
+- Stub handles `file.request` with native Socket.IO ack.
+- Paths are relative-only and resolved under stub file root (`default_output_dir` or `default_cwd`). Absolute paths and `..` escapes fail before access.
+- Reads are base64 encoded, sha256 checked, and capped. This is for small outputs/results/log snippets, not checkpoints or replay datasets.
+
+Verification:
+```bash
+cd server && npm test -- --run src/__tests__/api-stubs.test.ts -t "POST /stubs/:id/files"
+cd stub && uv run pytest tests/test_file_rpc.py tests/test_daemon.py::TestHandleFileRequestEvent -q
+```
 
 ### G1. `alch experiments inspect <ref>` reads SDK spec
 

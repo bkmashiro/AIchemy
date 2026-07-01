@@ -59,6 +59,51 @@ beforeEach(() => {
 });
 
 describe("experiment lineage API", () => {
+  it("aggregates an experiment series into useful result rows and best metrics", async () => {
+    const app = makeApp();
+    const first = await request(app)
+      .post("/experiments")
+      .send({
+        name: "series-a",
+        family: "world-rule",
+        param_points: [{ seed: 1, variant: "base" }],
+        task_specs: [{ ref: "eval", script: "eval.py", metric_schema: { score: "max", loss: "min" }, result_schema: { score: "number", loss: "number" } }],
+      })
+      .expect(201);
+    const second = await request(app)
+      .post("/experiments")
+      .send({
+        name: "series-b",
+        family: "world-rule",
+        param_points: [{ seed: 2, variant: "ablate" }],
+        task_specs: [{ ref: "eval", script: "eval.py", metric_schema: { score: "max", loss: "min" }, result_schema: { score: "number", loss: "number" } }],
+      })
+      .expect(201);
+
+    const firstTask = store.findTask(first.body.task_refs.eval)!;
+    const secondTask = store.findTask(second.body.task_refs.eval)!;
+    store.updateGlobalQueueTask(firstTask.task.id, {
+      exports: { result_path: "/runs/a/results.json", result: { score: 0.7, loss: 0.4 }, result_schema: { score: "number", loss: "number" } },
+    });
+    store.updateGlobalQueueTask(secondTask.task.id, {
+      exports: { result_path: "/runs/b/results.json", result: { score: 0.9, loss: 0.6 }, result_schema: { score: "number", loss: "number" } },
+    });
+
+    const res = await request(app).get("/experiments/series/world-rule/summary").expect(200);
+
+    expect(res.body.series).toBe("world-rule");
+    expect(res.body.counts).toEqual({ experiments: 2, result_rows: 2 });
+    expect(res.body.schema).toEqual({ metrics: { score: "max", loss: "min" }, results: { score: "number", loss: "number" } });
+    expect(res.body.best_metrics).toEqual({
+      score: { value: 0.9, direction: "max", experiment_id: second.body.id, experiment_name: "series-b", task_ref: "eval" },
+      loss: { value: 0.4, direction: "min", experiment_id: first.body.id, experiment_name: "series-a", task_ref: "eval" },
+    });
+    expect(res.body.rows).toEqual([
+      expect.objectContaining({ experiment_id: first.body.id, experiment_name: "series-a", task_ref: "eval", params: { seed: 1, variant: "base" }, result: { score: 0.7, loss: 0.4 }, result_path: "/runs/a/results.json" }),
+      expect.objectContaining({ experiment_id: second.body.id, experiment_name: "series-b", task_ref: "eval", params: { seed: 2, variant: "ablate" }, result: { score: 0.9, loss: 0.6 }, result_path: "/runs/b/results.json" }),
+    ]);
+  });
+
   it("roundtrips SDK-authored spec fields through create, list, detail, and store reload", async () => {
     const app = makeApp();
     const sdkSpec = {
