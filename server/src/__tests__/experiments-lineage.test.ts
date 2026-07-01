@@ -107,6 +107,7 @@ describe("experiment lineage API", () => {
   it("roundtrips SDK-authored spec fields through create, list, detail, and store reload", async () => {
     const app = makeApp();
     const sdkSpec = {
+      code_id: "jema.sdk.spec.roundtrip.v1",
       name: "sdk-spec-roundtrip",
       storage: { root: "/tmp/alchemy-runs", artifact_root: "/tmp/alchemy-artifacts" },
       param_space: { seed: [1, 2] },
@@ -127,6 +128,7 @@ describe("experiment lineage API", () => {
       .post("/experiments")
       .send({
         name: "sdk-spec-roundtrip",
+        code_id: sdkSpec.code_id,
         storage: sdkSpec.storage,
         sdk_spec: sdkSpec,
         param_space: sdkSpec.param_space,
@@ -135,6 +137,7 @@ describe("experiment lineage API", () => {
       })
       .expect(201);
 
+    expect(created.body.code_id).toBe(sdkSpec.code_id);
     expect(created.body.storage).toEqual(sdkSpec.storage);
     expect(created.body.sdk_spec).toEqual(sdkSpec);
     expect(created.body.param_space).toEqual(sdkSpec.param_space);
@@ -159,6 +162,47 @@ describe("experiment lineage API", () => {
     const reloaded = await request(app).get(`/experiments/${created.body.id}`).expect(200);
     expect(reloaded.body.sdk_spec).toEqual(sdkSpec);
     expect(reloaded.body.storage).toEqual(sdkSpec.storage);
+    expect(reloaded.body.code_id).toBe(sdkSpec.code_id);
+  });
+
+  it("rejects duplicate code_id aliases for new SDK-first experiments", async () => {
+    const app = makeApp();
+    await request(app)
+      .post("/experiments")
+      .send({
+        name: "first",
+        code_id: "jema.duplicate.v1",
+        task_specs: [{ ref: "train", script: "train.py" }],
+      })
+      .expect(201);
+
+    const duplicate = await request(app)
+      .post("/experiments")
+      .send({
+        name: "second",
+        code_id: "jema.duplicate.v1",
+        task_specs: [{ ref: "train", script: "train.py" }],
+      })
+      .expect(409);
+
+    expect(duplicate.body.error).toContain("code_id already exists");
+  });
+
+  it("fetches experiment detail by code_id alias", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "code-id-detail",
+        code_id: "jema.lookup.v1",
+        task_specs: [{ ref: "train", script: "train.py" }],
+      })
+      .expect(201);
+
+    const detail = await request(app).get("/experiments/by-code/jema.lookup.v1").expect(200);
+
+    expect(detail.body.id).toBe(created.body.id);
+    expect(detail.body.code_id).toBe("jema.lookup.v1");
   });
 
   it("summarizes SDK result artifacts and best declared result metrics by task ref", async () => {

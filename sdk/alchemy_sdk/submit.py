@@ -15,6 +15,7 @@ def submit_experiment(
     description: str,
     task_specs: list[dict[str, Any]],
     force: bool = False,
+    code_id: Optional[str] = None,
     config: Optional[dict[str, Any]] = None,
     config_diff: Optional[dict[str, Any]] = None,
     storage: Optional[dict[str, Any]] = None,
@@ -34,6 +35,8 @@ def submit_experiment(
     }
 
     # Config + lineage fields (only include when set)
+    if code_id is not None:
+        payload["code_id"] = code_id
     if config is not None:
         payload["config"] = config
     if config_diff is not None:

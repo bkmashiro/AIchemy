@@ -348,6 +348,7 @@ export interface ExperimentEvent {
 
 export interface Experiment {
   id: string;
+  code_id?: string;
   name: string;
   description?: string;
   criteria: Record<string, string>;    // "metric_name": "op value"

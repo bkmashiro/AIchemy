@@ -235,11 +235,12 @@ def find_experiment(client: ApiClient, ref: str) -> dict[str, Any]:
 
 
 def resolve_experiment(experiments: list[dict[str, Any]], ref: str) -> dict[str, Any]:
-    matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref]
+    matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref or e.get("code_id") == ref]
     if not matches:
         raise AlchError(f"experiment not found: {ref}")
     if len(matches) > 1:
-        raise AlchError(f"ambiguous experiment ref {ref}: {[e.get('name') for e in matches]}")
+        labels = [e.get("code_id") or e.get("name") or e.get("id") for e in matches]
+        raise AlchError(f"ambiguous experiment ref {ref}: {labels}")
     return matches[0]
 
 
@@ -998,6 +999,92 @@ def cmd_verify(args: argparse.Namespace, client: ApiClient) -> None:
         raise SystemExit(2)
 
 
+def render_experiment_scaffold(*, code_id: str, name: str, family: str | None = None) -> str:
+    from alchemy_sdk.ledger import render_ledger_block
+
+    family_arg = f", family={json.dumps(family)}" if family else ""
+    ledger = render_ledger_block()
+    return f'''from alchemy_sdk import Experiment
+
+
+exp = Experiment(code_id={json.dumps(code_id)}, name={json.dumps(name)}{family_arg})
+
+{ledger}
+
+# Replace this starter task with real business logic.
+exp.task("train", script="train.py")
+
+
+if __name__ == "__main__":
+    exp.submit()
+'''
+
+
+def cmd_experiments_scaffold(args: argparse.Namespace) -> int:
+    if not args.code_id.strip():
+        raise AlchError("--code-id must be non-empty")
+    if not args.name.strip():
+        raise AlchError("--name must be non-empty")
+    output = Path(args.output)
+    if output.exists() and not args.force:
+        raise AlchError(f"output exists: {output} (pass --force to overwrite)")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(render_experiment_scaffold(code_id=args.code_id.strip(), name=args.name.strip(), family=args.family), encoding="utf-8")
+    print_json({"path": str(output), "code_id": args.code_id.strip(), "name": args.name.strip()})
+    return 0
+
+
+def cmd_experiments_inject_ledger(args: argparse.Namespace) -> int:
+    from alchemy_sdk.ledger import append_decision, ledger_hash, parse_ledger, replace_ledger
+
+    path = Path(args.file)
+    text = path.read_text(encoding="utf-8")
+    ledger = parse_ledger(text)
+    evidence = list(args.evidence or [])
+    updated = append_decision(
+        ledger,
+        decision_id=args.decision_id,
+        decision=args.decision,
+        reason=args.reason,
+        evidence=evidence,
+    )
+    path.write_text(replace_ledger(text, updated), encoding="utf-8")
+    print_json({"path": str(path), "ledger_hash": ledger_hash(updated), "decisions": len(updated["decisions"])})
+    return 0
+
+
+def cmd_experiments_sync_ledger(args: argparse.Namespace, client: ApiClient) -> None:
+    from alchemy_sdk.ledger import ledger_hash, parse_ledger
+
+    path = Path(args.file)
+    ledger = parse_ledger(path.read_text(encoding="utf-8"))
+    exp = find_experiment(client, args.experiment)
+    timeline = client.get(f"/experiments/{exp['id']}/timeline")
+    events = timeline.get("events", []) if isinstance(timeline, dict) else []
+    existing = {
+        event.get("data", {}).get("source_id")
+        for event in events
+        if event.get("kind") == "decision" and event.get("data", {}).get("source") == "code-ledger"
+    }
+    created: list[dict[str, Any]] = []
+    for decision in ledger.get("decisions", []):
+        if not isinstance(decision, dict):
+            continue
+        source_id = decision.get("id")
+        verdict = decision.get("decision")
+        if not source_id or source_id in existing:
+            continue
+        reason = decision.get("reason")
+        message = f"{verdict}: {reason}" if reason else str(verdict)
+        data = {"source": "code-ledger", "source_id": source_id, "decision": verdict}
+        if reason:
+            data["reason"] = reason
+        if decision.get("evidence"):
+            data["evidence"] = decision.get("evidence")
+        created.append(client.post(f"/experiments/{exp['id']}/events", {"kind": "decision", "message": message, "data": data}))
+    print_json({"experiment_id": exp["id"], "ledger_hash": ledger_hash(ledger), "created": len(created), "events": created})
+
+
 def cmd_experiments_ls(args: argparse.Namespace, client: ApiClient) -> None:
     params: dict[str, Any] = {}
     if args.family:
@@ -1503,6 +1590,27 @@ def build_parser() -> argparse.ArgumentParser:
         description=EXPERIMENTS_DESCRIPTION,
     )
     exps_sub = exps.add_subparsers(dest="cmd", required=True)
+    p = exps_sub.add_parser("scaffold", help="write a code-first SDK experiment skeleton")
+    p.add_argument("--code-id", required=True, help="stable human-authored experiment code id, e.g. jema.atari.coverage500.v1")
+    p.add_argument("--name", required=True, help="human display name")
+    p.add_argument("--family", help="experiment series/family")
+    p.add_argument("--output", required=True, help="Python file to create")
+    p.add_argument("--force", action="store_true", help="overwrite output if it already exists")
+    p.set_defaults(func=cmd_experiments_scaffold, no_client=True)
+
+    p = exps_sub.add_parser("inject-ledger", help="idempotently update a code-first managed ledger block")
+    p.add_argument("file", help="Python experiment file containing an alchemy-ledger block")
+    p.add_argument("--decision-id", required=True, help="stable decision id inside this file")
+    p.add_argument("--decision", required=True, choices=["keep", "drop", "rerun", "fork"])
+    p.add_argument("--reason", help="decision rationale")
+    p.add_argument("--evidence", action="append", help="experiment code_id or artifact ref backing the decision; repeatable")
+    p.set_defaults(func=cmd_experiments_inject_ledger, no_client=True)
+
+    p = exps_sub.add_parser("sync-ledger", help="sync missing code-ledger decisions to the experiment timeline")
+    p.add_argument("file", help="Python experiment file containing an alchemy-ledger block")
+    p.add_argument("experiment", help="experiment id, name, or code_id")
+    p.set_defaults(func=cmd_experiments_sync_ledger)
+
     p = exps_sub.add_parser("ls", help="list experiments (optionally filtered)", description="List experiments with optional server-side filters.")
     p.add_argument("--family", help="filter by experiment family name")
     p.add_argument("--decision", choices=["keep", "drop", "rerun", "fork", "none"], help="filter by decision (use 'none' for undecided)")

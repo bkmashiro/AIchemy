@@ -89,7 +89,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | DONE |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | DONE |
 | G | CLI/Web inspection and evidence surfaces | Users can inspect SDK experiments, series, logs, and files without guessing | Medium | IN PROGRESS |
-| I | Code-first identity, scaffold, and research ledger | Stable code IDs, CLI scaffolds, and managed ledgers make decisions writable without hand-editing | Medium | TODO |
+| I | Code-first identity, scaffold, and research ledger | Stable code IDs, CLI scaffolds, and managed ledgers make decisions writable without hand-editing | Medium | IN PROGRESS |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
 
 ---
@@ -709,7 +709,17 @@ Design principle:
 - Managed ledger entries are append/upsert by deterministic `entry_id`; rerunning sync must not duplicate events.
 - The experiment code should not silently mutate its own scientific conclusion during training unless explicitly configured. Runtime can propose; operator decides.
 
-### I0. Add `code_id` to SDK/server experiment identity
+### I0. Add `code_id` to SDK/server experiment identity — DONE 2026-07-01
+
+Implemented `Experiment(code_id=..., name=...)`, `to_spec()["code_id"]`, submit payload forwarding, server `code_id` storage/duplicate rejection, `/experiments/by-code/:code_id`, and CLI ref resolution by UUID/name/code_id.
+
+Verified:
+```bash
+cd sdk && uv run pytest tests/test_experiment_spec.py tests/test_experiment_submit_payload.py tests/test_cli.py tests/test_ledger.py -q
+# 120 passed
+cd server && npm test -- --run src/__tests__/experiments-lineage.test.ts && npm run build
+# 36 passed + build passed
+```
 
 Desired API:
 ```python
@@ -733,7 +743,9 @@ Files:
 - Modify: `sdk/alchemy_sdk/cli/main.py` ref resolution.
 - Tests: `sdk/tests/test_experiment_spec.py`, `server/src/__tests__/experiments-lineage.test.ts`, `sdk/tests/test_cli.py`.
 
-### I1. CLI scaffold for new SDK-first experiment files
+### I1. CLI scaffold for new SDK-first experiment files — DONE 2026-07-01
+
+Implemented `alch experiments scaffold --code-id ... --name ... --family ... --output ...`, generating an SDK-first Python file with `Experiment(code_id=...)`, starter task, and managed ledger block. This first slice uses `--output` rather than the earlier draft `--path` positional form.
 
 CLI:
 ```bash
@@ -754,7 +766,9 @@ Tests:
 - Existing file without `--force` fails.
 - Generated file is syntactically valid via `py_compile`.
 
-### I2. CLI inject for existing experiment files
+### I2. CLI inject for existing experiment files — PARTIAL 2026-07-01
+
+Implemented `alch experiments inject-ledger <file> --decision-id ... --decision keep|drop|rerun|fork [--reason ...] [--evidence ...]` for idempotent managed-ledger decision insertion. Full AST/source injection of missing `Experiment(code_id=...)` into arbitrary legacy files remains TODO.
 
 CLI:
 ```bash
@@ -775,14 +789,19 @@ Tests:
 - Conflicting `code_id` fails.
 - Tampered ledger hash fails.
 
-### I3. Managed ledger block and hash helpers
+### I3. Managed ledger block and hash helpers — DONE 2026-07-01
 
-Managed block shape:
+Implemented `sdk/alchemy_sdk/ledger.py` with marker-bounded JSON comment blocks, `parse_ledger()`, `render_ledger_block()`, `replace_ledger()`, stable `ledger_hash()`, and idempotent `append_decision()`.
+
+Implemented block shape:
 ```python
-# --- ALCHEMY MANAGED LEDGER START ---
-ALCHEMY_LEDGER = []
-ALCHEMY_LEDGER_HASH = "sha256:empty"
-# --- ALCHEMY MANAGED LEDGER END ---
+# alchemy-ledger: start
+# {
+#   "decisions": [],
+#   "evidence": [],
+#   "notes": []
+# }
+# alchemy-ledger: end
 ```
 
 Behavior:
@@ -845,7 +864,9 @@ Files:
 - Modify: `sdk/alchemy_sdk/experiment.py`
 - Test: `sdk/tests/test_experiment_spec.py`
 
-### I6. SDK and CLI decision/comment recording with idempotent ledger sync
+### I6. SDK and CLI decision/comment recording with idempotent ledger sync — PARTIAL 2026-07-01
+
+Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing `kind="decision"` events with `data.source="code-ledger"` and stable `data.source_id`. Rerunning the command skips already-synced entries. Server-side idempotency enforcement and comment support remain TODO.
 
 Desired API:
 ```python

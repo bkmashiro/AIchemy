@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 from alchemy_sdk.cli import main as cli
@@ -51,6 +52,110 @@ def run_cli(monkeypatch, argv, responses):
     code, calls = run_cli_with_exit(monkeypatch, argv, responses)
     assert code == 0
     return calls
+
+
+def test_experiments_scaffold_writes_code_first_experiment_file(tmp_path):
+    output = tmp_path / "exp_atari.py"
+
+    code = cli.main([
+        "experiments",
+        "scaffold",
+        "--code-id", "jema.atari.coverage500.v1",
+        "--name", "Atari coverage500",
+        "--family", "jema-atari",
+        "--output", str(output),
+    ])
+
+    assert code == 0
+    text = output.read_text()
+    assert 'Experiment(code_id="jema.atari.coverage500.v1", name="Atari coverage500", family="jema-atari")' in text
+    assert "# alchemy-ledger: start" in text
+    assert "# alchemy-ledger: end" in text
+    assert "exp.task(\"train\", script=\"train.py\")" in text
+    assert "if __name__ == \"__main__\":" in text
+
+
+def test_experiments_scaffold_refuses_to_overwrite_without_force(tmp_path):
+    output = tmp_path / "existing.py"
+    output.write_text("keep me")
+
+    code = cli.main([
+        "experiments", "scaffold",
+        "--code-id", "jema.existing.v1",
+        "--name", "Existing",
+        "--output", str(output),
+    ])
+
+    assert code == 1
+    assert output.read_text() == "keep me"
+
+
+def test_experiments_inject_ledger_adds_decision_idempotently(tmp_path):
+    output = tmp_path / "exp.py"
+    cli.main([
+        "experiments", "scaffold",
+        "--code-id", "jema.ledger.v1",
+        "--name", "Ledger",
+        "--output", str(output),
+    ])
+
+    args = [
+        "experiments", "inject-ledger", str(output),
+        "--decision-id", "keep-baseline",
+        "--decision", "keep",
+        "--reason", "best score",
+        "--evidence", "jema.atari.coverage500.v1",
+    ]
+    assert cli.main(args) == 0
+    first = output.read_text()
+    assert cli.main(args) == 0
+    assert output.read_text() == first
+    assert '"id": "keep-baseline"' in first
+    assert '"decision": "keep"' in first
+    assert '"ref": "jema.atari.coverage500.v1"' in first
+
+
+def test_experiments_sync_ledger_posts_missing_decision_events(monkeypatch, tmp_path):
+    output = tmp_path / "exp.py"
+    cli.main(["experiments", "scaffold", "--code-id", "jema.sync.v1", "--name", "Sync", "--output", str(output)])
+    cli.main(["experiments", "inject-ledger", str(output), "--decision-id", "keep-baseline", "--decision", "keep", "--reason", "best"])
+
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "sync-ledger", str(output), "jema.sync.v1"],
+        [
+            [{"id": "exp-1", "name": "Sync", "code_id": "jema.sync.v1"}],
+            {"events": []},
+            {"id": "evt-1", "kind": "decision"},
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/timeline"
+    assert calls[2]["method"] == "POST"
+    assert calls[2]["url"] == "http://localhost:3002/api/experiments/exp-1/events"
+    assert calls[2]["body"] == {
+        "kind": "decision",
+        "message": "keep: best",
+        "data": {"source": "code-ledger", "source_id": "keep-baseline", "decision": "keep", "reason": "best"},
+    }
+
+
+def test_experiments_sync_ledger_skips_existing_source_ids(monkeypatch, tmp_path):
+    output = tmp_path / "exp.py"
+    cli.main(["experiments", "scaffold", "--code-id", "jema.sync.v1", "--name", "Sync", "--output", str(output)])
+    cli.main(["experiments", "inject-ledger", str(output), "--decision-id", "keep-baseline", "--decision", "keep"])
+
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "sync-ledger", str(output), "jema.sync.v1"],
+        [
+            [{"id": "exp-1", "name": "Sync", "code_id": "jema.sync.v1"}],
+            {"events": [{"kind": "decision", "data": {"source": "code-ledger", "source_id": "keep-baseline"}}]},
+        ],
+    )
+
+    assert len(calls) == 2
 
 
 def test_clone_task_body_preserves_structured_argv():
@@ -637,6 +742,23 @@ def test_experiments_show_resolves_name_then_fetches_detail(monkeypatch):
     )
 
     assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1"
+
+
+def test_experiments_show_resolves_code_id_then_fetches_detail(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "show", "jema.atari.coverage500.v1"],
+        [
+            [
+                {"id": "exp-1", "name": "alpha", "code_id": "jema.atari.coverage500.v1"},
+                {"id": "exp-2", "name": "beta", "code_id": "jema.atari.other.v1"},
+            ],
+            {"id": "exp-1", "name": "alpha", "code_id": "jema.atari.coverage500.v1", "status": "running", "tasks": []},
+        ],
+    )
+
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1"
 

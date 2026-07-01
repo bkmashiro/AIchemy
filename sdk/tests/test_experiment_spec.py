@@ -7,6 +7,23 @@ import pytest
 from alchemy_sdk.experiment import Experiment
 
 
+def test_experiment_code_id_is_explicit_human_reference_in_spec():
+    spec = Experiment(
+        code_id="jema.atari.coverage500.v1",
+        name="Atari coverage500",
+        family="jema-atari-parametric",
+    ).to_spec()
+
+    assert spec["code_id"] == "jema.atari.coverage500.v1"
+    assert spec["name"] == "Atari coverage500"
+    assert spec["family"] == "jema-atari-parametric"
+
+
+def test_experiment_code_id_rejects_empty_values():
+    with pytest.raises(ValueError, match="code_id"):
+        Experiment(code_id=" ", name="bad")
+
+
 def test_storage_root_is_in_experiment_spec():
     spec = Experiment("x").storage(root="/runs").to_spec()
 

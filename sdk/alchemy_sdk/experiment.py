@@ -117,8 +117,9 @@ class Experiment:
 
     def __init__(
         self,
-        name: str,
+        name: Optional[str] = None,
         *,
+        code_id: Optional[str] = None,
         description: str = "",
         server: Optional[str] = None,
         family: Optional[str] = None,
@@ -126,7 +127,12 @@ class Experiment:
         expected_outcome: Optional[str] = None,
         fork_reason: Optional[str] = None,
     ) -> None:
+        if name is None or not isinstance(name, str) or not name.strip():
+            raise ValueError("name must be a non-empty string")
+        if code_id is not None and (not isinstance(code_id, str) or not code_id.strip()):
+            raise ValueError("code_id must be a non-empty string")
         self.name = name
+        self.code_id = code_id.strip() if code_id is not None else None
         self.description = description
         self._server = server or os.environ.get("ALCHEMY_SERVER") or self._read_config_server()
         self._tasks: list[TaskNode] = []
@@ -255,6 +261,8 @@ class Experiment:
             },
             "tasks": self._task_specs(),
         }
+        if self.code_id is not None:
+            spec["code_id"] = self.code_id
         if self.family is not None:
             spec["family"] = self.family
         if self.hypothesis is not None:
@@ -352,6 +360,7 @@ class Experiment:
             name,
             description=description,
             server=self._server,
+            code_id=None,
             family=self.family,
             fork_reason=reason or None,
         )
@@ -397,6 +406,7 @@ class Experiment:
             description=self.description,
             task_specs=specs,
             force=force,
+            code_id=self.code_id,
             config=self.config if self.config else None,
             config_diff=self._compute_config_diff(),
             storage=copy.deepcopy(self._storage) if self._storage else None,

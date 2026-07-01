@@ -1149,6 +1149,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
   router.post("/", (req: Request, res: Response) => {
     const {
       name, description, criteria, script,
+      code_id,
       matrix, base_args, max_retries,
       requirements, target_tags, task_specs,
       python_env, cwd,
@@ -1160,6 +1161,11 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     } = req.body;
 
     if (!name) { res.status(400).json({ error: "name required" }); return; }
+    const codeId = typeof code_id === "string" && code_id.trim() ? code_id.trim() : undefined;
+    if (code_id !== undefined && !codeId) { res.status(400).json({ error: "code_id must be a non-empty string" }); return; }
+    if (codeId && store.getAllExperiments().some((exp) => exp.code_id === codeId)) {
+      res.status(409).json({ error: "code_id already exists" }); return;
+    }
 
     // ─── DAG task_specs path ──────────────────────────────────────────
     if (task_specs && Array.isArray(task_specs) && task_specs.length > 0) {
@@ -1246,6 +1252,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
 
       const experiment: Experiment = {
         id: experimentId,
+        code_id: codeId,
         name,
         description,
         criteria: criteria || {},
@@ -1370,6 +1377,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     // Create experiment
     const experiment: Experiment = {
       id: uuidv4(),
+      code_id: codeId,
       name,
       description,
       criteria,
@@ -1794,6 +1802,15 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       })),
       rows,
     });
+  });
+
+  // GET /experiments/by-code/:code_id — stable human-authored code reference lookup.
+  router.get("/by-code/:code_id", (req: Request, res: Response) => {
+    const exp = store.getAllExperiments().find((candidate) => candidate.code_id === req.params.code_id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    const grid = store.getGrid(exp.grid_id);
+    const tasks = grid ? store.getGridTasks(exp.grid_id) : [];
+    res.json({ ...exp, status: deriveExperimentStatus(exp), grid, tasks });
   });
 
   // GET /experiments/:id/summary — detailed summary including lineage

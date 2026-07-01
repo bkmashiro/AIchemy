@@ -46,6 +46,29 @@ def test_submit_forwards_sdk_storage_and_metadata_spec(monkeypatch):
     assert captured["sdk_spec"]["tasks"] == [{"ref": "train", "script": "train.py"}]
 
 
+def test_submit_forwards_code_id_to_http_payload(monkeypatch):
+    captured = {}
+
+    def fake_submit_experiment(**kwargs):
+        captured.update(kwargs)
+        return ExperimentResult(
+            experiment_id="exp-1",
+            task_refs={"train": "task-1"},
+            already_exists=False,
+            url="http://alchemy/experiments/exp-1",
+        )
+
+    monkeypatch.setattr("alchemy_sdk.submit.submit_experiment", fake_submit_experiment)
+
+    exp = Experiment(code_id="jema.atari.coverage500.v1", name="Atari coverage500", server="http://alchemy")
+    exp.task("train", script="train.py")
+
+    exp.submit()
+
+    assert captured["code_id"] == "jema.atari.coverage500.v1"
+    assert captured["sdk_spec"]["code_id"] == "jema.atari.coverage500.v1"
+
+
 def test_submit_experiment_http_payload_includes_sdk_storage(monkeypatch):
     calls = []
 
