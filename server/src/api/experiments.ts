@@ -448,8 +448,17 @@ function baselineCandidateForExperiment(
   };
 }
 
+function hasExecutingTask(exp: Experiment): boolean {
+  const grid = store.getGrid(exp.grid_id);
+  if (!grid) return false;
+  return store.getGridTasks(exp.grid_id).some((task) =>
+    ["assigned", "dispatched", "running", "paused"].includes(task.status),
+  );
+}
+
 function recommendationForExperiment(exp: Experiment, allExperiments: Experiment[]): Recommendation {
   const status = deriveExperimentStatus(exp);
+  const isExecuting = hasExecutingTask(exp);
   const primary = primaryMetricFor(exp);
 
   const recommendation: Recommendation = {
@@ -492,7 +501,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
     return recommendation;
   }
 
-  if (status === "running") {
+  if (status === "running" && isExecuting) {
     recommendation.verdict = "running";
     recommendation.action = "try_more";
     recommendation.reason = "Experiment is running";

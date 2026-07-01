@@ -411,6 +411,7 @@ describe("ExperimentResearchCallCard", () => {
 
     expect(screen.getByText("Discard branch")).toBeInTheDocument();
     expect(screen.getByText("Plan replication with larger cohort")).toBeInTheDocument();
+    expect(screen.queryByText("Replication plan")).not.toBeInTheDocument();
   });
 
   it("uses canonical user-facing copy for rerun decisions", () => {

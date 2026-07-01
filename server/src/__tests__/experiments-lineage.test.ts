@@ -1361,6 +1361,27 @@ describe("experiment lineage API", () => {
       }),
     );
 
+    const pending = await request(app)
+      .post("/experiments")
+      .send({
+        name: "pending-exp",
+        goal_metric: "loss",
+        goal_direction: "min",
+        task_specs: [{ ref: "train", script: "/tmp/train.py" }],
+      })
+      .expect(201);
+
+    const pendingSummary = await request(app).get(`/experiments/${pending.body.id}/summary`).expect(200);
+    expect(pendingSummary.body.status).toBe("running");
+    expect(pendingSummary.body.recommendation).toEqual(
+      expect.objectContaining({
+        action: "try_more",
+        verdict: "inconclusive",
+        reason: "Goal metric not yet available",
+        evidence_reason: "Goal metric not yet available",
+      }),
+    );
+
     const failed = await request(app)
       .post("/experiments")
       .send({

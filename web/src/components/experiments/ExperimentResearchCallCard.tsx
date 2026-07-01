@@ -326,7 +326,7 @@ export function ExperimentResearchCallCard({
     ["try more", "needs stronger evidence", "needs replication"].includes(
       recommendationLabelText.toLowerCase(),
     );
-  const showReplicationPlan = explicitDecisionIsTryMore || recommendationIsRerunLike;
+  const showReplicationPlan = explicitDecisionIsTryMore || (!explicitDecision && recommendationIsRerunLike);
 
   const parent = summary?.parent ?? null;
   const parentName = parent?.name ?? exp.parent_name ?? null;
