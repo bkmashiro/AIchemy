@@ -88,7 +88,8 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | DONE |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | DONE |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | DONE |
-| G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | IN PROGRESS |
+| G | CLI/Web inspection and evidence surfaces | Users can inspect SDK experiments, series, logs, and files without guessing | Medium | IN PROGRESS |
+| I | Research decisions and annotations | Keep/try-more/discard/comment decisions are first-class experiment evidence | Medium | TODO |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
 
 ---
@@ -580,32 +581,235 @@ cd stub && uv run pytest tests/test_file_rpc.py tests/test_daemon.py::TestHandle
 
 ### G1. `alch experiments inspect <ref>` reads SDK spec
 
+User value:
+- One command shows what SDK thinks the experiment is: storage, grid, DAG, schemas, outputs, and warnings.
+- No manual task ID lookup.
+
 Behavior:
-- Show storage, param space, task templates, expanded task counts, schemas, outputs, warnings.
-- JSON mode for agents/scripts.
+- `alch experiments inspect <ref>` calls experiment detail/summary endpoints and prints a compact JSON view by default.
+- Include `storage`, `param_space`, `param_points` count/sample, task refs/templates, dependencies, `metric_schema`, `result_schema`, outputs, latest result artifacts, and preflight warnings if present.
+- Add `--format markdown` for human handoff and Discord summaries.
+- Add `--raw` to print the server payload unchanged for agents.
+
+Files:
+- Modify: `sdk/alchemy_sdk/cli/main.py`
+- Test: `sdk/tests/test_cli.py`
 
 Tests:
 - Fake API payload renders expected fields.
+- Name resolution works like `summary`/`bundle`.
+- Missing SDK spec does not crash; prints a legacy-experiment warning.
 
-### G2. `alch experiments curves <ref>`
+### G2. `alch experiments series <family>` wraps series summary
+
+User value:
+- A whole experiment family can be summarized without opening individual run dirs.
+
+Behavior:
+- CLI calls `GET /experiments/series/:series/summary`.
+- JSON mode prints rows/best metrics unchanged.
+- Markdown mode renders: best metric table, per-param result rows, outlier/missing-result warnings, and drilldown commands.
+- Do not invent statistics yet; use declared metric directions and structured results only.
+
+Files:
+- Modify: `sdk/alchemy_sdk/cli/main.py`
+- Optional helper: `sdk/alchemy_sdk/experiments.py`
+- Test: `sdk/tests/test_cli.py`
+
+Tests:
+- CLI hits `/experiments/series/<family>/summary`.
+- Markdown includes best metric and result rows.
+
+### G3. `alch experiments curves <ref>`
 
 Behavior:
 - Fetch curves through SDK client and export JSON/CSV.
 - Do not make plotting a dependency.
+- Surface data source explicitly: `ring_buffer`, `task_snapshot`, or future `metric_tail`.
 
-### G3. Web read-only inspector
+Files:
+- Modify: `sdk/alchemy_sdk/cli/main.py`
+- Test: `sdk/tests/test_cli.py`
 
-Respect Yuzhe UI preference:
+### G4. Log and metric tail evidence on server
+
+Yuzhe clarified the durability rule:
+- Full logs do not belong in SQLite.
+- Server should keep a bounded tail for hot/recent tasks.
+- Cold logs can be dropped.
+- Database stores at most small tails / pointers / summary metadata, never big logs or full curves.
+
+Behavior:
+- Keep bounded `log_tail` and `metric_tail` in server task state, with explicit caps.
+- Preserve current ring buffer for hot data.
+- Persist only final N log lines / final N metric points per task or per metric. Default cap should be small and configurable.
+- Add `source` to read endpoints: `ring_buffer`, `snapshot_tail`, `dropped`, or `file_rpc`.
+- If data is cold/dropped, response must say so instead of returning empty as if no logs existed.
+- For larger/cold reads, CLI/Web can use online stub file RPC when the stub is alive and the path is under the allowed root.
+
+Files:
+- Modify: `server/src/socket/stub.ts` for bounded tail snapshots.
+- Modify: `server/src/api/tasks.ts` / `server/src/api/metrics.ts` for `source` and tail fallback.
+- Modify tests near `server/src/__tests__/metrics-persistence.test.ts`, `server/tests/socket-stub.test.ts`, and task-log tests.
+
+Tests:
+- Many log lines only persist the final N.
+- Many metric points only persist the final N per task/metric.
+- Empty/cold response carries `source="dropped"` or equivalent reason.
+- No large blob is stored in task state.
+
+### G5. Web UI redesign around use-case routes
+
+Current Web plan must change: do not build a generic tree dump. Build decision-oriented views.
+
+Required routes / tabs:
+- **Decide next**: series summary, best metrics, missing results, recommendation/decision buttons.
+- **Compare**: selected experiments/params, metric/result tables, deltas, drilldown.
+- **Audit**: SDK spec, storage, DAG, schemas, result artifacts, warnings, source labels.
+- **Handoff**: Markdown/JSON export, copyable CLI commands, comment/decision timeline.
+
+UI constraints:
 - Dense, polished, GitLens/VSCode-like.
-- Stable grouped branches.
 - Low-radius/full-width.
+- Stable grouped branches.
 - Muted/folded failed leaves.
-- Use-case routes: Decide next / Compare / Audit / Handoff.
+- Show light graph nodes plus inspector details; no giant raw JSON-first page.
 
-Do this after SDK/server data is real. UI before data model is decoration. 不行。
+Files:
+- Inspect first: `web/src` current routing/pages/components.
+- Server APIs should already provide most data before UI work starts.
+
+Tests:
+- Component tests for route rendering and empty/missing-result states.
+- Build gate: `cd web && npm run build && npm test -- --run`.
 
 Stop condition for Stage G:
-- The same SDK-created experiment can be inspected from CLI and Web without manual task ID lookup.
+- The same SDK-created experiment/series can be inspected from CLI and Web without manual task ID lookup, SSH, or raw SQLite.
+
+---
+
+## Stage I — Research decisions and annotations
+
+**User value:** every experiment has an explicit research outcome: keep, try more, discard, or comment. Decisions become queryable evidence, not lost Discord memory.
+
+Design principle:
+- Decisions are experiment events attached to SDK/server state.
+- SDK code can declare decision policy and emit structured decision suggestions.
+- Humans/agents can record actual decisions after seeing results.
+- The experiment code should not silently mutate its own scientific conclusion during training unless explicitly configured. Runtime can propose; operator decides.
+
+### I1. Normalize decision vocabulary
+
+Canonical statuses:
+- `keep`: result is worth preserving/promoting.
+- `try_more`: needs more seeds/ablations/coverage before judging.
+- `discard`: result is not worth continuing.
+- `comment`: neutral note, question, caveat, or observation.
+
+Fields:
+- `kind`: `decision` or `comment`.
+- `decision`: one of `keep|try_more|discard` for decision events.
+- `comment`: text.
+- `reason`: required for decisions.
+- `evidence`: optional structured references: metric names, result paths, task IDs, series rows.
+- `actor`: server-derived from auth token or explicit trusted automation identity.
+- `created_at`: server timestamp.
+
+Files:
+- Inspect existing `server/src/api/experiments.ts` event/decision endpoints before changing.
+- Modify only if current fields do not support the vocabulary.
+- Tests in `server/src/__tests__/experiments-lineage.test.ts`.
+
+### I2. SDK decision policy declarations
+
+Research code can declare decision intent, but this is a policy/spec, not an immediate final judgement.
+
+Desired API:
+```python
+exp = (
+    Experiment("x", family="jema")
+    .decision_policy(
+        primary_metric="retrieval_at5",
+        direction="max",
+        keep_if="mean(retrieval_at5) >= 0.65",
+        try_more_if="0.55 <= mean(retrieval_at5) < 0.65",
+        discard_if="mean(retrieval_at5) < 0.55",
+        min_seeds=3,
+    )
+)
+```
+
+Behavior:
+- Policy appears in `to_spec()` and server `sdk_spec`.
+- `dry_run()` validates referenced metric names exist in declared schemas.
+- No automatic task submission based on policy.
+
+Files:
+- Modify: `sdk/alchemy_sdk/experiment.py`
+- Test: `sdk/tests/test_experiment_spec.py`
+
+### I3. SDK and CLI decision recording
+
+Desired API:
+```python
+from alchemy_sdk.experiments import ExperimentClient
+
+client = ExperimentClient()
+client.decide("exp-or-name", decision="try_more", reason="seed variance high", evidence={"metric": "retrieval_at5"})
+client.comment("exp-or-name", "Freeway coverage still zero; need coverage collector")
+```
+
+CLI:
+```bash
+alch experiments decide <ref> keep --reason "beats baseline on all seeds"
+alch experiments decide <ref> try-more --reason "needs 3 seeds; current n=1"
+alch experiments decide <ref> discard --reason "coverage zero; result invalid"
+alch experiments comment <ref> "Freeway reward rate still zero"
+```
+
+Behavior:
+- `try-more` is CLI alias for canonical `try_more`.
+- Decision/comment endpoints append timeline events.
+- Latest decision is summarized in experiment detail and series summary.
+
+Files:
+- Modify: `sdk/alchemy_sdk/experiments.py`
+- Modify: `sdk/alchemy_sdk/cli/main.py`
+- Modify: `server/src/api/experiments.ts` if needed.
+- Tests: `sdk/tests/test_cli.py`, `server/src/__tests__/experiments-lineage.test.ts`.
+
+### I4. Series-level decisions
+
+Behavior:
+- Allow decisions/comments on a series/family, not just one experiment.
+- Store as experiment-series event or append identical event to member experiments with `scope="series"`.
+- Prefer a separate series event store only if the current experiment event model becomes awkward; do not overbuild.
+
+CLI:
+```bash
+alch experiments series-decision <family> try-more --reason "need seeds 1234/4242/7777"
+alch experiments series-comment <family> "random500 improved Pong but not Freeway"
+```
+
+Server:
+- `POST /experiments/series/:series/events`
+- `GET /experiments/series/:series/summary` includes latest series decision and comments.
+
+Tests:
+- Series summary shows latest decision/comment.
+- Empty/nonexistent family returns 404, not silent success.
+
+### I5. Web decision UX
+
+Behavior:
+- In **Decide next**, show recommended action from policy/summary, but keep human action explicit.
+- Buttons: `Keep`, `Try more`, `Discard`, `Comment`.
+- Every button requires a reason/comment before submit.
+- Timeline shows decisions/comments next to result artifacts and metric evidence.
+- Handoff export includes latest decision and unresolved `try_more` requests.
+
+Stop condition for Stage I:
+- A result can move from generated output → series summary → explicit research decision/comment → future query/handoff without Discord-only memory.
 
 ---
 
@@ -687,23 +891,37 @@ Use narrower focused tests during development; run broader gates before commit.
 
 ## 6. Near-term recommended order
 
-Do these first, in order:
+Completed foundation:
 
-1. A1 `Experiment.storage()`
-2. A2 `Experiment.base_config()` + immutable `to_spec()`
-3. A3 `dry_run()` returns spec/preflight dict
-4. B1 `params(**space)`
-5. B2 template ref expansion
-6. B3 same-point dependency resolution
-7. C1 storage warnings
-8. E1 metric schema declaration
-9. D1 local `write_result()`
-10. D2 result schema validation
+1. A1 `Experiment.storage()` — DONE
+2. A2 `Experiment.base_config()` + immutable `to_spec()` — DONE
+3. A3 `dry_run()` returns spec/preflight dict — DONE
+4. B1 `params(**space)` — DONE
+5. B2 template ref expansion — DONE
+6. B3 same-point dependency resolution — DONE
+7. C1 storage warnings — DONE
+8. D/E/F result, metric schema, curves, and server persistence — DONE
+9. G0 series summary API — DONE
+10. G0.5 stub small-file RPC — DONE
+
+Next implementation order:
+
+1. G1 `alch experiments inspect <ref>`.
+2. G2 `alch experiments series <family>`.
+3. I1 normalize decision vocabulary against existing experiment event API.
+4. I3 CLI/SDK decision and comment recording for single experiments.
+5. I4 series-level decision/comment events and summary inclusion.
+6. G4 bounded server log/metric tails with explicit `source` labels.
+7. G3 `alch experiments curves <ref>` export, after source labels are stable.
+8. G5 Web use-case routes: Decide next / Compare / Audit / Handoff.
+9. I5 Web decision UX.
+10. H dry-run-only JEMA dogfood script, still blocked from real submission until Yuzhe allows.
 
 Why this order:
-- It gives immediate value without server/stub deployment.
-- It keeps the SDK API shape honest before persistence/UI work.
-- It prevents the old failure mode: experiments whose config/storage exists outside Alchemy's model.
+- CLI inspect/series gives immediate value over already-built APIs.
+- Decision/comment recording should land before Web so the UI is not a decorative dashboard.
+- Log/metric tail semantics must be settled before Web shows evidence panels.
+- Web should be built from stable server facts and explicit research decisions, not raw task dumps.
 
 ---
 
@@ -763,10 +981,10 @@ Avoid breaking old scripts:
 
 Do not block Stage A/B on these:
 
-1. Should metric curves be fully durable or downsampled?
+1. Metric/log durability policy: bounded hot tails only. SQLite may store final N log lines / final N metric points and summary metadata; full logs/curves stay in files/artifacts/object storage or are dropped when cold.
 2. Should config schema use pydantic, JSON schema, or simple dotpath validation?
 3. Should callable tasks be supported directly, or should SDK only emit script/module commands?
-4. Should Web become a spec editor? Current answer: no, read-only/ops first.
+4. Should Web become a spec editor? Current answer: no, read-only/ops/decision first.
 5. Should strict metric schema be default? Current answer: not yet; opt-in after dogfood.
 6. How should global/cross-point dependencies be expressed? Defer until a real aggregate task needs it.
 
