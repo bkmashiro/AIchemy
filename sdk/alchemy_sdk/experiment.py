@@ -4,8 +4,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from importlib import metadata as importlib_metadata
+from typing import Any, Mapping, Optional
 
 
 @dataclass
@@ -77,6 +79,27 @@ def _validate_non_empty_path(value: str, field: str) -> None:
         raise ValueError(f"{field} must be a non-empty path")
 
 
+def _sdk_version() -> str:
+    try:
+        return importlib_metadata.version("alchemy-sdk")
+    except importlib_metadata.PackageNotFoundError:
+        return "unknown"
+
+
+def _git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.getcwd(),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return "unknown"
+    return result.stdout.strip() or "unknown"
+
+
 # ─── Experiment ──────────────────────────────────────────────────────────────
 
 class Experiment:
@@ -129,11 +152,23 @@ class Experiment:
         self._storage = copy.deepcopy(storage)
         return self
 
+    def base_config(self, config: Mapping[str, Any]) -> "Experiment":
+        """Set the SDK-authored base config snapshot for all tasks."""
+        if not isinstance(config, Mapping):
+            raise ValueError("base_config must be a mapping")
+        self.config = copy.deepcopy(dict(config))
+        return self
+
     def to_spec(self) -> dict[str, Any]:
         """Return a defensive snapshot of the SDK-authored experiment spec."""
         spec: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
+            "metadata": {
+                "sdk_version": _sdk_version(),
+                "git_commit": _git_commit(),
+                "cwd": os.getcwd(),
+            },
             "tasks": [copy.deepcopy(t._spec) for t in self._tasks],
         }
         if self.family is not None:

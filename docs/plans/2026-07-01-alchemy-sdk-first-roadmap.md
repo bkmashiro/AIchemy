@@ -82,7 +82,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 
 | Stage | Name | Outcome | Risk | Status |
 |---|---|---|---|---|
-| A | SDK spec snapshot | Experiment has a strict serializable spec | Low | IN PROGRESS — A1 done |
+| A | SDK spec snapshot | Experiment has a strict serializable spec | Low | IN PROGRESS — A1-A2 done |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | TODO |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | TODO |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
@@ -149,7 +149,16 @@ git add sdk/alchemy_sdk/experiment.py sdk/tests/test_experiment_spec.py
 git commit -S -m "feat(sdk): add experiment storage spec"
 ```
 
-### A2. Add `Experiment.base_config()` and immutable `to_spec()`
+### A2. Add `Experiment.base_config()` and immutable `to_spec()` — DONE 2026-07-01
+
+Implemented `base_config()` and `metadata` snapshot fields in `to_spec()`.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_spec.py tests/test_experiment_lineage.py -q
+# 27 passed
+```
 
 Behavior:
 - `.base_config(mapping)` replaces `exp.config` through an explicit method while keeping existing `exp.config = ...` compatibility.
