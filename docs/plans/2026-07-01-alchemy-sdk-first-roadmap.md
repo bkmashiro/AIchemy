@@ -85,7 +85,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
-| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1 done |
+| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1-D2 done |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
@@ -387,7 +387,16 @@ Tests:
 - Atomic temp file does not remain after success.
 - Works in no-op local context using temp run_dir.
 
-### D2. Add schema validation
+### D2. Add schema validation — DONE 2026-07-01
+
+Implemented `write_result(..., schema={dotpath: type_or_name})` with nested key checks, simple string type names, and bool-not-number handling.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_context.py::TestReportHelpers -q
+# 10 passed
+```
 
 Behavior:
 - Support simple schema: dotpath → type or string type name.

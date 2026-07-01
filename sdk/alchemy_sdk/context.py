@@ -284,8 +284,16 @@ class TrainingContext:
         """Report evaluation metrics."""
         self._al.log_eval(metrics)
 
-    def write_result(self, result: dict[str, Any], path: str | Path = "results.json") -> Path:
+    def write_result(
+        self,
+        result: dict[str, Any],
+        path: str | Path = "results.json",
+        *,
+        schema: Optional[dict[str, type | str]] = None,
+    ) -> Path:
         """Write a typed result artifact as JSON under run_dir, atomically."""
+        if schema:
+            self._validate_result_schema(result, schema)
         output_path = self._resolve_result_path(path)
         _makedirs_002(output_path.parent)
 
@@ -325,12 +333,55 @@ class TrainingContext:
             raise ValueError("result path must stay under run_dir")
         return candidate
 
+    def _validate_result_schema(self, result: dict[str, Any], schema: dict[str, type | str]) -> None:
+        for dotpath, expected in schema.items():
+            value = self._get_result_dotpath(result, dotpath)
+            expected_type = _schema_type(expected)
+            if expected_type in (int, float) and isinstance(value, bool):
+                raise TypeError(f"Result key {dotpath} expected {expected_type.__name__}, got bool")
+            if expected_type is float:
+                if not isinstance(value, (int, float)):
+                    raise TypeError(f"Result key {dotpath} expected float, got {type(value).__name__}")
+                continue
+            if not isinstance(value, expected_type):
+                raise TypeError(
+                    f"Result key {dotpath} expected {expected_type.__name__}, got {type(value).__name__}"
+                )
+
+    @staticmethod
+    def _get_result_dotpath(result: dict[str, Any], dotpath: str) -> Any:
+        current: Any = result
+        for part in dotpath.split("."):
+            if not isinstance(current, dict) or part not in current:
+                raise ValueError(f"Missing result key: {dotpath}")
+            current = current[part]
+        return current
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _UMASK_LOCK = threading.Lock()
+
+_SCHEMA_TYPES: dict[str, type] = {
+    "bool": bool,
+    "dict": dict,
+    "float": float,
+    "int": int,
+    "list": list,
+    "str": str,
+}
+
+
+def _schema_type(expected: type | str) -> type:
+    if isinstance(expected, type):
+        return expected
+    try:
+        return _SCHEMA_TYPES[expected]
+    except KeyError as exc:
+        raise ValueError(f"Unknown result schema type: {expected!r}") from exc
+
 
 def _makedirs_002(path: Path) -> None:
     """Create directories with umask 002 (group-writable)."""

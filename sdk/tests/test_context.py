@@ -495,3 +495,28 @@ class TestReportHelpers:
 
         with pytest.raises(ValueError, match="run_dir"):
             ctx.write_result({"ok": True}, path=tmp_path / "outside.json")
+
+    def test_write_result_schema_validates_nested_types(self, tmp_path):
+        ctx, _ = _make_ctx(tmp_path)
+
+        path = ctx.write_result(
+            {"retrieval_at5": 0.71, "coverage": {"reward_rate": 0.12}},
+            schema={"retrieval_at5": float, "coverage.reward_rate": "float"},
+        )
+
+        assert path.exists()
+
+    def test_write_result_schema_rejects_missing_nested_key(self, tmp_path):
+        ctx, _ = _make_ctx(tmp_path)
+
+        with pytest.raises(ValueError, match="Missing result key: coverage.reward_rate"):
+            ctx.write_result({"coverage": {}}, schema={"coverage.reward_rate": float})
+
+    def test_write_result_schema_rejects_wrong_type_and_bool_as_number(self, tmp_path):
+        ctx, _ = _make_ctx(tmp_path)
+
+        with pytest.raises(TypeError, match="retrieval_at5"):
+            ctx.write_result({"retrieval_at5": "bad"}, schema={"retrieval_at5": float})
+
+        with pytest.raises(TypeError, match="retrieval_at5"):
+            ctx.write_result({"retrieval_at5": True}, schema={"retrieval_at5": float})
