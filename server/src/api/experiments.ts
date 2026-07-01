@@ -348,7 +348,7 @@ export interface PrimaryMetric {
   best: number | null;
 }
 
-export type RecommendationAction = "keep" | "drop" | "rerun" | "fork";
+export type RecommendationAction = "keep" | "try_more" | "discard";
 export type RecommendationVerdict = "best" | "improved" | "regressed" | "inconclusive" | "failed" | "running";
 
 export interface Recommendation {
@@ -453,7 +453,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
   const primary = primaryMetricFor(exp);
 
   const recommendation: Recommendation = {
-    action: "rerun",
+    action: "try_more",
     verdict: "inconclusive",
     reason: "Recommendation unavailable",
     metric: primary?.metric ?? exp.goal_metric ?? null,
@@ -482,7 +482,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
   // declared metric/direction/value context so UI/tree nodes remain informative.
   if (status === "failed") {
     recommendation.verdict = "failed";
-    recommendation.action = "rerun";
+    recommendation.action = "try_more";
     recommendation.reason = "Experiment failed";
     recommendation.evidence_quality = "insufficient";
     recommendation.evidence_reason = recommendation.reason;
@@ -494,7 +494,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
 
   if (status === "running") {
     recommendation.verdict = "running";
-    recommendation.action = "rerun";
+    recommendation.action = "try_more";
     recommendation.reason = "Experiment is running";
     recommendation.evidence_reason = "Experiment is running; evidence is incomplete";
     recommendation.evidence_quality = recommendation.sample_count && recommendation.sample_count > 0 ? "weak" : "insufficient";
@@ -530,7 +530,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
   if (baseline.source === "parent") {
     recommendation.evidence_quality = recommendation.sample_count && recommendation.sample_count >= 2 ? "strong" : "moderate";
     if (recommendation.delta === 0) {
-      recommendation.action = "rerun";
+      recommendation.action = "try_more";
       recommendation.verdict = "inconclusive";
       recommendation.reason = "Metric equals parent baseline";
     } else if (betterDirection(primary.direction, primary.best, recommendation.baseline_value)) {
@@ -538,7 +538,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
       recommendation.verdict = "improved";
       recommendation.reason = "Better than parent baseline";
     } else {
-      recommendation.action = "drop";
+      recommendation.action = "discard";
       recommendation.verdict = "regressed";
       recommendation.reason = "Worse than parent baseline";
     }
@@ -553,7 +553,7 @@ function recommendationForExperiment(exp: Experiment, allExperiments: Experiment
     recommendation.verdict = "best";
     recommendation.reason = "Current best in family";
   } else {
-    recommendation.action = "rerun";
+    recommendation.action = "try_more";
     recommendation.verdict = "inconclusive";
     recommendation.reason = "Not family best";
   }

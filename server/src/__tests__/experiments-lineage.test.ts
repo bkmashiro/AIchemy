@@ -1148,7 +1148,7 @@ describe("experiment lineage API", () => {
     expect((await request(app).get(`/experiments/${adopted.body.id}`).expect(200)).body.status).toBe("passed");
   });
 
-  it("recommends keep/improved vs rerun/inconclusive for min direction against parent", async () => {
+  it("recommends keep/improved vs discard/regressed for min direction against parent", async () => {
     const app = makeApp();
 
     const parent = await request(app)
@@ -1214,7 +1214,7 @@ describe("experiment lineage API", () => {
     expect(regressedRecommendation.body).toEqual(regressedSummary.body.recommendation);
     expect(regressedSummary.body.recommendation).toEqual(
       expect.objectContaining({
-        action: "drop",
+        action: "discard",
         verdict: "regressed",
         metric: "loss",
         baseline_value: 1.2,
@@ -1324,7 +1324,7 @@ describe("experiment lineage API", () => {
     );
   });
 
-  it("overrides with rerun on failed or running status", async () => {
+  it("overrides with try_more on failed or running status", async () => {
     const app = makeApp();
 
     const running = await request(app)
@@ -1351,7 +1351,7 @@ describe("experiment lineage API", () => {
     const runningSummary = await request(app).get(`/experiments/${running.body.id}/summary`).expect(200);
     expect(runningSummary.body.recommendation).toEqual(
       expect.objectContaining({
-        action: "rerun",
+        action: "try_more",
         verdict: "running",
         evidence_quality: "insufficient",
         baseline_source: "none",
@@ -1385,7 +1385,7 @@ describe("experiment lineage API", () => {
     const failedSummary = await request(app).get(`/experiments/${failed.body.id}/summary`).expect(200);
     expect(failedSummary.body.recommendation).toEqual(
       expect.objectContaining({
-        action: "rerun",
+        action: "try_more",
         verdict: "failed",
         evidence_quality: "insufficient",
         baseline_source: "none",
@@ -1395,7 +1395,7 @@ describe("experiment lineage API", () => {
     );
   });
 
-  it("reruns when goal metric metadata is missing", async () => {
+  it("asks to try_more when goal metric metadata is missing", async () => {
     const app = makeApp();
 
     const exp = await request(app)
@@ -1410,7 +1410,7 @@ describe("experiment lineage API", () => {
     const summary = await request(app).get(`/experiments/${exp.body.id}/summary`).expect(200);
     expect(summary.body.recommendation).toEqual(
       expect.objectContaining({
-        action: "rerun",
+        action: "try_more",
         verdict: "inconclusive",
         metric: null,
         direction: null,
@@ -1441,7 +1441,7 @@ describe("experiment lineage API", () => {
     const summary = await request(app).get(`/experiments/${exp.body.id}/summary`).expect(200);
     expect(summary.body.recommendation).toEqual(
       expect.objectContaining({
-        action: "rerun",
+        action: "try_more",
         verdict: "inconclusive",
         baseline_value: null,
         value: 0.4,
@@ -1498,7 +1498,7 @@ describe("experiment lineage API", () => {
     );
     expect(secondSummary.body.recommendation).toEqual(
       expect.objectContaining({
-        action: "rerun",
+        action: "try_more",
         verdict: "inconclusive",
         baseline_value: 0.4,
         value: 0.9,

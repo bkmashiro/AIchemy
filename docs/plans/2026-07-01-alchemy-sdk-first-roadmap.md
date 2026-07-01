@@ -830,7 +830,7 @@ Files:
 
 ### I4. Normalize decision vocabulary — DONE 2026-07-01
 
-Implemented canonical decision vocabulary at SDK/CLI/server boundaries: `keep`, `try_more`, `discard`, plus neutral comments via note events. Legacy aliases remain accepted for compatibility and normalize before write: `try-more`/`rerun`/`fork` → `try_more`, `drop` → `discard`. `ExperimentClient.resolve()` also accepts `code_id`.
+Implemented canonical decision vocabulary at SDK/CLI/server boundaries: `keep`, `try_more`, `discard`, plus neutral comments via note events. Legacy aliases remain accepted for compatibility and normalize before write: `try-more`/`rerun`/`fork` → `try_more`, `drop` → `discard`. `ExperimentClient.resolve()` also accepts `code_id`. Server-generated experiment recommendations now use the same canonical actions (`try_more` instead of `rerun`, `discard` instead of `drop`) so Web/CLI decision surfaces do not reintroduce legacy labels.
 
 Verified:
 ```bash

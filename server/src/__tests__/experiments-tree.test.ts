@@ -225,7 +225,7 @@ describe("GET /experiments/tree", () => {
     expect(res.body.roots[0]).toMatchObject({
       id: "root-rec",
       recommendation: {
-        action: "rerun",
+        action: "try_more",
         verdict: "running",
         metric: "loss",
         direction: "min",
