@@ -94,12 +94,15 @@ function evidenceBadgeClass(value: string | null | undefined): string {
 
 const WRITEBACK_MODES = ["note", "decision", "artifact", "checkpoint"] as const;
 type WritebackMode = (typeof WRITEBACK_MODES)[number];
-const WRITEBACK_DECISIONS: ExperimentDecision[] = ["keep", "drop", "rerun", "fork"];
+const WRITEBACK_DECISIONS = ["keep", "try_more", "discard"] as const;
+type WritebackDecision = (typeof WRITEBACK_DECISIONS)[number];
 const WRITEBACK_DECISION_LABEL: Record<ExperimentDecision, string> = {
   keep: "Keep",
-  drop: "Drop",
-  rerun: "Needs stronger evidence",
-  fork: "Fork",
+  try_more: "Try more",
+  discard: "Discard",
+  drop: "Discard",
+  rerun: "Try more",
+  fork: "Try more",
 };
 const WRITEBACK_MODE_LABEL: Record<WritebackMode, string> = {
   note: "Add note",
@@ -193,9 +196,7 @@ function renderResearchBundleMarkdown(
   const rawDecisionValue = isText(typeof decision.decision === "string" ? decision.decision : "")
     ? (decision.decision as string)
     : "";
-  const decisionValue = WRITEBACK_DECISIONS.includes(rawDecisionValue as ExperimentDecision)
-    ? decisionLabelForFilter(rawDecisionValue as ExperimentDecision)
-    : rawDecisionValue;
+  const decisionValue = decisionLabelForFilter(rawDecisionValue) ?? rawDecisionValue;
   const decisionReason =
     isText(typeof decision.reason === "string" ? decision.reason : "")
       ? (decision.reason as string)
@@ -318,14 +319,14 @@ export function ExperimentResearchCallCard({
   const baselineSource = recommendation?.baseline_source ?? null;
   const comparableCount = recommendation?.comparable_count ?? null;
 
-  const explicitDecisionIsRerun = explicitDecision === "rerun";
+  const explicitDecisionIsTryMore = explicitDecision === "try_more" || explicitDecision === "rerun" || explicitDecision === "fork";
   const recommendationLabelText = recommendationLabel(recommendation);
   const recommendationIsRerunLike =
     recommendationLabelText != null &&
-    ["needs stronger evidence", "needs replication"].includes(
+    ["try more", "needs stronger evidence", "needs replication"].includes(
       recommendationLabelText.toLowerCase(),
     );
-  const showReplicationPlan = explicitDecisionIsRerun || recommendationIsRerunLike;
+  const showReplicationPlan = explicitDecisionIsTryMore || recommendationIsRerunLike;
 
   const parent = summary?.parent ?? null;
   const parentName = parent?.name ?? exp.parent_name ?? null;
@@ -352,7 +353,7 @@ export function ExperimentResearchCallCard({
   const [bundleCopyError, setBundleCopyError] = useState<string | null>(null);
   const [writeMode, setWriteMode] = useState<WritebackMode>("note");
   const [writeNote, setWriteNote] = useState("");
-  const [writeDecision, setWriteDecision] = useState<ExperimentDecision>("keep");
+  const [writeDecision, setWriteDecision] = useState<WritebackDecision>("keep");
   const [writeDecisionReason, setWriteDecisionReason] = useState("");
   const [writeLocator, setWriteLocator] = useState("");
   const [writeState, setWriteState] = useState<"idle" | "saving" | "success" | "error">("idle");
@@ -797,7 +798,7 @@ client.replication_plan(${sdkRef}, reason=${sdkReason})`;
                 <select
                   id="research-call-decision"
                   value={writeDecision}
-                  onChange={(e) => setWriteDecision(e.target.value as ExperimentDecision)}
+                  onChange={(e) => setWriteDecision(e.target.value as WritebackDecision)}
                   aria-label="Decision"
                   className="w-full rounded border border-gray-700 bg-gray-900 px-2 py-1 text-[12px] text-gray-200 focus:border-indigo-400 focus:outline-none"
                 >

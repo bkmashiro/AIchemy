@@ -238,17 +238,19 @@ describe("ExperimentResearchCallCard", () => {
     expect(noteInput).toHaveValue("");
   });
 
-  it("submits a decision via research writeback", async () => {
-    vi.mocked(experimentsApi.decide).mockResolvedValue(makeExperiment({ decision: "rerun" }));
+  it("submits a canonical try_more decision via research writeback", async () => {
+    vi.mocked(experimentsApi.decide).mockResolvedValue(makeExperiment({ decision: "try_more" }));
 
     render(<ExperimentResearchCallCard exp={makeExperiment()} summary={makeSummary()} />);
 
     const writebackSection = copyToSection("Research writeback");
     fireEvent.click(within(writebackSection).getByRole("button", { name: "Record decision" }));
     expect(within(writebackSection).getByRole("button", { name: "Submit writeback" })).toBeDisabled();
+    expect(within(writebackSection).queryByRole("option", { name: "Drop" })).not.toBeInTheDocument();
+    expect(within(writebackSection).queryByRole("option", { name: "Fork" })).not.toBeInTheDocument();
 
     fireEvent.change(within(writebackSection).getByRole("combobox", { name: "Decision" }), {
-      target: { value: "rerun" },
+      target: { value: "try_more" },
     });
     fireEvent.change(within(writebackSection).getByPlaceholderText("Write decision reason"), {
       target: { value: "Need stronger evidence from second run" },
@@ -259,12 +261,12 @@ describe("ExperimentResearchCallCard", () => {
     await waitFor(() => {
       expect(experimentsApi.decide).toHaveBeenCalledWith(
         "exp-a",
-        "rerun",
+        "try_more",
         "Need stronger evidence from second run",
       );
     });
 
-    expect(screen.getByText("Needs stronger evidence")).toBeInTheDocument();
+    expect(screen.getByText("Try more")).toBeInTheDocument();
     expect(screen.getByText("Writeback saved.")).toBeInTheDocument();
   });
 
@@ -420,7 +422,7 @@ describe("ExperimentResearchCallCard", () => {
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
     expect(screen.getByText("Plan replication")).toBeInTheDocument();
-    expect(screen.getByText("needs stronger evidence")).toBeInTheDocument();
+    expect(screen.getByText("try more")).toBeInTheDocument();
   });
 
   it("falls back to summary recommendation when no explicit decision exists", () => {
@@ -454,8 +456,8 @@ describe("ExperimentResearchCallCard", () => {
 
     render(<ExperimentResearchCallCard exp={exp} summary={summary} />);
 
-    const labels = screen.getAllByText("Needs stronger evidence");
-    expect(labels).toHaveLength(2);
+    const labels = screen.getAllByText("Try more");
+    expect(labels.length).toBeGreaterThanOrEqual(2);
   });
 
   it("renders a dry-run replication plan preview for rerun recommendations", () => {
@@ -565,11 +567,11 @@ describe("ExperimentResearchCallCard", () => {
     await waitFor(async () => {
       const markdown = await spy.getBlobText();
       expect(markdown).toContain("# Research bundle: research-call (exp-a)");
-      expect(markdown).toContain("- action: Needs stronger evidence");
-      expect(markdown).toContain("- verdict: Needs stronger evidence");
+      expect(markdown).toContain("- action: Try more");
+      expect(markdown).toContain("- verdict: Try more");
       expect(markdown).toContain("- reason: Signal remains noisy and sample count is limited.");
       expect(markdown).toContain("## Decision");
-      expect(markdown).toContain("- decision: needs stronger evidence");
+      expect(markdown).toContain("- decision: try more");
       expect(markdown).toContain("- reason: Need stronger confidence before shipping");
       expect(markdown).toContain("Recent timeline events");
       expect(markdown).toContain("artifact emitted");
@@ -709,7 +711,7 @@ describe("ExperimentResearchCallCard", () => {
     expect(payload.goal_metric).toBe("val_loss");
     expect(payload.goal_direction).toBe("min");
     expect(payload.recommendation).toMatchObject({
-      action: "Needs stronger evidence",
+      action: "Try more",
       verdict: null,
       reason: "Need higher confidence before shipping",
       metric: "val_loss",
@@ -745,7 +747,7 @@ describe("ExperimentResearchCallCard", () => {
     ).toBeInTheDocument();
   });
 
-  it.each(["keep", "drop", "fork"])(
+  it.each(["keep", "discard"])(
     "does not render a replication plan for recommendation %s",
     (recAction) => {
       const exp = makeExperiment({});

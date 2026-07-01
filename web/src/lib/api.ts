@@ -352,7 +352,7 @@ export const metricsApi = {
 
 // ─── Experiments API ─────────────────────────────────────────────────────────
 
-export type ExperimentDecision = "keep" | "drop" | "rerun" | "fork";
+export type ExperimentDecision = "keep" | "try_more" | "discard" | "drop" | "rerun" | "fork";
 
 export type ExperimentEventKind =
   | "created"

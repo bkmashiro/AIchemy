@@ -975,7 +975,15 @@ Tests:
 - Series summary shows latest decision/comment.
 - Empty/nonexistent family returns 404, not silent success.
 
-### I8. Web decision UX
+### I8. Web decision UX — IN PROGRESS, first slice DONE 2026-07-01
+
+Implemented the first safe Web slice in the existing `ExperimentResearchCallCard`: decision writeback now exposes only canonical actions (`Keep`, `Try more`, `Discard`), while legacy `rerun`/`fork`/`drop` values still render as canonical copy for read compatibility. Research bundle Markdown/manifest exports also use `Try more` / `Discard` wording instead of reintroducing old labels.
+
+Verified:
+```bash
+cd web && npm test -- --run src/components/experiments/__tests__/ExperimentResearchCallCard.test.tsx src/components/experiments/__tests__/experimentDetailUtils.test.ts && npm run build
+# 41 passed; build passed
+```
 
 Behavior:
 - In **Decide next**, show recommended action from policy/summary, but keep human action explicit.

@@ -197,9 +197,9 @@ describe("recommendationLabel", () => {
     expect(recommendationLabel(rec)).toBe("Fork this run");
   });
 
-  it("maps recommendation rerun to 'Needs stronger evidence'", () => {
+  it("maps recommendation rerun alias to 'Try more'", () => {
     const rec = mkRecommendation({ action: "rerun", verdict: null });
-    expect(recommendationLabel(rec)).toBe("Needs stronger evidence");
+    expect(recommendationLabel(rec)).toBe("Try more");
   });
 
   it("rewrites rerun-prefixed freeform actions without changing API enums", () => {
@@ -212,7 +212,7 @@ describe("recommendationLabel", () => {
       action: "   ",
       verdict: "drop",
     });
-    expect(recommendationLabel(rec)).toBe("drop");
+    expect(recommendationLabel(rec)).toBe("Discard");
   });
 
   it("returns null when no action or verdict exists", () => {
@@ -225,19 +225,19 @@ describe("recommendationLabel", () => {
       action: "   ",
       verdict: "rerun",
     });
-    expect(recommendationLabel(rec)).toBe("Needs stronger evidence");
+    expect(recommendationLabel(rec)).toBe("Try more");
   });
 });
 
 describe("decisionLabelForFilter", () => {
   it("normalizes rerun to needs stronger evidence", () => {
-    expect(decisionLabelForFilter("rerun")).toBe("needs stronger evidence");
-    expect(decisionLabelForFilter("ReRuN")).toBe("needs stronger evidence");
+    expect(decisionLabelForFilter("rerun")).toBe("try more");
+    expect(decisionLabelForFilter("ReRuN")).toBe("try more");
   });
 
   it("preserves known decision labels", () => {
     expect(decisionLabelForFilter("keep")).toBe("keep");
-    expect(decisionLabelForFilter("drop")).toBe("drop");
+    expect(decisionLabelForFilter("drop")).toBe("discard");
   });
 });
 

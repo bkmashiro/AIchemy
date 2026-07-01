@@ -24,15 +24,21 @@ export function statusBadgeClass(status: string): string {
 
 export const DECISION_BADGE: Record<string, string> = {
   keep:  "bg-green-900/30 text-green-400 border-green-700/40",
+  discard:  "bg-red-900/30 text-red-400 border-red-700/40",
   drop:  "bg-red-900/30 text-red-400 border-red-700/40",
+  try_more: "bg-blue-900/30 text-blue-400 border-blue-700/40",
   rerun: "bg-blue-900/30 text-blue-400 border-blue-700/40",
-  fork:  "bg-purple-900/30 text-purple-400 border-purple-700/40",
+  fork:  "bg-blue-900/30 text-blue-400 border-blue-700/40",
 };
 
 const RECOMMENDATION_BADGE_FALLBACK = "bg-cyan-900/30 text-cyan-400 border-cyan-700/40";
 
 const RECOMMENDATION_LABEL_OVERRIDES: Record<string, string> = {
-  rerun: "Needs stronger evidence",
+  try_more: "Try more",
+  rerun: "Try more",
+  fork: "Try more",
+  discard: "Discard",
+  drop: "Discard",
 };
 
 function normalizeString(value: unknown): string | null {
@@ -61,7 +67,8 @@ export function decisionLabelForFilter(value: string | null | undefined): string
   const trimmed = normalizeString(value);
   if (trimmed === null) return null;
   const key = trimmed.toLowerCase();
-  if (key === "rerun") return "needs stronger evidence";
+  if (key === "try_more" || key === "try-more" || key === "rerun" || key === "fork") return "try more";
+  if (key === "discard" || key === "drop") return "discard";
   return trimmed;
 }
 
@@ -70,7 +77,7 @@ export function recommendationBadgeClass(actionOrVerdict?: string | null): strin
   if (!raw) return RECOMMENDATION_BADGE_FALLBACK;
   const key = raw.toLowerCase();
 
-  if (key === "needs replication" || key === "needs stronger evidence") return DECISION_BADGE.rerun;
+  if (key === "needs replication" || key === "needs stronger evidence" || key === "try_more" || key === "try-more") return DECISION_BADGE.try_more;
   return DECISION_BADGE[key] ?? RECOMMENDATION_BADGE_FALLBACK;
 }
 
