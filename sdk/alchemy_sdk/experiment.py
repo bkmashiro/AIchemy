@@ -183,6 +183,11 @@ class Experiment:
             spec["config"] = copy.deepcopy(self.config)
         return spec
 
+    def dry_run(self) -> dict[str, Any]:
+        """Validate locally and return the SDK-authored spec without network I/O."""
+        self._validate_dag()
+        return self.to_spec()
+
     def task(
         self,
         ref: str,

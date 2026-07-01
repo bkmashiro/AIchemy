@@ -82,7 +82,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 
 | Stage | Name | Outcome | Risk | Status |
 |---|---|---|---|---|
-| A | SDK spec snapshot | Experiment has a strict serializable spec | Low | IN PROGRESS — A1-A2 done |
+| A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | TODO |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | TODO |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
@@ -171,7 +171,16 @@ Tests:
 - Mutating returned `to_spec()` does not mutate experiment internals.
 - Existing `exp.config = {...}` still appears in `to_spec()`.
 
-### A3. Make dry-run return the spec
+### A3. Make dry-run return the spec — DONE 2026-07-01
+
+Implemented `Experiment.dry_run()` as local DAG validation plus `to_spec()` with no submit import/network path.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_spec.py tests/test_experiment_lineage.py -q
+# 29 passed
+```
 
 Current `submit(dry_run=True)` prints the DAG and returns a dummy `ExperimentResult`. Keep compatibility, but add a side-effect-free programmatic path:
 

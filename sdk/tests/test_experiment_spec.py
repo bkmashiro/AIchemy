@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import builtins
+
 import pytest
 
 from alchemy_sdk.experiment import Experiment
@@ -75,3 +77,42 @@ def test_to_spec_includes_sdk_metadata_snapshot():
     assert spec["metadata"]["sdk_version"] == "2.1.0"
     assert "cwd" in spec["metadata"]
     assert "git_commit" in spec["metadata"]
+
+
+def test_dry_run_validates_and_returns_spec_without_submit_import(monkeypatch):
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "alchemy_sdk.submit":
+            raise AssertionError("dry_run must not import submit_experiment")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    exp = (
+        Experiment("dry", family="sdk")
+        .storage(root="/runs")
+        .base_config({"train": {"batch_size": 64}})
+    )
+    exp.task("train", script="train.py")
+
+    spec = exp.dry_run()
+
+    assert spec["name"] == "dry"
+    assert spec["family"] == "sdk"
+    assert spec["storage"] == {"root": "/runs"}
+    assert spec["config"] == {"train": {"batch_size": 64}}
+    assert spec["tasks"] == [{"ref": "train", "script": "train.py"}]
+
+
+def test_dry_run_reuses_dag_validation():
+    exp = Experiment("bad")
+
+    with pytest.raises(ValueError, match="no tasks"):
+        exp.dry_run()
+
+    train = exp.task("train", script="train.py")
+    train._spec["depends_on"] = ["missing"]
+
+    with pytest.raises(ValueError, match="depends on unknown ref"):
+        exp.dry_run()
