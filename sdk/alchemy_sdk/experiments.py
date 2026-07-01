@@ -212,6 +212,45 @@ class ExperimentClient:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/summary")
 
+    def curves(
+        self,
+        ref: str,
+        *,
+        metric: Optional[str] = None,
+        params: Optional[Mapping[str, Any]] = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Fetch currently available task metric curves by experiment ref.
+
+        This reads existing task metric endpoints and labels the source as
+        ring_buffer because server-side training curves are not durable yet.
+        """
+        exp = self.resolve(ref, refresh=refresh)
+        task_refs = exp.get("task_refs") or {}
+        task_specs = exp.get("task_specs") or []
+        specs_by_ref = {
+            spec.get("ref"): spec
+            for spec in task_specs
+            if isinstance(spec, Mapping) and spec.get("ref")
+        }
+        curves: dict[str, Any] = {}
+        for task_ref, task_id in task_refs.items():
+            spec = specs_by_ref.get(task_ref, {})
+            point = dict(spec.get("param_point") or {}) if isinstance(spec, Mapping) else {}
+            if params and any(point.get(k) != v for k, v in params.items()):
+                continue
+            payload = self._get(f"/tasks/{task_id}/metrics")
+            metrics_buffer = payload.get("metrics_buffer") if isinstance(payload, Mapping) else None
+            if isinstance(metrics_buffer, Mapping):
+                selected = dict(metrics_buffer)
+                if metric is not None:
+                    selected = {metric: selected.get(metric, [])}
+            else:
+                points = payload.get("points", []) if isinstance(payload, Mapping) else []
+                selected = {"legacy": points}
+            curves[task_ref] = {"task_id": task_id, "params": point, "metrics": selected}
+        return {"experiment_id": exp["id"], "source": "ring_buffer", "curves": curves}
+
     def _get_allow_http_error(self, path: str) -> Any:
         """Like :meth:`_get`, but lets ``HTTPError`` propagate.
 

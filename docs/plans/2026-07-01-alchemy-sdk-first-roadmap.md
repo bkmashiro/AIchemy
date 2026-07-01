@@ -85,8 +85,8 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
-| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1-D3 done |
-| E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | IN PROGRESS — E1-E2 done |
+| D | Runtime result API | Training/eval writes typed results/artifacts | Medium | DONE |
+| E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | DONE |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
@@ -475,7 +475,7 @@ Verified:
 cd sdk && uv run pytest tests/test_client.py::test_log_allows_undeclared_metrics_by_default tests/test_client.py::test_log_rejects_undeclared_metrics_when_strict -q
 ```
 
-### E3. Curves by experiment ref and param filter
+### E3. Curves by experiment ref and param filter — DONE 2026-07-01
 
 API candidate:
 
@@ -484,15 +484,22 @@ ExperimentClient().curves("exp-name", metric="loss", params={"seed": 1})
 ```
 
 Behavior:
-- Resolve experiment → task refs → task IDs → existing `/api/tasks/:id/metrics` endpoints.
-- Return deterministic mapping: `ref -> metric -> points`.
-- If server lacks persisted curves, return what exists and mark `source="ring_buffer"`.
+- Implemented `ExperimentClient.curves(ref, metric=..., params=...)`.
+- Resolves experiment → task refs → task IDs → existing `/api/tasks/:id/metrics` endpoints.
+- Returns deterministic mapping under `curves[ref]` with `task_id`, `params`, and selected metric points.
+- If server lacks persisted curves, returns what exists and marks `source="ring_buffer"`.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_curves.py -q
+```
 
 Important discovered issue:
 - Current server metrics are partly in-memory ring buffers. Roadmap must not pretend they are durable. Persisting curves is Stage F, not hidden in E.
 
 Stop condition for Stage E:
-- SDK can fetch currently available curves through experiment/task refs.
+- SDK can fetch currently available curves through experiment/task refs. Met by `ExperimentClient.curves()`.
 
 ---
 
