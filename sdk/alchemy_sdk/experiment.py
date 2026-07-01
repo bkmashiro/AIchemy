@@ -274,7 +274,9 @@ class Experiment:
     def dry_run(self) -> dict[str, Any]:
         """Validate locally and return the SDK-authored spec without network I/O."""
         self._validate_dag()
-        return self.to_spec()
+        spec = self.to_spec()
+        spec["warnings"] = self._preflight_warnings(spec)
+        return spec
 
     def task(
         self,
@@ -390,6 +392,46 @@ class Experiment:
             t.task_id = result.task_refs.get(t.ref)
 
         return result
+
+    def _preflight_warnings(self, spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+        warnings: list[dict[str, Any]] = []
+        has_storage_root = bool(spec.get("storage", {}).get("root"))
+
+        if spec.get("param_space") and not has_storage_root:
+            warnings.append(
+                {
+                    "code": "grid_without_storage_root",
+                    "message": "Grid experiment has no explicit experiment storage root",
+                }
+            )
+
+        if not has_storage_root:
+            for task in spec.get("tasks", []):
+                ref = task.get("ref", "<unknown>")
+                for field in ("cwd", "run_dir", "output_dir"):
+                    value = task.get(field)
+                    if isinstance(value, str) and "/vol/bitbucket" in value:
+                        warnings.append(
+                            {
+                                "code": "bitbucket_storage_without_root",
+                                "message": f"Task {ref!r} references /vol/bitbucket without explicit experiment storage root",
+                                "ref": ref,
+                                "field": field,
+                                "path": value,
+                            }
+                        )
+                for path in task.get("outputs", []) or []:
+                    if isinstance(path, str) and "/vol/bitbucket" in path:
+                        warnings.append(
+                            {
+                                "code": "bitbucket_storage_without_root",
+                                "message": f"Task {ref!r} references /vol/bitbucket without explicit experiment storage root",
+                                "ref": ref,
+                                "field": "outputs",
+                                "path": path,
+                            }
+                        )
+        return warnings
 
     def status(self) -> "ExperimentStatus":
         if not self._experiment_id:

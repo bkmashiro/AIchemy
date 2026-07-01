@@ -84,7 +84,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 |---|---|---|---|---|
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
-| C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | TODO |
+| C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | IN PROGRESS — C1 done |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
@@ -290,7 +290,16 @@ Stop condition for Stage B:
 
 **User value:** catch bitbucket/run_dir/storage mistakes before burning SLURM time.
 
-### C1. Storage warnings in dry-run
+### C1. Storage warnings in dry-run — DONE 2026-07-01
+
+Implemented `dry_run()["warnings"]` with explicit storage warnings for grid experiments missing `.storage(root=...)` and `/vol/bitbucket` task paths without an SDK storage root.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_spec.py tests/test_experiment_grid.py -q
+# 21 passed
+```
 
 Behavior:
 - Dry-run returns `warnings: []`.

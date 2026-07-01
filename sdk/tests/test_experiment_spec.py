@@ -116,3 +116,43 @@ def test_dry_run_reuses_dag_validation():
 
     with pytest.raises(ValueError, match="depends on unknown ref"):
         exp.dry_run()
+
+
+def test_dry_run_includes_empty_warnings_for_clean_storage():
+    exp = Experiment("clean").storage(root="/vol/gpudata/runs")
+    exp.task("train", script="train.py", cwd="/tmp/project")
+
+    dry = exp.dry_run()
+
+    assert dry["warnings"] == []
+
+
+def test_dry_run_warns_about_bitbucket_paths_without_explicit_storage():
+    exp = Experiment("legacy")
+    exp.task("train", script="train.py", cwd="/vol/bitbucket/ys25/jema-v2")
+
+    dry = exp.dry_run()
+
+    assert dry["warnings"] == [
+        {
+            "code": "bitbucket_storage_without_root",
+            "message": "Task 'train' references /vol/bitbucket without explicit experiment storage root",
+            "ref": "train",
+            "field": "cwd",
+            "path": "/vol/bitbucket/ys25/jema-v2",
+        }
+    ]
+
+
+def test_dry_run_warns_when_grid_has_no_storage_root():
+    exp = Experiment("grid").params(seed=[1, 2])
+    exp.task("train-{seed}", script="train.py")
+
+    dry = exp.dry_run()
+
+    assert dry["warnings"] == [
+        {
+            "code": "grid_without_storage_root",
+            "message": "Grid experiment has no explicit experiment storage root",
+        }
+    ]
