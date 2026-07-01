@@ -72,6 +72,11 @@ def _set_nested(d: dict, path: str, value: Any) -> None:
     d[keys[-1]] = value
 
 
+def _validate_non_empty_path(value: str, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty path")
+
+
 # ─── Experiment ──────────────────────────────────────────────────────────────
 
 class Experiment:
@@ -112,6 +117,36 @@ class Experiment:
         self.fork_reason = fork_reason
         self._parent_name: Optional[str] = None
         self._parent_config: Optional[dict[str, Any]] = None  # snapshot for diff
+        self._storage: dict[str, str] = {}
+
+    def storage(self, *, root: str, artifact_root: Optional[str] = None) -> "Experiment":
+        """Declare experiment storage roots in the SDK-authored spec."""
+        _validate_non_empty_path(root, "storage root")
+        storage = {"root": root}
+        if artifact_root is not None:
+            _validate_non_empty_path(artifact_root, "artifact_root")
+            storage["artifact_root"] = artifact_root
+        self._storage = copy.deepcopy(storage)
+        return self
+
+    def to_spec(self) -> dict[str, Any]:
+        """Return a defensive snapshot of the SDK-authored experiment spec."""
+        spec: dict[str, Any] = {
+            "name": self.name,
+            "description": self.description,
+            "tasks": [copy.deepcopy(t._spec) for t in self._tasks],
+        }
+        if self.family is not None:
+            spec["family"] = self.family
+        if self.hypothesis is not None:
+            spec["hypothesis"] = self.hypothesis
+        if self.expected_outcome is not None:
+            spec["expected_outcome"] = self.expected_outcome
+        if self._storage:
+            spec["storage"] = copy.deepcopy(self._storage)
+        if self.config:
+            spec["config"] = copy.deepcopy(self.config)
+        return spec
 
     def task(
         self,
