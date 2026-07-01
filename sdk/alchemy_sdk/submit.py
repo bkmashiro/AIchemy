@@ -17,6 +17,8 @@ def submit_experiment(
     force: bool = False,
     config: Optional[dict[str, Any]] = None,
     config_diff: Optional[dict[str, Any]] = None,
+    storage: Optional[dict[str, Any]] = None,
+    sdk_spec: Optional[dict[str, Any]] = None,
     parent_name: Optional[str] = None,
     family: Optional[str] = None,
     hypothesis: Optional[str] = None,
@@ -36,6 +38,10 @@ def submit_experiment(
         payload["config"] = config
     if config_diff is not None:
         payload["config_diff"] = config_diff
+    if storage is not None:
+        payload["storage"] = storage
+    if sdk_spec is not None:
+        payload["sdk_spec"] = sdk_spec
     if parent_name is not None:
         payload["parent_name"] = parent_name
     if family is not None:

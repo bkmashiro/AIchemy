@@ -379,6 +379,8 @@ class Experiment:
             force=force,
             config=self.config if self.config else None,
             config_diff=self._compute_config_diff(),
+            storage=copy.deepcopy(self._storage) if self._storage else None,
+            sdk_spec=self.to_spec(),
             parent_name=self._parent_name,
             family=self.family,
             hypothesis=self.hypothesis,

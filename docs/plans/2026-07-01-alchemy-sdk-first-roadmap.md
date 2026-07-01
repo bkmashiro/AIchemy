@@ -84,7 +84,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 |---|---|---|---|---|
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
-| C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | IN PROGRESS — C1 done |
+| C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | IN PROGRESS — C1-C2 done |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
@@ -311,7 +311,16 @@ Tests:
 - Bitbucket path produces warning.
 - Explicit gpudata storage has no warning.
 
-### C2. Submit payload includes SDK storage spec
+### C2. Submit payload includes SDK storage spec — DONE 2026-07-01
+
+Implemented SDK submit payload forwarding for `storage` and full `sdk_spec`, while preserving existing task/config fields.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_submit_payload.py tests/test_experiment_spec.py tests/test_experiment_grid.py tests/test_experiment_lineage.py -q
+# 43 passed
+```
 
 Behavior:
 - `submit()` forwards storage to `submit_experiment()` payload.
