@@ -47,6 +47,7 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
       jump_host: s.jump_host,
       python_path: s.python_path,
       default_cwd: s.default_cwd,
+      default_output_dir: s.default_output_dir,
       env_setup: s.env_setup,
       tags: s.tags,
       max_concurrent: s.max_concurrent,
@@ -62,8 +63,8 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     const conn = resolveDeployConnection(req, res);
     if (!conn) return;
     const { serverUrl, token } = conn;
-    const slurmOverrides = req.body?.mem || req.body?.time || req.body?.idle_timeout
-      ? { mem: req.body.mem, time: req.body.time, idle_timeout: req.body.idle_timeout }
+    const slurmOverrides = req.body?.mem || req.body?.time || req.body?.idle_timeout || req.body?.default_output_dir
+      ? { mem: req.body.mem, time: req.body.time, idle_timeout: req.body.idle_timeout, default_output_dir: req.body.default_output_dir }
       : undefined;
     const result = await deployStub(
       target, serverUrl, token,
@@ -118,8 +119,8 @@ export function createDeployRouter(config: DeployFileConfig | null, tunnelMgr?: 
     const conn = resolveDeployConnection(req, res);
     if (!conn) return;
     const { serverUrl, token } = conn;
-    const slurmOverrides = req.body?.mem || req.body?.time || req.body?.idle_timeout
-      ? { mem: req.body.mem, time: req.body.time, idle_timeout: req.body.idle_timeout }
+    const slurmOverrides = req.body?.mem || req.body?.time || req.body?.idle_timeout || req.body?.default_output_dir
+      ? { mem: req.body.mem, time: req.body.time, idle_timeout: req.body.idle_timeout, default_output_dir: req.body.default_output_dir }
       : undefined;
     const result = await restartStub(
       target, serverUrl, token,

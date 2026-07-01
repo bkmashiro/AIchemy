@@ -304,6 +304,7 @@ class StubDaemon:
             "dead_tasks": dead_tasks,
             "env_setup": self.config.env_setup or None,
             "default_cwd": self.config.default_cwd or None,
+            "default_output_dir": self.config.default_output_dir or None,
             "user": os.environ.get("USER", "unknown"),
         }
 

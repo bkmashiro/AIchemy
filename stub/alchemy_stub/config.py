@@ -46,6 +46,7 @@ class EnvFileConfig:
     """Structured result from loading a --default-env-file YAML."""
     default_env: dict[str, str]
     default_cwd: str | None = None
+    default_output_dir: str | None = None
     umask: int | None = None  # parsed octal, e.g. 0o022
 
 
@@ -55,6 +56,7 @@ def _load_env_file_full(path: str) -> EnvFileConfig:
     Supported top-level keys:
       default_env:   mapping of env var name → value
       default_cwd:   string path (used as fallback cwd for tasks)
+      default_output_dir: string path (base for server-computed run_dir)
       umask:         octal string like "022" or integer
 
     The file may also be a flat mapping of env var names (legacy format).
@@ -67,7 +69,7 @@ def _load_env_file_full(path: str) -> EnvFileConfig:
     if not isinstance(data, dict):
         raise ValueError(f"default-env-file must be a YAML mapping, got {type(data).__name__}")
 
-    _RESERVED_KEYS = {"default_env", "default_cwd", "umask"}
+    _RESERVED_KEYS = {"default_env", "default_cwd", "default_output_dir", "umask"}
 
     # Accept nested under 'default_env' key, or top-level if all keys look like env vars
     if "default_env" in data or any(k in data for k in _RESERVED_KEYS):
@@ -101,10 +103,14 @@ def _load_env_file_full(path: str) -> EnvFileConfig:
     default_cwd = data.get("default_cwd") or None
     if default_cwd is not None:
         default_cwd = str(default_cwd)
+    default_output_dir = data.get("default_output_dir") or None
+    if default_output_dir is not None:
+        default_output_dir = str(default_output_dir)
 
     return EnvFileConfig(
         default_env={str(k): str(v) for k, v in env_dict.items()},
         default_cwd=default_cwd,
+        default_output_dir=default_output_dir,
         umask=umask_val,
     )
 
@@ -133,6 +139,7 @@ class Config:
     env_setup: str  # deprecated, kept for backward compat
     default_cwd: str
     idle_timeout: int  # seconds; 0 = infinite
+    default_output_dir: str | None = None
     tags: list[str] = field(default_factory=list)
     default_env: dict[str, str] = field(default_factory=dict)
     umask: int = 0o022  # applied before spawning task subprocesses
@@ -201,6 +208,11 @@ def parse_args() -> Config:
         "--default-cwd",
         default=os.environ.get("ALCHEMY_DEFAULT_CWD", ""),
         help="Default working directory for tasks",
+    )
+    parser.add_argument(
+        "--default-output-dir",
+        default=os.environ.get("ALCHEMY_DEFAULT_OUTPUT_DIR", ""),
+        help="Base directory for server-computed task run_dir paths",
     )
     parser.add_argument(
         "--idle-timeout",
@@ -303,6 +315,11 @@ def parse_args() -> Config:
     file_cwd = file_cfg.default_cwd if file_cfg else None
     default_cwd = args.default_cwd or file_cwd or os.getcwd()
 
+    # Resolve default_output_dir: CLI/env flag > env file > unset.
+    # When unset, the server falls back to (cwd/default_cwd)/runs.
+    file_output_dir = file_cfg.default_output_dir if file_cfg else None
+    default_output_dir = args.default_output_dir or file_output_dir or None
+
     # Resolve umask: CLI flag > env file > default 022
     resolved_umask: int = 0o022
     if file_cfg and file_cfg.umask is not None:
@@ -320,6 +337,7 @@ def parse_args() -> Config:
         env_setup=args.env_setup,
         default_cwd=default_cwd,
         idle_timeout=idle_timeout,
+        default_output_dir=default_output_dir,
         tags=tags,
         default_env=default_env,
         umask=resolved_umask,

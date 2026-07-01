@@ -858,6 +858,16 @@ describe("resume reconciliation", () => {
     expect(webNs.emit).toHaveBeenCalledWith("stub.online", expect.objectContaining({ hostname: BASE_HOSTNAME }));
   });
 
+  it("persists default_output_dir from stub resume payload", () => {
+    const { socketHandlers } = buildHarness({ skipResume: true });
+    socketHandlers["resume"]?.({
+      ...BASE_RESUME_PAYLOAD,
+      default_output_dir: "/vol/gpudata/ys25-MySpace/alchemy-runs",
+    });
+    const updated = _stubs.get(STUB_ID)!;
+    expect(updated.default_output_dir).toBe("/vol/gpudata/ys25-MySpace/alchemy-runs");
+  });
+
   it("stub.online payload omits socket_id (sanitized)", () => {
     const { socketHandlers, webNs } = buildHarness({ skipResume: true });
     socketHandlers["resume"]?.(BASE_RESUME_PAYLOAD);

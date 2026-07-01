@@ -102,7 +102,7 @@ async function startStub(
   token: string,
   sshKeyPath?: string,
 ): Promise<number | undefined> {
-  const { user, jump_host, python_path, remote_dir, max_concurrent, tags, default_cwd, name } = target;
+  const { user, jump_host, python_path, remote_dir, max_concurrent, tags, default_cwd, default_output_dir, name } = target;
   const host = target.host ?? "";
   const opts = { keyPath: sshKeyPath, jumpHost: jump_host, timeout: 30_000 };
   const pidFile = `/tmp/alchemy_stub_${name}.pid`;
@@ -133,6 +133,7 @@ async function startStub(
     ` --max-concurrent ${max_concurrent}`;
   if (tags) launchCmd += ` --tags ${JSON.stringify(tags)}`;
   if (default_cwd) launchCmd += ` --default-cwd ${JSON.stringify(default_cwd)}`;
+  if (default_output_dir) launchCmd += ` --default-output-dir ${JSON.stringify(default_output_dir)}`;
   // Write PID file for clean shutdown; log to per-stub file
   launchCmd += ` >> ${logFile} 2>&1 & echo $! | tee ${pidFile}`;
 
@@ -170,6 +171,7 @@ interface SlurmSubmitOptions {
   mem?: string;
   time?: string;
   idle_timeout?: number;
+  default_output_dir?: string;
 }
 
 export function buildSlurmStubScript(target: StubTarget, serverUrl: string, token: string, overrides?: SlurmSubmitOptions): string {
@@ -177,6 +179,7 @@ export function buildSlurmStubScript(target: StubTarget, serverUrl: string, toke
   const mem = overrides?.mem ?? target.mem ?? "60G";
   const time = overrides?.time ?? target.time ?? "24:00:00";
   const idleTimeout = overrides?.idle_timeout ?? target.idle_timeout;
+  const defaultOutputDir = overrides?.default_output_dir ?? target.default_output_dir;
   const continuation = " " + "\\";
   const args = [
     `--server ${JSON.stringify(serverUrl)}`,
@@ -184,6 +187,7 @@ export function buildSlurmStubScript(target: StubTarget, serverUrl: string, toke
     `--max-concurrent ${target.max_concurrent}`,
     ...(target.tags ? [`--tags ${JSON.stringify(target.tags)}`] : []),
     ...(target.default_cwd ? [`--default-cwd ${JSON.stringify(target.default_cwd)}`] : []),
+    ...(defaultOutputDir ? [`--default-output-dir ${JSON.stringify(defaultOutputDir)}`] : []),
     ...(target.env_setup ? [`--env-setup ${JSON.stringify(target.env_setup)}`] : []),
     ...(idleTimeout !== undefined ? [`--idle-timeout ${idleTimeout}`] : []),
   ];

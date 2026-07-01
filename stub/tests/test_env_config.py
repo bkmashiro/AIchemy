@@ -5,7 +5,7 @@ Tests merge_env(), _parse_env_value(), and CLI config loading.
 import os
 import pytest
 
-from alchemy_stub.config import _parse_env_value, _parse_key_value, _load_env_file, _load_env_file_full
+from alchemy_stub.config import _parse_env_value, _parse_key_value, _load_env_file, _load_env_file_full, parse_args
 from alchemy_stub.process_mgr import merge_env, ProcessManager
 
 try:
@@ -220,6 +220,7 @@ class TestLoadEnvFileFull:
         f = tmp_path / "env.yaml"
         f.write_text(
             "default_cwd: /vol/bitbucket/ys25/jema\n"
+            "default_output_dir: /vol/gpudata/ys25-MySpace/alchemy-runs\n"
             "default_env:\n"
             "  NUMBA_CACHE_DIR: /tmp/numba_cache\n"
             "  FOO: bar\n"
@@ -228,6 +229,7 @@ class TestLoadEnvFileFull:
         cfg = _load_env_file_full(str(f))
         assert cfg.default_env == {"NUMBA_CACHE_DIR": "/tmp/numba_cache", "FOO": "bar"}
         assert cfg.default_cwd == "/vol/bitbucket/ys25/jema"
+        assert cfg.default_output_dir == "/vol/gpudata/ys25-MySpace/alchemy-runs"
         assert cfg.umask == 0o022
 
     def test_umask_string_formats(self, tmp_path):
@@ -257,6 +259,7 @@ class TestLoadEnvFileFull:
         f.write_text("default_env:\n  X: y\n")
         cfg = _load_env_file_full(str(f))
         assert cfg.default_cwd is None
+        assert cfg.default_output_dir is None
 
     def test_invalid_umask_raises(self, tmp_path):
         f = tmp_path / "env.yaml"
@@ -275,6 +278,85 @@ class TestLoadEnvFileFull:
         )
         result = _load_env_file(str(f))
         assert result == {"KEY": "val"}
+
+
+class TestParseArgsDefaultOutputDir:
+    def test_default_output_dir_from_env_var_is_preserved(self, monkeypatch):
+        monkeypatch.setenv("ALCHEMY_DEFAULT_OUTPUT_DIR", "/vol/gpudata/ys25-MySpace/alchemy-runs")
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "alchemy-stub",
+                "--server", "ws://alchemy.test",
+                "--token", "tok",
+            ],
+        )
+
+        cfg = parse_args()
+
+        assert cfg.default_output_dir == "/vol/gpudata/ys25-MySpace/alchemy-runs"
+
+    def test_default_output_dir_cli_overrides_env_var(self, monkeypatch):
+        monkeypatch.setenv("ALCHEMY_DEFAULT_OUTPUT_DIR", "/vol/bitbucket/ys25/bad-runs")
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "alchemy-stub",
+                "--server", "ws://alchemy.test",
+                "--token", "tok",
+                "--default-output-dir", "/vol/gpudata/ys25-MySpace/alchemy-runs",
+            ],
+        )
+
+        cfg = parse_args()
+
+        assert cfg.default_output_dir == "/vol/gpudata/ys25-MySpace/alchemy-runs"
+
+
+@pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
+class TestParseArgsDefaultOutputDirEnvFile:
+    def test_default_output_dir_from_env_file_is_preserved(self, tmp_path, monkeypatch):
+        f = tmp_path / "env.yaml"
+        f.write_text(
+            "default_cwd: /vol/bitbucket/ys25/jema-v2\n"
+            "default_output_dir: /vol/gpudata/ys25-MySpace/alchemy-runs\n"
+            "default_env: {}\n"
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "alchemy-stub",
+                "--server", "ws://alchemy.test",
+                "--token", "tok",
+                "--default-env-file", str(f),
+            ],
+        )
+
+        cfg = parse_args()
+
+        assert cfg.default_cwd == "/vol/bitbucket/ys25/jema-v2"
+        assert cfg.default_output_dir == "/vol/gpudata/ys25-MySpace/alchemy-runs"
+
+    def test_default_output_dir_cli_overrides_env_file(self, tmp_path, monkeypatch):
+        f = tmp_path / "env.yaml"
+        f.write_text(
+            "default_output_dir: /vol/bitbucket/ys25/bad-runs\n"
+            "default_env: {}\n"
+        )
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "alchemy-stub",
+                "--server", "ws://alchemy.test",
+                "--token", "tok",
+                "--default-env-file", str(f),
+                "--default-output-dir", "/vol/gpudata/ys25-MySpace/alchemy-runs",
+            ],
+        )
+
+        cfg = parse_args()
+
+        assert cfg.default_output_dir == "/vol/gpudata/ys25-MySpace/alchemy-runs"
 
 
 # ─── umask applied in subprocess ─────────────────────────────────────────────

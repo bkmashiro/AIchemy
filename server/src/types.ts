@@ -252,6 +252,7 @@ export interface DeployConfig {
   max_concurrent?: number;
   env_setup?: string;
   default_cwd?: string;
+  default_output_dir?: string;
   python_path?: string;
   server_url?: string;
   token?: string;
@@ -408,6 +409,7 @@ export interface ResumePayload {
   token: string;
   env_setup?: string;
   default_cwd?: string;
+  default_output_dir?: string;
   tags?: string[];
   user?: string;
   running_tasks: Array<{ task_id: string; pid: number; step?: number; status: string }>;
@@ -536,6 +538,7 @@ export interface StubTarget {
   max_concurrent: number;
   tags?: string;
   default_cwd?: string;
+  default_output_dir?: string;
   env_setup?: string;
   idle_timeout?: number;
   default_env?: Record<string, string>;

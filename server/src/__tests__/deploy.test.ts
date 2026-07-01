@@ -46,4 +46,26 @@ describe("SLURM deploy script generation", () => {
 
     expect(script).toContain("  --idle-timeout 300");
   });
+
+  it("includes default output dir from deploy config", () => {
+    const script = buildSlurmStubScript(
+      makeSlurmTarget({ default_output_dir: "/vol/gpudata/ys25-MySpace/alchemy-runs" }),
+      "https://alchemy-v2.yuzhes.com",
+      "secret-token",
+    );
+
+    expect(script).toContain("  --default-output-dir \"/vol/gpudata/ys25-MySpace/alchemy-runs\"");
+  });
+
+  it("lets API overrides replace deploy-config default output dir", () => {
+    const script = buildSlurmStubScript(
+      makeSlurmTarget({ default_output_dir: "/vol/bitbucket/ys25/bad-runs" }),
+      "https://alchemy-v2.yuzhes.com",
+      "secret-token",
+      { default_output_dir: "/vol/gpudata/ys25-MySpace/alchemy-runs" },
+    );
+
+    expect(script).toContain("  --default-output-dir \"/vol/gpudata/ys25-MySpace/alchemy-runs\"");
+    expect(script).not.toContain("/vol/bitbucket/ys25/bad-runs");
+  });
 });

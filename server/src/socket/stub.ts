@@ -565,7 +565,7 @@ function handleResume(
   ns: Namespace,
   deployConfig?: DeployFileConfig | null,
 ): void {
-  const { hostname, gpu, slurm_job_id, max_concurrent, token, env_setup, default_cwd,
+  const { hostname, gpu, slurm_job_id, max_concurrent, token, env_setup, default_cwd, default_output_dir,
     tags, running_tasks: rawRunningTasks, local_queue: rawLocalQueue, available_envs, user, slurm_constraints,
     cuda_visible_devices } = payload;
   const running_tasks = Array.isArray(rawRunningTasks) ? rawRunningTasks : [];
@@ -702,6 +702,7 @@ function handleResume(
       socket_id: socket.id,
       env_setup: env_setup ?? existingStub.env_setup,
       default_cwd: default_cwd ?? existingStub.default_cwd,
+      default_output_dir: default_output_dir ?? existingStub.default_output_dir,
       // Server is authoritative: preserve stored max_concurrent; only fall back to stub's value if none is stored
       max_concurrent: existingStub.max_concurrent ?? max_concurrent,
       // Update tags from stub only if non-empty; empty array would overwrite API-set tags
@@ -736,6 +737,7 @@ function handleResume(
       tasks: [],
       env_setup,
       default_cwd,
+      default_output_dir,
       tags,
       available_envs,
       user,

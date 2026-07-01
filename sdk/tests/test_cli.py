@@ -1585,6 +1585,21 @@ def test_slurm_submit_posts_idle_timeout_override(monkeypatch):
     assert calls[0]["body"]["idle_timeout"] == 600
 
 
+def test_slurm_submit_posts_default_output_dir_override(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "slurm", "submit", "a30",
+            "--default-output-dir", "/vol/gpudata/ys25-MySpace/alchemy-runs",
+            "--yes",
+        ],
+        [{"ok": True, "job_id": "249"}],
+    )
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30/restart"
+    assert calls[0]["body"]["default_output_dir"] == "/vol/gpudata/ys25-MySpace/alchemy-runs"
+
+
 def test_tasks_lost_filters_terminal_pretrain_without_active_successor(monkeypatch, capsys):
     failed = {
         "id": "old-1", "seq": 1, "status": "failed", "script": "/repo/scripts/train_pretrain_nethack.py",

@@ -601,6 +601,35 @@ class TestSendResume:
         assert payload["tags"] == ["a40", "gpu22"]
 
     @pytest.mark.asyncio
+    async def test_resume_includes_default_output_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ALCHEMY_LOG_DIR", str(tmp_path / "logs"))
+        config = _make_config(default_output_dir="/vol/gpudata/ys25-MySpace/alchemy-runs")
+
+        with patch("alchemy_stub.daemon.GpuMonitor"):
+            with patch("alchemy_stub.daemon.SystemMonitor"):
+                with patch("alchemy_stub.daemon.TaskSocketRegistry"):
+                    with patch("alchemy_stub.daemon.ProcessManager") as MockPM:
+                        pm = MagicMock()
+                        pm.get_task_pids.return_value = {}
+                        pm._dead_on_reattach = []
+                        MockPM.return_value = pm
+                        with patch("socketio.AsyncClient") as MockSio:
+                            sio = MagicMock()
+                            sio.connected = True
+                            sio.emit = AsyncMock()
+                            MockSio.return_value = sio
+
+                            d = StubDaemon(config)
+                            d._connected = True
+
+        with patch("alchemy_stub.daemon.discover_python_envs", return_value=[]):
+            await d._send_resume()
+
+        emit_calls = [c for c in d.sio.emit.call_args_list if c[0][0] == "resume"]
+        payload = emit_calls[0][0][1]
+        assert payload["default_output_dir"] == "/vol/gpudata/ys25-MySpace/alchemy-runs"
+
+    @pytest.mark.asyncio
     async def test_resume_not_sent_when_disconnected(self, daemon):
         daemon._connected = False
         with patch("alchemy_stub.daemon.discover_python_envs", return_value=[]):
