@@ -579,7 +579,9 @@ cd server && npm test -- --run src/__tests__/api-stubs.test.ts -t "POST /stubs/:
 cd stub && uv run pytest tests/test_file_rpc.py tests/test_daemon.py::TestHandleFileRequestEvent -q
 ```
 
-### G1. `alch experiments inspect <ref>` reads SDK spec
+### G1. `alch experiments inspect <ref>` reads SDK spec — DONE 2026-07-01
+
+Implemented CLI `alch experiments inspect <ref>` resolving UUID/name/code_id and printing the persisted SDK spec when available, or a legacy warning when absent.
 
 User value:
 - One command shows what SDK thinks the experiment is: storage, grid, DAG, schemas, outputs, and warnings.
@@ -600,7 +602,9 @@ Tests:
 - Name resolution works like `summary`/`bundle`.
 - Missing SDK spec does not crash; prints a legacy-experiment warning.
 
-### G2. `alch experiments series <family>` wraps series summary
+### G2. `alch experiments series <family>` wraps series summary — DONE 2026-07-01
+
+Implemented CLI `alch experiments series <family>` as a thin wrapper over `GET /experiments/series/:series/summary`.
 
 User value:
 - A whole experiment family can be summarized without opening individual run dirs.
@@ -620,7 +624,9 @@ Tests:
 - CLI hits `/experiments/series/<family>/summary`.
 - Markdown includes best metric and result rows.
 
-### G3. `alch experiments curves <ref>`
+### G3. `alch experiments curves <ref>` — DONE 2026-07-01
+
+Implemented CLI `alch experiments curves <ref> [--metric name]` resolving UUID/name/code_id and fetching current task metric endpoints. Output labels `source="ring_buffer"`; it does not claim durable curve storage.
 
 Behavior:
 - Fetch curves through SDK client and export JSON/CSV.

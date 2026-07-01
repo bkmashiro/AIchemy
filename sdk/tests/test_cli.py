@@ -237,6 +237,42 @@ def test_experiments_series_comment_posts_series_event(monkeypatch):
     assert calls[0]["body"] == {"kind": "note", "message": "random500 improved Pong"}
 
 
+def test_experiments_inspect_outputs_sdk_spec_or_legacy_warning(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "inspect", "alpha"],
+        [
+            [{"id": "exp-1", "name": "alpha"}],
+            {"id": "exp-1", "name": "alpha", "sdk_spec": {"code_id": "jema.alpha.v1", "storage": {"root": "/tmp/runs"}}},
+        ],
+    )
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1"
+
+
+def test_experiments_series_wraps_series_summary(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "series", "world-rule"],
+        [{"series": "world-rule", "counts": {"experiments": 2}, "rows": []}],
+    )
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/series/world-rule/summary"
+
+
+def test_experiments_curves_resolves_and_fetches_task_metrics(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "curves", "alpha", "--metric", "loss"],
+        [
+            [{"id": "exp-1", "name": "alpha", "task_refs": {"train": "task-1"}, "task_specs": [{"ref": "train", "param_point": {"seed": 1}}]}],
+            {"metrics_buffer": {"loss": [{"step": 1, "value": 0.4}], "acc": [{"step": 1, "value": 0.2}]}},
+        ],
+    )
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[1]["url"] == "http://localhost:3002/api/tasks/task-1/metrics"
+
+
 def test_clone_task_body_preserves_structured_argv():
     body = cli.clone_task_body({
         "script": "/workspace/train.py",

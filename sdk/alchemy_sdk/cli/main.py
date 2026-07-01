@@ -1139,6 +1139,40 @@ def cmd_experiments_show(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.get(f"/experiments/{exp['id']}"))
 
 
+def cmd_experiments_inspect(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    detail = client.get(f"/experiments/{exp['id']}")
+    sdk_spec = detail.get("sdk_spec") if isinstance(detail, dict) else None
+    if sdk_spec:
+        print_json({"experiment_id": exp["id"], "name": detail.get("name"), "sdk_spec": sdk_spec})
+    else:
+        print_json({"experiment_id": exp["id"], "name": detail.get("name"), "warning": "legacy experiment has no sdk_spec", "detail": detail})
+
+
+def cmd_experiments_series(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get(f"/experiments/series/{args.family}/summary"))
+
+
+def cmd_experiments_curves(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    task_refs = exp.get("task_refs") or {}
+    task_specs = exp.get("task_specs") or []
+    specs_by_ref = {spec.get("ref"): spec for spec in task_specs if isinstance(spec, dict) and spec.get("ref")}
+    curves: dict[str, Any] = {}
+    for task_ref, task_id in task_refs.items():
+        spec = specs_by_ref.get(task_ref, {})
+        payload = client.get(f"/tasks/{task_id}/metrics")
+        metrics_buffer = payload.get("metrics_buffer") if isinstance(payload, dict) else None
+        if isinstance(metrics_buffer, dict):
+            selected = dict(metrics_buffer)
+            if args.metric:
+                selected = {args.metric: selected.get(args.metric, [])}
+        else:
+            selected = {"legacy": payload.get("points", []) if isinstance(payload, dict) else []}
+        curves[task_ref] = {"task_id": task_id, "params": dict(spec.get("param_point") or {}), "metrics": selected}
+    print_json({"experiment_id": exp["id"], "source": "ring_buffer", "curves": curves})
+
+
 def cmd_experiments_timeline(args: argparse.Namespace, client: ApiClient) -> None:
     exp = find_experiment(client, args.experiment)
     print_json(client.get(f"/experiments/{exp['id']}/timeline"))
@@ -1670,9 +1704,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", choices=["running", "passed", "partial", "failed"], help="filter by rollup status")
     p.set_defaults(func=cmd_experiments_ls)
 
-    p = exps_sub.add_parser("show", help="fetch full detail for one experiment", description="Resolve <experiment> (name or id) and print the full detail document.")
-    p.add_argument("experiment", help="experiment name or id")
+    p = exps_sub.add_parser("show", help="fetch full detail for one experiment", description="Resolve <experiment> (name, id, or code_id) and print the full detail document.")
+    p.add_argument("experiment", help="experiment name, id, or code_id")
     p.set_defaults(func=cmd_experiments_show)
+
+    p = exps_sub.add_parser("inspect", help="show SDK spec for one experiment")
+    p.add_argument("experiment", help="experiment name, id, or code_id")
+    p.set_defaults(func=cmd_experiments_inspect)
+
+    p = exps_sub.add_parser("series", help="show experiment family/series summary")
+    p.add_argument("family", help="experiment family/series")
+    p.set_defaults(func=cmd_experiments_series)
+
+    p = exps_sub.add_parser("curves", help="fetch experiment metric curves from task metric endpoints")
+    p.add_argument("experiment", help="experiment name, id, or code_id")
+    p.add_argument("--metric", help="only include one metric name")
+    p.set_defaults(func=cmd_experiments_curves)
 
     p = exps_sub.add_parser("timeline", help="read the append-only event timeline", description="Print the experiment's append-only event log: notes, decisions, artifacts, and synthesized task lifecycle events.")
     p.add_argument("experiment", help="experiment name or id")
