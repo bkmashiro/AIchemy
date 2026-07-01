@@ -70,7 +70,18 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
   return "running";
 }
 
-const DECISIONS = new Set<ExperimentDecision>(["keep", "drop", "rerun", "fork"]);
+const DECISIONS = new Set<ExperimentDecision>(["keep", "try_more", "discard", "drop", "rerun", "fork"]);
+const DECISION_ALIASES: Record<string, ExperimentDecision> = {
+  "try-more": "try_more",
+  rerun: "try_more",
+  drop: "discard",
+  fork: "try_more",
+};
+function normalizeDecision(value: unknown): ExperimentDecision | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = DECISION_ALIASES[value] ?? value;
+  return DECISIONS.has(normalized as ExperimentDecision) ? normalized as ExperimentDecision : undefined;
+}
 const EXPERIMENT_STATUSES = new Set<Experiment["status"]>(["running", "passed", "partial", "failed"]);
 const EVENT_KINDS = new Set<ExperimentEventKind>([
   "created", "forked", "task_started", "task_completed", "task_failed",
@@ -1945,14 +1956,15 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const exp = store.getExperiment(req.params.id);
     if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
     const { decision, reason } = req.body;
-    if (!DECISIONS.has(decision)) { res.status(400).json({ error: "invalid decision" }); return; }
+    const normalizedDecision = normalizeDecision(decision);
+    if (!normalizedDecision) { res.status(400).json({ error: "invalid decision" }); return; }
     const reasonError = validateMessage(reason, "reason");
     if (reasonError) { res.status(400).json({ error: reasonError }); return; }
 
     const decisionAt = new Date().toISOString();
     const updated: Experiment = {
       ...exp,
-      decision,
+      decision: normalizedDecision,
       decision_reason: reason,
       decision_at: decisionAt,
     };
@@ -1961,9 +1973,9 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       id: uuidv4(),
       experiment_id: exp.id,
       kind: "decision",
-      message: `Marked ${decision}: ${reason}`,
+      message: `Marked ${normalizedDecision}: ${reason}`,
       actor: operatorActor(req),
-      data: { decision },
+      data: { decision: normalizedDecision },
       created_at: decisionAt,
     });
     webNs.emit("experiment.update", updated);

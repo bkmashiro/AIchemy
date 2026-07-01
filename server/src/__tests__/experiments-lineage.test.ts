@@ -334,12 +334,18 @@ describe("experiment lineage API", () => {
 
     const decided = await request(app)
       .patch(`/experiments/${created.body.id}/decision`)
-      .send({ decision: "keep", reason: "best zn so far" })
+      .send({ decision: "try-more", reason: "seed variance high" })
       .expect(200);
 
-    expect(decided.body.decision).toBe("keep");
-    expect(decided.body.decision_reason).toBe("best zn so far");
+    expect(decided.body.decision).toBe("try_more");
+    expect(decided.body.decision_reason).toBe("seed variance high");
     expect(decided.body.decision_at).toBeTruthy();
+
+    const discarded = await request(app)
+      .patch(`/experiments/${created.body.id}/decision`)
+      .send({ decision: "drop", reason: "legacy drop alias" })
+      .expect(200);
+    expect(discarded.body.decision).toBe("discard");
 
     await request(app)
       .post(`/experiments/${created.body.id}/events`)
@@ -349,7 +355,8 @@ describe("experiment lineage API", () => {
     const timeline = await request(app).get(`/experiments/${created.body.id}/timeline`).expect(200);
     expect(timeline.body.events).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ kind: "decision", message: "Marked keep: best zn so far" }),
+        expect.objectContaining({ kind: "decision", message: "Marked try_more: seed variance high" }),
+        expect.objectContaining({ kind: "decision", message: "Marked discard: legacy drop alias" }),
       ]),
     );
   });

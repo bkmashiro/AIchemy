@@ -11,8 +11,8 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 DEFAULT_SERVER = "http://localhost:3002"
-DECISION_CHOICES = ("keep", "drop", "rerun", "fork", "none")
-DECISION_WRITE_CHOICES = ("keep", "drop", "rerun", "fork")
+DECISION_CHOICES = ("keep", "try_more", "discard", "drop", "rerun", "fork", "none")
+DECISION_WRITE_CHOICES = ("keep", "try_more", "discard", "try-more", "drop", "rerun", "fork")
 STATUS_CHOICES = ("running", "passed", "partial", "failed")
 ARTIFACT_TYPES = ("checkpoint", "tensorboard", "log", "file", "metrics")
 
@@ -57,6 +57,14 @@ def _validate_artifact_step(step: Any) -> None:
     is_number = isinstance(step, (int, float)) and not isinstance(step, bool)
     if not is_number or not math.isfinite(float(step)):
         raise RuntimeError("artifact step must be a finite number")
+
+
+def normalize_decision(value: str) -> str:
+    aliases = {"try-more": "try_more", "rerun": "try_more", "drop": "discard", "fork": "try_more"}
+    normalized = aliases.get(value, value)
+    if normalized not in {"keep", "try_more", "discard"}:
+        raise RuntimeError(f"decision must be one of {list(DECISION_WRITE_CHOICES)}, got {value!r}")
+    return normalized
 
 
 class ExperimentClient:
@@ -196,7 +204,7 @@ class ExperimentClient:
         self, experiments: list[dict[str, Any]], ref: str
     ) -> dict[str, Any]:
         matches = [
-            e for e in experiments if e.get("id") == ref or e.get("name") == ref
+            e for e in experiments if e.get("id") == ref or e.get("name") == ref or e.get("code_id") == ref
         ]
         if not matches:
             raise RuntimeError(f"experiment not found: {ref}")
@@ -339,6 +347,18 @@ class ExperimentClient:
             body["data"] = dict(data)
         return self._request(f"/experiments/{exp['id']}/events", method="POST", body=body)
 
+    def comment(
+        self,
+        ref: str,
+        message: str,
+        *,
+        task_id: Optional[str] = None,
+        data: Optional[Mapping[str, Any]] = None,
+        refresh: bool = False,
+    ) -> Any:
+        """Alias for :meth:`add_note` using the code-first vocabulary."""
+        return self.add_note(ref, message, task_id=task_id, data=data, refresh=refresh)
+
     def decide(
         self,
         ref: str,
@@ -351,10 +371,7 @@ class ExperimentClient:
 
         Mutates server state by setting experiment decision and reason.
         """
-        if decision not in DECISION_WRITE_CHOICES:
-            raise RuntimeError(
-                f"decision must be one of {list(DECISION_WRITE_CHOICES)}, got {decision!r}"
-            )
+        decision = normalize_decision(decision)
         _validate_event_message(reason, "reason")
 
         exp = self.resolve(ref, refresh=refresh)

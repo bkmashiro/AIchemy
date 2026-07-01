@@ -27,12 +27,16 @@ class FakeResponse:
 
 def _patched_urlopen(queue, calls):
     def fake_urlopen(req, timeout=20.0):
-        calls.append({
+        body = req.data.decode("utf-8") if req.data else None
+        call = {
             "method": req.method,
             "url": req.full_url,
             "auth": req.headers.get("Authorization"),
             "timeout": timeout,
-        })
+        }
+        if body:
+            call["body"] = json.loads(body)
+        calls.append(call)
         assert queue, f"unexpected request {req.method} {req.full_url}"
         return FakeResponse(queue.pop(0))
 
@@ -444,6 +448,43 @@ def test_list_rejects_invalid_decision_or_status(monkeypatch):
         client.list(decision="nope")
     with pytest.raises(RuntimeError, match="status must be one of"):
         client.list(status="hot")
+
+
+def test_resolve_accepts_code_id(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.resolve("jema.atari.coverage500.v1"),
+        [[{"id": "exp-1", "name": "Atari", "code_id": "jema.atari.coverage500.v1"}]],
+    )
+    assert result["id"] == "exp-1"
+    assert calls[0]["url"] == "http://server/api/experiments"
+
+
+def test_decide_normalizes_code_first_vocabulary(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.decide("alpha", decision="try-more", reason="seed variance high"),
+        [[{"id": "exp-1", "name": "alpha"}], {"id": "exp-1", "decision": "try_more"}],
+    )
+    assert result["decision"] == "try_more"
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["body"] == {"decision": "try_more", "reason": "seed variance high"}
+
+
+def test_comment_is_alias_for_add_note(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    _, calls = _run(
+        monkeypatch,
+        lambda: client.comment("alpha", "needs Freeway coverage", data={"source": "notebook"}),
+        [[{"id": "exp-1", "name": "alpha"}], {"id": "evt-1"}],
+    )
+    assert calls[1]["body"] == {
+        "kind": "note",
+        "message": "needs Freeway coverage",
+        "data": {"source": "notebook"},
+    }
 
 
 def test_list_filtered_results_bypass_cache_writes(monkeypatch):

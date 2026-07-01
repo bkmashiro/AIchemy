@@ -1035,6 +1035,7 @@ def cmd_experiments_scaffold(args: argparse.Namespace) -> int:
 
 
 def cmd_experiments_inject_ledger(args: argparse.Namespace) -> int:
+    from alchemy_sdk.experiments import normalize_decision
     from alchemy_sdk.ledger import append_decision, ledger_hash, parse_ledger, replace_ledger
 
     path = Path(args.file)
@@ -1044,7 +1045,7 @@ def cmd_experiments_inject_ledger(args: argparse.Namespace) -> int:
     updated = append_decision(
         ledger,
         decision_id=args.decision_id,
-        decision=args.decision,
+        decision=normalize_decision(args.decision),
         reason=args.reason,
         evidence=evidence,
     )
@@ -1469,11 +1470,13 @@ def cmd_experiments_report(args: argparse.Namespace, client: ApiClient) -> None:
 
 
 def cmd_experiments_decide(args: argparse.Namespace, client: ApiClient) -> None:
+    from alchemy_sdk.experiments import normalize_decision
+
     reason = args.reason_flag or args.reason
     if not reason:
         raise AlchError("decision reason required: pass --reason <text>")
     exp = find_experiment(client, args.experiment)
-    body = {"decision": args.decision, "reason": reason}
+    body = {"decision": normalize_decision(args.decision), "reason": reason}
     print_json(client.patch(f"/experiments/{exp['id']}/decision", body))
 
 
@@ -1601,7 +1604,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = exps_sub.add_parser("inject-ledger", help="idempotently update a code-first managed ledger block")
     p.add_argument("file", help="Python experiment file containing an alchemy-ledger block")
     p.add_argument("--decision-id", required=True, help="stable decision id inside this file")
-    p.add_argument("--decision", required=True, choices=["keep", "drop", "rerun", "fork"])
+    p.add_argument("--decision", required=True, choices=["keep", "try_more", "try-more", "discard", "drop", "rerun", "fork"])
     p.add_argument("--reason", help="decision rationale")
     p.add_argument("--evidence", action="append", help="experiment code_id or artifact ref backing the decision; repeatable")
     p.set_defaults(func=cmd_experiments_inject_ledger, no_client=True)
@@ -1613,7 +1616,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = exps_sub.add_parser("ls", help="list experiments (optionally filtered)", description="List experiments with optional server-side filters.")
     p.add_argument("--family", help="filter by experiment family name")
-    p.add_argument("--decision", choices=["keep", "drop", "rerun", "fork", "none"], help="filter by decision (use 'none' for undecided)")
+    p.add_argument("--decision", choices=["keep", "try_more", "discard", "drop", "rerun", "fork", "none"], help="filter by decision (use 'none' for undecided)")
     p.add_argument("--status", choices=["running", "passed", "partial", "failed"], help="filter by rollup status")
     p.set_defaults(func=cmd_experiments_ls)
 
@@ -1630,6 +1633,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("message", help="note text")
     p.add_argument("--task", help="optionally attach the note to a specific task id")
     p.add_argument("--data", help="optional JSON object payload (e.g. metric snapshot)")
+    p.set_defaults(func=cmd_experiments_note)
+
+    p = exps_sub.add_parser("comment", help="alias for note using code-first vocabulary", description="Append a neutral comment event. Alias for `experiments note`.")
+    p.add_argument("experiment", help="experiment name, id, or code_id")
+    p.add_argument("message", help="comment text")
+    p.add_argument("--task", help="optionally attach the comment to a specific task id")
+    p.add_argument("--data", help="optional JSON object payload")
     p.set_defaults(func=cmd_experiments_note)
 
     def add_experiment_metadata_flags(parser: argparse.ArgumentParser) -> None:
@@ -1730,7 +1740,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Set the experiment decision via PATCH /experiments/<id>/decision. A reason is required (positional or --reason). Actor is derived server-side from the token.",
     )
     p.add_argument("experiment", help="experiment name or id")
-    p.add_argument("decision", choices=["keep", "drop", "rerun", "fork"], help="decision verdict")
+    p.add_argument("decision", choices=["keep", "try_more", "try-more", "discard", "drop", "rerun", "fork"], help="decision verdict")
     p.add_argument("reason", nargs="?", help="rationale (positional). Alternative: --reason TEXT")
     p.add_argument("--reason", dest="reason_flag", help="rationale (flag form, takes precedence over positional)")
     p.set_defaults(func=cmd_experiments_decide)

@@ -814,7 +814,17 @@ Files:
 - Prefer new helper module: `sdk/alchemy_sdk/ledger.py` or `sdk/alchemy_sdk/scaffold.py`.
 - Tests: new `sdk/tests/test_experiment_ledger.py`.
 
-### I4. Normalize decision vocabulary
+### I4. Normalize decision vocabulary — DONE 2026-07-01
+
+Implemented canonical decision vocabulary at SDK/CLI/server boundaries: `keep`, `try_more`, `discard`, plus neutral comments via note events. Legacy aliases remain accepted for compatibility and normalize before write: `try-more`/`rerun`/`fork` → `try_more`, `drop` → `discard`. `ExperimentClient.resolve()` also accepts `code_id`.
+
+Verified:
+```bash
+cd sdk && uv run pytest tests/test_experiment_client.py::test_resolve_accepts_code_id tests/test_experiment_client.py::test_decide_normalizes_code_first_vocabulary tests/test_experiment_client.py::test_comment_is_alias_for_add_note tests/test_cli.py::test_experiments_decide_normalizes_try_more_alias tests/test_cli.py::test_experiments_comment_posts_note_event -q
+# 5 passed
+cd server && npm test -- --run src/__tests__/experiments-lineage.test.ts -t "sets decisions"
+# 1 passed
+```
 
 Canonical statuses:
 - `keep`: result is worth preserving/promoting.
@@ -874,7 +884,7 @@ Files:
 
 ### I6. SDK and CLI decision/comment recording with idempotent ledger sync — PARTIAL 2026-07-01
 
-Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing `kind="decision"` events with `data.source="code-ledger"` and stable `data.source_id`. Rerunning the command skips already-synced entries. Server event POST also deduplicates repeated code-ledger `source_id` for the same experiment/kind and returns the existing event. Comment support remains TODO.
+Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing `kind="decision"` events with `data.source="code-ledger"` and stable `data.source_id`. Rerunning the command skips already-synced entries. Server event POST also deduplicates repeated code-ledger `source_id` for the same experiment/kind and returns the existing event. SDK/CLI comment support exists through `ExperimentClient.comment()` and `alch experiments comment`; ledger comment sync remains TODO.
 
 Desired API:
 ```python

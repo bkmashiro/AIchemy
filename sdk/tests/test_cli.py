@@ -158,6 +158,27 @@ def test_experiments_sync_ledger_skips_existing_source_ids(monkeypatch, tmp_path
     assert len(calls) == 2
 
 
+def test_experiments_decide_normalizes_try_more_alias(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "decide", "alpha", "try-more", "needs seeds"],
+        [[{"id": "exp-1", "name": "alpha"}], {"id": "exp-1", "decision": "try_more"}],
+    )
+    assert calls[1]["method"] == "PATCH"
+    assert calls[1]["body"] == {"decision": "try_more", "reason": "needs seeds"}
+
+
+def test_experiments_comment_posts_note_event(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "comment", "alpha", "coverage too low"],
+        [[{"id": "exp-1", "name": "alpha"}], {"id": "evt-1", "kind": "note"}],
+    )
+    assert calls[1]["method"] == "POST"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/events"
+    assert calls[1]["body"] == {"kind": "note", "message": "coverage too low"}
+
+
 def test_clone_task_body_preserves_structured_argv():
     body = cli.clone_task_body({
         "script": "/workspace/train.py",
@@ -1097,13 +1118,13 @@ def test_experiments_decide_accepts_reason_flag(monkeypatch):
         ["experiments", "decide", "exp-1", "fork", "--reason", "needs ablation"],
         [
             [{"id": "exp-1", "name": "alpha"}],
-            {"id": "exp-1", "decision": "fork", "decision_reason": "needs ablation"},
+            {"id": "exp-1", "decision": "try_more", "decision_reason": "needs ablation"},
         ],
     )
 
     assert calls[1]["method"] == "PATCH"
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/decision"
-    assert calls[1]["body"] == {"decision": "fork", "reason": "needs ablation"}
+    assert calls[1]["body"] == {"decision": "try_more", "reason": "needs ablation"}
 
 
 def test_experiments_show_ambiguous_name_fails(monkeypatch):
