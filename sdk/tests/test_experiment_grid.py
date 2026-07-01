@@ -76,3 +76,38 @@ def test_missing_template_param_key_fails_loudly():
 
     with pytest.raises(ValueError, match="unknown template key"):
         exp.to_spec()
+
+
+def test_template_dependencies_resolve_to_same_param_point():
+    exp = Experiment("grid").params(seed=[1, 2])
+    train = exp.task("train-{seed}", script="train.py")
+    exp.task("eval-{seed}", script="eval.py", depends_on=[train])
+
+    tasks = exp.to_spec()["tasks"]
+
+    assert tasks[1]["ref"] == "train-2"
+    assert tasks[2]["ref"] == "eval-1"
+    assert tasks[2]["depends_on"] == ["train-1"]
+    assert tasks[3]["ref"] == "eval-2"
+    assert tasks[3]["depends_on"] == ["train-2"]
+
+
+def test_template_task_can_depend_on_global_task():
+    exp = Experiment("grid").params(seed=[1, 2])
+    aggregate = exp.task("aggregate", script="aggregate.py")
+    exp.task("eval-{seed}", script="eval.py", depends_on=[aggregate])
+
+    tasks = exp.to_spec()["tasks"]
+
+    assert tasks[0]["ref"] == "aggregate"
+    assert tasks[1]["depends_on"] == ["aggregate"]
+    assert tasks[2]["depends_on"] == ["aggregate"]
+
+
+def test_global_task_cannot_depend_on_expanded_task_without_explicit_policy():
+    exp = Experiment("grid").params(seed=[1, 2])
+    train = exp.task("train-{seed}", script="train.py")
+    exp.task("aggregate", script="aggregate.py", depends_on=[train])
+
+    with pytest.raises(ValueError, match="cannot depend on expanded task"):
+        exp.to_spec()

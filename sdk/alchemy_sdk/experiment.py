@@ -211,11 +211,37 @@ class Experiment:
                     rendered_refs.append(spec)
 
             for spec in rendered_refs:
+                point = spec.get("param_point")
+                rendered_deps: list[str] = []
+                for dep_ref in spec.get("depends_on", []):
+                    if "{" in dep_ref or "}" in dep_ref:
+                        if point is None:
+                            raise ValueError(
+                                f"Global task {spec['ref']!r} cannot depend on expanded task {dep_ref!r} "
+                                "without an explicit dependency policy"
+                            )
+                        try:
+                            dep_ref = dep_ref.format(**point)
+                        except KeyError as exc:
+                            missing = exc.args[0]
+                            raise ValueError(
+                                f"Dependency template {dep_ref!r} uses unknown template key {missing!r}"
+                            ) from exc
+                    rendered_deps.append(dep_ref)
+                if rendered_deps:
+                    spec["depends_on"] = rendered_deps
+
                 ref = spec["ref"]
                 if ref in seen_refs:
                     raise ValueError(f"Duplicate rendered task ref: {ref!r}")
                 seen_refs.add(ref)
                 specs.append(spec)
+
+        rendered_refs = {spec["ref"] for spec in specs}
+        for spec in specs:
+            for dep_ref in spec.get("depends_on", []):
+                if dep_ref not in rendered_refs:
+                    raise ValueError(f"Task {spec['ref']!r} depends on unknown rendered ref {dep_ref!r}")
         return specs
 
     def to_spec(self) -> dict[str, Any]:
