@@ -42,6 +42,9 @@ function isDecisionLikeMessage(value: unknown): string | null {
   if (!normalized) return null;
   const knownDecisionLike = [
     "keep",
+    "try_more",
+    "try more",
+    "discard",
     "drop",
     "fork",
     "rerun",
@@ -54,7 +57,6 @@ function isDecisionLikeMessage(value: unknown): string | null {
 function formatDecisionLabel(raw: string): string {
   const normalized = decisionLabelForFilter(raw);
   if (!normalized) return raw;
-  if (normalized === "needs stronger evidence") return "Needs stronger evidence";
   return normalized;
 }
 

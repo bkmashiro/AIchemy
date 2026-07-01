@@ -981,10 +981,12 @@ Implemented the first safe Web slice in the existing `ExperimentResearchCallCard
 
 Implemented the second Web cleanup slice: the experiments list decision filter now exposes only canonical options (`keep`, `try_more`, `discard`, `undecided`), so the old `drop` / `rerun` / `fork` vocabulary no longer leaks through the main review surface.
 
+Implemented the third Web cleanup slice: the legacy `DecisionCard` selector now also exposes only canonical actions and keeps the existing reason-required guard. Timeline rendering accepts old event labels but displays canonical `try more` / `discard` wording.
+
 Verified:
 ```bash
-cd web && npm test -- --run src/pages/__tests__/ExperimentsPage.test.tsx src/components/experiments/__tests__/ExperimentResearchCallCard.test.tsx src/components/experiments/__tests__/experimentDetailUtils.test.ts && npm run build
-# 46 passed; build passed
+cd web && npm test -- --run src/components/experiments/__tests__/DecisionCard.test.tsx src/pages/__tests__/ExperimentsPage.test.tsx src/components/experiments/__tests__/ExperimentResearchCallCard.test.tsx src/components/experiments/__tests__/experimentDetailUtils.test.ts && npm run build
+# 48 passed; build passed
 ```
 
 Behavior:

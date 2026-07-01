@@ -7,7 +7,13 @@ import {
 import { formatRelTime } from "../../lib/format";
 import { DECISION_BADGE, decisionLabelForFilter } from "./experimentDetailUtils";
 
-const DECISION_OPTIONS: ExperimentDecision[] = ["keep", "drop", "rerun", "fork"];
+const DECISION_OPTIONS: ExperimentDecision[] = ["keep", "try_more", "discard"];
+
+function canonicalDecision(decision: ExperimentDecision | null | undefined): ExperimentDecision {
+  if (decision === "drop") return "discard";
+  if (decision === "rerun" || decision === "fork") return "try_more";
+  return decision ?? "keep";
+}
 
 export function DecisionCard({
   exp,
@@ -17,7 +23,7 @@ export function DecisionCard({
   onUpdated: (u: Partial<ExperimentDetail>) => void;
 }) {
   const [decision, setDecision] = useState<ExperimentDecision>(
-    exp.decision ?? "keep",
+    canonicalDecision(exp.decision),
   );
   const [reason, setReason] = useState("");
   const [submitting, setSubmitting] = useState(false);
