@@ -183,15 +183,12 @@ class Experiment:
         ]
 
     def _task_specs(self) -> list[dict[str, Any]]:
-        if not self._param_space:
-            return [copy.deepcopy(t._spec) for t in self._tasks]
-
         points = self._param_points()
         specs: list[dict[str, Any]] = []
         seen_refs: set[str] = set()
         for task in self._tasks:
             template = task._spec["ref"]
-            if "{" not in template and "}" not in template:
+            if not self._param_space or ("{" not in template and "}" not in template):
                 spec = copy.deepcopy(task._spec)
                 rendered_refs = [spec]
             else:
@@ -230,6 +227,8 @@ class Experiment:
                     rendered_deps.append(dep_ref)
                 if rendered_deps:
                     spec["depends_on"] = rendered_deps
+                if spec.get("config_mode") == "yaml_file":
+                    spec["resolved_config"] = self._resolved_config_for_spec(spec)
 
                 ref = spec["ref"]
                 if ref in seen_refs:
@@ -298,10 +297,13 @@ class Experiment:
         max_retries: int = 0,
         priority: int = 5,
         outputs: Optional[list[str]] = None,
+        config_mode: Optional[str] = None,
         config_overrides: Optional[dict[str, Any]] = None,
     ) -> TaskNode:
         if ref in self._refs:
             raise ValueError(f"Duplicate task ref: {ref!r}")
+        if config_mode is not None and config_mode != "yaml_file":
+            raise ValueError("config_mode must be 'yaml_file' when set")
         self._refs.add(ref)
 
         spec: dict[str, Any] = {"ref": ref, "script": script}
@@ -320,6 +322,7 @@ class Experiment:
         if max_retries:        spec["max_retries"] = max_retries
         if priority != 5:      spec["priority"] = priority
         if outputs:            spec["outputs"] = outputs
+        if config_mode:        spec["config_mode"] = config_mode
         if config_overrides:   spec["config_overrides"] = config_overrides
 
         node = TaskNode(ref=ref, _spec=spec)
@@ -442,6 +445,14 @@ class Experiment:
         return get_experiment_status(self._server, self._experiment_id)
 
     # ── Config resolution ──
+
+    def _resolved_config_for_spec(self, spec: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge experiment config + task-level config_overrides for a task spec."""
+        config = copy.deepcopy(self.config)
+        overrides = spec.get("config_overrides", {})
+        for dotpath, value in overrides.items():
+            _set_nested(config, dotpath, value)
+        return config
 
     def _resolve_task_config(self, task: TaskNode) -> dict[str, Any]:
         """Merge experiment config + task-level config_overrides."""

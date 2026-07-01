@@ -84,7 +84,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 |---|---|---|---|---|
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
-| C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | IN PROGRESS — C1-C2 done |
+| C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
@@ -329,7 +329,16 @@ Behavior:
 Tests:
 - Mock `submit_experiment()` and assert storage/spec metadata is sent.
 
-### C3. Config sidecar declaration for legacy scripts
+### C3. Config sidecar declaration for legacy scripts — DONE 2026-07-01
+
+Implemented `config_mode="yaml_file"` task declaration with fail-loud mode validation. Dry-run and submit task specs include `resolved_config` for YAML sidecar tasks; runtime materialization remains a later server/stub slice.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_submit_payload.py tests/test_experiment_spec.py tests/test_experiment_grid.py -q
+# 25 passed
+```
 
 Behavior:
 - Task can declare `config_mode="yaml_file"` or similar.
