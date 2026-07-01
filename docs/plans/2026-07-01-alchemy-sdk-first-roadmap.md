@@ -89,7 +89,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | DONE |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | DONE |
 | G | CLI/Web inspection and evidence surfaces | Users can inspect SDK experiments, series, logs, and files without guessing | Medium | IN PROGRESS |
-| I | Research decisions and annotations | Keep/try-more/discard/comment decisions are first-class experiment evidence | Medium | TODO |
+| I | Code-first identity, scaffold, and research ledger | Stable code IDs, CLI scaffolds, and managed ledgers make decisions writable without hand-editing | Medium | TODO |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
 
 ---
@@ -688,17 +688,114 @@ Stop condition for Stage G:
 
 ---
 
-## Stage I — Research decisions and annotations
+## Stage I — Code-first identity, scaffold, and research ledger
 
-**User value:** every experiment has an explicit research outcome: keep, try more, discard, or comment. Decisions become queryable evidence, not lost Discord memory.
+**User value:** every experiment starts from a stable, readable code ID and a generated Python skeleton. Research decisions live in a managed ledger block and sync idempotently to server events; they are not Discord-only memory, not fragile comments, and not hand-written posthoc Python.
+
+Current pain points to solve:
+- UUID-only experiments are bad for code-first references: the UUID does not exist when the researcher writes the experiment.
+- Plain filenames are not enough: files move, one file can define multiple experiments, and imports are not stable IDs.
+- Existing CLI decisions mutate server state but are not naturally reflected in source-controlled experiment code.
+- Injected posthoc Python can be duplicated or manually corrupted unless it has entry IDs, hashes, and conflict semantics.
+- Experiment comments should support `@code_id` references to prior experiments/series without requiring UUID copy-paste.
+- Migration cost is acceptable to ignore for this track; old decision data can be discarded or left legacy/read-only.
 
 Design principle:
-- Decisions are experiment events attached to SDK/server state.
+- `code_id` is the human/code-facing globally unique ID; server UUID remains an internal DB primary key.
+- CLI can create scaffolds and inject initial values. Humans edit business logic; Alchemy edits only managed blocks.
+- Decisions are experiment/series events attached to SDK/server state.
 - SDK code can declare decision policy and emit structured decision suggestions.
 - Humans/agents can record actual decisions after seeing results.
+- Managed ledger entries are append/upsert by deterministic `entry_id`; rerunning sync must not duplicate events.
 - The experiment code should not silently mutate its own scientific conclusion during training unless explicitly configured. Runtime can propose; operator decides.
 
-### I1. Normalize decision vocabulary
+### I0. Add `code_id` to SDK/server experiment identity
+
+Desired API:
+```python
+exp = Experiment(
+    code_id="jema.atari.coverage500.v1",
+    name="Atari coverage500",
+    family="jema-atari-parametric",
+)
+```
+
+Behavior:
+- `Experiment("jema.atari.coverage500.v1")` may remain a shorthand, but `to_spec()` must expose `code_id` explicitly.
+- Server stores `code_id` as a unique alias for new SDK-first experiments.
+- Ref resolution accepts UUID, name, and `code_id`; new code-first paths prefer `code_id`.
+- Duplicate `code_id` with a different spec fingerprint must fail loudly unless a future explicit revision/supersedes path exists.
+- Do not write server UUID into experiment source files.
+
+Files:
+- Modify: `sdk/alchemy_sdk/experiment.py`
+- Modify: `server/src/types.ts`, `server/src/api/experiments.ts`, store schema/migration if needed.
+- Modify: `sdk/alchemy_sdk/cli/main.py` ref resolution.
+- Tests: `sdk/tests/test_experiment_spec.py`, `server/src/__tests__/experiments-lineage.test.ts`, `sdk/tests/test_cli.py`.
+
+### I1. CLI scaffold for new SDK-first experiment files
+
+CLI:
+```bash
+alch experiments scaffold jema.atari.coverage500.v1 \
+  --path experiments/jema_atari_coverage500.py \
+  --family jema-atari-parametric \
+  --name "Atari coverage500"
+```
+
+Behavior:
+- Create a new Python file with imports, `Experiment(code_id=...)`, family/name, storage TODO, config TODO, seed params, train/eval task skeleton, `exp.dry_run()` main guard, and an empty managed ledger block.
+- Refuse to overwrite an existing file unless `--force` is passed.
+- Optional `--template minimal|train-eval|grid` can come later; start with one practical train/eval skeleton.
+- Output the path and next commands.
+
+Tests:
+- Scaffold writes expected `code_id`, family/name, train/eval refs, and ledger markers.
+- Existing file without `--force` fails.
+- Generated file is syntactically valid via `py_compile`.
+
+### I2. CLI inject for existing experiment files
+
+CLI:
+```bash
+alch experiments inject experiments/jema_atari_coverage500.py \
+  --code-id jema.atari.coverage500.v1 \
+  --family jema-atari-parametric
+```
+
+Behavior:
+- For an existing SDK experiment file, inject missing `code_id` / family defaults and the managed ledger block.
+- If `code_id` already exists and matches, do nothing.
+- If `code_id` conflicts, fail loudly.
+- If ledger exists and hash matches, do nothing.
+- If ledger exists and hash does not match, fail loudly instead of repairing silently.
+
+Tests:
+- Injection is idempotent.
+- Conflicting `code_id` fails.
+- Tampered ledger hash fails.
+
+### I3. Managed ledger block and hash helpers
+
+Managed block shape:
+```python
+# --- ALCHEMY MANAGED LEDGER START ---
+ALCHEMY_LEDGER = []
+ALCHEMY_LEDGER_HASH = "sha256:empty"
+# --- ALCHEMY MANAGED LEDGER END ---
+```
+
+Behavior:
+- Implement helpers that parse only the managed block, not arbitrary comments.
+- Ledger entries contain `entry_id`, `kind`, `decision/comment`, `reason`, `evidence`, `refs`, `created_by`, `created_at`, optional `server_event_id`, and `content_hash`.
+- Full block hash catches manual edits.
+- Mutation path rewrites only inside markers.
+
+Files:
+- Prefer new helper module: `sdk/alchemy_sdk/ledger.py` or `sdk/alchemy_sdk/scaffold.py`.
+- Tests: new `sdk/tests/test_experiment_ledger.py`.
+
+### I4. Normalize decision vocabulary
 
 Canonical statuses:
 - `keep`: result is worth preserving/promoting.
@@ -720,7 +817,7 @@ Files:
 - Modify only if current fields do not support the vocabulary.
 - Tests in `server/src/__tests__/experiments-lineage.test.ts`.
 
-### I2. SDK decision policy declarations
+### I5. SDK decision policy declarations
 
 Research code can declare decision intent, but this is a policy/spec, not an immediate final judgement.
 
@@ -748,7 +845,7 @@ Files:
 - Modify: `sdk/alchemy_sdk/experiment.py`
 - Test: `sdk/tests/test_experiment_spec.py`
 
-### I3. SDK and CLI decision recording
+### I6. SDK and CLI decision/comment recording with idempotent ledger sync
 
 Desired API:
 ```python
@@ -769,7 +866,8 @@ alch experiments comment <ref> "Freeway reward rate still zero"
 
 Behavior:
 - `try-more` is CLI alias for canonical `try_more`.
-- Decision/comment endpoints append timeline events.
+- Decision/comment commands can write to server and optionally update the managed ledger block in a source file.
+- Server write should be idempotent by `code_id + entry_id` or explicit `idempotency_key`: same hash returns existing event; different hash returns conflict.
 - Latest decision is summarized in experiment detail and series summary.
 
 Files:
@@ -778,7 +876,7 @@ Files:
 - Modify: `server/src/api/experiments.ts` if needed.
 - Tests: `sdk/tests/test_cli.py`, `server/src/__tests__/experiments-lineage.test.ts`.
 
-### I4. Series-level decisions
+### I7. Series-level decisions
 
 Behavior:
 - Allow decisions/comments on a series/family, not just one experiment.
@@ -799,7 +897,7 @@ Tests:
 - Series summary shows latest decision/comment.
 - Empty/nonexistent family returns 404, not silent success.
 
-### I5. Web decision UX
+### I8. Web decision UX
 
 Behavior:
 - In **Decide next**, show recommended action from policy/summary, but keep human action explicit.
@@ -809,6 +907,7 @@ Behavior:
 - Handoff export includes latest decision and unresolved `try_more` requests.
 
 Stop condition for Stage I:
+- A new experiment can be scaffolded from CLI, edited by a human, dry-run/submitted by SDK, and later receive idempotent code-first decisions/comments through a managed ledger synced to server events.
 - A result can move from generated output → series summary → explicit research decision/comment → future query/handoff without Discord-only memory.
 
 ---
@@ -906,19 +1005,26 @@ Completed foundation:
 
 Next implementation order:
 
-1. G1 `alch experiments inspect <ref>`.
-2. G2 `alch experiments series <family>`.
-3. I1 normalize decision vocabulary against existing experiment event API.
-4. I3 CLI/SDK decision and comment recording for single experiments.
-5. I4 series-level decision/comment events and summary inclusion.
-6. G4 bounded server log/metric tails with explicit `source` labels.
-7. G3 `alch experiments curves <ref>` export, after source labels are stable.
-8. G5 Web use-case routes: Decide next / Compare / Audit / Handoff.
-9. I5 Web decision UX.
-10. H dry-run-only JEMA dogfood script, still blocked from real submission until Yuzhe allows.
+1. I0 `code_id` SDK/server identity and CLI ref resolution.
+2. I1 `alch experiments scaffold <code_id> --path ...` for new SDK-first files.
+3. I2 `alch experiments inject <path.py> --code-id ...` for existing files.
+4. I3 managed ledger parser/hash/rewrite helpers.
+5. I4 normalize decision vocabulary against existing experiment event API.
+6. I6 idempotent decision/comment recording and ledger sync for single experiments.
+7. G1 `alch experiments inspect <ref>`.
+8. G2 `alch experiments series <family>`.
+9. I7 series-level decision/comment events and summary inclusion.
+10. G4 bounded server log/metric tails with explicit `source` labels.
+11. G3 `alch experiments curves <ref>` export, after source labels are stable.
+12. G5 Web use-case routes: Decide next / Compare / Audit / Handoff.
+13. I8 Web decision UX.
+14. H dry-run-only JEMA dogfood script, still blocked from real submission until Yuzhe allows.
 
 Why this order:
-- CLI inspect/series gives immediate value over already-built APIs.
+- Stable `code_id` and scaffold/inject are now foundational: without them, decision/comment UX remains server-first and UUID-shaped.
+- CLI-generated skeletons reduce cold-start friction and make "code is experiment" real before adding more inspection UI.
+- Managed ledger/idempotency must land before decision commands write source files; otherwise repeated runs can duplicate or corrupt events.
+- CLI inspect/series gives immediate value over already-built APIs after refs are stable.
 - Decision/comment recording should land before Web so the UI is not a decorative dashboard.
 - Log/metric tail semantics must be settled before Web shows evidence panels.
 - Web should be built from stable server facts and explicit research decisions, not raw task dumps.
@@ -987,6 +1093,8 @@ Do not block Stage A/B on these:
 4. Should Web become a spec editor? Current answer: no, read-only/ops/decision first.
 5. Should strict metric schema be default? Current answer: not yet; opt-in after dogfood.
 6. How should global/cross-point dependencies be expressed? Defer until a real aggregate task needs it.
+7. Should legacy UUID-only decision data be migrated? Current answer: no; migration cost can be ignored for the new code-first path.
+8. Should filenames be IDs? Current answer: no; filenames can suggest a `code_id`, but `code_id` must be explicit in the SDK spec.
 
 ---
 
