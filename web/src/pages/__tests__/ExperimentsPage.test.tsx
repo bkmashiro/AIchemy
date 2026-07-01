@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import type {
   ExperimentDetail,
@@ -16,7 +16,9 @@ vi.mock("../../components/experiments", async () => {
     IntentCard: () => null,
     DecisionCard: () => null,
     LineageCard: () => null,
-    ExperimentListTable: () => null,
+    ExperimentListTable: ({ experiments }: { experiments: Array<{ name: string }> }) => (
+      React.createElement("ul", { "aria-label": "experiment-list" }, experiments.map((exp) => React.createElement("li", { key: exp.name }, exp.name)))
+    ),
     ExperimentDetailHeader: () => null,
     ExperimentCriteriaCard: () => null,
     ExperimentTaskTable: () => null,
@@ -205,6 +207,16 @@ function renderDetailPage() {
   );
 }
 
+function renderListPage() {
+  return render(
+    <MemoryRouter initialEntries={["/experiments"]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
+      <Routes>
+        <Route path="/experiments" element={<ExperimentsPage />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
 describe("ExperimentsPage lineage preview", () => {
   let childSummaryName = "child summary";
 
@@ -223,6 +235,29 @@ describe("ExperimentsPage lineage preview", () => {
       Promise.resolve(id === "child" ? diff("child", "child diff") : diff("root", "root diff")),
     );
 
+  });
+
+  it("uses canonical decision filter labels on the experiments list", async () => {
+    vi.mocked(experimentsApi.list).mockResolvedValue([
+      { ...detail("keep-exp", "keep exp"), decision: "keep" },
+      { ...detail("try-exp", "try exp"), decision: "try_more" },
+      { ...detail("discard-exp", "discard exp"), decision: "discard" },
+    ]);
+
+    renderListPage();
+
+    const filter = await screen.findByDisplayValue("All decisions");
+    expect(within(filter).getByRole("option", { name: "keep" })).toBeInTheDocument();
+    expect(within(filter).getByRole("option", { name: "try_more" })).toBeInTheDocument();
+    expect(within(filter).getByRole("option", { name: "discard" })).toBeInTheDocument();
+    expect(within(filter).queryByRole("option", { name: "drop" })).not.toBeInTheDocument();
+    expect(within(filter).queryByRole("option", { name: /stronger evidence/i })).not.toBeInTheDocument();
+    expect(within(filter).queryByRole("option", { name: "fork" })).not.toBeInTheDocument();
+
+    fireEvent.change(filter, { target: { value: "try_more" } });
+    expect(screen.getByText("try exp")).toBeInTheDocument();
+    expect(screen.queryByText("keep exp")).not.toBeInTheDocument();
+    expect(screen.queryByText("discard exp")).not.toBeInTheDocument();
   });
 
   it("renders detail page as a research workbench with map, inspector, and evidence regions", async () => {

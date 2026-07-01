@@ -979,10 +979,12 @@ Tests:
 
 Implemented the first safe Web slice in the existing `ExperimentResearchCallCard`: decision writeback now exposes only canonical actions (`Keep`, `Try more`, `Discard`), while legacy `rerun`/`fork`/`drop` values still render as canonical copy for read compatibility. Research bundle Markdown/manifest exports also use `Try more` / `Discard` wording instead of reintroducing old labels.
 
+Implemented the second Web cleanup slice: the experiments list decision filter now exposes only canonical options (`keep`, `try_more`, `discard`, `undecided`), so the old `drop` / `rerun` / `fork` vocabulary no longer leaks through the main review surface.
+
 Verified:
 ```bash
-cd web && npm test -- --run src/components/experiments/__tests__/ExperimentResearchCallCard.test.tsx src/components/experiments/__tests__/experimentDetailUtils.test.ts && npm run build
-# 41 passed; build passed
+cd web && npm test -- --run src/pages/__tests__/ExperimentsPage.test.tsx src/components/experiments/__tests__/ExperimentResearchCallCard.test.tsx src/components/experiments/__tests__/experimentDetailUtils.test.ts && npm run build
+# 46 passed; build passed
 ```
 
 Behavior:
