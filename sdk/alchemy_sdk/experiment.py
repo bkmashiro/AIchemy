@@ -277,6 +277,20 @@ class Experiment:
         spec["warnings"] = self._preflight_warnings(spec)
         return spec
 
+    @staticmethod
+    def _normalize_metric_schema(metrics: Optional[dict[str, str]]) -> dict[str, str]:
+        if not metrics:
+            return {}
+        allowed = {"min", "max", "latest"}
+        normalized: dict[str, str] = {}
+        for name, direction in metrics.items():
+            if not name or not isinstance(name, str):
+                raise ValueError("metric name must be a non-empty string")
+            if direction not in allowed:
+                raise ValueError("metric direction must be one of: min, max, latest")
+            normalized[name] = direction
+        return copy.deepcopy(normalized)
+
     def task(
         self,
         ref: str,
@@ -299,11 +313,13 @@ class Experiment:
         outputs: Optional[list[str]] = None,
         config_mode: Optional[str] = None,
         config_overrides: Optional[dict[str, Any]] = None,
+        metrics: Optional[dict[str, str]] = None,
     ) -> TaskNode:
         if ref in self._refs:
             raise ValueError(f"Duplicate task ref: {ref!r}")
         if config_mode is not None and config_mode != "yaml_file":
             raise ValueError("config_mode must be 'yaml_file' when set")
+        metric_schema = self._normalize_metric_schema(metrics)
         self._refs.add(ref)
 
         spec: dict[str, Any] = {"ref": ref, "script": script}
@@ -324,6 +340,7 @@ class Experiment:
         if outputs:            spec["outputs"] = outputs
         if config_mode:        spec["config_mode"] = config_mode
         if config_overrides:   spec["config_overrides"] = config_overrides
+        if metric_schema:      spec["metric_schema"] = metric_schema
 
         node = TaskNode(ref=ref, _spec=spec)
         self._tasks.append(node)

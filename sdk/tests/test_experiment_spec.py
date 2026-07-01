@@ -149,10 +149,37 @@ def test_dry_run_warns_when_grid_has_no_storage_root():
     exp.task("train-{seed}", script="train.py")
 
     dry = exp.dry_run()
-
     assert dry["warnings"] == [
         {
             "code": "grid_without_storage_root",
             "message": "Grid experiment has no explicit experiment storage root",
         }
     ]
+
+
+def test_task_metric_schema_appears_in_spec():
+    exp = Experiment("metrics")
+    exp.task("train", script="train.py", metrics={"loss": "min", "retrieval_at5": "max"})
+
+    task = exp.to_spec()["tasks"][0]
+
+    assert task["metric_schema"] == {"loss": "min", "retrieval_at5": "max"}
+
+
+def test_task_metric_schema_rejects_invalid_direction():
+    exp = Experiment("metrics")
+
+    with pytest.raises(ValueError, match="metric direction"):
+        exp.task("train", script="train.py", metrics={"loss": "down"})
+
+
+def test_task_metric_schema_is_defensively_copied():
+    metrics = {"loss": "min"}
+    exp = Experiment("metrics")
+    exp.task("train", script="train.py", metrics=metrics)
+    metrics["loss"] = "max"
+
+    spec = exp.to_spec()
+    spec["tasks"][0]["metric_schema"]["loss"] = "max"
+
+    assert exp.to_spec()["tasks"][0]["metric_schema"] == {"loss": "min"}

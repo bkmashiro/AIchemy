@@ -86,7 +86,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | B | Grid expansion | Params and templated refs become SDK-owned | Medium | DONE |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | IN PROGRESS — D1-D3 done |
-| E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
+| E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | IN PROGRESS — E1 done |
 | F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
@@ -435,7 +435,7 @@ Stop condition for Stage D:
 
 **User value:** loss/metrics curves are discoverable by experiment/grid param, not by manually knowing task IDs.
 
-### E1. Task metric schema declaration
+### E1. Task metric schema declaration — DONE 2026-07-01
 
 API:
 
@@ -448,9 +448,15 @@ exp.task(
 ```
 
 Behavior:
-- Validate direction: `min`, `max`, maybe `latest` later.
-- Serialize as `metric_schema` in task spec.
-- Do not change runtime metric reporting yet.
+- Implemented `Experiment.task(metrics={...})` with directions `min`, `max`, and `latest`.
+- Serializes as `metric_schema` in task spec.
+- Does not change runtime metric reporting yet.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_spec.py::test_task_metric_schema_appears_in_spec tests/test_experiment_spec.py::test_task_metric_schema_rejects_invalid_direction tests/test_experiment_spec.py::test_task_metric_schema_is_defensively_copied -q
+```
 
 Tests:
 - Valid schema appears in dry-run spec.
