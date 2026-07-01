@@ -182,6 +182,42 @@ class Experiment:
             for values in itertools.product(*(self._param_space[key] for key in keys))
         ]
 
+    def _task_specs(self) -> list[dict[str, Any]]:
+        if not self._param_space:
+            return [copy.deepcopy(t._spec) for t in self._tasks]
+
+        points = self._param_points()
+        specs: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for task in self._tasks:
+            template = task._spec["ref"]
+            if "{" not in template and "}" not in template:
+                spec = copy.deepcopy(task._spec)
+                rendered_refs = [spec]
+            else:
+                rendered_refs = []
+                for point in points:
+                    try:
+                        rendered_ref = template.format(**point)
+                    except KeyError as exc:
+                        missing = exc.args[0]
+                        raise ValueError(
+                            f"Task ref template {template!r} uses unknown template key {missing!r}"
+                        ) from exc
+                    spec = copy.deepcopy(task._spec)
+                    spec["ref"] = rendered_ref
+                    spec["ref_template"] = template
+                    spec["param_point"] = copy.deepcopy(point)
+                    rendered_refs.append(spec)
+
+            for spec in rendered_refs:
+                ref = spec["ref"]
+                if ref in seen_refs:
+                    raise ValueError(f"Duplicate rendered task ref: {ref!r}")
+                seen_refs.add(ref)
+                specs.append(spec)
+        return specs
+
     def to_spec(self) -> dict[str, Any]:
         """Return a defensive snapshot of the SDK-authored experiment spec."""
         spec: dict[str, Any] = {
@@ -192,7 +228,7 @@ class Experiment:
                 "git_commit": _git_commit(),
                 "cwd": os.getcwd(),
             },
-            "tasks": [copy.deepcopy(t._spec) for t in self._tasks],
+            "tasks": self._task_specs(),
         }
         if self.family is not None:
             spec["family"] = self.family
@@ -295,12 +331,15 @@ class Experiment:
 
         from .submit import submit_experiment
 
-        # Resolve per-task configs before submission
+        # Resolve per-task configs before submission. Use expanded task specs so SDK grids
+        # submit the same canonical tasks shown by to_spec()/dry_run().
         specs = []
-        for t in self._tasks:
-            spec = dict(t._spec)
+        for spec in self._task_specs():
+            spec = copy.deepcopy(spec)
             if self.config:
-                resolved = self._resolve_task_config(t)
+                resolved = copy.deepcopy(self.config)
+                for dotpath, value in spec.get("config_overrides", {}).items():
+                    _set_nested(resolved, dotpath, value)
                 spec["resolved_config"] = resolved
             specs.append(spec)
 

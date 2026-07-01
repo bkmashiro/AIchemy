@@ -83,7 +83,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | Stage | Name | Outcome | Risk | Status |
 |---|---|---|---|---|
 | A | SDK spec snapshot | Experiment has a strict serializable spec | Low | DONE |
-| B | Grid expansion | Params and templated refs become SDK-owned | Medium | IN PROGRESS — B1 done |
+| B | Grid expansion | Params and templated refs become SDK-owned | Medium | IN PROGRESS — B1-B2 done |
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | TODO |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | TODO |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | TODO |
@@ -235,7 +235,16 @@ Tests:
 - Empty list raises.
 - Scalar raises with useful message.
 
-### B2. Expand task ref templates
+### B2. Expand task ref templates — DONE 2026-07-01
+
+Implemented template ref expansion in canonical task specs, including `ref_template`, `param_point`, duplicate detection, and fail-loud missing-key errors. `submit()` now uses the same expanded specs as `to_spec()` / `dry_run()`.
+
+Verified:
+
+```bash
+cd sdk && uv run pytest tests/test_experiment_grid.py tests/test_experiment_spec.py tests/test_experiment_lineage.py -q
+# 35 passed
+```
 
 Behavior:
 - If no params exist, existing task behavior remains unchanged.
