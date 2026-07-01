@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import os
 import subprocess
@@ -141,6 +142,7 @@ class Experiment:
         self._parent_name: Optional[str] = None
         self._parent_config: Optional[dict[str, Any]] = None  # snapshot for diff
         self._storage: dict[str, str] = {}
+        self._param_space: dict[str, list[Any]] = {}
 
     def storage(self, *, root: str, artifact_root: Optional[str] = None) -> "Experiment":
         """Declare experiment storage roots in the SDK-authored spec."""
@@ -158,6 +160,27 @@ class Experiment:
             raise ValueError("base_config must be a mapping")
         self.config = copy.deepcopy(dict(config))
         return self
+
+    def params(self, **space: list[Any] | tuple[Any, ...]) -> "Experiment":
+        """Declare an ordered hyperparameter space for SDK-owned grid expansion."""
+        copied: dict[str, list[Any]] = {}
+        for key, values in space.items():
+            if not isinstance(values, (list, tuple)):
+                raise ValueError(f"param {key!r} must be a list or tuple")
+            if not values:
+                raise ValueError(f"param {key!r} must be non-empty")
+            copied[key] = list(copy.deepcopy(values))
+        self._param_space = copied
+        return self
+
+    def _param_points(self) -> list[dict[str, Any]]:
+        if not self._param_space:
+            return []
+        keys = list(self._param_space.keys())
+        return [
+            dict(zip(keys, values, strict=True))
+            for values in itertools.product(*(self._param_space[key] for key in keys))
+        ]
 
     def to_spec(self) -> dict[str, Any]:
         """Return a defensive snapshot of the SDK-authored experiment spec."""
@@ -179,6 +202,9 @@ class Experiment:
             spec["expected_outcome"] = self.expected_outcome
         if self._storage:
             spec["storage"] = copy.deepcopy(self._storage)
+        if self._param_space:
+            spec["param_space"] = copy.deepcopy(self._param_space)
+            spec["param_points"] = copy.deepcopy(self._param_points())
         if self.config:
             spec["config"] = copy.deepcopy(self.config)
         return spec
