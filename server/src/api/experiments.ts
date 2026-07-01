@@ -1796,12 +1796,25 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     }
     const rows = seriesRowsForExperiments(experiments);
     const schema = schemaSummaryForSeries(experiments, rows);
+    const seenSeriesEvents = new Set<string>();
+    const latestSeriesEvents = experiments
+      .flatMap((exp) => store.getExperimentEvents(exp.id))
+      .filter((event) => !event.deleted_at && event.data?.scope === "series" && event.data?.family === series)
+      .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""))
+      .filter((event) => {
+        const key = `${event.kind}:${event.message}:${event.data?.decision ?? ""}:${event.created_at}`;
+        if (seenSeriesEvents.has(key)) return false;
+        seenSeriesEvents.add(key);
+        return true;
+      })
+      .slice(0, 10);
     res.json({
       series,
       generated_at: new Date().toISOString(),
       counts: { experiments: experiments.length, result_rows: rows.length },
       schema,
       best_metrics: bestMetricsForSeries(rows, schema.metrics),
+      latest_series_events: latestSeriesEvents,
       experiments: experiments.map((exp) => ({
         id: exp.id,
         name: exp.name,

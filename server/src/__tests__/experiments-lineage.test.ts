@@ -137,6 +137,11 @@ describe("experiment lineage API", () => {
         expect.objectContaining({ kind: "note", message: "random500 improved Pong but not Freeway" }),
       ]));
     }
+    const summary = await request(app).get("/experiments/series/series-decide/summary").expect(200);
+    expect(summary.body.latest_series_events).toEqual([
+      expect.objectContaining({ kind: "note", message: "random500 improved Pong but not Freeway" }),
+      expect.objectContaining({ kind: "decision", message: "Series decision try_more: need seeds 1234/4242/7777" }),
+    ]);
   });
 
   it("roundtrips SDK-authored spec fields through create, list, detail, and store reload", async () => {
