@@ -8,6 +8,7 @@
  */
 
 import { Namespace, Socket } from "socket.io";
+import { v4 as uuidv4 } from "uuid";
 import { createHash } from "crypto";
 import { store } from "../store";
 import { metricsStore } from "../metrics";
@@ -434,8 +435,19 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       if (!stubId) return;
       const { task_id, metrics, step } = payload;
       if (!task_id || !metrics || step === undefined) return;
-      // Buffer in metricsStore (ephemeral, not persisted)
+      // Buffer in metricsStore (ephemeral) and snapshot onto task state for restart-safe reads.
       metricsStore.pushTaskMetricsDirect(task_id, step, metrics);
+      const task = store.getTask(stubId, task_id);
+      if (task) {
+        const nextBuffer: Record<string, Array<{ step: number; value: number; ts: string }>> = { ...(task.metrics_buffer || {}) };
+        const ts = new Date().toISOString();
+        for (const [key, value] of Object.entries(metrics)) {
+          const existing = Array.isArray(nextBuffer[key]) ? nextBuffer[key] : [];
+          nextBuffer[key] = [...existing, { step, value, ts }].slice(-500);
+        }
+        const updated = store.updateTask(stubId, task_id, { metrics_buffer: nextBuffer });
+        if (updated) webNs.emit("task.update", updated);
+      }
       // Forward to web clients
       webNs.emit("task.metrics", { task_id, metrics, step });
     });
@@ -503,6 +515,25 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
       };
       const updated = store.updateTask(stubId, payload.task_id, { exports });
       if (updated) webNs.emit("task.update", updated);
+      if (task.experiment_id) {
+        store.addExperimentEvent({
+          id: uuidv4(),
+          experiment_id: task.experiment_id,
+          task_id: payload.task_id,
+          kind: "artifact",
+          message: `Result artifact reported for ${task.ref || payload.task_id}`,
+          actor: "sdk",
+          created_at: new Date().toISOString(),
+          data: {
+            artifact_type: "metrics",
+            name: "result",
+            path: payload.path,
+            result: payload.result || {},
+            schema: payload.schema || {},
+            task_ref: task.ref || null,
+          },
+        });
+      }
       webNs.emit("task.result", {
         stub_id: stubId,
         task_id: payload.task_id,

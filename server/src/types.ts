@@ -137,9 +137,12 @@ export interface Task {
   ref?: string;                        // Reference name within an experiment (for DAG wiring)
   exports?: Record<string, any>;       // Runtime key-value outputs
   args_template?: Record<string, string>; // Template strings resolved at promotion time
+  ref_template?: string;                  // SDK template ref before grid expansion
+  param_point?: Record<string, any>;       // SDK grid point for this expanded task
   experiment_id?: string;              // Owning experiment ID
   outputs?: string[];                  // Declared output file paths for artifact rollback
   metric_schema?: Record<string, string>; // SDK-declared metric directions
+  result_schema?: Record<string, string>; // SDK-declared final result schema
 
   // === Grid ===
   grid_id?: string;
@@ -294,6 +297,9 @@ export interface TaskSpec {
   priority?: number;
   outputs?: string[];     // Declared output file paths for artifact rollback
   metric_schema?: Record<string, string>; // SDK-declared metric directions
+  result_schema?: Record<string, string>; // SDK-declared final result schema
+  ref_template?: string;                  // SDK template ref before grid expansion
+  param_point?: Record<string, any>;      // SDK grid point for this expanded task
   config_overrides?: Record<string, any>;   // Per-task config overrides (dot-path → value)
   resolved_config?: Record<string, any>;    // Merged experiment config + task overrides (computed by SDK)
 }
@@ -371,6 +377,11 @@ export interface Experiment {
   // Git tracking
   git_tracking?: boolean;                                  // Enable git manifest tracking
   git_repo_path?: string;                                  // Absolute path to git repo on stub
+  // SDK-first spec fields
+  storage?: Record<string, any>;
+  sdk_spec?: Record<string, any>;
+  param_space?: Record<string, any[]>;
+  param_points?: Record<string, any>[];
 }
 
 export interface Token {

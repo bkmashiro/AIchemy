@@ -87,7 +87,7 @@ Read docs/plans/2026-07-01-alchemy-sdk-first-roadmap.md and docs/plans/2026-07-0
 | C | Storage and dry-run preflight | Run dirs/storage are visible before submit | Low | DONE |
 | D | Runtime result API | Training/eval writes typed results/artifacts | Medium | DONE |
 | E | Metric schema and curves | Loss/metrics tied to experiment refs/params | Medium | DONE |
-| F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | TODO |
+| F | Server persistence hardening | Server preserves SDK-authored schemas/specs | Medium | DONE |
 | G | CLI/Web inspection | Users can inspect SDK experiments without guessing | Medium | TODO |
 | H | JEMA dogfood migration | One real JEMA experiment script uses SDK-first path | High | TODO, blocked until storage cleared / user says run |
 
@@ -507,36 +507,39 @@ Stop condition for Stage E:
 
 **User value:** SDK-authored schema/result/metric data survives restarts and powers Web/CLI.
 
-### F1. Preserve SDK spec fields on experiment submit
+### F1. Preserve SDK spec fields on experiment submit — DONE
 
 Behavior:
-- Server keeps unknown-safe but typed fields: `storage`, `param_space`, `param_points`, `metric_schema`, `result_schema`, `ref_template`.
-- Fetching experiment returns those fields intact.
+- Server keeps unknown-safe but typed fields: `storage`, `sdk_spec`, `param_space`, `param_points`, `metric_schema`, `result_schema`, `ref_template`, `param_point`.
+- Fetching/listing experiment returns those fields intact.
 
 Tests:
-- POST experiment with SDK fields; GET returns them.
-- SQLite reload preserves them.
+- POST experiment with SDK fields; GET/list returns them.
+- Store export/reload preserves them.
 
-### F2. Durable metric curve persistence
+Implementation notes:
+- `server/src/api/experiments.ts` accepts and stores SDK spec fields on the experiment record.
+- Created tasks inherit task-level `metric_schema`, `result_schema`, `ref_template`, and `param_point`.
+
+### F2. Durable metric curve persistence — DONE, bounded snapshot
 
 Current issue:
 - `server/src/metrics.ts` uses ring buffers. Good for live UI, bad for experiment records.
 
-Practical first step:
-- Persist final/eval metrics and result events before trying to persist every training step.
-- If training curves need durability, store downsampled points or periodic snapshots; do not dump millions of points into SQLite blindly.
+Practical first step implemented:
+- Keep the live ring buffer path.
+- Also snapshot `task.metrics` events onto task state as bounded per-metric buffers.
+- `GET /tasks/:id/metrics` falls back to persisted task snapshots when the live ring buffer is empty.
+- Do not dump unbounded training curves into SQLite blindly. Bounded snapshot is enough for restart-safe inspection; full-fidelity curves should be artifacts later.
 
-Decision needed before implementation:
-- Retention granularity: all points, every N seconds, or ring-buffer snapshots into artifact file.
-
-### F3. Result artifact indexing
+### F3. Result artifact indexing — DONE
 
 Behavior:
-- Result events/artifacts should be queryable by experiment and task ref.
-- Summary endpoint should expose best/final result metrics using declared direction.
+- Result events/artifacts are indexed by experiment via task `exports.result_path` and timeline artifact events.
+- Summary endpoint exposes result artifacts and best result metrics using declared metric direction.
 
 Stop condition for Stage F:
-- A server restart does not lose SDK-authored experiment intent or final results.
+- A server restart does not lose SDK-authored experiment intent or bounded metric/result summaries. Met for server state export/reload and persisted task snapshots.
 
 ---
 

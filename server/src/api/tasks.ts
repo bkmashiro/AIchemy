@@ -87,6 +87,9 @@ export interface TaskInput {
   experiment_id?: string;
   outputs?: string[];
   metric_schema?: Record<string, string>;
+  result_schema?: Record<string, string>;
+  ref_template?: string;
+  param_point?: Record<string, any>;
   resolved_config?: Record<string, any>;
   auto_retry_on?: number[];
 }
@@ -156,6 +159,9 @@ export function createTask(input: TaskInput): Task {
     experiment_id: input.experiment_id,
     outputs: input.outputs,
     metric_schema: input.metric_schema,
+    result_schema: input.result_schema,
+    ref_template: input.ref_template,
+    param_point: input.param_point,
     resolved_config: input.resolved_config,
   };
 

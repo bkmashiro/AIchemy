@@ -20,6 +20,7 @@ vi.mock("../src/log", () => ({
 const _stubs = new Map<string, any>();
 let _seqCounter = 0;
 const _queue: any[] = [];
+const { mockAddExperimentEvent } = vi.hoisted(() => ({ mockAddExperimentEvent: vi.fn() }));
 
 vi.mock("../src/store", () => ({
   store: {
@@ -63,6 +64,8 @@ vi.mock("../src/store", () => ({
     getBlockedTasksDependingOn: () => [],
     updateGlobalQueueTask: vi.fn(),
     getExperiment: () => undefined,
+    addExperimentEvent: mockAddExperimentEvent,
+    getExperimentEvents: vi.fn(() => []),
     rebuildWriteLocks: vi.fn(),
     unarchiveTask: vi.fn(),
     requeueStubTasks: vi.fn(() => []),
@@ -389,12 +392,38 @@ afterEach(() => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SDK result reports
+// SDK metric/result reports
 // ═══════════════════════════════════════════════════════════════════════════════
 
+describe("task.metrics", () => {
+  it("persists structured metric curves on task state as a restart-safe snapshot", () => {
+    const task = makeTask({ id: "task-metrics-1", metrics_buffer: { loss: [{ step: 1, value: 0.9, ts: "old" }] } });
+    const stub = makeStub({ tasks: [task] });
+    const { socketHandlers } = buildHarness({
+      preExistingStub: stub,
+      resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234 }] },
+    });
+
+    socketHandlers["task.metrics"]({
+      task_id: "task-metrics-1",
+      step: 2,
+      metrics: { loss: 0.7, acc: 0.6 },
+    });
+
+    const updated = _stubs.get(STUB_ID).tasks[0];
+    expect(updated.metrics_buffer.loss.map((p: any) => ({ step: p.step, value: p.value }))).toEqual([
+      { step: 1, value: 0.9 },
+      { step: 2, value: 0.7 },
+    ]);
+    expect(updated.metrics_buffer.acc.map((p: any) => ({ step: p.step, value: p.value }))).toEqual([
+      { step: 2, value: 0.6 },
+    ]);
+  });
+});
+
 describe("task.result", () => {
-  it("stores SDK result artifact on task exports and notifies web clients", () => {
-    const task = makeTask({ id: "task-1", exports: { existing: "keep" } });
+  it("stores SDK result artifact on task exports, indexes an experiment event, and notifies web clients", () => {
+    const task = makeTask({ id: "task-1", experiment_id: "exp-1", ref: "train", exports: { existing: "keep" } });
     const stub = makeStub({ tasks: [task] });
     const { socketHandlers, webNs } = buildHarness({
       preExistingStub: stub,
@@ -426,6 +455,20 @@ describe("task.result", () => {
       result: { score: 0.7 },
       schema: { score: "float" },
     });
+    expect(mockAddExperimentEvent).toHaveBeenCalledWith(expect.objectContaining({
+      experiment_id: "exp-1",
+      task_id: "task-1",
+      kind: "artifact",
+      message: "Result artifact reported for train",
+      data: {
+        artifact_type: "metrics",
+        name: "result",
+        path: "/runs/task-1/results.json",
+        result: { score: 0.7 },
+        schema: { score: "float" },
+        task_ref: "train",
+      },
+    }));
     expect(ack).toHaveBeenCalledWith({ ok: true });
   });
 });

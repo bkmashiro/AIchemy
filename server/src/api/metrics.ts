@@ -94,10 +94,14 @@ export function createMetricsRouter(options: MetricsRouterOptions = {}): Router 
   router.get("/tasks/:id/metrics", (req: Request, res: Response) => {
     const taskId = req.params.id;
     // Structured per-key metrics (from task.metrics events)
-    const metrics_buffer = metricsStore.getTaskMetricsDirect(taskId);
+    const liveMetrics = metricsStore.getTaskMetricsDirect(taskId);
+    const found = store.findTask(taskId);
+    const persistedMetrics = found?.task.metrics_buffer ?? {};
+    const metrics_buffer = Object.keys(liveMetrics).length > 0 ? liveMetrics : persistedMetrics;
     // Legacy flat time-series (from task.progress events)
     const points = metricsStore.getTaskMetrics(taskId);
-    res.json({ task_id: taskId, metrics_buffer, points });
+    const source = Object.keys(liveMetrics).length > 0 ? "ring_buffer" : Object.keys(persistedMetrics).length > 0 ? "persistent_task_snapshot" : "empty";
+    res.json({ task_id: taskId, source, metrics_buffer, points });
   });
 
   // GET /tasks/:id/logs

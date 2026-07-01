@@ -640,6 +640,78 @@ function taskCountsByStatus(exp: Experiment): Record<string, number> {
   return counts;
 }
 
+interface ResultArtifactSummary {
+  task_id: string;
+  ref: string | null;
+  path: string;
+  result: Record<string, any>;
+  schema: Record<string, any>;
+}
+
+interface BestResultMetricSummary {
+  value: number;
+  direction: "min" | "max" | "latest";
+  task_id: string;
+  ref: string | null;
+}
+
+function resultArtifactsForExperiment(exp: Experiment): ResultArtifactSummary[] {
+  const grid = store.getGrid(exp.grid_id);
+  if (!grid) return [];
+  return store.getGridTasks(exp.grid_id)
+    .filter((task) => task.exports && typeof task.exports.result_path === "string")
+    .map((task) => ({
+      task_id: task.id,
+      ref: task.ref ?? null,
+      path: task.exports!.result_path,
+      result: isPlainObject(task.exports!.result) ? task.exports!.result : {},
+      schema: isPlainObject(task.exports!.result_schema) ? task.exports!.result_schema : {},
+    }));
+}
+
+function metricDirectionsForExperiment(exp: Experiment): Record<string, "min" | "max" | "latest"> {
+  const directions: Record<string, "min" | "max" | "latest"> = {};
+  for (const spec of exp.task_specs ?? []) {
+    for (const [metric, direction] of Object.entries(spec.metric_schema ?? {})) {
+      if (["min", "max", "latest"].includes(direction)) {
+        directions[metric] = direction as "min" | "max" | "latest";
+      }
+    }
+  }
+  const grid = store.getGrid(exp.grid_id);
+  if (grid) {
+    for (const task of store.getGridTasks(exp.grid_id)) {
+      for (const [metric, direction] of Object.entries(task.metric_schema ?? {})) {
+        if (["min", "max", "latest"].includes(direction)) {
+          directions[metric] = direction as "min" | "max" | "latest";
+        }
+      }
+    }
+  }
+  return directions;
+}
+
+function bestResultMetricsForExperiment(exp: Experiment): Record<string, BestResultMetricSummary> {
+  const directions = metricDirectionsForExperiment(exp);
+  const artifacts = resultArtifactsForExperiment(exp);
+  const out: Record<string, BestResultMetricSummary> = {};
+  for (const artifact of artifacts) {
+    for (const [metric, direction] of Object.entries(directions)) {
+      const value = artifact.result[metric];
+      if (typeof value !== "number" || !Number.isFinite(value)) continue;
+      const current = out[metric];
+      if (!current) {
+        out[metric] = { value, direction, task_id: artifact.task_id, ref: artifact.ref };
+        continue;
+      }
+      if ((direction === "min" && value < current.value) || (direction === "max" && value > current.value) || direction === "latest") {
+        out[metric] = { value, direction, task_id: artifact.task_id, ref: artifact.ref };
+      }
+    }
+  }
+  return out;
+}
+
 type FoundTask = NonNullable<ReturnType<typeof store.findTask>>;
 
 const METADATA_FIELDS = [
@@ -1006,6 +1078,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       family, hypothesis, expected_outcome, fork_reason,
       goal_metric, goal_direction,
       git_tracking, git_repo_path,
+      storage, sdk_spec, param_space, param_points,
     } = req.body;
 
     if (!name) { res.status(400).json({ error: "name required" }); return; }
@@ -1060,6 +1133,11 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           target_tags: spec.target_tags ?? target_tags,
           max_retries: spec.max_retries ?? 0,
           priority: spec.priority,
+          outputs: spec.outputs,
+          metric_schema: spec.metric_schema,
+          result_schema: spec.result_schema,
+          ref_template: spec.ref_template,
+          param_point: spec.param_point,
         });
 
         // Attach resolved_config from SDK (experiment config + task overrides)
@@ -1111,6 +1189,10 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         goal_direction: goal_direction || undefined,
         git_tracking: git_tracking === true ? true : undefined,
         git_repo_path: git_repo_path || undefined,
+        storage: storage || undefined,
+        sdk_spec: sdk_spec || undefined,
+        param_space: param_space || undefined,
+        param_points: param_points || undefined,
       };
 
       store.setExperiment(experiment);
@@ -1637,6 +1719,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       task_counts: taskCountsByStatus(exp),
       validation: passFailSummary(exp),
       best_metrics: bestMetricValues(exp),
+      result_artifacts: resultArtifactsForExperiment(exp),
+      best_result_metrics: bestResultMetricsForExperiment(exp),
       primary_metric: primaryMetricFor(exp),
       timeline_event_count: eventCount,
       config: exp.config ?? null,
@@ -1793,6 +1877,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       task_counts: taskCountsByStatus(exp),
       validation: passFailSummary(exp),
       best_metrics: bestMetricValues(exp),
+      result_artifacts: resultArtifactsForExperiment(exp),
+      best_result_metrics: bestResultMetricsForExperiment(exp),
       primary_metric: primaryMetricFor(exp),
       timeline_event_count: eventCount,
       config: exp.config ?? null,

@@ -59,6 +59,111 @@ beforeEach(() => {
 });
 
 describe("experiment lineage API", () => {
+  it("roundtrips SDK-authored spec fields through create, list, detail, and store reload", async () => {
+    const app = makeApp();
+    const sdkSpec = {
+      name: "sdk-spec-roundtrip",
+      storage: { root: "/tmp/alchemy-runs", artifact_root: "/tmp/alchemy-artifacts" },
+      param_space: { seed: [1, 2] },
+      param_points: [{ seed: 1 }, { seed: 2 }],
+      tasks: [
+        {
+          ref: "train-1",
+          ref_template: "train-{seed}",
+          param_point: { seed: 1 },
+          script: "train.py",
+          metric_schema: { loss: "min" },
+          result_schema: { score: "number" },
+        },
+      ],
+    };
+
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "sdk-spec-roundtrip",
+        storage: sdkSpec.storage,
+        sdk_spec: sdkSpec,
+        param_space: sdkSpec.param_space,
+        param_points: sdkSpec.param_points,
+        task_specs: sdkSpec.tasks,
+      })
+      .expect(201);
+
+    expect(created.body.storage).toEqual(sdkSpec.storage);
+    expect(created.body.sdk_spec).toEqual(sdkSpec);
+    expect(created.body.param_space).toEqual(sdkSpec.param_space);
+    expect(created.body.param_points).toEqual(sdkSpec.param_points);
+    expect(created.body.task_specs[0]).toMatchObject({
+      ref_template: "train-{seed}",
+      param_point: { seed: 1 },
+      metric_schema: { loss: "min" },
+      result_schema: { score: "number" },
+    });
+
+    const listed = await request(app).get("/experiments").expect(200);
+    expect(listed.body[0].sdk_spec).toEqual(sdkSpec);
+
+    const detail = await request(app).get(`/experiments/${created.body.id}`).expect(200);
+    expect(detail.body.storage).toEqual(sdkSpec.storage);
+    expect(detail.body.sdk_spec).toEqual(sdkSpec);
+
+    const exported = store.exportState();
+    store.reset();
+    store.loadFromState(exported);
+    const reloaded = await request(app).get(`/experiments/${created.body.id}`).expect(200);
+    expect(reloaded.body.sdk_spec).toEqual(sdkSpec);
+    expect(reloaded.body.storage).toEqual(sdkSpec.storage);
+  });
+
+  it("summarizes SDK result artifacts and best declared result metrics by task ref", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "sdk-result-summary",
+        task_specs: [
+          { ref: "train-a", script: "train.py", metric_schema: { loss: "min", score: "max" }, result_schema: { loss: "number", score: "number" } },
+          { ref: "train-b", script: "train.py", metric_schema: { loss: "min", score: "max" }, result_schema: { loss: "number", score: "number" } },
+        ],
+      })
+      .expect(201);
+
+    const refs = created.body.task_refs;
+    const first = store.findTask(refs["train-a"]);
+    const second = store.findTask(refs["train-b"]);
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    store.updateGlobalQueueTask(first!.task.id, {
+      exports: { result_path: "/runs/a/results.json", result: { loss: 0.4, score: 0.7 }, result_schema: { loss: "number", score: "number" } },
+    });
+    store.updateGlobalQueueTask(second!.task.id, {
+      exports: { result_path: "/runs/b/results.json", result: { loss: 0.2, score: 0.6 }, result_schema: { loss: "number", score: "number" } },
+    });
+
+    const summary = await request(app).get(`/experiments/${created.body.id}/summary`).expect(200);
+    expect(summary.body.result_artifacts).toEqual([
+      {
+        task_id: first!.task.id,
+        ref: "train-a",
+        path: "/runs/a/results.json",
+        result: { loss: 0.4, score: 0.7 },
+        schema: { loss: "number", score: "number" },
+      },
+      {
+        task_id: second!.task.id,
+        ref: "train-b",
+        path: "/runs/b/results.json",
+        result: { loss: 0.2, score: 0.6 },
+        schema: { loss: "number", score: "number" },
+      },
+    ]);
+    expect(summary.body.best_result_metrics).toEqual({
+      loss: { value: 0.2, direction: "min", task_id: second!.task.id, ref: "train-b" },
+      score: { value: 0.7, direction: "max", task_id: first!.task.id, ref: "train-a" },
+    });
+  });
+
   it("stores intent fields and creates an initial timeline event", async () => {
     const app = makeApp();
 
