@@ -226,7 +226,7 @@ describe("GET /experiments/tree", () => {
       id: "root-rec",
       recommendation: {
         action: "try_more",
-        verdict: "running",
+        verdict: "inconclusive",
         metric: "loss",
         direction: "min",
       },
