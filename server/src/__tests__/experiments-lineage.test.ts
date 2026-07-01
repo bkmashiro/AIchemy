@@ -300,6 +300,26 @@ describe("experiment lineage API", () => {
     );
   });
 
+  it("deduplicates code-ledger event source IDs server-side", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({ name: "ledger-event", task_specs: [{ ref: "train", script: "train.py" }] })
+      .expect(201);
+
+    const body = {
+      kind: "decision",
+      message: "keep: best",
+      data: { source: "code-ledger", source_id: "keep-baseline", decision: "keep" },
+    };
+    const first = await request(app).post(`/experiments/${created.body.id}/events`).send(body).expect(201);
+    const second = await request(app).post(`/experiments/${created.body.id}/events`).send(body).expect(200);
+
+    expect(second.body.id).toBe(first.body.id);
+    const timeline = await request(app).get(`/experiments/${created.body.id}/timeline`).expect(200);
+    expect(timeline.body.events.filter((event: any) => event.data?.source_id === "keep-baseline")).toHaveLength(1);
+  });
+
   it("sets decisions, records decision events, and rejects bad payloads", async () => {
     const app = makeApp();
     const created = await request(app)

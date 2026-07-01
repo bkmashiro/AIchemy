@@ -1919,6 +1919,13 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const artifactError = validateArtifactData(kind, data);
     if (artifactError) { res.status(400).json({ error: artifactError }); return; }
 
+    if (data?.source === "code-ledger" && typeof data.source_id === "string" && data.source_id) {
+      const existing = store.getExperimentEvents(exp.id).find((event) =>
+        !event.deleted_at && event.kind === kind && event.data?.source === "code-ledger" && event.data?.source_id === data.source_id
+      );
+      if (existing) { res.status(200).json(existing); return; }
+    }
+
     const event: ExperimentEvent = {
       id: uuidv4(),
       experiment_id: exp.id,

@@ -874,7 +874,7 @@ Files:
 
 ### I6. SDK and CLI decision/comment recording with idempotent ledger sync — PARTIAL 2026-07-01
 
-Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing `kind="decision"` events with `data.source="code-ledger"` and stable `data.source_id`. Rerunning the command skips already-synced entries. Server-side idempotency enforcement and comment support remain TODO.
+Implemented `alch experiments sync-ledger <file> <experiment-ref>`: parses the code ledger, resolves `<experiment-ref>` by UUID/name/code_id, reads timeline, and posts only missing `kind="decision"` events with `data.source="code-ledger"` and stable `data.source_id`. Rerunning the command skips already-synced entries. Server event POST also deduplicates repeated code-ledger `source_id` for the same experiment/kind and returns the existing event. Comment support remains TODO.
 
 Desired API:
 ```python
