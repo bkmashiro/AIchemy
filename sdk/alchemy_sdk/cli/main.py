@@ -125,12 +125,20 @@ def cmd_config_set(args: argparse.Namespace) -> None:
     config = load_config()
     if args.server:
         config["server"] = args.server.rstrip("/")
+    if args.stub_server_url:
+        config["stub_server_url"] = args.stub_server_url.rstrip("/")
     if args.state_db:
         config["state_db"] = str(Path(args.state_db).expanduser())
     if args.timeout is not None:
         config["timeout"] = args.timeout
     path = save_config(config)
-    print_json({"ok": True, "path": str(path), "server": config.get("server"), "state_db": config.get("state_db")})
+    print_json({
+        "ok": True,
+        "path": str(path),
+        "server": config.get("server"),
+        "stub_server_url": config.get("stub_server_url"),
+        "state_db": config.get("state_db"),
+    })
 
 
 def cmd_config_show(_args: argparse.Namespace) -> None:
@@ -368,12 +376,32 @@ def cmd_stubs_exec(args: argparse.Namespace, client: ApiClient) -> int:
 
 
 def deploy_connection_body(args: argparse.Namespace, client: ApiClient) -> dict[str, Any]:
+    config = load_config()
     server_url = (
         getattr(args, "stub_server_url", None)
         or os.environ.get("ALCHEMY_STUB_SERVER_URL")
+        or config.get("stub_server_url")
         or client.server
     )
     return {"server_url": str(server_url).rstrip("/"), "token": client.token}
+
+
+def summarize_deploy_result(result: dict[str, Any], *, target: str, body: dict[str, Any]) -> dict[str, Any]:
+    server_url = str(body.get("server_url") or "").rstrip("/")
+    out = {
+        **result,
+        "target": result.get("target") or target,
+        "stub_server_url": server_url,
+        "default_output_dir": body.get("default_output_dir"),
+        "wait_command": f"alch stubs wait --tag {target.replace('slurm-', '')} --tag slurm --timeout 300 --interval 5",
+        "verify_commands": [
+            "alch stubs ls --online",
+            "alch tasks ls --status running --limit 10",
+        ],
+    }
+    if server_url.startswith("http://localhost") or server_url.startswith("http://127.0.0.1"):
+        out["warning"] = "stub_server_url is localhost; remote SLURM nodes usually cannot connect. Set `alch config set --stub-server-url <public-url>` or pass --stub-server-url."
+    return out
 
 
 def cmd_stubs_restart(args: argparse.Namespace, client: ApiClient) -> None:
@@ -388,7 +416,7 @@ def cmd_stubs_restart(args: argparse.Namespace, client: ApiClient) -> None:
         body["idle_timeout"] = args.idle_timeout
     if getattr(args, "default_output_dir", None):
         body["default_output_dir"] = args.default_output_dir
-    print_json(client.post(f"/deploy/stubs/{args.name}/restart", body))
+    print_json(summarize_deploy_result(client.post(f"/deploy/stubs/{args.name}/restart", body), target=args.name, body=body))
 
 
 def cmd_stubs_canary(args: argparse.Namespace, client: ApiClient) -> None:
@@ -404,7 +432,7 @@ def cmd_stubs_canary(args: argparse.Namespace, client: ApiClient) -> None:
         body["idle_timeout"] = args.idle_timeout
     if getattr(args, "default_output_dir", None):
         body["default_output_dir"] = args.default_output_dir
-    print_json(client.post(f"/deploy/stubs/{target}", body))
+    print_json(summarize_deploy_result(client.post(f"/deploy/stubs/{target}", body), target=target, body=body))
 
 
 def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
@@ -422,7 +450,7 @@ def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
             body["idle_timeout"] = args.idle_timeout
         if getattr(args, "default_output_dir", None):
             body["default_output_dir"] = args.default_output_dir
-        results.append(client.post(f"/deploy/stubs/{target}/restart", body))
+        results.append(summarize_deploy_result(client.post(f"/deploy/stubs/{target}/restart", body), target=target, body=body))
     print_json(results[0] if args.count == 1 else results)
 
 
@@ -1622,8 +1650,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="persist default server/state-db for this operator")
     config_sub = config.add_subparsers(dest="cmd", required=True)
-    p = config_sub.add_parser("set", help="save default server/state-db; token is not stored")
+    p = config_sub.add_parser("set", help="save default server/stub-server/state-db; token is not stored")
     p.add_argument("--server", help=f"default Alchemy server URL (default {DEFAULT_SERVER})")
+    p.add_argument("--stub-server-url", help="default public URL remote stubs should connect to")
     p.add_argument("--state-db", help="SQLite state db to read the operator token from automatically")
     p.add_argument("--timeout", type=float, default=None, help="default request timeout")
     p.set_defaults(func=cmd_config_set, no_client=True)

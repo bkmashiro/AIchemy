@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import sqlite3
 from pathlib import Path
@@ -40,6 +41,8 @@ def run_cli_with_exit(monkeypatch, argv, responses):
         return FakeResponse(queue.pop(0))
 
     monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    if "ALCHEMY_CLI_CONFIG" not in os.environ:
+        monkeypatch.setenv("ALCHEMY_CLI_CONFIG", f"/tmp/alch-test-empty-{id(calls)}.json")
     with patch("alchemy_sdk.cli.main.urlopen", fake_urlopen):
         try:
             code = cli.main(argv)
@@ -1822,6 +1825,17 @@ def test_config_set_persists_state_and_default_client_uses_it(monkeypatch, tmp_p
     assert calls == [{"url": "http://alchemy.local/api/stubs", "auth": "Bearer state-token"}]
 
 
+def test_config_set_persists_default_stub_server_url(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "alch-config.json"
+    monkeypatch.setenv("ALCHEMY_CLI_CONFIG", str(config_path))
+
+    assert cli.main(["config", "set", "--stub-server-url", "https://alchemy-v2.yuzhes.com/"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stub_server_url"] == "https://alchemy-v2.yuzhes.com"
+    assert json.loads(config_path.read_text())["stub_server_url"] == "https://alchemy-v2.yuzhes.com"
+
+
 def test_tasks_logs_reads_task_log_buffer(monkeypatch, capsys):
     calls = run_cli(
         monkeypatch,
@@ -1865,6 +1879,34 @@ def test_slurm_submit_posts_idle_timeout_override(monkeypatch):
     assert calls[0]["method"] == "POST"
     assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30/restart"
     assert calls[0]["body"]["idle_timeout"] == 600
+
+
+def test_slurm_submit_uses_configured_stub_server_url_and_verbose_output(monkeypatch, tmp_path, capsys):
+    config_path = tmp_path / "alch-config.json"
+    config_path.write_text(json.dumps({"stub_server_url": "https://alchemy-v2.yuzhes.com"}))
+    monkeypatch.setenv("ALCHEMY_CLI_CONFIG", str(config_path))
+    calls = run_cli(
+        monkeypatch,
+        ["slurm", "submit", "a30", "--yes"],
+        [{"ok": True, "job_id": "250", "target": "slurm-a30"}],
+    )
+    assert calls[0]["body"]["server_url"] == "https://alchemy-v2.yuzhes.com"
+    out = json.loads(capsys.readouterr().out)
+    assert out["job_id"] == "250"
+    assert out["stub_server_url"] == "https://alchemy-v2.yuzhes.com"
+    assert out["wait_command"] == "alch stubs wait --tag a30 --tag slurm --timeout 300 --interval 5"
+    assert "alch stubs ls --online" in out["verify_commands"]
+
+
+def test_slurm_submit_warns_when_stub_server_url_is_localhost(monkeypatch, capsys):
+    run_cli(
+        monkeypatch,
+        ["slurm", "submit", "a30", "--yes"],
+        [{"ok": True, "job_id": "251"}],
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert out["stub_server_url"] == "http://localhost:3002"
+    assert "localhost" in out["warning"]
 
 
 def test_slurm_submit_posts_default_output_dir_override(monkeypatch):
