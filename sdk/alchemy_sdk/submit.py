@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
 import urllib.error
 from typing import Any, Optional
@@ -57,7 +58,11 @@ def submit_experiment(
         payload["fork_reason"] = fork_reason
 
     body = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    token = os.environ.get("ALCHEMY_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=body, headers=headers)
 
     try:
         resp = urllib.request.urlopen(req, timeout=30)

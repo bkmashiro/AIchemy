@@ -99,6 +99,26 @@ def test_submit_experiment_http_payload_includes_sdk_storage(monkeypatch):
     ]
 
 
+def test_submit_experiment_uses_alchemy_token_for_authorization(monkeypatch):
+    calls = []
+
+    def fake_urlopen(req, timeout=30):
+        calls.append(req.headers.get("Authorization"))
+        return _Response()
+
+    monkeypatch.setenv("ALCHEMY_TOKEN", "secret-token")
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+
+    submit_experiment(
+        server="http://alchemy",
+        name="payload",
+        description="",
+        task_specs=[{"ref": "train", "script": "train.py"}],
+    )
+
+    assert calls == ["Bearer secret-token"]
+
+
 def test_config_yaml_file_mode_includes_resolved_config_in_spec_and_submit(monkeypatch):
     captured = {}
 
