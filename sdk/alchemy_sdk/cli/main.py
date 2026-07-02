@@ -290,6 +290,38 @@ def cmd_stubs_ls(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(rows)
 
 
+def stub_matches_wait_filter(stub: dict[str, Any], ref: str | None, tags: list[str]) -> bool:
+    if stub.get("status") != "online":
+        return False
+    if ref and not (stub.get("id") == ref or stub.get("name") == ref or stub.get("hostname") == ref):
+        return False
+    stub_tags = set(stub.get("tags") or [])
+    return all(tag in stub_tags for tag in tags)
+
+
+def cmd_stubs_wait(args: argparse.Namespace, client: ApiClient) -> int:
+    if args.timeout < 0:
+        raise AlchError("timeout must be non-negative")
+    if args.interval <= 0:
+        raise AlchError("interval must be greater than 0")
+
+    tags = list(args.tag or [])
+    deadline = time.monotonic() + float(args.timeout)
+    while True:
+        if time.monotonic() > deadline:
+            print_json({"ok": False, "error": "timeout", "tags": tags, "timeout": float(args.timeout)})
+            return 1
+        matches = [
+            stub
+            for stub in client.get("/stubs")
+            if stub_matches_wait_filter(stub, args.stub, tags)
+        ]
+        if matches:
+            print_json({"ok": True, "stub": matches[0]})
+            return 0
+        time.sleep(float(args.interval))
+
+
 def cmd_stubs_drain(args: argparse.Namespace, client: ApiClient) -> None:
     stub = find_stub(client, args.stub)
     result = client.patch(f"/stubs/{stub['id']}", {"max_concurrent": 0})
@@ -1604,6 +1636,7 @@ def build_parser() -> argparse.ArgumentParser:
     stubs = sub.add_parser("stubs", help="list, drain, or restart stubs")
     stubs_sub = stubs.add_subparsers(dest="cmd", required=True)
     p = stubs_sub.add_parser("ls", help="list known stubs"); p.add_argument("--online", action="store_true", help="only include online stubs"); p.set_defaults(func=cmd_stubs_ls)
+    p = stubs_sub.add_parser("wait", help="wait until an online stub matches optional ref/tags"); p.add_argument("stub", nargs="?", help="optional stub id, name, or hostname"); p.add_argument("--tag", action="append", default=[], help="required tag; repeat for multiple tags"); p.add_argument("--timeout", type=float, default=300.0, help="seconds to wait before returning 1 (default 300)"); p.add_argument("--interval", type=float, default=5.0, help="poll interval in seconds (default 5)"); p.set_defaults(func=cmd_stubs_wait)
     p = stubs_sub.add_parser("drain", help="set a stub's max_concurrent to 0"); p.add_argument("stub", help="stub id, name, or hostname"); p.set_defaults(func=cmd_stubs_drain)
     p = stubs_sub.add_parser("undrain", help="restore a stub's max_concurrent"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("--n", type=int, default=1, help="new max_concurrent (default 1)"); p.set_defaults(func=cmd_stubs_undrain)
     p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (defaults to REST server)"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)

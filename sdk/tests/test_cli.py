@@ -437,6 +437,51 @@ def test_stubs_drain_uses_patch_payload(monkeypatch):
     assert calls[1]["auth"] == "Bearer secret-token"
 
 
+def test_stubs_wait_polls_until_matching_online_stub(monkeypatch, capsys):
+    sleeps = []
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    calls = run_cli(
+        monkeypatch,
+        ["stubs", "wait", "--tag", "a30", "--tag", "slurm", "--timeout", "5", "--interval", "1"],
+        [
+            [],
+            [{"id": "stub-1", "name": "dipper-a30", "status": "online", "tags": ["a30", "slurm"], "tasks": []}],
+        ],
+    )
+
+    assert [(c["method"], c["url"]) for c in calls] == [
+        ("GET", "http://localhost:3002/api/stubs"),
+        ("GET", "http://localhost:3002/api/stubs"),
+    ]
+    assert sleeps == [1.0]
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["stub"]["id"] == "stub-1"
+
+
+def test_stubs_wait_times_out_without_matching_online_stub(monkeypatch, capsys):
+    now = iter([0.0, 0.0, 1.0, 2.1])
+    sleeps = []
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(now))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    code, calls = run_cli_with_exit(
+        monkeypatch,
+        ["stubs", "wait", "--tag", "a30", "--timeout", "2", "--interval", "1"],
+        [
+            [{"id": "stub-1", "name": "cpu", "status": "online", "tags": ["cpu"]}],
+            [{"id": "stub-1", "name": "cpu", "status": "online", "tags": ["cpu"]}],
+        ],
+    )
+
+    assert code == 1
+    assert len(calls) == 2
+    assert sleeps == [1.0, 1.0]
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": False, "error": "timeout", "tags": ["a30"], "timeout": 2.0}
+
+
 def test_stubs_exec_posts_exec2_and_prints_output(monkeypatch, capsys):
     code, calls = run_cli_with_exit(
         monkeypatch,
