@@ -1162,6 +1162,86 @@ describe("Fuzzing: POST /tasks", () => {
   });
 });
 
+describe("Task surgical update/replace", () => {
+  it("replaces a task attempt and rewires downstream blocked dependencies without cancelling them", async () => {
+    const webNs = makeWebNamespace();
+    const app = makeApp(undefined, webNs);
+    const train = makeTask({
+      id: "train-attempt-1",
+      status: "pending",
+      ref: "train",
+      experiment_id: "exp-replace",
+      script: "/tmp/train.py",
+      raw_args: "--old-code",
+    });
+    const evalTask = makeTask({
+      id: "eval-blocked",
+      status: "blocked",
+      ref: "eval",
+      experiment_id: "exp-replace",
+      script: "/tmp/eval.py",
+      depends_on: [train.id],
+      args_template: { "--checkpoint": "{{deps.train.exports.checkpoint}}" },
+    });
+    store.addToGlobalQueue(train);
+    store.addToGlobalQueue(evalTask);
+    store.setExperiment({
+      id: "exp-replace",
+      name: "replace test",
+      criteria: {},
+      grid_id: "grid-replace",
+      status: "running",
+      results: {},
+      created_at: new Date().toISOString(),
+      task_refs: { train: train.id, eval: evalTask.id },
+    });
+
+    const res = await request(app)
+      .post(`/tasks/${train.id}/replace`)
+      .send({ overrides: { raw_args: "--new-code", env: { PYTHONPATH: "/new" } }, cancel_old: true });
+
+    expect(res.status).toBe(201);
+    const replacement = res.body.task;
+    expect(replacement.id).not.toBe(train.id);
+    expect(replacement.raw_args).toBe("--new-code");
+    expect(replacement.env).toEqual({ PYTHONPATH: "/new" });
+    expect(replacement.ref).toBe("train");
+    expect(replacement.replaces_task_id).toBe(train.id);
+    expect(replacement.attempt).toBe(2);
+    expect(store.findTask(train.id)?.task.status).toBe("cancelled");
+    expect(store.findTask(evalTask.id)?.task.status).toBe("blocked");
+    expect(store.findTask(evalTask.id)?.task.depends_on).toEqual([replacement.id]);
+    expect(store.getExperiment("exp-replace")?.task_refs?.train).toBe(replacement.id);
+  });
+
+  it("updates a blocked task spec in place without changing dependency identity", async () => {
+    const webNs = makeWebNamespace();
+    const app = makeApp(undefined, webNs);
+    const task = makeTask({
+      id: "blocked-eval",
+      status: "blocked",
+      script: "/tmp/eval.py",
+      depends_on: ["train-attempt-2"],
+      env: { OLD: "1" },
+      raw_args: "--old",
+    });
+    store.addToGlobalQueue(task);
+
+    const res = await request(app)
+      .patch(`/tasks/${task.id}`)
+      .send({ raw_args: "--new", env: { NEW: "1" }, target_tags: ["a30", "slurm"] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(task.id);
+    expect(res.body.status).toBe("blocked");
+    expect(res.body.depends_on).toEqual(["train-attempt-2"]);
+    expect(res.body.raw_args).toBe("--new");
+    expect(res.body.env).toEqual({ NEW: "1" });
+    expect(res.body.target_tags).toEqual(["a30", "slurm"]);
+    expect(res.body.command).toContain("--new");
+  });
+});
+
 describe("Fuzzing: PATCH /tasks/:id", () => {
   it("handles empty body on existing task", async () => {
     const app = makeApp();

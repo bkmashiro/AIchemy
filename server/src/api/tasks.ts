@@ -168,8 +168,122 @@ export function createTask(input: TaskInput): Task {
   return task;
 }
 
-// ─── Terminal statuses ────────────────────────────────────────────────────────
+// ─── Surgical task update/replace helpers ────────────────────────────────────
 
+const TASK_SPEC_UPDATE_FIELDS = [
+  "script", "argv", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
+  "requirements", "priority", "max_retries", "target_stub_id", "target_tags", "python_env",
+  "submitted_by", "outputs", "metric_schema", "result_schema", "resolved_config", "auto_retry_on",
+] as const;
+
+function pickTaskSpecUpdates(body: any): Partial<Task> {
+  const update: Partial<Task> = {};
+  for (const field of TASK_SPEC_UPDATE_FIELDS) {
+    if (body[field] !== undefined) {
+      (update as any)[field] = body[field];
+    }
+  }
+  return update;
+}
+
+function hasTaskSpecUpdates(update: Partial<Task>): boolean {
+  return Object.keys(update).length > 0;
+}
+
+function validateTaskSpecUpdate(update: Partial<Task>): string | undefined {
+  if (update.env && typeof update.env === "object") {
+    const invalidKey = Object.keys(update.env).find((k) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k));
+    if (invalidKey) return `Invalid env key: "${invalidKey}"`;
+  }
+  if (update.script !== undefined && !String(update.script).startsWith("/")) {
+    return `Script must be an absolute path, got: "${update.script}"`;
+  }
+  if (update.cwd !== undefined && update.cwd && !String(update.cwd).startsWith("/")) {
+    return `cwd must be an absolute path, got: "${update.cwd}"`;
+  }
+  return undefined;
+}
+
+function reassembleTaskSpec(task: Task): Partial<Task> {
+  const command = assembleCommand({
+    script: task.script,
+    argv: task.argv,
+    args: task.args,
+    raw_args: task.raw_args,
+    cwd: task.cwd,
+    env_setup: task.env_setup,
+    env: task.env,
+  });
+  const display_name = generateDisplayName({
+    script: task.script,
+    args: task.args,
+    raw_args: task.raw_args,
+    name: task.name,
+    command,
+  });
+  return { command, display_name };
+}
+
+function createReplacementTask(task: Task, overrides: Partial<Task>): Task {
+  const merged: Task = { ...task, ...overrides };
+  const replacement = createTask({
+    script: merged.script,
+    argv: merged.argv,
+    args: merged.args,
+    raw_args: merged.raw_args,
+    name: merged.name,
+    cwd: merged.cwd,
+    env_setup: merged.env_setup,
+    env: merged.env,
+    env_overrides: merged.env_overrides,
+    requirements: merged.requirements,
+    priority: merged.priority,
+    max_retries: merged.max_retries,
+    grid_id: merged.grid_id,
+    param_overrides: merged.param_overrides,
+    target_stub_id: merged.target_stub_id,
+    target_tags: merged.target_tags,
+    python_env: merged.python_env,
+    submitted_by: merged.submitted_by,
+    depends_on: merged.depends_on,
+    ref: merged.ref,
+    args_template: merged.args_template,
+    experiment_id: merged.experiment_id,
+    outputs: merged.outputs,
+    metric_schema: merged.metric_schema,
+    result_schema: merged.result_schema,
+    resolved_config: merged.resolved_config,
+    auto_retry_on: merged.auto_retry_on,
+  });
+  replacement.retry_count = task.retry_count;
+  replacement.replaces_task_id = task.id;
+  replacement.attempt = (task.attempt ?? 1) + 1;
+  return replacement;
+}
+
+function rewireDownstreamBlockedDeps(oldTaskId: string, newTaskId: string, webNs?: Namespace): Task[] {
+  const updated: Task[] = [];
+  for (const task of store.getAllTasks()) {
+    if (task.status !== "blocked" || !task.depends_on?.includes(oldTaskId)) continue;
+    const nextDeps = task.depends_on.map((depId) => depId === oldTaskId ? newTaskId : depId);
+    const next = store.updateGlobalQueueTask(task.id, { depends_on: nextDeps });
+    if (next) {
+      updated.push(next);
+      webNs?.emit("task.update", next);
+    }
+  }
+  return updated;
+}
+
+function updateExperimentCanonicalRef(task: Task, newTaskId: string): void {
+  if (!task.experiment_id || !task.ref) return;
+  const exp = store.getExperiment(task.experiment_id);
+  if (!exp?.task_refs) return;
+  if (exp.task_refs[task.ref] !== task.id) return;
+  store.setExperiment({ ...exp, task_refs: { ...exp.task_refs, [task.ref]: newTaskId } });
+}
+
+// ─── Terminal statuses ────────────────────────────────────────────────────────
 const TERMINAL_STATUSES = ["completed", "failed", "cancelled"];
 
 const ACTIVE_STATUS_FOR_INBOX_ATTENTION: Task["status"][] = ["pending", "assigned", "running", "paused", "blocked"];
@@ -841,6 +955,21 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       }
     }
 
+    const specUpdate = pickTaskSpecUpdates(req.body);
+    if (hasTaskSpecUpdates(specUpdate)) {
+      if (!["pending", "blocked"].includes(task.status)) {
+        res.status(400).json({ error: `Cannot update task spec in status '${task.status}'` });
+        return;
+      }
+      const validationError = validateTaskSpecUpdate(specUpdate);
+      if (validationError) {
+        res.status(400).json({ error: validationError });
+        return;
+      }
+      Object.assign(update, specUpdate);
+      Object.assign(update, reassembleTaskSpec({ ...task, ...update }));
+    }
+
     let updated: Task | undefined;
     if (stubId) {
       updated = store.updateTask(stubId, task.id, update);
@@ -908,6 +1037,68 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     logger.info("task.reschedule", { old_seq: task.seq, new_seq: newTask.seq, target_tags: newTask.target_tags });
     triggerSchedule();
     res.status(201).json(newTask);
+  });
+
+  // POST /tasks/:id/replace — create a new canonical attempt and rewire blocked downstream deps
+  router.post("/:id/replace", (req: Request, res: Response) => {
+    if (!webNs) { res.status(503).json({ error: "Not ready" }); return; }
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const { task, stubId, archived } = found;
+    const overrides = pickTaskSpecUpdates(req.body?.overrides ?? req.body ?? {});
+    const validationError = validateTaskSpecUpdate(overrides);
+    if (validationError) {
+      res.status(400).json({ error: validationError });
+      return;
+    }
+
+    const replacement = createReplacementTask(task, overrides);
+    store.addToGlobalQueue(replacement);
+
+    const replacedByUpdate = { replaced_by_task_id: replacement.id } as Partial<Task>;
+    if (req.body?.cancel_old === true && !TERMINAL_STATUSES.includes(task.status)) {
+      if (stubId && (task.status === "running" || task.status === "assigned")) {
+        initiateKillChain(stubId, task.id);
+        const marked = store.updateTask(stubId, task.id, replacedByUpdate);
+        if (marked) webNs.emit("task.update", marked);
+      } else if (stubId) {
+        const cancelled = store.updateTask(stubId, task.id, {
+          ...replacedByUpdate,
+          status: "cancelled" as any,
+          finished_at: new Date().toISOString(),
+        });
+        if (cancelled) webNs.emit("task.update", cancelled);
+      } else {
+        const cancelled = store.updateGlobalQueueTask(task.id, {
+          ...replacedByUpdate,
+          status: "cancelled" as any,
+          finished_at: new Date().toISOString(),
+        });
+        if (cancelled) webNs.emit("task.update", cancelled);
+      }
+    } else if (archived) {
+      const marked = store.updateArchivedTask(task.id, replacedByUpdate);
+      if (marked) webNs.emit("task.update", marked);
+    } else if (stubId) {
+      const marked = store.updateTask(stubId, task.id, replacedByUpdate);
+      if (marked) webNs.emit("task.update", marked);
+    } else {
+      const marked = store.updateGlobalQueueTask(task.id, replacedByUpdate);
+      if (marked) webNs.emit("task.update", marked);
+    }
+
+    const rewired = rewireDownstreamBlockedDeps(task.id, replacement.id, webNs);
+    updateExperimentCanonicalRef(task, replacement.id);
+    webNs.emit("task.update", replacement);
+    logger.info("task.replace", {
+      old_task_id: task.id,
+      new_task_id: replacement.id,
+      attempt: replacement.attempt,
+      rewired_downstream: rewired.length,
+      cancel_old: req.body?.cancel_old === true,
+    });
+    triggerSchedule();
+    res.status(201).json({ task: replacement, replaced_task_id: task.id, rewired_downstream: rewired.map((t) => t.id) });
   });
 
   // POST /tasks/:id/retry

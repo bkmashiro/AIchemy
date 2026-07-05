@@ -908,6 +908,26 @@ def cmd_tasks_resubmit(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(short_task(client.post(path, body)))
 
 
+def build_task_spec_patch(sets: list[str]) -> dict[str, Any]:
+    if not sets:
+        raise AlchError("pass at least one --set KEY=VALUE")
+    body: dict[str, Any] = {}
+    for raw in sets:
+        key, value = parse_set_pair(raw)
+        body[key] = value
+    return body
+
+
+def cmd_tasks_update(args: argparse.Namespace, client: ApiClient) -> None:
+    body = build_task_spec_patch(args.set)
+    print_json(short_task(client.patch(f"/tasks/{args.task}", body)))
+
+
+def cmd_tasks_replace(args: argparse.Namespace, client: ApiClient) -> None:
+    body = {"overrides": build_task_spec_patch(args.set), "cancel_old": bool(args.cancel_old)}
+    print_json(client.post(f"/tasks/{args.task}/replace", body))
+
+
 def cmd_tasks_logs(args: argparse.Namespace, client: ApiClient) -> None:
     task = client.get(f"/tasks/{args.task}")
     logs = task.get("log_buffer") or task.get("logs") or []
@@ -1726,6 +1746,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
     p = tasks_sub.add_parser("move", help="resubmit a task targeting a new stub or tag set"); p.add_argument("task", help="task id"); p.add_argument("--to-stub", help="target stub id/name/hostname (exclusive with --to-tags)"); p.add_argument("--to-tags", help="comma-separated target_tags (exclusive with --to-stub)"); p.add_argument("--name", help="override display name of the new task"); p.add_argument("--yes", action="store_true", help="required when cancelling a running/assigned task"); p.set_defaults(func=cmd_tasks_move)
     p = tasks_sub.add_parser("resubmit", help="clone a task as a new submission"); p.add_argument("task", help="task id to clone"); p.add_argument("--resume", action="store_true", help="append --resume to raw_args"); p.add_argument("--to-stub", help="retarget to a specific stub"); p.add_argument("--to-tags", help="retarget to comma-separated tags"); p.add_argument("--name", help="override display name"); p.add_argument("--wait", action="store_true", help="block until task is accepted"); p.add_argument("--wait-timeout", type=int, default=15, help="accept-wait timeout seconds (default 15)"); p.set_defaults(func=cmd_tasks_resubmit)
+    p = tasks_sub.add_parser("update", help="patch a pending/blocked task spec in place"); p.add_argument("task", help="task id to patch"); p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="spec field override; JSON values accepted; repeatable"); p.set_defaults(func=cmd_tasks_update)
+    p = tasks_sub.add_parser("replace", help="create a replacement attempt and rewire blocked downstream deps"); p.add_argument("task", help="task id to replace"); p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="replacement spec override; JSON values accepted; repeatable"); p.add_argument("--cancel-old", action="store_true", help="cancel/stop the superseded task attempt"); p.set_defaults(func=cmd_tasks_replace)
     p = tasks_sub.add_parser("logs", help="print recent log_buffer lines for a task"); p.add_argument("task", help="task id"); p.add_argument("--tail", type=int, default=80, help="number of log lines to print (default 80)"); p.set_defaults(func=cmd_tasks_logs)
     p = tasks_sub.add_parser("metrics", help="print task metrics and metrics_buffer"); p.add_argument("task", help="task id"); p.set_defaults(func=cmd_tasks_metrics)
     p = tasks_sub.add_parser("lost", help="find terminal pretrain tasks without active/completed resume successors"); p.add_argument("--kind", default="nethack-pretrain", help="intent filter (default nethack-pretrain; use all for everything)"); p.add_argument("--limit", type=int, default=500, help="tasks to inspect per status group (default 500)"); p.set_defaults(func=cmd_tasks_lost)

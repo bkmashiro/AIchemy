@@ -795,6 +795,38 @@ def test_tasks_resubmit_clone_preserves_run_dir_and_targets_tags(monkeypatch):
     assert body["idempotency_key"].startswith("resubmit:task-1:")
 
 
+def test_tasks_replace_posts_surgical_replace_payload(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "tasks", "replace", "task-1",
+            "--set", "raw_args=--config new.yaml",
+            "--set", 'env={"PYTHONPATH":"/repo"}',
+            "--cancel-old",
+        ],
+        [{"task": {"id": "task-2", "status": "pending"}, "rewired_downstream": ["eval-1"]}],
+    )
+
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1/replace"
+    assert calls[0]["body"] == {
+        "overrides": {"raw_args": "--config new.yaml", "env": {"PYTHONPATH": "/repo"}},
+        "cancel_old": True,
+    }
+
+
+def test_tasks_update_patches_spec_payload(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        ["tasks", "update", "task-1", "--set", "raw_args=--eval", "--set", 'target_tags=["a30","slurm"]'],
+        [{"id": "task-1", "status": "blocked", "raw_args": "--eval"}],
+    )
+
+    assert calls[0]["method"] == "PATCH"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1"
+    assert calls[0]["body"] == {"raw_args": "--eval", "target_tags": ["a30", "slurm"]}
+
+
 def test_tasks_wait_completed_returns_zero(monkeypatch, capsys):
     code, calls = run_cli_with_exit(
         monkeypatch,

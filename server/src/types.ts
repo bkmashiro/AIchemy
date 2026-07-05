@@ -188,6 +188,9 @@ export interface Task {
   max_retries: number;
   retry_of?: string;
   auto_retry_on?: number[];       // Exit codes that trigger automatic retry (e.g. [-9, -15])
+  attempt?: number;               // Surgical replacement attempt number for this logical task ref
+  replaces_task_id?: string;      // Previous attempt replaced by this task
+  replaced_by_task_id?: string;   // Newer canonical attempt that supersedes this task
 
   // === Death classification (B1) ===
   death_cause?: string;           // 'success' | 'code_error' | 'oom' | 'walltime' | 'preempt' | 'lost'
