@@ -1214,6 +1214,38 @@ describe("Task surgical update/replace", () => {
     expect(store.getExperiment("exp-replace")?.task_refs?.train).toBe(replacement.id);
   });
 
+  it("creates replacement as pending when all of its dependencies are already completed", async () => {
+    const webNs = makeWebNamespace();
+    const app = makeApp(undefined, webNs);
+    const collector = makeTask({
+      id: "collector-done",
+      status: "completed",
+      ref: "collector",
+      script: "/tmp/collect.py",
+      exports: { replay: "/runs/replay.npz" },
+    });
+    const train = makeTask({
+      id: "train-with-done-dep",
+      status: "running",
+      ref: "train",
+      script: "/tmp/train.py",
+      depends_on: [collector.id],
+    });
+    const stub = makeStub({ id: "stub-running", tasks: [train] });
+    train.stub_id = stub.id;
+    store.setArchive([collector]);
+    store.setStub(stub);
+
+    const res = await request(app)
+      .post(`/tasks/${train.id}/replace`)
+      .send({ cancel_old: true });
+
+    expect(res.status).toBe(201);
+    expect(res.body.task.depends_on).toEqual([collector.id]);
+    expect(res.body.task.status).toBe("pending");
+    expect(store.findTask(res.body.task.id)?.task.status).toBe("pending");
+  });
+
   it("updates a blocked task spec in place without changing dependency identity", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);

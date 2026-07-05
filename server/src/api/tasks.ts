@@ -224,6 +224,11 @@ function reassembleTaskSpec(task: Task): Partial<Task> {
   return { command, display_name };
 }
 
+function dependenciesAreCompleted(dependsOn?: string[]): boolean {
+  if (!dependsOn || dependsOn.length === 0) return true;
+  return dependsOn.every((depId) => store.findTask(depId)?.task.status === "completed");
+}
+
 function createReplacementTask(task: Task, overrides: Partial<Task>): Task {
   const merged: Task = { ...task, ...overrides };
   const replacement = createTask({
@@ -256,6 +261,7 @@ function createReplacementTask(task: Task, overrides: Partial<Task>): Task {
     auto_retry_on: merged.auto_retry_on,
   });
   replacement.retry_count = task.retry_count;
+  replacement.status = dependenciesAreCompleted(replacement.depends_on) ? "pending" : "blocked";
   replacement.replaces_task_id = task.id;
   replacement.attempt = (task.attempt ?? 1) + 1;
   return replacement;
