@@ -32,8 +32,8 @@ vi.mock("../socket/stub", () => ({
   initiateKillChain: vi.fn(),
 }));
 
-// After imports, we'll make initiateKillChain actually set should_stop on the task
-// (the real implementation does store.updateTask(stubId, taskId, { should_stop: true }))
+// In tests that exercise destructive kill paths, make initiateKillChain mirror the
+// real side effect: cooperative should_stop plus internal kill_requested.
 
 vi.mock("../task-actions", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../task-actions")>();
@@ -57,6 +57,7 @@ import { assembleCommand, generateDisplayName, createTask, createGlobalTasksRout
 import { writeLockTable, idempotencyCache } from "../dedup";
 import { initiateKillChain } from "../socket/stub";
 import { cancelTask, cancelGlobalTask, pauseTask, resumeTask } from "../task-actions";
+import { reliableEmitToStub } from "../reliable";
 import { Task, Stub } from "../types";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -92,6 +93,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     max_retries: 0,
     should_stop: false,
     should_checkpoint: false,
+    kill_requested: false,
     ...overrides,
   };
 }
@@ -860,6 +862,25 @@ describe("PATCH /tasks/:id", () => {
     expect(res.body.error).toMatch(/unsupported status transition/i);
   });
 
+  it("sets should_stop as a cooperative SDK signal without starting the kill chain", async () => {
+    const webNs = makeWebNamespace();
+    const app = makeApp(undefined, webNs);
+    const task = makeTask({ status: "running" });
+    const stub = makeStub({ tasks: [task] });
+    store.setStub(stub);
+
+    const res = await request(app).patch(`/tasks/${task.id}`).send({ should_stop: true });
+
+    expect(res.status).toBe(200);
+    expect(res.body.should_stop).toBe(true);
+    expect(initiateKillChain).not.toHaveBeenCalled();
+    expect(reliableEmitToStub).toHaveBeenCalledWith(stub.id, "task.signal", {
+      task_id: task.id,
+      signal: "should_stop",
+    });
+    expect(store.getTask(stub.id, task.id)?.status).toBe("running");
+  });
+
   it("kill via PATCH calls cancelGlobalTask for pending task with no stub", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
@@ -879,9 +900,9 @@ describe("PATCH /tasks/:id", () => {
     const stub = makeStub({ tasks: [task] });
     store.setStub(stub);
 
-    // Make mock actually set should_stop (as the real initiateKillChain does)
+    // Make mock actually set destructive kill state (as the real initiateKillChain does)
     vi.mocked(initiateKillChain).mockImplementationOnce((stubId, taskId) => {
-      store.updateTask(stubId, taskId, { should_stop: true });
+      store.updateTask(stubId, taskId, { should_stop: true, kill_requested: true });
     });
 
     const res = await request(app)
@@ -903,7 +924,7 @@ describe("PATCH /tasks/:id", () => {
     store.setStub(stub);
 
     vi.mocked(initiateKillChain).mockImplementationOnce((stubId, taskId) => {
-      store.updateTask(stubId, taskId, { should_stop: true });
+      store.updateTask(stubId, taskId, { should_stop: true, kill_requested: true });
     });
 
     const res = await request(app)
@@ -948,10 +969,10 @@ describe("PATCH /tasks/:id", () => {
   });
 });
 
-// ─── P0-2: Fingerprint dedup bypasses should_stop=true ──────────────────────
+// ─── P0-2: Fingerprint dedup bypasses kill_requested=true ─────────────────────
 
-describe("P0-2: findActiveByFingerprint skips should_stop=true tasks", () => {
-  it("allows resubmit after kill (should_stop=true) bypasses fingerprint dedup", async () => {
+describe("P0-2: findActiveByFingerprint skips kill_requested=true tasks", () => {
+  it("allows resubmit after destructive kill request bypasses fingerprint dedup", async () => {
     const app = makeApp();
     const body = { script: "/tmp/train.py", args: { "--seed": "42" } };
 
@@ -959,35 +980,37 @@ describe("P0-2: findActiveByFingerprint skips should_stop=true tasks", () => {
     const first = await request(app).post("/tasks").send(body);
     expect(first.status).toBe(201);
 
-    // Mark it as should_stop (simulating a kill in progress)
+    // Mark it as kill_requested (simulating a destructive kill in progress)
     const taskId = first.body.id;
-    store.updateGlobalQueueTask(taskId, { should_stop: true });
+    store.updateGlobalQueueTask(taskId, { kill_requested: true });
 
-    // Second submit with same fingerprint should succeed because first has should_stop=true
+    // Second submit with same fingerprint should succeed because first is being killed
     const second = await request(app).post("/tasks").send(body);
     expect(second.status).toBe(201);
     expect(second.body.id).not.toBe(taskId);
   });
 
-  it("still rejects duplicate when should_stop=false", async () => {
+  it("still rejects duplicate when should_stop=true but kill_requested=false", async () => {
     const app = makeApp();
     const body = { script: "/tmp/train.py", args: { "--seed": "99" } };
 
-    await request(app).post("/tasks").send(body);
+    const first = await request(app).post("/tasks").send(body);
+    store.updateGlobalQueueTask(first.body.id, { should_stop: true, kill_requested: false });
+
     const second = await request(app).post("/tasks").send(body);
     expect(second.status).toBe(409);
   });
 
-  it("store.findActiveByFingerprint returns undefined for should_stop task", () => {
-    const task = makeTask({ should_stop: true, fingerprint: "fp-stop-test" });
+  it("store.findActiveByFingerprint returns undefined for kill_requested task", () => {
+    const task = makeTask({ kill_requested: true, fingerprint: "fp-stop-test" });
     store.addToGlobalQueue(task);
 
     const result = store.findActiveByFingerprint("fp-stop-test");
     expect(result).toBeUndefined();
   });
 
-  it("store.findActiveByFingerprint returns task_id for active task", () => {
-    const task = makeTask({ should_stop: false, fingerprint: "fp-active-test" });
+  it("store.findActiveByFingerprint returns task_id for cooperative should_stop task", () => {
+    const task = makeTask({ should_stop: true, kill_requested: false, fingerprint: "fp-active-test" });
     store.addToGlobalQueue(task);
 
     const result = store.findActiveByFingerprint("fp-active-test");

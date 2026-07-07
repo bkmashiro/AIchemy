@@ -1301,7 +1301,7 @@ class Store {
       this.fingerprintIndex.delete(fingerprint);
       return undefined;
     }
-    if (found.task.should_stop) return undefined;
+    if (found.task.kill_requested) return undefined;
     if (found.task.stub_offline) return undefined;
     return taskId;
   }

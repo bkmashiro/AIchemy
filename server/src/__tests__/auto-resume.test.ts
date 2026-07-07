@@ -186,9 +186,9 @@ describe("auto-resume decision logic", () => {
       expect(isResumable).toBe(true);
     });
 
-    it("killed task should not auto-resume", () => {
-      const task = makeTask({ should_stop: true });
-      const isKilled = task.should_stop && true; // exit_code !== 0
+    it("destructive kill request should not auto-resume", () => {
+      const task = makeTask({ should_stop: true, kill_requested: true });
+      const isKilled = Boolean(task.kill_requested) && true; // exit_code !== 0
       expect(isKilled).toBe(true);
     });
   });

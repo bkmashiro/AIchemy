@@ -795,18 +795,24 @@ describe("reset", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// P0-2: findActiveByFingerprint — should_stop exclusion
+// P0-2: findActiveByFingerprint — kill_requested exclusion
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("findActiveByFingerprint — P0-2: should_stop exclusion", () => {
+describe("findActiveByFingerprint — P0-2: kill_requested exclusion", () => {
   it("returns task_id for normal active task", () => {
-    const task = makeTask({ fingerprint: "fp-normal", should_stop: false });
+    const task = makeTask({ fingerprint: "fp-normal", should_stop: false, kill_requested: false });
     store.addToGlobalQueue(task);
     expect(store.findActiveByFingerprint("fp-normal")).toBe(task.id);
   });
 
-  it("returns undefined for task with should_stop=true", () => {
-    const task = makeTask({ fingerprint: "fp-killing", should_stop: true });
+  it("returns task_id for cooperative should_stop=true without kill_requested", () => {
+    const task = makeTask({ fingerprint: "fp-cooperative-stop", should_stop: true, kill_requested: false });
+    store.addToGlobalQueue(task);
+    expect(store.findActiveByFingerprint("fp-cooperative-stop")).toBe(task.id);
+  });
+
+  it("returns undefined for task with kill_requested=true", () => {
+    const task = makeTask({ fingerprint: "fp-killing", should_stop: true, kill_requested: true });
     store.addToGlobalQueue(task);
     expect(store.findActiveByFingerprint("fp-killing")).toBeUndefined();
   });
@@ -825,8 +831,8 @@ describe("findActiveByFingerprint — P0-2: should_stop exclusion", () => {
     expect(store.findActiveByFingerprint("fp-terminal")).toBeUndefined();
   });
 
-  it("returns undefined for stub task with should_stop=true", () => {
-    const task = makeTask({ fingerprint: "fp-stub-kill", status: "running", should_stop: true });
+  it("returns undefined for stub task with kill_requested=true", () => {
+    const task = makeTask({ fingerprint: "fp-stub-kill", status: "running", should_stop: true, kill_requested: true });
     const stub = makeStub({ tasks: [task] });
     task.stub_id = stub.id;
     store.setStub(stub);

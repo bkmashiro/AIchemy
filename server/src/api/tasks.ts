@@ -150,6 +150,7 @@ export function createTask(input: TaskInput): Task {
     auto_retry_on: input.auto_retry_on,
     should_stop: false,
     should_checkpoint: false,
+    kill_requested: false,
     run_dir: input.run_dir,
     python_env: input.python_env,
     submitted_by: input.submitted_by,
@@ -903,8 +904,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     if (should_stop !== undefined) {
       update.should_stop = should_stop;
       if (should_stop && stubId && (task.status === "running" || task.status === "assigned")) {
-        // Initiate kill chain
-        initiateKillChain(stubId, task.id);
+        reliableEmitToStub(stubId, "task.signal", { task_id: task.id, signal: "should_stop" });
       }
     }
     if (should_checkpoint !== undefined) {

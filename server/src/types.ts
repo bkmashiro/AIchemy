@@ -197,8 +197,11 @@ export interface Task {
   has_checkpoint?: boolean;
 
   // === Server Signals ===
+  // should_stop is a cooperative SDK signal. It must not imply process kill.
   should_stop: boolean;
   should_checkpoint: boolean;
+  // kill_requested is server-internal intent for destructive task.kill chains.
+  kill_requested?: boolean;
 
   // === Disconnect tracking (not a status change) ===
   disconnected_at?: string;   // ISO timestamp: when stub went offline (task stays "running")

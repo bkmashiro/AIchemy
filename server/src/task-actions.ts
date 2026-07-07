@@ -156,6 +156,7 @@ export function createRetryTask(task: Task, opts?: RetryTaskOpts): Task {
     progress: undefined,
     should_stop: false,
     should_checkpoint: false,
+    kill_requested: false,
     disconnected_at: undefined,
     stub_offline: undefined,
     requirements: opts?.requirements ?? task.requirements,

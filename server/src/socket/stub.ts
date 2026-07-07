@@ -128,7 +128,7 @@ function failDisconnectedTasks(stub: Stub, webNs: Namespace): void {
   const tasksSnapshot = [...stub.tasks];
   for (const task of tasksSnapshot) {
     if (["running", "paused"].includes(task.status) && task.stub_offline) {
-      if (task.should_stop) {
+      if (task.kill_requested) {
         // Task was being killed — mark as cancelled
         const updated = cancelTask(stub.id, task.id, undefined);
         if (updated) {
@@ -226,7 +226,9 @@ export function initiateKillChain(
 
   // Tell the stub to SIGTERM the task (stub's kill_graceful handles grace + SIGKILL).
   // grace_period_s passed to stub = full grace period before SIGKILL.
-  store.updateTask(stubId, taskId, { should_stop: true });
+  // should_stop remains the cooperative SDK signal; kill_requested is the
+  // destructive server intent used for reconnect/failure classification.
+  store.updateTask(stubId, taskId, { should_stop: true, kill_requested: true });
   reliableEmitToStub(stubId, "task.kill", { task_id: taskId, grace_period_s: gracePeriodS });
 
   // Safety net: if task hasn't transitioned after 2× grace period, send another kill
@@ -875,7 +877,7 @@ function handleResume(
           if (cleared) webNs.emit("task.update", cleared);
         }
         // Re-send kill if task was being killed when stub disconnected
-        if (task.should_stop && reportedRunning.has(task.id)) {
+        if (task.kill_requested && reportedRunning.has(task.id)) {
           killTasks.push(task.id);
         }
       }
@@ -1082,7 +1084,7 @@ function handleTaskFailed(stubId: string, payload: TaskFailedPayload, webNs: Nam
 
   const deathCause = payload.death_cause || (payload.exit_code === 137 ? "oom" : undefined);
   const hasCheckpoint = payload.has_checkpoint ?? false;
-  const isKilled = task.should_stop && payload.exit_code !== 0;
+  const isKilled = Boolean(task.kill_requested) && payload.exit_code !== 0;
 
   // auto_retry_on: exit code based retry (user-configured, no checkpoint required)
   if (
@@ -1287,6 +1289,7 @@ function createAutoEvalTask(parentTask: Task, stubId: string, webNs: Namespace):
     max_retries: 0,
     should_stop: false,
     should_checkpoint: false,
+    kill_requested: false,
   };
   store.addToGlobalQueue(evalTask);
   webNs.emit("task.update", evalTask);

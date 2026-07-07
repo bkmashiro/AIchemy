@@ -150,6 +150,7 @@ export interface Task {
   // Server signals
   should_stop: boolean;
   should_checkpoint: boolean;
+  kill_requested?: boolean;
 
   // Dispatch tracking
   dispatch_attempts?: number;
