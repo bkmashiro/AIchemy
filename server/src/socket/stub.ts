@@ -34,7 +34,7 @@ import {
   notifyExperimentPassed, notifyExperimentPartial,
 } from "../discord";
 import { evaluateCriteria } from "../criteria";
-import { deriveExperimentStatus } from "../api/experiments";
+import { deriveExperimentStatus, reconcileExperimentStatusForGrid } from "../api/experiments";
 import { writeLockTable } from "../dedup";
 import { logger } from "../log";
 import { ALCHEMY_VERSION } from "../version";
@@ -181,6 +181,11 @@ function checkGridCompletion(gridId: string, webNs: Namespace): void {
   store.updateGridStatus(gridId);
   const updated = store.getGrid(gridId)!;
   webNs.emit("grid.update", updated);
+
+  const reconciled = reconcileExperimentStatusForGrid(gridId);
+  if (reconciled?.changed) {
+    webNs.emit("experiment.update", reconciled.experiment);
+  }
 
   if (updated.status === "completed" || updated.status === "partial" || updated.status === "failed") {
     const tasks = store.getGridTasks(gridId);

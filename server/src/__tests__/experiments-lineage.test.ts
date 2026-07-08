@@ -199,6 +199,88 @@ describe("experiment lineage API", () => {
     ]);
   });
 
+  it("returns a terminal status snapshot with result artifact aggregation", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "watcher-native-summary",
+        goal_metric: "score",
+        goal_direction: "max",
+        task_specs: [
+          {
+            ref: "eval_a",
+            script: "eval.py",
+            metric_schema: { score: "max" },
+            result_schema: { score: "number" },
+            outputs: ["runs/eval_a/results.json"],
+          },
+          {
+            ref: "eval_b",
+            script: "eval.py",
+            metric_schema: { score: "max" },
+            result_schema: { score: "number" },
+            outputs: ["runs/eval_b/results.json"],
+          },
+        ],
+      })
+      .expect(201);
+
+    const exp = store.getExperiment(created.body.id)!;
+    const checkedAt = new Date().toISOString();
+    const archived: any[] = [];
+    for (const task of store.getGridTasks(exp.grid_id)) {
+      const removed = store.removeFromGlobalQueue(task.id);
+      expect(removed).toBeDefined();
+      const score = task.ref === "eval_b" ? 0.9 : 0.2;
+      archived.push({
+        ...removed!,
+        status: "completed" as const,
+        finished_at: checkedAt,
+        exports: {
+          result_path: `/runs/${task.ref}/results.json`,
+          result: { score },
+          result_schema: { score: "number" },
+        },
+      });
+      exp.results[task.id] = {
+        passed: true,
+        checked_at: checkedAt,
+        details: { score: { value: score, threshold: "> 0", ok: true } },
+      };
+    }
+    exp.status = "running"; // stale persisted status; Alchemy should derive and sync terminal state.
+    store.setArchive([...store.getArchive(), ...archived]);
+    store.setExperiment(exp);
+
+    const res = await request(app).get(`/experiments/${created.body.id}/status-snapshot`).expect(200);
+
+    expect(res.body).toEqual(expect.objectContaining({
+      id: created.body.id,
+      name: "watcher-native-summary",
+      status: "passed",
+      stored_status: "running",
+      terminal: true,
+      total_tasks: 2,
+      terminal_count: 2,
+      active_count: 0,
+      task_counts: { completed: 2 },
+      validation: { total: 2, passed: 2, failed: 0, missing: 0 },
+    }));
+    expect(res.body.artifact_summary).toEqual(expect.objectContaining({
+      result_count: 2,
+      missing_result_refs: [],
+      declared_output_count: 2,
+    }));
+    expect(res.body.result_artifacts).toHaveLength(2);
+    expect(res.body.best_result_metrics.score).toEqual(expect.objectContaining({
+      value: 0.9,
+      direction: "max",
+      ref: "eval_b",
+    }));
+    expect(store.getExperiment(created.body.id)?.status).toBe("passed");
+  });
+
   it("appends series-scoped decisions and comments to family members", async () => {
     const app = makeApp();
     const one = await request(app)

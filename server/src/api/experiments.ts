@@ -4,6 +4,7 @@
  * POST   /experiments           — create experiment (creates grid internally)
  * GET    /experiments           — list all experiments
  * GET    /experiments/:id       — experiment detail + task validations
+ * GET    /experiments/:id/status-snapshot — compact terminal/artifact snapshot
  * DELETE /experiments/:id       — delete experiment (does NOT delete tasks)
  * POST   /experiments/:id/retry-failed — retry tasks that failed criteria
  * GET    /experiments/:id/research-bundle — read-only export composite payload
@@ -69,6 +70,30 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
     return completed > 0 && terminalFailed > 0 ? "partial" : "failed";
   }
   return "running";
+}
+
+export interface ReconciledExperimentStatus {
+  experiment: Experiment;
+  previous_status: Experiment["status"];
+  status: Experiment["status"];
+  changed: boolean;
+}
+
+export function reconcileExperimentStatus(exp: Experiment): ReconciledExperimentStatus {
+  const previousStatus = exp.status;
+  const status = deriveExperimentStatus(exp);
+  if (status !== previousStatus) {
+    const updated = { ...exp, status };
+    store.setExperiment(updated);
+    return { experiment: updated, previous_status: previousStatus, status, changed: true };
+  }
+  return { experiment: exp, previous_status: previousStatus, status, changed: false };
+}
+
+export function reconcileExperimentStatusForGrid(gridId: string): ReconciledExperimentStatus | undefined {
+  const exp = store.getExperimentByGridId(gridId);
+  if (!exp) return undefined;
+  return reconcileExperimentStatus(exp);
 }
 
 const DECISIONS = new Set<ExperimentDecision>(["keep", "try_more", "discard", "drop", "rerun", "fork"]);
@@ -674,6 +699,83 @@ interface BestResultMetricSummary {
   direction: "min" | "max" | "latest";
   task_id: string;
   ref: string | null;
+}
+
+interface ArtifactRollupSummary {
+  result_count: number;
+  declared_output_count: number;
+  missing_result_refs: string[];
+}
+
+interface ExperimentStatusSnapshot {
+  id: string;
+  name: string;
+  status: Experiment["status"];
+  stored_status: Experiment["status"];
+  terminal: boolean;
+  total_tasks: number;
+  terminal_count: number;
+  active_count: number;
+  task_counts: Record<string, number>;
+  validation: PassFailSummary & { missing: number };
+  artifact_summary: ArtifactRollupSummary;
+  result_artifacts: ResultArtifactSummary[];
+  best_result_metrics: Record<string, BestResultMetricSummary>;
+  primary_metric: PrimaryMetric | null;
+  generated_at: string;
+}
+
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+function taskDeclaresResult(task: Task): boolean {
+  return Object.keys(task.result_schema ?? {}).length > 0 || Object.keys(task.metric_schema ?? {}).length > 0;
+}
+
+function artifactRollupForExperiment(tasks: Task[], artifacts: ResultArtifactSummary[]): ArtifactRollupSummary {
+  const artifactTaskIds = new Set(artifacts.map((artifact) => artifact.task_id));
+  const missingResultRefs = tasks
+    .filter((task) => TERMINAL_TASK_STATUSES.has(task.status))
+    .filter((task) => taskDeclaresResult(task))
+    .filter((task) => !artifactTaskIds.has(task.id))
+    .map((task) => task.ref ?? task.id)
+    .sort();
+  const declaredOutputCount = tasks.reduce((sum, task) => sum + (task.outputs?.length ?? 0), 0);
+  return {
+    result_count: artifacts.length,
+    declared_output_count: declaredOutputCount,
+    missing_result_refs: missingResultRefs,
+  };
+}
+
+function statusSnapshotForExperiment(exp: Experiment): ExperimentStatusSnapshot {
+  const reconciled = reconcileExperimentStatus(exp);
+  const current = reconciled.experiment;
+  const grid = store.getGrid(current.grid_id);
+  const tasks = grid ? store.getGridTasks(current.grid_id) : [];
+  const taskCounts = taskCountsByStatus(current);
+  const terminalCount = tasks.filter((task) => TERMINAL_TASK_STATUSES.has(task.status)).length;
+  const validationBase = passFailSummary(current);
+  const artifacts = resultArtifactsForExperiment(current);
+  return {
+    id: current.id,
+    name: current.name,
+    status: reconciled.status,
+    stored_status: reconciled.previous_status,
+    terminal: tasks.length > 0 && terminalCount === tasks.length,
+    total_tasks: tasks.length,
+    terminal_count: terminalCount,
+    active_count: Math.max(0, tasks.length - terminalCount),
+    task_counts: taskCounts,
+    validation: {
+      ...validationBase,
+      missing: Math.max(0, tasks.length - validationBase.total),
+    },
+    artifact_summary: artifactRollupForExperiment(tasks, artifacts),
+    result_artifacts: artifacts,
+    best_result_metrics: bestResultMetricsForExperiment(current),
+    primary_metric: primaryMetricFor(current),
+    generated_at: new Date().toISOString(),
+  };
 }
 
 interface SeriesResultRow {
@@ -1913,6 +2015,14 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const grid = store.getGrid(exp.grid_id);
     const tasks = grid ? store.getGridTasks(exp.grid_id) : [];
     res.json({ ...exp, status: deriveExperimentStatus(exp), grid, tasks });
+  });
+
+  // GET /experiments/:id/status-snapshot — watcher-friendly terminal + artifact rollup.
+  // Registered before /:id so agents can poll one compact, canonical payload.
+  router.get("/:id/status-snapshot", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    res.json(statusSnapshotForExperiment(exp));
   });
 
   // GET /experiments/:id/summary — detailed summary including lineage
