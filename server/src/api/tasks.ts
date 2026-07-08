@@ -11,7 +11,7 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { store } from "../store";
-import { Task, TaskMark } from "../types";
+import { Task, TaskMark, SubmissionLintIssue } from "../types";
 import { Namespace } from "socket.io";
 import {
   computeFingerprint, writeLockTable, idempotencyCache,
@@ -23,6 +23,7 @@ import { cancelTask, cancelGlobalTask, pauseTask, resumeTask, createRetryTask } 
 import { reliableEmitToStub } from "../reliable";
 import { logger } from "../log";
 import { assembleCommand } from "../command";
+import { lintTaskSpecs } from "../submission-lint";
 export { assembleCommand, buildCommandArgv } from "../command";
 
 // ─── Display name generation ──────────────────────────────────────────────────
@@ -92,6 +93,7 @@ export interface TaskInput {
   param_point?: Record<string, any>;
   resolved_config?: Record<string, any>;
   auto_retry_on?: number[];
+  submission_warnings?: SubmissionLintIssue[];
 }
 
 export function createTask(input: TaskInput): Task {
@@ -164,6 +166,7 @@ export function createTask(input: TaskInput): Task {
     ref_template: input.ref_template,
     param_point: input.param_point,
     resolved_config: input.resolved_config,
+    submission_warnings: input.submission_warnings,
   };
 
   return task;
@@ -741,11 +744,17 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       }
     }
 
+    const submission_warnings = lintTaskSpecs([{
+      script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
+      requirements, priority, max_retries, run_dir, param_overrides, target_tags, target_stub_id,
+      python_env, submitted_by, depends_on, ref, args_template, experiment_id, outputs, metric_schema,
+    }]);
+
     const task = createTask({
       script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs, metric_schema, auto_retry_on,
-      stub_id, target_stub_id,
+      stub_id, target_stub_id, submission_warnings,
     });
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected

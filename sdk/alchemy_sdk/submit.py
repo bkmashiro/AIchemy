@@ -79,6 +79,7 @@ def submit_experiment(
         task_refs=data.get("task_refs", {}),
         already_exists=already_exists,
         url=dashboard_url,
+        submission_warnings=data.get("submission_warnings", []),
     )
 
 

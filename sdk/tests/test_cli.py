@@ -288,6 +288,21 @@ def test_clone_task_body_preserves_structured_argv():
     }
 
 
+def test_clone_task_body_preserves_target_stub_id():
+    body = cli.clone_task_body({
+        "script": "/workspace/train.py",
+        "target_stub_id": "stub-a",
+        "target_tags": ["a30"],
+        "run_dir": "/runs/source",
+    })
+
+    assert body == {
+        "script": "/workspace/train.py",
+        "target_stub_id": "stub-a",
+        "target_tags": ["a30"],
+    }
+
+
 def test_webhooks_add_posts_subscription(monkeypatch):
     calls = run_cli(
         monkeypatch,

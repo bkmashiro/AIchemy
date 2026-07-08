@@ -58,6 +58,79 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+describe("experiment submission preflight", () => {
+  it("preserves argv and target_stub_id from DAG task_specs", async () => {
+    const app = makeApp();
+    store.setStub({
+      id: "stub-a",
+      name: "stub-a",
+      hostname: "cluster-a",
+      gpu: { name: "A30", vram_total_mb: 24576, count: 1 },
+      status: "online",
+      type: "slurm",
+      connected_at: new Date().toISOString(),
+      last_heartbeat: new Date().toISOString(),
+      max_concurrent: 1,
+      tasks: [],
+    } as any);
+
+    const res = await request(app)
+      .post("/experiments")
+      .send({
+        name: "targeted-dag",
+        task_specs: [
+          {
+            ref: "smoke",
+            script: "/vol/bitbucket/ys25/conda-envs/jema/bin/python",
+            argv: ["scripts/run_synthetic.py", "--seed", "0"],
+            cwd: "/vol/bitbucket/ys25/jspace-workspace-regularization",
+            target_stub_id: "stub-a",
+          },
+        ],
+      })
+      .expect(201);
+
+    const task = store.findTask(res.body.task_refs.smoke)?.task;
+    expect(task).toBeDefined();
+    expect(task?.target_stub_id).toBe("stub-a");
+    expect(task?.command).toContain("scripts/run_synthetic.py");
+    expect(task?.command).toContain("--seed 0");
+  });
+
+  it("returns submission warnings for suspicious DAG task_specs", async () => {
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/experiments")
+      .send({
+        name: "linted-dag",
+        task_specs: [
+          {
+            ref: "seed0",
+            script: "/vol/bitbucket/ys25/jspace-workspace-regularization/scripts/run_synthetic.py",
+            raw_args: "--output results/synthetic_seed0.json",
+            priority: 5,
+          },
+          {
+            ref: "seed1",
+            script: "/vol/bitbucket/ys25/jspace-workspace-regularization/scripts/run_synthetic.py",
+            raw_args: "--output results/synthetic_seed0.json",
+            priority: 5,
+          },
+        ],
+      })
+      .expect(201);
+
+    const codes = res.body.submission_warnings.map((w: any) => w.code);
+    expect(codes).toContain("python_script_uses_default_python");
+    expect(codes).toContain("high_priority_unrouted");
+    expect(codes).toContain("duplicate_relative_output");
+
+    const task = store.findTask(res.body.task_refs.seed0)?.task;
+    expect(task?.submission_warnings?.map((w: any) => w.code) ?? []).toContain("python_script_uses_default_python");
+  });
+});
+
 describe("experiment lineage API", () => {
   it("aggregates an experiment series into useful result rows and best metrics", async () => {
     const app = makeApp();

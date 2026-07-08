@@ -14,7 +14,7 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { store } from "../store";
-import { Experiment, ExperimentDecision, ExperimentEvent, ExperimentEventKind, Grid, Task, TaskSpec } from "../types";
+import { Experiment, ExperimentDecision, ExperimentEvent, ExperimentEventKind, Grid, Task, TaskSpec, SubmissionLintIssue } from "../types";
 import { Namespace } from "socket.io";
 import { createTask } from "./tasks";
 import { triggerSchedule } from "../scheduler";
@@ -23,6 +23,7 @@ import { evaluateCriteria } from "../criteria";
 import { validateDag } from "../dag";
 import { logger } from "../log";
 import { initExperimentManifest, readExperimentManifest } from "../git-tracking";
+import { lintTaskSpecs } from "../submission-lint";
 
 // ─── Cartesian product (same as grids.ts) ────────────────────────────────────
 
@@ -943,6 +944,11 @@ function removeTaskFromGrid(taskId: string, gridId: string | undefined): Grid | 
   return updated;
 }
 
+function submissionWarningsForRef(warnings: SubmissionLintIssue[], ref: string): SubmissionLintIssue[] | undefined {
+  const matched = warnings.filter((warning) => warning.ref === ref || warning.refs?.includes(ref));
+  return matched.length > 0 ? matched : undefined;
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Router {
@@ -1198,6 +1204,13 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       const gridId = uuidv4();
       const refToTaskId: Record<string, string> = {};
       const taskIds: string[] = [];
+      const materializedTaskSpecs = (task_specs as TaskSpec[]).map((spec) => ({
+        ...spec,
+        cwd: spec.cwd ?? cwd,
+        python_env: spec.python_env ?? python_env,
+        target_tags: spec.target_tags ?? target_tags,
+      }));
+      const submissionWarnings = lintTaskSpecs(materializedTaskSpecs);
 
       // Resolve parent_id from parent_name (best-effort)
       let parentId: string | undefined = typeof parent_id === "string" && parent_id ? parent_id : undefined;
@@ -1221,6 +1234,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
 
         const task = createTask({
           script: spec.script,
+          argv: spec.argv,
           args: spec.args,
           raw_args: spec.raw_args,
           args_template: spec.args_template,
@@ -1235,6 +1249,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           env_overrides: spec.env_overrides,
           requirements: spec.requirements,
           target_tags: spec.target_tags ?? target_tags,
+          target_stub_id: spec.target_stub_id,
           max_retries: spec.max_retries ?? 0,
           priority: spec.priority,
           outputs: spec.outputs,
@@ -1242,6 +1257,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           result_schema: spec.result_schema,
           ref_template: spec.ref_template,
           param_point: spec.param_point,
+          submission_warnings: submissionWarningsForRef(submissionWarnings, spec.ref),
         });
 
         // Attach resolved_config from SDK (experiment config + task overrides)
@@ -1282,6 +1298,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         created_at: new Date().toISOString(),
         task_specs: task_specs as TaskSpec[],
         task_refs: refToTaskId,
+        submission_warnings: submissionWarnings,
         config: config || undefined,
         config_diff: config_diff || undefined,
         parent_name: parent_name || undefined,
@@ -1346,6 +1363,12 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     // Create grid internally
     const gridId = uuidv4();
     const combinations = cartesianProduct(matrix);
+    const legacyLintSpecs = combinations.map((combo, index) => {
+      const mergedArgs: Record<string, string> = { ...(base_args || {}) };
+      for (const [k, v] of Object.entries(combo)) mergedArgs[`--${k}`] = String(v);
+      return { ref: `matrix-${index + 1}`, script, args: mergedArgs, requirements, target_tags };
+    });
+    const submissionWarnings = lintTaskSpecs(legacyLintSpecs);
     const paramKeys = Object.keys(matrix);
     const paramSummary = paramKeys
       .map((k) => `${k}=[${(matrix as Record<string, any[]>)[k].join(",")}]`)
@@ -1371,7 +1394,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
 
     // Create tasks
     const taskIds: string[] = [];
-    for (const combo of combinations) {
+    for (const [index, combo] of combinations.entries()) {
+      const ref = `matrix-${index + 1}`;
       const mergedArgs: Record<string, string> = { ...(base_args || {}) };
       for (const [k, v] of Object.entries(combo)) {
         mergedArgs[`--${k}`] = String(v);
@@ -1385,6 +1409,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         grid_id: gridId,
         param_overrides: combo,
         target_tags,
+        submission_warnings: submissionWarningsForRef(submissionWarnings, ref),
       });
       store.addToGlobalQueue(task);
       webNs.emit("task.update", task);
@@ -1405,6 +1430,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       status: "running",
       results: {},
       created_at: new Date().toISOString(),
+      submission_warnings: submissionWarnings,
       family: family || undefined,
       hypothesis: hypothesis || undefined,
       expected_outcome: expected_outcome || undefined,

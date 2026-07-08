@@ -23,7 +23,7 @@ DANGEROUS_STATUSES = {"running", "assigned"}
 COMPARE_MAX_REFS = 6  # server caps `/experiments/compare?ids=...` at 6
 TASK_FIELDS = [
     "script", "argv", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
-    "requirements", "priority", "max_retries", "param_overrides", "target_tags",
+    "requirements", "priority", "max_retries", "param_overrides", "target_tags", "target_stub_id",
     "python_env", "submitted_by", "depends_on", "ref", "args_template", "experiment_id",
     "outputs", "auto_retry_on",
 ]
@@ -213,7 +213,7 @@ def _summarize_inbox_payload(payload: dict[str, Any]) -> None:
 
 
 def short_task(task: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "seq": task.get("seq"),
         "id": task.get("id"),
         "name": task.get("display_name") or task.get("name"),
@@ -224,10 +224,13 @@ def short_task(task: dict[str, Any]) -> dict[str, Any]:
         "pid": task.get("pid"),
         "run_dir": task.get("run_dir"),
     }
+    if task.get("submission_warnings"):
+        out["submission_warnings"] = task.get("submission_warnings")
+    return out
 
 
 def short_experiment(exp: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "id": exp.get("id"),
         "name": exp.get("name"),
         "status": exp.get("status"),
@@ -236,6 +239,9 @@ def short_experiment(exp: dict[str, Any]) -> dict[str, Any]:
         "parent_name": exp.get("parent_name"),
         "created_at": exp.get("created_at"),
     }
+    if exp.get("submission_warnings"):
+        out["submission_warnings"] = exp.get("submission_warnings")
+    return out
 
 
 def find_experiment(client: ApiClient, ref: str) -> dict[str, Any]:

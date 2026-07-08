@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from typing import Any, Mapping, Optional
 
+from .submission_lint import lint_task_specs
+
 
 @dataclass
 class TaskNode:
@@ -29,6 +31,7 @@ class ExperimentResult:
     task_refs: dict[str, str]
     already_exists: bool
     url: str
+    submission_warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -346,6 +349,7 @@ class Experiment:
         env_overrides: Optional[dict[str, str]] = None,
         requirements: Optional[dict] = None,
         target_tags: Optional[list[str]] = None,
+        target_stub_id: Optional[str] = None,
         max_retries: int = 0,
         priority: int = 5,
         outputs: Optional[list[str]] = None,
@@ -373,6 +377,7 @@ class Experiment:
         if env_overrides:      spec["env_overrides"] = env_overrides
         if requirements:       spec["requirements"] = requirements
         if target_tags:        spec["target_tags"] = target_tags
+        if target_stub_id:     spec["target_stub_id"] = target_stub_id
         if max_retries:        spec["max_retries"] = max_retries
         if priority != 5:      spec["priority"] = priority
         if outputs:            spec["outputs"] = outputs
@@ -430,6 +435,7 @@ class Experiment:
                 spec["resolved_config"] = resolved
             specs.append(spec)
         submit_spec = self.to_spec()
+        submit_spec["warnings"] = self._preflight_warnings({**submit_spec, "tasks": specs})
         self._validate_decision_policy({**submit_spec, "tasks": specs})
 
         result = submit_experiment(
@@ -495,6 +501,7 @@ class Experiment:
                                 "path": path,
                             }
                         )
+        warnings.extend(lint_task_specs(list(spec.get("tasks", []))))
         return warnings
 
     def status(self) -> "ExperimentStatus":

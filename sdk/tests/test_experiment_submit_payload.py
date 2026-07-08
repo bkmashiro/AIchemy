@@ -13,6 +13,13 @@ class _Response:
         return b'{"id":"exp-1","task_refs":{"train":"task-1"}}'
 
 
+class _WarningResponse:
+    status = 201
+
+    def read(self):
+        return b'{"id":"exp-1","task_refs":{"train":"task-1"},"submission_warnings":[{"code":"high_priority_unrouted"}]}'
+
+
 def test_submit_forwards_sdk_storage_and_metadata_spec(monkeypatch):
     captured = {}
 
@@ -98,6 +105,22 @@ def test_submit_experiment_http_payload_includes_sdk_storage(monkeypatch):
         }
     ]
 
+
+
+def test_submit_experiment_returns_submission_warnings(monkeypatch):
+    def fake_urlopen(req, timeout=30):
+        return _WarningResponse()
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+
+    result = submit_experiment(
+        server="http://alchemy",
+        name="payload",
+        description="",
+        task_specs=[{"ref": "train", "script": "train.py"}],
+    )
+
+    assert result.submission_warnings == [{"code": "high_priority_unrouted"}]
 
 def test_submit_experiment_uses_alchemy_token_for_authorization(monkeypatch):
     calls = []

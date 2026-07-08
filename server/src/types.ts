@@ -93,6 +93,18 @@ export interface TaskMark {
   updated_at: string;
 }
 
+export interface SubmissionLintIssue {
+  code: string;
+  severity: "warning" | "error";
+  message: string;
+  ref?: string;
+  field?: string;
+  script?: string;
+  priority?: number;
+  path?: string;
+  refs?: string[];
+}
+
 export interface Task {
   // === Identity ===
   id: string;
@@ -177,6 +189,7 @@ export interface Task {
 
   // === Submission ===
   submitted_by?: string;
+  submission_warnings?: SubmissionLintIssue[];
 
   // === Error ===
   error_message?: string;
@@ -288,6 +301,7 @@ export interface Grid {
 export interface TaskSpec {
   ref: string;
   script: string;
+  argv?: string[];
   raw_args?: string;
   args?: Record<string, string> | string;
   args_template?: Record<string, string>;
@@ -299,6 +313,7 @@ export interface TaskSpec {
   env_overrides?: Record<string, string>;
   requirements?: Task["requirements"];
   target_tags?: string[];
+  target_stub_id?: string;
   max_retries?: number;
   priority?: number;
   outputs?: string[];     // Declared output file paths for artifact rollback
@@ -364,6 +379,7 @@ export interface Experiment {
   created_at: string;
   task_specs?: TaskSpec[];                  // Original DAG spec
   task_refs?: Record<string, string>;      // ref name → task_id mapping
+  submission_warnings?: SubmissionLintIssue[];
   // Config + Lineage
   config?: Record<string, any>;                           // Full config snapshot
   config_diff?: Record<string, { old: any; new: any }>;   // Diff against parent

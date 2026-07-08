@@ -238,3 +238,50 @@ def test_task_metric_schema_is_defensively_copied():
     spec["tasks"][0]["metric_schema"]["loss"] = "max"
 
     assert exp.to_spec()["tasks"][0]["metric_schema"] == {"loss": "min"}
+
+
+def test_task_target_stub_id_appears_in_spec():
+    exp = Experiment("targeted")
+    exp.task("train", script="/vol/bitbucket/ys25/conda-envs/jema/bin/python", target_stub_id="stub-a")
+
+    assert exp.to_spec()["tasks"][0]["target_stub_id"] == "stub-a"
+
+
+def test_dry_run_warns_when_cluster_py_script_would_use_default_python():
+    exp = Experiment("plain-python")
+    exp.task(
+        "train",
+        script="/vol/bitbucket/ys25/jspace-workspace-regularization/scripts/run_synthetic.py",
+    )
+
+    warnings = exp.dry_run()["warnings"]
+
+    assert any(w["code"] == "python_script_uses_default_python" for w in warnings)
+    warning = next(w for w in warnings if w["code"] == "python_script_uses_default_python")
+    assert warning["ref"] == "train"
+    assert "plain `python`" in warning["message"]
+
+
+def test_dry_run_warns_explicit_high_priority_without_routing():
+    exp = Experiment("priority")
+    exp.task("train", script="/bin/bash", raw_args="-lc true", priority=6)
+
+    warnings = exp.dry_run()["warnings"]
+
+    assert any(w["code"] == "high_priority_unrouted" for w in warnings)
+    warning = next(w for w in warnings if w["code"] == "high_priority_unrouted")
+    assert warning["ref"] == "train"
+    assert "priority sorts descending" in warning["message"]
+
+
+def test_dry_run_warns_duplicate_relative_output_args():
+    exp = Experiment("output-collision")
+    exp.task("seed0", script="/bin/python", raw_args="train.py --output results/synthetic_seed0.json")
+    exp.task("seed1", script="/bin/python", raw_args="train.py --output results/synthetic_seed0.json")
+
+    warnings = exp.dry_run()["warnings"]
+
+    assert any(w["code"] == "duplicate_relative_output" for w in warnings)
+    warning = next(w for w in warnings if w["code"] == "duplicate_relative_output")
+    assert warning["path"] == "results/synthetic_seed0.json"
+    assert warning["refs"] == ["seed0", "seed1"]

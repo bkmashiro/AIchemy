@@ -446,6 +446,22 @@ describe("POST /tasks", () => {
     expect(res.body.priority).toBe(9);
   });
 
+  it("attaches submission warnings for risky standalone submissions", async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post("/tasks")
+      .send({
+        script: "/vol/bitbucket/ys25/jspace-workspace-regularization/scripts/run_synthetic.py",
+        raw_args: "--output results/synthetic_seed0.json",
+        priority: 5,
+      });
+
+    expect(res.status).toBe(201);
+    const codes = res.body.submission_warnings.map((w: any) => w.code);
+    expect(codes).toContain("python_script_uses_default_python");
+    expect(codes).toContain("high_priority_unrouted");
+  });
+
   it("BUG: script as non-string truthy value passes validation", async () => {
     const app = makeApp();
     // JSON sends object — passes !script check since {} is truthy
