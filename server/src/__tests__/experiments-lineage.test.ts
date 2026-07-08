@@ -129,6 +129,28 @@ describe("experiment submission preflight", () => {
     const task = store.findTask(res.body.task_refs.seed0)?.task;
     expect(task?.submission_warnings?.map((w: any) => w.code) ?? []).toContain("python_script_uses_default_python");
   });
+
+  it("does not warn when one task declares the same output it passes to argv", async () => {
+    const app = makeApp();
+
+    const res = await request(app)
+      .post("/experiments")
+      .send({
+        name: "declared-output-dag",
+        task_specs: [
+          {
+            ref: "eval",
+            script: "/bin/python",
+            raw_args: "eval.py --output results/eval.json",
+            outputs: ["results/eval.json"],
+          },
+        ],
+      })
+      .expect(201);
+
+    const codes = (res.body.submission_warnings ?? []).map((w: any) => w.code);
+    expect(codes).not.toContain("duplicate_relative_output");
+  });
 });
 
 describe("experiment lineage API", () => {

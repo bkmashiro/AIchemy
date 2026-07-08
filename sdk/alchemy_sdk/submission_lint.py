@@ -39,7 +39,7 @@ def lint_task_specs(task_specs: list[Mapping[str, Any]]) -> list[dict[str, Any]]
     for index, spec in enumerate(task_specs):
         ref = str(spec.get("ref") or spec.get("name") or f"task-{index + 1}")
         warnings.extend(_lint_single_task(spec, ref))
-        for output in _extract_output_paths(spec):
+        for output in set(_extract_output_paths(spec)):
             if _is_collision_prone_relative_path(output):
                 output_refs[output].append(ref)
 

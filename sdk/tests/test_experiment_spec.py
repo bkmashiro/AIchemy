@@ -285,3 +285,17 @@ def test_dry_run_warns_duplicate_relative_output_args():
     warning = next(w for w in warnings if w["code"] == "duplicate_relative_output")
     assert warning["path"] == "results/synthetic_seed0.json"
     assert warning["refs"] == ["seed0", "seed1"]
+
+
+def test_dry_run_allows_task_output_also_present_in_raw_args():
+    exp = Experiment("declared-output")
+    exp.task(
+        "eval",
+        script="/bin/python",
+        raw_args="eval.py --output results/eval.json",
+        outputs=["results/eval.json"],
+    )
+
+    warnings = exp.dry_run()["warnings"]
+
+    assert not any(w["code"] == "duplicate_relative_output" for w in warnings)

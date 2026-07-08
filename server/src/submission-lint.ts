@@ -45,7 +45,7 @@ export function lintTaskSpecs(specs: TaskLike[]): SubmissionLintIssue[] {
   specs.forEach((spec, index) => {
     const ref = String(spec.ref || spec.name || `task-${index + 1}`);
     warnings.push(...lintSingleTask(spec, ref));
-    for (const output of extractOutputPaths(spec)) {
+    for (const output of new Set(extractOutputPaths(spec))) {
       if (!isCollisionProneRelativePath(output)) continue;
       const refs = outputs.get(output) ?? [];
       refs.push(ref);
