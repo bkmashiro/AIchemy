@@ -4,9 +4,14 @@
  * singleton state — so they can be unit-tested without spinning up a server.
  */
 
-import fs from "fs";
 import fsp from "fs/promises";
 import path from "path";
+import { promisify } from "util";
+import { gzip, gunzip } from "zlib";
+
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
+const BACKUP_FILE_RE = /^state_(\d+)\.json(?:\.gz)?$/;
 
 export interface BackupMeta {
   filename: string;
@@ -14,10 +19,42 @@ export interface BackupMeta {
   size_bytes: number;
 }
 
-/** Parse the timestamp embedded in a backup filename (state_<ts>.json). */
+/** Parse the timestamp embedded in a backup filename (state_<ts>.json[.gz]). */
 function parseTimestamp(filename: string): number {
-  const m = filename.match(/^state_(\d+)\.json$/);
+  const m = filename.match(BACKUP_FILE_RE);
   return m ? parseInt(m[1], 10) : 0;
+}
+
+function isBackupFilename(filename: string): boolean {
+  return BACKUP_FILE_RE.test(filename);
+}
+
+async function readBackupFile(fullPath: string, filename: string): Promise<string> {
+  const raw = await fsp.readFile(fullPath);
+  if (filename.endsWith(".gz")) {
+    return (await gunzipAsync(raw)).toString("utf-8");
+  }
+  return raw.toString("utf-8");
+}
+
+async function writeCompressedJson(fullPath: string, state: unknown): Promise<void> {
+  const raw = Buffer.from(JSON.stringify(state, null, 2), "utf-8");
+  await fsp.writeFile(fullPath, await gzipAsync(raw));
+}
+
+/**
+ * Write a compressed JSON snapshot into the backups directory.
+ * Returns the backup filename (not full path).
+ */
+export async function writeStateBackup(backupsDir: string, state: unknown): Promise<string> {
+  await fsp.mkdir(backupsDir, { recursive: true });
+
+  const timestamp = Date.now();
+  const filename = `state_${timestamp}.json.gz`;
+  const dest = path.join(backupsDir, filename);
+
+  await writeCompressedJson(dest, state);
+  return filename;
 }
 
 /**
@@ -28,10 +65,11 @@ export async function backupState(stateFile: string, backupsDir: string): Promis
   await fsp.mkdir(backupsDir, { recursive: true });
 
   const timestamp = Date.now();
-  const filename = `state_${timestamp}.json`;
+  const filename = `state_${timestamp}.json.gz`;
   const dest = path.join(backupsDir, filename);
 
-  await fsp.copyFile(stateFile, dest);
+  const raw = await fsp.readFile(stateFile);
+  await fsp.writeFile(dest, await gzipAsync(raw));
   return filename;
 }
 
@@ -41,7 +79,7 @@ export async function backupState(stateFile: string, backupsDir: string): Promis
 export async function listBackups(backupsDir: string): Promise<BackupMeta[]> {
   try {
     const files = await fsp.readdir(backupsDir);
-    const backupFiles = files.filter((f) => /^state_\d+\.json$/.test(f));
+    const backupFiles = files.filter(isBackupFilename);
 
     const metas: BackupMeta[] = await Promise.all(
       backupFiles.map(async (f) => {
@@ -69,11 +107,11 @@ export async function listBackups(backupsDir: string): Promise<BackupMeta[]> {
  */
 export async function restoreFromBackup(backupsDir: string, filename: string): Promise<any> {
   // Validate filename to prevent path traversal
-  if (!filename || !/^state_\d+\.json$/.test(filename)) {
+  if (!filename || !isBackupFilename(filename)) {
     throw new Error(`Invalid backup filename: ${filename}`);
   }
   const fullPath = path.join(backupsDir, filename);
-  const raw = await fsp.readFile(fullPath, "utf-8");
+  const raw = await readBackupFile(fullPath, filename);
   return JSON.parse(raw);
 }
 

@@ -9,7 +9,6 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import path from "path";
-import fsp from "fs/promises";
 import { v4 as uuidv4 } from "uuid";
 
 import { store } from "./store";
@@ -26,8 +25,8 @@ import { createClusterRouter } from "./api/cluster";
 import { createWebhooksRouter } from "./api/webhooks";
 import { startScheduler, triggerSchedule } from "./scheduler";
 import { Token } from "./types";
-import { listBackups, restoreFromBackup, pruneBackups } from "./store/backup";
-import { BACKUPS_DIR } from "./store";
+import { listBackups, restoreFromBackup, pruneBackups, writeStateBackup } from "./store/backup";
+import { BACKUPS_DIR, BACKUP_KEEP_COUNT } from "./store";
 import { logger } from "./log";
 import { startAutoRenew } from "./autorenew";
 import { loadDeployConfig } from "./deploy";
@@ -148,11 +147,8 @@ api.delete("/tokens/:name", (req, res) => {
 // Backup/restore
 api.post("/admin/backup", async (_req, res) => {
   try {
-    await fsp.mkdir(BACKUPS_DIR, { recursive: true });
-    const timestamp = Date.now();
-    const filename = `state_${timestamp}.json`;
-    await fsp.writeFile(path.join(BACKUPS_DIR, filename), JSON.stringify(store.exportState(), null, 2));
-    await pruneBackups(BACKUPS_DIR, 48);
+    const filename = await writeStateBackup(BACKUPS_DIR, store.exportState());
+    await pruneBackups(BACKUPS_DIR, BACKUP_KEEP_COUNT);
     res.json({ ok: true, filename });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

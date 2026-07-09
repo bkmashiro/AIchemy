@@ -8,8 +8,6 @@
  * Tables: stubs, tokens, tasks, grids, experiments, meta
  */
 
-import fs from "fs";
-import fsp from "fs/promises";
 import path from "path";
 import Database from "better-sqlite3";
 import { randomUUID } from "crypto";
@@ -34,7 +32,7 @@ import {
 } from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
-import { backupState, pruneBackups } from "./backup";
+import { pruneBackups, writeStateBackup } from "./backup";
 import { logger } from "../log";
 import { canTransition } from "../state-machine";
 
@@ -43,7 +41,7 @@ const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, "state.json");
 const DB_FILE = process.env.DB_FILE || path.join(path.dirname(STATE_FILE), "state.db");
 const BACKUP_INTERVAL = 30 * 60_000;
 const WAL_CHECKPOINT_INTERVAL = 30_000;
-const BACKUP_KEEP_COUNT = 48;
+export const BACKUP_KEEP_COUNT = 12;
 const ARCHIVE_LOG_TAIL = 50;
 const ARCHIVE_MAX = 500;
 export const BACKUPS_DIR = path.join(path.dirname(STATE_FILE), "backups");
@@ -1558,11 +1556,7 @@ class Store {
 
   private async _autoBackup(): Promise<void> {
     try {
-      await fsp.mkdir(BACKUPS_DIR, { recursive: true });
-      const timestamp = Date.now();
-      const filename = `state_${timestamp}.json`;
-      const dest = path.join(BACKUPS_DIR, filename);
-      await fsp.writeFile(dest, JSON.stringify(this.exportState(), null, 2));
+      const filename = await writeStateBackup(BACKUPS_DIR, this.exportState());
       await pruneBackups(BACKUPS_DIR, BACKUP_KEEP_COUNT);
       logger.info("state.backup", { filename });
     } catch (err) {
