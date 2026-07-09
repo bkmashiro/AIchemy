@@ -219,6 +219,15 @@ export function initiateKillChain(
   taskId: string,
   gracePeriodS: number = 30
 ): void {
+  const stub = store.getStub(stubId);
+  if (stub?.status === "offline") {
+    const cancelled = cancelTask(stubId, taskId);
+    if (cancelled) {
+      logger.warn("task.cancelled_offline_stub", { task_id: taskId, stub: stubId });
+    }
+    return;
+  }
+
   // Checkpoint protection: if the task is currently writing a checkpoint,
   // defer the kill to avoid corrupting saved state. The caller should retry later.
   const task = store.getTask(stubId, taskId);

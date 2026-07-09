@@ -703,6 +703,19 @@ describe("initiateKillChain / cancelKillChain", () => {
     );
   });
 
+  it("cancels immediately instead of emitting a kill to an offline stub", () => {
+    const taskId = uuidv4();
+    const task = makeTask({ id: taskId, status: "running" });
+    const stub = makeStub({ status: "offline", tasks: [task] });
+    _stubs.set(stub.id, stub);
+
+    initiateKillChain(stub.id, taskId, 30);
+
+    expect(cancelTask).toHaveBeenCalledWith(stub.id, taskId);
+    expect(reliableEmitToStub).not.toHaveBeenCalled();
+    expect(_stubs.get(stub.id)!.tasks[0].status).toBe("cancelled");
+  });
+
   it("uses default grace period of 30s", () => {
     const taskId = uuidv4();
     const task = makeTask({ id: taskId, status: "running" });
