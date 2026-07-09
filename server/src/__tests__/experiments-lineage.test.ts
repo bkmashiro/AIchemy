@@ -281,6 +281,58 @@ describe("experiment lineage API", () => {
     expect(store.getExperiment(created.body.id)?.status).toBe("passed");
   });
 
+  it("marks all-completed experiments passed even when non-result tasks have no validation rows", async () => {
+    const app = makeApp();
+    const created = await request(app)
+      .post("/experiments")
+      .send({
+        name: "mixed-train-eval-terminal-summary",
+        task_specs: [
+          { ref: "train", script: "train.py", outputs: ["runs/train/final.pt"] },
+          { ref: "eval_a", script: "eval.py", metric_schema: { score: "max" }, result_schema: { score: "number" } },
+          { ref: "eval_b", script: "eval.py", metric_schema: { score: "max" }, result_schema: { score: "number" } },
+        ],
+      })
+      .expect(201);
+
+    const exp = store.getExperiment(created.body.id)!;
+    const checkedAt = new Date().toISOString();
+    const archived: any[] = [];
+    for (const task of store.getGridTasks(exp.grid_id)) {
+      const removed = store.removeFromGlobalQueue(task.id);
+      expect(removed).toBeDefined();
+      archived.push({
+        ...removed!,
+        status: "completed" as const,
+        finished_at: checkedAt,
+      });
+      if (task.ref?.startsWith("eval_")) {
+        exp.results[task.id] = {
+          passed: true,
+          checked_at: checkedAt,
+          details: { score: { value: task.ref === "eval_b" ? 0.9 : 0.2, threshold: "> 0", ok: true } },
+        };
+      }
+    }
+    exp.status = "running";
+    store.setArchive([...store.getArchive(), ...archived]);
+    store.setExperiment(exp);
+
+    const res = await request(app).get(`/experiments/${created.body.id}/status-snapshot`).expect(200);
+
+    expect(res.body).toEqual(expect.objectContaining({
+      status: "passed",
+      stored_status: "running",
+      terminal: true,
+      total_tasks: 3,
+      terminal_count: 3,
+      active_count: 0,
+      task_counts: { completed: 3 },
+      validation: { total: 2, passed: 2, failed: 0, missing: 1 },
+    }));
+    expect(store.getExperiment(created.body.id)?.status).toBe("passed");
+  });
+
   it("appends series-scoped decisions and comments to family members", async () => {
     const app = makeApp();
     const one = await request(app)

@@ -64,8 +64,8 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
   const terminalFailed = tasks.filter((t) => ["failed", "cancelled"].includes(t.status)).length;
 
   if (passed === totalTasks && totalTasks > 0) return "passed";
-  if (allDone && failed > 0) return passed > 0 ? "partial" : "failed";
-  if (allDone && validated.length === 0) {
+  if (allDone) {
+    if (failed > 0) return passed > 0 ? "partial" : "failed";
     if (completed === totalTasks) return "passed";
     return completed > 0 && terminalFailed > 0 ? "partial" : "failed";
   }
