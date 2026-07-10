@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -423,9 +424,9 @@ class TestProbeUnixSocket:
         result = _probe_unix_socket(str(tmp_path / "nonexistent.sock"))
         assert result is False
 
-    def test_returns_true_when_connectable(self, tmp_path):
+    def test_returns_true_when_connectable(self):
         """Spin up a real Unix domain server to test probe."""
-        sock_path = str(tmp_path / "test.sock")
+        sock_path = f"/tmp/alch-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(sock_path)
         srv.listen(1)
@@ -446,3 +447,5 @@ class TestProbeUnixSocket:
         finally:
             srv.close()
             t.join(timeout=2)
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)

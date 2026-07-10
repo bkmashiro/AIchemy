@@ -215,7 +215,7 @@ def test_decide_patches_decision_and_reason(monkeypatch):
 
     assert [c["method"] for c in calls] == ["GET", "PATCH"]
     assert calls[1]["url"] == "http://server/api/experiments/exp-1/decision"
-    assert calls[1]["body"] == {"decision": "drop", "reason": "bad validation curve"}
+    assert calls[1]["body"] == {"decision": "discard", "reason": "bad validation curve"}
     assert decided["id"] == "exp-1"
 
 
