@@ -250,13 +250,22 @@ def find_experiment(client: ApiClient, ref: str) -> dict[str, Any]:
 
 
 def resolve_experiment(experiments: list[dict[str, Any]], ref: str) -> dict[str, Any]:
-    matches = [e for e in experiments if e.get("id") == ref or e.get("name") == ref or e.get("code_id") == ref]
-    if not matches:
-        raise AlchError(f"experiment not found: {ref}")
-    if len(matches) > 1:
-        labels = [e.get("code_id") or e.get("name") or e.get("id") for e in matches]
+    id_matches = [e for e in experiments if e.get("id") == ref]
+    if id_matches:
+        return id_matches[0]
+    name_matches = [e for e in experiments if e.get("name") == ref]
+    if len(name_matches) > 1:
+        labels = [e.get("name") or e.get("id") for e in name_matches]
         raise AlchError(f"ambiguous experiment ref {ref}: {labels}")
-    return matches[0]
+    if name_matches:
+        return name_matches[0]
+    code_matches = [e for e in experiments if e.get("code_id") == ref]
+    if code_matches:
+        return max(
+            enumerate(code_matches),
+            key=lambda item: (str(item[1].get("created_at") or ""), item[0]),
+        )[1]
+    raise AlchError(f"experiment not found: {ref}")
 
 
 def parse_data_object(raw: str | None) -> dict[str, Any] | None:

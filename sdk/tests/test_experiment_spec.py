@@ -4,7 +4,7 @@ import builtins
 
 import pytest
 
-from alchemy_sdk.experiment import Experiment
+from alchemy_sdk.experiment import Experiment, RuntimeProfile
 
 
 def test_experiment_code_id_is_explicit_human_reference_in_spec():
@@ -22,6 +22,66 @@ def test_experiment_code_id_is_explicit_human_reference_in_spec():
 def test_experiment_code_id_rejects_empty_values():
     with pytest.raises(ValueError, match="code_id"):
         Experiment(code_id=" ", name="bad")
+
+
+def test_runtime_profile_materializes_shared_execution_environment():
+    profile = RuntimeProfile(
+        name="jema-v3-a30",
+        cwd="/vol/bitbucket/ys25/jema-v3",
+        python_env="/vol/bitbucket/ys25/conda-envs/jema",
+        env={
+            "PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/vol/bitbucket/ys25/alchemy-v2/sdk",
+        },
+    )
+    exp = Experiment("runtime").runtime(profile)
+    exp.task("train", script="scripts/train.py", env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"})
+
+    spec = exp.to_spec()
+
+    assert spec["runtime"] == {
+        "name": "jema-v3-a30",
+        "cwd": "/vol/bitbucket/ys25/jema-v3",
+        "python_env": "/vol/bitbucket/ys25/conda-envs/jema",
+        "env": {
+            "PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/vol/bitbucket/ys25/alchemy-v2/sdk",
+        },
+    }
+    assert spec["tasks"] == [
+        {
+            "ref": "train",
+            "script": "scripts/train.py",
+            "cwd": "/vol/bitbucket/ys25/jema-v3",
+            "python_env": "/vol/bitbucket/ys25/conda-envs/jema",
+            "env": {
+                "PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/vol/bitbucket/ys25/alchemy-v2/sdk",
+                "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+            },
+        }
+    ]
+
+
+def test_task_values_override_runtime_profile_without_mutating_it():
+    profile = RuntimeProfile(
+        name="base",
+        cwd="/base",
+        python_env="/base/python",
+        env={"MODE": "base", "KEEP": "yes"},
+    )
+    exp = Experiment("runtime").runtime(profile)
+    exp.task(
+        "train",
+        script="train.py",
+        cwd="/task",
+        python_env="/task/python",
+        env={"MODE": "task"},
+    )
+
+    task = exp.to_spec()["tasks"][0]
+
+    assert task["cwd"] == "/task"
+    assert task["python_env"] == "/task/python"
+    assert task["env"] == {"MODE": "task", "KEEP": "yes"}
+    assert profile.env == {"MODE": "base", "KEEP": "yes"}
 
 
 def test_decision_policy_is_declared_in_spec_and_chainable():

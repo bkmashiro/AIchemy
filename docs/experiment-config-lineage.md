@@ -26,6 +26,8 @@ list filters) have shipped too. The full lineage rail is documented in
 | CLI `experiments fork-plan` (read-only)    | `sdk/alchemy_sdk/cli/main.py` — never POSTs                      |
 | CLI `experiments ls --family/--decision/--status` | server-side filters in `server/src/api/experiments.ts`    |
 | Read-only `ExperimentClient`               | `sdk/alchemy_sdk/experiments.py` (incl. `timeline`, `fork_plan`) |
+| Reusable `RuntimeProfile` defaults          | `sdk/alchemy_sdk/experiment.py`                                  |
+| Operator server/token discovery             | `sdk/alchemy_sdk/operator_config.py`                              |
 
 Sections below describe the original design intent. Anywhere the running
 implementation has drifted, the source files above are authoritative.
@@ -104,6 +106,34 @@ exp.submit()
 ```
 
 Server 存完整 config 快照。**不存文件路径，不引用外部 YAML。** 实验的 config 是自包含的。
+
+### 1.4 Runtime profile 与代码身份
+
+稳定的执行环境不应复制到每个 task。SDK 提供实验级 runtime profile，materialize 时由 task 显式值覆盖 profile 默认值：
+
+```python
+from alchemy_sdk import Experiment, RuntimeProfile
+
+exp = Experiment(name="jema", code_id="jema.v3.minigrid.bridge.v2")
+exp.runtime(RuntimeProfile(
+    name="jema-v3-cluster",
+    cwd="/vol/bitbucket/ys25/jema-v3",
+    env={"PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/opt/alchemy/sdk"},
+))
+exp.task("seed-1234", script="/opt/venvs/jema/bin/python", raw_args="train.py --seed 1234")
+```
+
+`RuntimeProfile` 只保存非秘密的 cwd、Python environment、env setup 和环境默认值。研究参数仍属于 config/task spec；token 不得放进 runtime profile。
+
+`code_id` 是可复用的代码/实验定义身份，不是 run ID。每次 POST 都生成新的 experiment UUID；`GET /experiments/by-code/:code_id`、SDK 和 CLI 默认解析该 code identity 的最新 run。只有显式 idempotency key 才应承担去重语义。
+
+SDK submission 与 `ExperimentClient` 共用 operator config。执行一次：
+
+```bash
+alch config set --server http://localhost:3002 --state-db /path/to/state.db
+```
+
+之后 SDK 可从只读 state DB 自动发现 operator token，无需每次导出 `ALCHEMY_TOKEN` 或写 SQLite shell wrapper。显式 token 和环境变量仍具有更高优先级。
 
 ---
 

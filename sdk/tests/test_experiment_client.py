@@ -57,8 +57,10 @@ def _run(monkeypatch, action, responses, *, token="secret-token"):
     return result, calls
 
 
-def test_missing_token_raises_clear_error(monkeypatch):
+def test_missing_token_raises_clear_error(monkeypatch, tmp_path):
     monkeypatch.delenv("ALCHEMY_TOKEN", raising=False)
+    monkeypatch.delenv("ALCHEMY_STATE_DB", raising=False)
+    monkeypatch.setenv("ALCHEMY_CLI_CONFIG", str(tmp_path / "missing.json"))
     client = ExperimentClient(server="http://server")
     with pytest.raises(RuntimeError, match="missing Alchemy token"):
         client.list()
@@ -459,6 +461,30 @@ def test_resolve_accepts_code_id(monkeypatch):
     )
     assert result["id"] == "exp-1"
     assert calls[0]["url"] == "http://server/api/experiments"
+
+
+def test_resolve_code_id_selects_latest_run(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    result, _ = _run(
+        monkeypatch,
+        lambda: client.resolve("jema.atari.coverage500.v1"),
+        [[
+            {
+                "id": "exp-old",
+                "name": "old",
+                "code_id": "jema.atari.coverage500.v1",
+                "created_at": "2026-07-09T00:00:00Z",
+            },
+            {
+                "id": "exp-new",
+                "name": "new",
+                "code_id": "jema.atari.coverage500.v1",
+                "created_at": "2026-07-10T00:00:00Z",
+            },
+        ]],
+    )
+
+    assert result["id"] == "exp-new"
 
 
 def test_decide_normalizes_code_first_vocabulary(monkeypatch):

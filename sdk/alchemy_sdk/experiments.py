@@ -4,11 +4,12 @@ from __future__ import annotations
 import copy
 import json
 import math
-import os
 from typing import Any, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from .operator_config import resolve_server, resolve_token
 
 DEFAULT_SERVER = "http://localhost:3002"
 DECISION_CHOICES = ("keep", "try_more", "discard", "drop", "rerun", "fork", "none")
@@ -18,16 +19,11 @@ ARTIFACT_TYPES = ("checkpoint", "tensorboard", "log", "file", "metrics")
 
 
 def _resolve_server(server: Optional[str]) -> str:
-    return (
-        server
-        or os.environ.get("ALCHEMY_SERVER")
-        or os.environ.get("ALCHEMY_SERVER_URL")
-        or DEFAULT_SERVER
-    )
+    return resolve_server(server)
 
 
 def _resolve_token(token: Optional[str]) -> Optional[str]:
-    return token or os.environ.get("ALCHEMY_TOKEN")
+    return resolve_token(token)
 
 
 def _validate_event_message(value: Any, field: str = "message") -> None:
@@ -203,15 +199,22 @@ class ExperimentClient:
     def _resolve_one(
         self, experiments: list[dict[str, Any]], ref: str
     ) -> dict[str, Any]:
-        matches = [
-            e for e in experiments if e.get("id") == ref or e.get("name") == ref or e.get("code_id") == ref
-        ]
-        if not matches:
-            raise RuntimeError(f"experiment not found: {ref}")
-        if len(matches) > 1:
-            names = [e.get("name") for e in matches]
+        id_matches = [e for e in experiments if e.get("id") == ref]
+        if id_matches:
+            return id_matches[0]
+        name_matches = [e for e in experiments if e.get("name") == ref]
+        if len(name_matches) > 1:
+            names = [e.get("name") for e in name_matches]
             raise RuntimeError(f"ambiguous experiment ref {ref!r}: {names}")
-        return matches[0]
+        if name_matches:
+            return name_matches[0]
+        code_matches = [e for e in experiments if e.get("code_id") == ref]
+        if code_matches:
+            return max(
+                enumerate(code_matches),
+                key=lambda item: (str(item[1].get("created_at") or ""), item[0]),
+            )[1]
+        raise RuntimeError(f"experiment not found: {ref}")
 
     def resolve(self, ref: str, *, refresh: bool = False) -> dict[str, Any]:
         return self._resolve_one(self.list(refresh=refresh), ref)

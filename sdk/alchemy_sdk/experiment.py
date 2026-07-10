@@ -11,6 +11,7 @@ from importlib import metadata as importlib_metadata
 from typing import Any, Mapping, Optional
 
 from .submission_lint import lint_task_specs
+from .operator_config import resolve_server
 
 
 @dataclass
@@ -23,6 +24,42 @@ class TaskNode:
     def __repr__(self) -> str:
         status = f" id={self.task_id}" if self.task_id else ""
         return f"TaskNode({self.ref!r}{status})"
+
+
+@dataclass(frozen=True)
+class RuntimeProfile:
+    """Reusable, non-secret execution defaults shared by an experiment's tasks."""
+
+    name: str
+    cwd: Optional[str] = None
+    python_env: Optional[str] = None
+    env_setup: Optional[str] = None
+    env: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("runtime profile name must be a non-empty string")
+        for field_name in ("cwd", "python_env", "env_setup"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"runtime profile {field_name} must be a non-empty string")
+        for key, value in self.env.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError("runtime profile env keys must be non-empty strings")
+            if not isinstance(value, str):
+                raise ValueError("runtime profile env values must be strings")
+
+    def to_spec(self) -> dict[str, Any]:
+        spec: dict[str, Any] = {"name": self.name.strip()}
+        if self.cwd is not None:
+            spec["cwd"] = self.cwd
+        if self.python_env is not None:
+            spec["python_env"] = self.python_env
+        if self.env_setup is not None:
+            spec["env_setup"] = self.env_setup
+        if self.env:
+            spec["env"] = copy.deepcopy(dict(self.env))
+        return spec
 
 
 @dataclass
@@ -137,7 +174,7 @@ class Experiment:
         self.name = name
         self.code_id = code_id.strip() if code_id is not None else None
         self.description = description
-        self._server = server or os.environ.get("ALCHEMY_SERVER") or self._read_config_server()
+        self._server = resolve_server(server)
         self._tasks: list[TaskNode] = []
         self._refs: set[str] = set()
         self._experiment_id: Optional[str] = None
@@ -151,6 +188,7 @@ class Experiment:
         self._parent_name: Optional[str] = None
         self._parent_config: Optional[dict[str, Any]] = None  # snapshot for diff
         self._storage: dict[str, str] = {}
+        self._runtime: Optional[RuntimeProfile] = None
         self._param_space: dict[str, list[Any]] = {}
         self._decision_policy: dict[str, Any] = {}
 
@@ -162,6 +200,13 @@ class Experiment:
             _validate_non_empty_path(artifact_root, "artifact_root")
             storage["artifact_root"] = artifact_root
         self._storage = copy.deepcopy(storage)
+        return self
+
+    def runtime(self, profile: RuntimeProfile) -> "Experiment":
+        """Apply one reusable execution profile to every task in this experiment."""
+        if not isinstance(profile, RuntimeProfile):
+            raise TypeError("runtime profile must be a RuntimeProfile")
+        self._runtime = copy.deepcopy(profile)
         return self
 
     def base_config(self, config: Mapping[str, Any]) -> "Experiment":
@@ -244,6 +289,14 @@ class Experiment:
                     rendered_refs.append(spec)
 
             for spec in rendered_refs:
+                if self._runtime is not None:
+                    runtime = self._runtime.to_spec()
+                    for field_name in ("cwd", "python_env", "env_setup"):
+                        if field_name not in spec and field_name in runtime:
+                            spec[field_name] = runtime[field_name]
+                    runtime_env = runtime.get("env", {})
+                    if runtime_env:
+                        spec["env"] = {**runtime_env, **spec.get("env", {})}
                 point = spec.get("param_point")
                 rendered_deps: list[str] = []
                 for dep_ref in spec.get("depends_on", []):
@@ -301,6 +354,8 @@ class Experiment:
             spec["expected_outcome"] = self.expected_outcome
         if self._storage:
             spec["storage"] = copy.deepcopy(self._storage)
+        if self._runtime is not None:
+            spec["runtime"] = self._runtime.to_spec()
         if self._param_space:
             spec["param_space"] = copy.deepcopy(self._param_space)
             spec["param_points"] = copy.deepcopy(self._param_points())
@@ -400,6 +455,7 @@ class Experiment:
             fork_reason=reason or None,
         )
         child.config = copy.deepcopy(self.config)
+        child._runtime = copy.deepcopy(self._runtime)
         child._parent_name = self.name
         child._parent_config = copy.deepcopy(self.config)
         # Copy task DAG structure (without task_ids)

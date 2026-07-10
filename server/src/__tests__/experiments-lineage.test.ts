@@ -434,9 +434,9 @@ describe("experiment lineage API", () => {
     expect(reloaded.body.code_id).toBe(sdkSpec.code_id);
   });
 
-  it("rejects duplicate code_id aliases for new SDK-first experiments", async () => {
+  it("allows repeated runs of the same code_id and resolves the latest run", async () => {
     const app = makeApp();
-    await request(app)
+    const first = await request(app)
       .post("/experiments")
       .send({
         name: "first",
@@ -445,16 +445,22 @@ describe("experiment lineage API", () => {
       })
       .expect(201);
 
-    const duplicate = await request(app)
+    const second = await request(app)
       .post("/experiments")
       .send({
         name: "second",
         code_id: "jema.duplicate.v1",
         task_specs: [{ ref: "train", script: "train.py" }],
       })
-      .expect(409);
+      .expect(201);
 
-    expect(duplicate.body.error).toContain("code_id already exists");
+    expect(second.body.id).not.toBe(first.body.id);
+
+    const latest = await request(app)
+      .get("/experiments/by-code/jema.duplicate.v1")
+      .expect(200);
+
+    expect(latest.body.id).toBe(second.body.id);
   });
 
   it("fetches experiment detail by code_id alias", async () => {

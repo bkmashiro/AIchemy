@@ -1291,9 +1291,6 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     if (!name) { res.status(400).json({ error: "name required" }); return; }
     const codeId = typeof code_id === "string" && code_id.trim() ? code_id.trim() : undefined;
     if (code_id !== undefined && !codeId) { res.status(400).json({ error: "code_id must be a non-empty string" }); return; }
-    if (codeId && store.getAllExperiments().some((exp) => exp.code_id === codeId)) {
-      res.status(409).json({ error: "code_id already exists" }); return;
-    }
 
     // ─── DAG task_specs path ──────────────────────────────────────────
     if (task_specs && Array.isArray(task_specs) && task_specs.length > 0) {
@@ -2008,9 +2005,12 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     res.status(201).json({ series, created: events.length, events });
   });
 
-  // GET /experiments/by-code/:code_id — stable human-authored code reference lookup.
+  // GET /experiments/by-code/:code_id — latest run for a reusable code identity.
   router.get("/by-code/:code_id", (req: Request, res: Response) => {
-    const exp = store.getAllExperiments().find((candidate) => candidate.code_id === req.params.code_id);
+    const matches = store.getAllExperiments()
+      .filter((candidate) => candidate.code_id === req.params.code_id)
+      .sort(compareExperiments);
+    const exp = matches[matches.length - 1];
     if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
     const grid = store.getGrid(exp.grid_id);
     const tasks = grid ? store.getGridTasks(exp.grid_id) : [];

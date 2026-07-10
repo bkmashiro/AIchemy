@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import json
-import os
 import urllib.request
 import urllib.error
 from typing import Any, Optional
 
 from .experiment import ExperimentResult, ExperimentStatus, TaskStatusDetail
+from .operator_config import resolve_token
 
 
 def submit_experiment(
@@ -59,7 +59,7 @@ def submit_experiment(
 
     body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("ALCHEMY_TOKEN")
+    token = resolve_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=body, headers=headers)
