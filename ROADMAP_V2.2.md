@@ -70,9 +70,11 @@ When task reaches `failed`/`lost` state:
 ### B3. Separate host pressure, SLURM allocation, and task reservations
 - Preserve whole-host telemetry (`MemTotal`, `MemAvailable`, aggregate GPU usage). It correctly includes other users and is useful as a pressure/safety signal.
 - Treat `slurm_constraints.mem_mb` / cgroup memory limit as the authoritative ceiling available to the stub. Do not compare a task only against physical host total.
-- Display both explicitly:
+- Display these layers explicitly:
   - `host_mem_total_mb`, `host_mem_used_mb` — whole node, includes other users;
-  - `allocation_mem_limit_mb`, `allocation_mem_current_mb` — this Slurm job/cgroup;
+  - `user_mem_rss_mb` — aggregate processes owned by the Unix user across the node; useful attribution, but may include other Slurm jobs and can double-count shared pages;
+  - `allocation_mem_limit_mb`, `allocation_mem_current_mb` — this Slurm job/cgroup; authoritative for the stub's actual usage and hard ceiling;
+  - `task_process_rss_mb` — process-tree attribution inside the allocation when available;
   - `reserved_task_mem_mb`, `reserved_task_vram_mb` — Alchemy admission reservations.
 - Stub startup continues to read `SLURM_MEM_PER_NODE`, `SLURM_JOB_NUM_NODES`, `SLURM_CPUS_ON_NODE`; cgroup values override only when they represent a tighter effective limit.
 - Dashboard labels must prevent interpreting host usage as this job's usage.
@@ -397,9 +399,11 @@ allocation budget
 = allocatable remainder
 ```
 
-Keep whole-host pressure as an additional rejection/safety signal; never relabel it as per-job use. Avoid double-counting running telemetry and declared reservation: define and test one conservative formula.
+Keep whole-host and same-user pressure as additional diagnostic/safety signals; never relabel either as this Slurm job's actual use. The allocation cgroup is the authoritative actual-use boundary. Avoid double-counting running telemetry and declared reservation: define and test one conservative formula.
 
-For GPU memory, subtract assigned reservations even before NVML usage rises. Use a configurable 10–15% safety headroom for CUDA context, workspace, and fragmentation.
+Reservations are admission estimates, not hard enforcement. A task may exceed its reservation. On overage, Alchemy records `reservation_overage_mb`, stops admitting new siblings to that allocation, and marks the stub memory-pressured. It must not kill or pause the over-budget task automatically. CPU hard isolation may later use nested cgroups or Slurm steps where supported; GPU-memory hard limits are not portable without MIG/application cooperation.
+
+For GPU memory, subtract assigned reservations even before NVML usage rises. Use a configurable 10–15% safety headroom for CUDA context, workspace, and fragmentation. Running usage above reservation creates reservation debt and reduces allocatable remainder to zero until pressure clears.
 
 ### I3. Per-task peak telemetry
 
@@ -424,9 +428,10 @@ Store peak usage by task fingerprint. A future submission may use a conservative
 ### I acceptance gates
 
 - Two assigned tasks cannot both consume the same unreserved free VRAM.
-- Whole-host memory, allocation memory, and reservation memory remain distinct fields.
+- Whole-host memory, same-user aggregate memory, allocation memory, per-task process memory, and reservations remain distinct fields.
 - An 80 GiB Slurm allocation is the hard CPU-memory ceiling even when the host has more RAM.
-- Other users' host usage remains visible as pressure.
+- Other users' host usage remains visible as pressure; same-user usage is diagnostic and may span multiple jobs.
+- Reservation overage blocks new sibling admission and is observable, but does not destructively kill the running task.
 - Unknown GPU tasks run exclusively.
 - `max_concurrent=5` cannot override failed memory admission.
 - OOM classification identifies the failed task and does not kill/retry unrelated siblings as one unit.
