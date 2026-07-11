@@ -134,6 +134,7 @@ export interface Task {
     gpu_mem_mb?: number;
     cpu_mem_mb?: number;
     gpu_type?: string[];
+    exclusive_gpu?: boolean;
   };
 
   // === Scheduling ===

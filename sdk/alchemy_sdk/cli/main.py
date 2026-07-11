@@ -841,6 +841,10 @@ def cmd_tasks_get(args: argparse.Namespace, client: ApiClient) -> None:
     print_json(short_task(task) if args.short else task)
 
 
+def cmd_tasks_why(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get(f"/tasks/{args.task}/assignment-diagnosis"))
+
+
 def cmd_tasks_wait(args: argparse.Namespace, client: ApiClient) -> int:
     deadline = None if args.timeout is None else time.monotonic() + args.timeout
     last_task: dict[str, Any] | None = None
@@ -1232,6 +1236,11 @@ def cmd_experiments_ls(args: argparse.Namespace, client: ApiClient) -> None:
 def cmd_experiments_show(args: argparse.Namespace, client: ApiClient) -> None:
     exp = find_experiment(client, args.experiment)
     print_json(client.get(f"/experiments/{exp['id']}"))
+
+
+def cmd_experiments_why(args: argparse.Namespace, client: ApiClient) -> None:
+    exp = find_experiment(client, args.experiment)
+    print_json(client.get(f"/experiments/{exp['id']}/assignment-diagnosis"))
 
 
 def cmd_experiments_inspect(args: argparse.Namespace, client: ApiClient) -> None:
@@ -1757,6 +1766,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = tasks_sub.add_parser("top", help="summarize active tasks and recent failures"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.add_argument("--failed-limit", type=int, default=10, help="recent failed tasks to include (default 10)"); p.set_defaults(func=cmd_tasks_top)
     p = tasks_sub.add_parser("repair", help="dry-run recommendations for risky active tasks"); p.add_argument("--limit", type=int, default=50, help="active tasks to inspect (default 50)"); p.set_defaults(func=cmd_tasks_repair)
     p = tasks_sub.add_parser("get", help="fetch a single task"); p.add_argument("task", help="task id"); p.add_argument("--short", action="store_true", help="trim to the short summary form"); p.set_defaults(func=cmd_tasks_get)
+    p = tasks_sub.add_parser("why", help="explain why a task can or cannot be assigned")
+    p.add_argument("task", help="task id")
+    p.set_defaults(func=cmd_tasks_why)
     p = tasks_sub.add_parser("wait", help="poll until a task reaches completed/failed/cancelled"); p.add_argument("task", help="task id"); p.add_argument("--interval", type=float, default=5.0, help="poll interval seconds (default 5)"); p.add_argument("--timeout", type=float, default=None, help="max seconds to wait; omit to wait forever"); p.add_argument("--status", action="store_true", help="print each observed non-terminal status to stderr"); p.add_argument("--short", action="store_true", help="trim final task to short summary form"); p.add_argument("--print-last", action="store_true", help="print last observed task JSON on timeout"); p.set_defaults(func=cmd_tasks_wait)
     p = tasks_sub.add_parser("cancel", help="cancel a task"); p.add_argument("task", help="task id"); p.add_argument("--yes", action="store_true", help="required for running/assigned tasks"); p.set_defaults(func=cmd_tasks_cancel)
     p = tasks_sub.add_parser("move", help="resubmit a task targeting a new stub or tag set"); p.add_argument("task", help="task id"); p.add_argument("--to-stub", help="target stub id/name/hostname (exclusive with --to-tags)"); p.add_argument("--to-tags", help="comma-separated target_tags (exclusive with --to-stub)"); p.add_argument("--name", help="override display name of the new task"); p.add_argument("--yes", action="store_true", help="required when cancelling a running/assigned task"); p.set_defaults(func=cmd_tasks_move)
@@ -1806,6 +1818,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = exps_sub.add_parser("show", help="fetch full detail for one experiment", description="Resolve <experiment> (name, id, or code_id) and print the full detail document.")
     p.add_argument("experiment", help="experiment name, id, or code_id")
     p.set_defaults(func=cmd_experiments_show)
+
+    p = exps_sub.add_parser("why", help="explain assignment blockers for canonical experiment tasks")
+    p.add_argument("experiment", help="experiment name, id, or code_id")
+    p.set_defaults(func=cmd_experiments_why)
 
     p = exps_sub.add_parser("inspect", help="show SDK spec for one experiment")
     p.add_argument("experiment", help="experiment name, id, or code_id")

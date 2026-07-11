@@ -4,6 +4,7 @@ import request from "supertest";
 
 vi.mock("../scheduler", () => ({
   triggerSchedule: vi.fn(),
+  diagnoseTaskAssignment: vi.fn(),
 }));
 
 vi.mock("../git-tracking", () => ({
@@ -14,6 +15,7 @@ vi.mock("../git-tracking", () => ({
 import { store } from "../store";
 import { createTask } from "../api/tasks";
 import { createExperimentsRouter } from "../api/experiments";
+import { diagnoseTaskAssignment } from "../scheduler";
 
 function makeApp() {
   const app = express();
@@ -56,6 +58,65 @@ function completeExperiment(expId: string, metric: string, value: number, opts: 
 beforeEach(() => {
   store.reset();
   vi.clearAllMocks();
+});
+
+describe("experiment assignment diagnosis", () => {
+  it("returns diagnosis for every canonical active task ref", async () => {
+    const app = makeApp();
+    const task = createTask({ script: "train.py", ref: "train" });
+    task.id = "task-train";
+    task.experiment_id = "exp-why";
+    task.grid_id = "grid-why";
+    store.addToGlobalQueue(task);
+    const superseded = createTask({ script: "old.py", ref: "train" });
+    superseded.id = "task-train-old";
+    superseded.experiment_id = "exp-why";
+    superseded.grid_id = "grid-why";
+    store.addToGlobalQueue(superseded);
+    store.setGrid({
+      id: "grid-why",
+      display_name: "why",
+      script: "train.py",
+      param_space: {},
+      task_ids: [superseded.id, task.id],
+      status: "pending",
+      created_at: new Date().toISOString(),
+      max_retries: 0,
+    });
+    store.setExperiment({
+      id: "exp-why",
+      name: "why",
+      grid_id: "grid-why",
+      status: "running",
+      results: {},
+      criteria: {},
+      created_at: new Date().toISOString(),
+      task_refs: { train: task.id },
+    });
+    vi.mocked(diagnoseTaskAssignment).mockReturnValue({
+      task_id: task.id,
+      status: "pending",
+      summary_code: "no_online_stubs",
+      schedulable: false,
+      blocker: "no_online_stubs",
+      dependencies: [],
+      requested: {},
+      eligible_stub_ids: [],
+      stubs: [],
+    } as any);
+
+    const response = await request(app).get("/experiments/exp-why/assignment-diagnosis");
+
+    expect(response.status).toBe(200);
+    expect(response.body.experiment_id).toBe("exp-why");
+    expect(response.body.counts).toEqual({ total: 1, schedulable: 0, blocked: 1 });
+    expect(response.body.groups).toEqual({ no_online_stubs: ["train"] });
+    expect(response.body.tasks.train.blocker).toBe("no_online_stubs");
+
+    const snapshot = await request(app).get("/experiments/exp-why/status-snapshot");
+    expect(snapshot.status).toBe(200);
+    expect(snapshot.body.pending_reasons).toEqual({ no_online_stubs: 1 });
+  });
 });
 
 describe("experiment submission preflight", () => {

@@ -101,6 +101,32 @@ export function lintSingleTask(spec: TaskLike, ref: string): SubmissionLintIssue
     });
   }
 
+  const requirements = spec.requirements || {};
+  for (const [field, value] of [
+    ["gpu_mem_mb", requirements.gpu_mem_mb],
+    ["cpu_mem_mb", requirements.cpu_mem_mb],
+  ] as const) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+      warnings.push({
+        code: "invalid_resource_requirement",
+        severity: "warning",
+        message: `Task ${JSON.stringify(ref)} declares non-positive ${field}; memory requirements must be positive MiB values.`,
+        ref,
+        field: `requirements.${field}`,
+      });
+    }
+  }
+  const declaresGpuWork = Boolean(requirements.gpu_type?.length || requirements.gpu_mem_mb || requirements.exclusive_gpu);
+  if (declaresGpuWork && !requirements.gpu_mem_mb && requirements.exclusive_gpu !== true) {
+    warnings.push({
+      code: "gpu_memory_unreserved",
+      severity: "warning",
+      message: `Task ${JSON.stringify(ref)} declares GPU work without gpu_mem_mb; it will be scheduled exclusively. Set requirements.gpu_mem_mb for safe sharing or exclusive_gpu=true to make the intent explicit.`,
+      ref,
+      field: "requirements.gpu_mem_mb",
+    });
+  }
+
   return warnings;
 }
 

@@ -14,6 +14,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
     tasksApi: {
       ...actual.tasksApi,
       get: vi.fn(),
+      assignmentDiagnosis: vi.fn(),
       patch: vi.fn(),
       retry: vi.fn(),
     },
@@ -57,6 +58,24 @@ function renderDetail() {
 describe("TaskDetailPage operator diagnostics", () => {
   beforeEach(() => {
     vi.mocked(costApi.taskCost).mockRejectedValue(new Error("no cost"));
+    vi.mocked(tasksApi.assignmentDiagnosis).mockResolvedValue({
+      task_id: "task-abc",
+      task_status: "blocked",
+      ready: false,
+      schedulable: false,
+      blocker: "target_stub_offline",
+      summary_code: "target_stub_offline",
+      next_action: "restart_target_or_retarget",
+      compatible_stub_count: 0,
+      online_stub_count: 2,
+      rejections: [{
+        stub_id: "stub-dead",
+        stub_name: "a30-dead",
+        reason_code: "target_stub_offline",
+        details: { slots_active: 0, slots_limit: 1 },
+      }],
+      computed_at: "2026-07-11T00:00:00.000Z",
+    });
   });
 
   it("shows diagnosis and copyable operator commands", async () => {
@@ -70,6 +89,9 @@ describe("TaskDetailPage operator diagnostics", () => {
 
     expect(await screen.findByText("Operator Diagnostics")).toBeInTheDocument();
     expect(screen.getByText("waiting for target stub")).toBeInTheDocument();
+    expect(await screen.findByText("target_stub_offline")).toBeInTheDocument();
+    expect(screen.getByText("restart_target_or_retarget")).toBeInTheDocument();
+    expect(screen.getByText("a30-dead · target_stub_offline")).toBeInTheDocument();
     expect(screen.getByText("alch tasks get task-abc")).toBeInTheDocument();
     expect(screen.getByText("alch tasks logs task-abc --tail 200")).toBeInTheDocument();
     expect(screen.getByText("ls -la /tmp/run-a")).toBeInTheDocument();

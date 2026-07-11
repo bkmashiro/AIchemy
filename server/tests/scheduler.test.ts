@@ -53,7 +53,16 @@ vi.mock("../src/discord", () => ({
 
 // ─── Import after mocks ───────────────────────────────────────────────────────
 
-import { scoreStub, computeRunDir, buildRunPayload, maybeDispatch, schedule, triggerSchedule } from "../src/scheduler";
+import {
+  scoreStub,
+  computeRunDir,
+  buildRunPayload,
+  maybeDispatch,
+  schedule,
+  triggerSchedule,
+  diagnoseTaskAssignment,
+  getStubCapacity,
+} from "../src/scheduler";
 import { store } from "../src/store/index";
 import { reliableEmitToStub } from "../src/reliable";
 import { Task, Stub, TaskStatus, GpuStatEntry } from "../src/types";
@@ -170,6 +179,96 @@ describe("scoreStub — hard constraints", () => {
     expect(scoreStub(stub, task)).toBe(-Infinity);
   });
 
+  it("reserves assigned VRAM before telemetry catches up", () => {
+    const assigned = makeTask({ status: "assigned", requirements: { gpu_mem_mb: 18_000 } });
+    const stub = makeStub({
+      gpu: { name: "A30", vram_total_mb: 24_000, count: 1 },
+      gpu_stats: {
+        timestamp: new Date().toISOString(),
+        gpus: [{ index: 0, utilization_pct: 0, memory_used_mb: 1_000, memory_total_mb: 24_000, temperature_c: 40 }],
+      },
+      max_concurrent: 4,
+      tasks: [assigned],
+    });
+    const task = makeTask({ requirements: { gpu_mem_mb: 4_000 } });
+
+    expect(scoreStub(stub, task)).toBe(-Infinity);
+    expect(getStubCapacity(stub).gpu.assigned_reserved_mb).toBe(18_000);
+  });
+
+  it("supports an operator-configured GPU safety headroom", () => {
+    const previous = process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO;
+    process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO = "0.10";
+    try {
+      const stub = makeStub({ gpu: { name: "A100", vram_total_mb: 40_000, count: 1 } });
+      expect(getStubCapacity(stub).gpu.headroom_mb).toBe(4_000);
+    } finally {
+      if (previous === undefined) delete process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO;
+      else process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO = previous;
+    }
+  });
+
+  it("rejects non-positive resource declarations without inflating capacity", () => {
+    const invalidAssigned = makeTask({ status: "assigned", requirements: { gpu_mem_mb: -10_000 } });
+    const stub = makeStub({
+      gpu: { name: "A100", vram_total_mb: 40_000, count: 1 },
+      max_concurrent: 4,
+      tasks: [invalidAssigned],
+    });
+    const invalidCandidate = makeTask({ requirements: { cpu_mem_mb: -1 } });
+
+    expect(getStubCapacity(stub).gpu.assigned_reserved_mb).toBe(0);
+    expect(scoreStub(stub, invalidCandidate)).toBe(-Infinity);
+  });
+
+  it("uses the Slurm allocation rather than whole-host free memory", () => {
+    const assigned = makeTask({ status: "assigned", requirements: { cpu_mem_mb: 50_000 } });
+    const stub = makeStub({
+      slurm_constraints: { mem_mb: 64_000 },
+      system_stats: { cpu_pct: 1, mem_used_mb: 8_000, mem_total_mb: 512_000 },
+      max_concurrent: 4,
+      tasks: [assigned],
+    });
+    const task = makeTask({ requirements: { cpu_mem_mb: 20_000 } });
+
+    expect(scoreStub(stub, task)).toBe(-Infinity);
+    expect(getStubCapacity(stub).cpu.allocation_mb).toBe(64_000);
+    expect(getStubCapacity(stub).cpu.host_total_mb).toBe(512_000);
+  });
+
+  it("runs a GPU task without a memory estimate exclusively on the whole stub", () => {
+    const running = makeTask({ status: "running", requirements: { gpu_mem_mb: 4_000 } });
+    const stub = makeStub({ max_concurrent: 4, tasks: [running] });
+    const unknownGpuTask = makeTask({ requirements: { gpu_type: ["A100"] } });
+
+    expect(scoreStub(stub, unknownGpuTask)).toBe(-Infinity);
+
+    const exclusiveRunning = makeTask({ status: "running", requirements: { gpu_type: ["A100"] } });
+    const exclusiveStub = makeStub({ max_concurrent: 4, tasks: [exclusiveRunning] });
+    const cpuSibling = makeTask({ requirements: { cpu_mem_mb: 512 } });
+    expect(scoreStub(exclusiveStub, cpuSibling)).toBe(-Infinity);
+  });
+
+  it("blocks siblings while an attributed task exceeds its GPU reservation", () => {
+    const running = makeTask({ id: "over-budget", status: "running", requirements: { gpu_mem_mb: 4_000 } });
+    const stub = makeStub({
+      gpu: { name: "A100", vram_total_mb: 80_000, count: 1 },
+      system_stats: {
+        cpu_pct: 1,
+        mem_used_mb: 1_000,
+        mem_total_mb: 128_000,
+        per_task: { "over-budget": { cpu_pct: 1, mem_mb: 2_000, gpu_mem_mb: 8_000 } },
+      },
+      max_concurrent: 4,
+      tasks: [running],
+    });
+    const candidate = makeTask({ requirements: { gpu_mem_mb: 1_000 } });
+
+    expect(scoreStub(stub, candidate)).toBe(-Infinity);
+    expect(getStubCapacity(stub).gpu.reservation_overage_mb).toBe(4_000);
+    expect(getStubCapacity(stub).gpu.memory_pressure).toBe(true);
+  });
+
   it("gpu_type mismatch returns -Infinity", () => {
     const stub = makeStub({ gpu: { name: "RTX 3090", vram_total_mb: 24576, count: 1 } });
     const task = makeTask({ requirements: { gpu_type: ["A100"] } });
@@ -219,6 +318,12 @@ describe("scoreStub — hard constraints", () => {
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
 
+  it("does not claim an environment is missing when the stub has not reported its environment inventory", () => {
+    const stub = makeStub({ available_envs: undefined });
+    const task = makeTask({ python_env: "jema" });
+    expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
+  });
+
   it("slots_full returns -Infinity", () => {
     const runningTasks = Array.from({ length: 4 }, () =>
       makeTask({ status: "running" })
@@ -243,6 +348,53 @@ describe("scoreStub — hard constraints", () => {
     const stub = makeStub({ max_concurrent: 4, tasks: [r1, r2, q1, q2] });
     const task = makeTask();
     expect(scoreStub(stub, task)).toBe(-Infinity);
+  });
+});
+
+describe("assignment diagnosis", () => {
+  it("separates dependency blocking from capacity rejection", () => {
+    const task = makeTask({ status: "blocked", depends_on: ["parent-1"] });
+    const diagnosis = diagnoseTaskAssignment(task, [makeStub()]);
+
+    expect(diagnosis.blocker).toBe("dependency_blocked");
+    expect(diagnosis.schedulable).toBe(false);
+    expect(diagnosis.dependencies).toEqual(["parent-1"]);
+  });
+
+  it("explains a pinned offline target without mutating state", () => {
+    const task = makeTask({ target_stub_id: "target-offline" });
+    const target = makeStub({ id: "target-offline", status: "offline" });
+    const other = makeStub({ id: "other-online" });
+    const before = JSON.stringify([task, target, other]);
+
+    const diagnosis = diagnoseTaskAssignment(task, [target, other]);
+
+    expect(diagnosis.blocker).toBe("target_stub_offline");
+    expect(diagnosis.stubs.find((row) => row.stub_id === "target-offline")?.reasons).toContain("target_stub_offline");
+    expect(diagnosis.stubs.find((row) => row.stub_id === "other-online")?.reasons).toContain("target_stub_mismatch");
+    expect(JSON.stringify([task, target, other])).toBe(before);
+  });
+
+  it("reports reservation-aware memory values and stable reason codes", () => {
+    const assigned = makeTask({ status: "assigned", requirements: { gpu_mem_mb: 18_000 } });
+    const stub = makeStub({
+      id: "a30",
+      gpu: { name: "A30", vram_total_mb: 24_000, count: 1 },
+      gpu_stats: {
+        timestamp: new Date().toISOString(),
+        gpus: [{ index: 0, utilization_pct: 0, memory_used_mb: 1_000, memory_total_mb: 24_000, temperature_c: 40 }],
+      },
+      max_concurrent: 4,
+      tasks: [assigned],
+    });
+    const task = makeTask({ requirements: { gpu_mem_mb: 4_000 } });
+
+    const diagnosis = diagnoseTaskAssignment(task, [stub]);
+
+    expect(diagnosis.blocker).toBe("gpu_memory_insufficient");
+    expect(diagnosis.stubs[0].reasons).toContain("gpu_memory_insufficient");
+    expect(diagnosis.stubs[0].capacity.gpu.assigned_reserved_mb).toBe(18_000);
+    expect(diagnosis.stubs[0].capacity.gpu.headroom_mb).toBe(3_600);
   });
 });
 
@@ -682,7 +834,7 @@ describe("scoreStub — VRAM estimation from running tasks", () => {
       gpu: { name: "A100", vram_total_mb: 40_960, count: 1 },
       tasks: [],
     });
-    const task = makeTask({ requirements: { gpu_mem_mb: 0 } });
+    const task = makeTask({ requirements: {} });
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
 });

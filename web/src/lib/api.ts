@@ -88,6 +88,28 @@ export interface TaskRequirements {
   gpu_mem_mb?: number;
   cpu_mem_mb?: number;
   gpu_type?: string[];
+  exclusive_gpu?: boolean;
+}
+
+export interface AssignmentRejection {
+  stub_id: string;
+  stub_name: string;
+  reason_code: string;
+  details: Record<string, unknown>;
+}
+
+export interface AssignmentDiagnosis {
+  task_id: string;
+  task_status: TaskStatus;
+  ready: boolean;
+  schedulable: boolean;
+  blocker: string | null;
+  summary_code: string;
+  next_action: string;
+  compatible_stub_count: number;
+  online_stub_count: number;
+  rejections: AssignmentRejection[];
+  computed_at: string;
 }
 
 export interface Task {
@@ -292,6 +314,8 @@ export const tasksApi = {
   list: (params?: { page?: number; limit?: number; status?: string; status_group?: string }) =>
     api.get<PaginatedTasks>("/tasks", { params }).then((r) => r.data),
   get: (id: string) => api.get<Task>(`/tasks/${id}`).then((r) => r.data),
+  assignmentDiagnosis: (id: string) =>
+    api.get<AssignmentDiagnosis>(`/tasks/${id}/assignment-diagnosis`).then((r) => r.data),
   submit: (data: TaskSubmitPayload) => api.post<Task>("/tasks", data).then((r) => r.data),
   patch: (id: string, data: { status?: TaskStatus; priority?: number; name?: string; should_stop?: boolean }) =>
     api.patch<Task>(`/tasks/${id}`, data).then((r) => r.data),

@@ -4,7 +4,6 @@ import json
 import os
 import shlex
 import sqlite3
-from pathlib import Path
 from unittest.mock import patch
 
 from alchemy_sdk.cli import main as cli
@@ -55,6 +54,33 @@ def run_cli(monkeypatch, argv, responses):
     code, calls = run_cli_with_exit(monkeypatch, argv, responses)
     assert code == 0
     return calls
+
+
+def test_tasks_why_fetches_assignment_diagnosis(monkeypatch, capsys):
+    payload = {"task_id": "task-1", "schedulable": False, "blocker": "slots_full"}
+
+    calls = run_cli(monkeypatch, ["tasks", "why", "task-1"], [payload])
+
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/tasks/task-1/assignment-diagnosis"
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_experiments_why_resolves_ref_then_fetches_assignment_diagnosis(monkeypatch, capsys):
+    payload = {"experiment_id": "exp-1", "counts": {"total": 2, "schedulable": 1, "blocked": 1}}
+
+    calls = run_cli(
+        monkeypatch,
+        ["experiments", "why", "jema.connected.w1"],
+        [
+            [{"id": "exp-1", "name": "W1", "code_id": "jema.connected.w1"}],
+            payload,
+        ],
+    )
+
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/assignment-diagnosis"
+    assert json.loads(capsys.readouterr().out) == payload
 
 
 def test_experiments_scaffold_writes_code_first_experiment_file(tmp_path):

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, lazy, Suspense } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
-import { Task, tasksApi, costApi, TaskCost } from "../lib/api";
+import { Task, tasksApi, costApi, TaskCost, AssignmentDiagnosis } from "../lib/api";
 import { taskDuration, taskEta, formatRelTime, generateDisplayName } from "../lib/format";
 import LogViewer from "../components/LogViewer";
 import ConfirmDialog from "../components/ConfirmDialog";
@@ -43,6 +43,7 @@ export default function TaskDetailPage() {
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState(false);
   const [taskCost, setTaskCost] = useState<TaskCost | null>(null);
+  const [assignmentDiagnosis, setAssignmentDiagnosis] = useState<AssignmentDiagnosis | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     action: () => void;
     title: string;
@@ -54,6 +55,7 @@ export default function TaskDetailPage() {
   const fetch = useCallback(() => {
     if (!id) return;
     tasksApi.get(id).then(setTask).finally(() => setLoading(false));
+    tasksApi.assignmentDiagnosis(id).then(setAssignmentDiagnosis).catch(() => setAssignmentDiagnosis(null));
   }, [id]);
 
   useEffect(() => {
@@ -188,6 +190,22 @@ export default function TaskDetailPage() {
             {diagnosis.label}
           </span>
         </div>
+        {assignmentDiagnosis && (
+          <div className="mb-3 rounded border border-gray-800 bg-gray-950 px-3 py-2 text-xs font-mono">
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <span className="text-yellow-300">{assignmentDiagnosis.summary_code}</span>
+              <span className="text-gray-500">next: <span className="text-gray-300">{assignmentDiagnosis.next_action}</span></span>
+              <span className="text-gray-500">
+                compatible {assignmentDiagnosis.compatible_stub_count}/{assignmentDiagnosis.online_stub_count} online
+              </span>
+            </div>
+            {assignmentDiagnosis.rejections.slice(0, 4).map((rejection) => (
+              <div key={`${rejection.stub_id}:${rejection.reason_code}`} className="mt-1 text-gray-400">
+                {rejection.stub_name} · {rejection.reason_code}
+              </div>
+            ))}
+          </div>
+        )}
         <div className="space-y-1">
           {operatorCommands.map((command) => (
             <pre key={command} className="text-xs font-mono text-gray-300 bg-gray-950 rounded px-3 py-2 overflow-x-auto select-all whitespace-pre-wrap break-all">

@@ -334,6 +334,40 @@ def test_dry_run_warns_explicit_high_priority_without_routing():
     assert "priority sorts descending" in warning["message"]
 
 
+def test_dry_run_warns_gpu_work_without_memory_reservation():
+    exp = Experiment("gpu-reservation")
+    exp.task("train", script="/bin/python", requirements={"gpu_type": ["A30"]})
+
+    warnings = exp.dry_run()["warnings"]
+
+    warning = next(w for w in warnings if w["code"] == "gpu_memory_unreserved")
+    assert warning["ref"] == "train"
+    assert warning["field"] == "requirements.gpu_mem_mb"
+
+
+def test_dry_run_accepts_explicit_exclusive_gpu_without_memory_reservation():
+    exp = Experiment("gpu-exclusive")
+    exp.task(
+        "train",
+        script="/bin/python",
+        requirements={"gpu_type": ["A30"], "exclusive_gpu": True},
+    )
+
+    warnings = exp.dry_run()["warnings"]
+
+    assert not any(w["code"] == "gpu_memory_unreserved" for w in warnings)
+
+
+def test_dry_run_warns_non_positive_resource_requirement():
+    exp = Experiment("invalid-resource")
+    exp.task("train", script="/bin/python", requirements={"cpu_mem_mb": 0})
+
+    warnings = exp.dry_run()["warnings"]
+
+    warning = next(w for w in warnings if w["code"] == "invalid_resource_requirement")
+    assert warning["field"] == "requirements.cpu_mem_mb"
+
+
 def test_dry_run_warns_duplicate_relative_output_args():
     exp = Experiment("output-collision")
     exp.task("seed0", script="/bin/python", raw_args="train.py --output results/synthetic_seed0.json")

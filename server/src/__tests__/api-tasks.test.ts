@@ -26,6 +26,7 @@ vi.mock("../scheduler", () => ({
   triggerSchedule: vi.fn(),
   maybeDispatch: vi.fn(),
   startScheduler: vi.fn(),
+  diagnoseTaskAssignment: vi.fn(),
 }));
 
 vi.mock("../socket/stub", () => ({
@@ -59,6 +60,7 @@ import { initiateKillChain } from "../socket/stub";
 import { cancelTask, cancelGlobalTask, pauseTask, resumeTask } from "../task-actions";
 import { reliableEmitToStub } from "../reliable";
 import { Task, Stub } from "../types";
+import { diagnoseTaskAssignment } from "../scheduler";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -121,6 +123,32 @@ beforeEach(() => {
 
 afterEach(() => {
   writeLockTable.clear();
+});
+
+describe("GET /tasks/:id/assignment-diagnosis", () => {
+  it("returns a read-only scheduler diagnosis", async () => {
+    const app = makeApp();
+    const task = makeTask({ id: "pending-why" });
+    store.addToGlobalQueue(task);
+    vi.mocked(diagnoseTaskAssignment).mockReturnValue({
+      task_id: task.id,
+      status: "pending",
+      schedulable: false,
+      blocker: "no_online_stubs",
+      dependencies: [],
+      requested: {},
+      eligible_stub_ids: [],
+      stubs: [],
+    } as any);
+
+    const before = JSON.stringify(store.findTask(task.id)?.task);
+    const response = await request(app).get(`/tasks/${task.id}/assignment-diagnosis`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.blocker).toBe("no_online_stubs");
+    expect(diagnoseTaskAssignment).toHaveBeenCalledWith(task, []);
+    expect(JSON.stringify(store.findTask(task.id)?.task)).toBe(before);
+  });
 });
 
 // ─── assembleCommand ──────────────────────────────────────────────────────────

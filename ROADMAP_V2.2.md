@@ -353,6 +353,8 @@ Task rows show one stable reason badge. Inspector shows per-stub rejection detai
 - Diagnostics are read-only and do not assign, requeue, reprioritize, or append lifecycle events.
 - Scheduler and diagnosis tests prove identical eligibility outcomes for the same task/stub fixtures.
 
+**Implementation status (2026-07-11):** H1/H2, both CLI commands, and task-inspector rejection details are implemented. Status snapshots now include `pending_reasons`. A compact task-row reason badge remains UI follow-up; the authoritative API and CLI path is available now.
+
 ## Stream I: Reservation-aware memory admission (P0)
 
 **User problem:** Increasing `max_concurrent` can dispatch several memory-heavy tasks that initialize together and OOM.
@@ -435,6 +437,8 @@ Store peak usage by task fingerprint. A future submission may use a conservative
 - Unknown GPU tasks run exclusively.
 - `max_concurrent=5` cannot override failed memory admission.
 - OOM classification identifies the failed task and does not kill/retry unrelated siblings as one unit.
+
+**Implementation status (2026-07-11):** the I1/I2 admission core is implemented for `gpu_mem_mb`, `cpu_mem_mb`, and `exclusive_gpu`. Assigned/running/paused task declarations form the persisted reservation ledger; Slurm allocation memory is the CPU ceiling; GPU admission subtracts assigned reservations before telemetry rises; headroom defaults to 15% GPU / 5% CPU and is configurable with `ALCHEMY_GPU_MEMORY_HEADROOM_RATIO` / `ALCHEMY_CPU_MEMORY_HEADROOM_RATIO`. Attributed reservation overage exposes pressure in assignment diagnostics and blocks new siblings without killing work. `cpu_cores`, peak telemetry/OOM classification (I3), and learned retry estimates (I4) remain follow-up and are not claimed complete.
 
 ## Stream J: Capacity leases and A30 autoscaling (P1, after H and I)
 

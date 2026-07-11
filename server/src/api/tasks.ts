@@ -16,7 +16,7 @@ import { Namespace } from "socket.io";
 import {
   computeFingerprint, writeLockTable, idempotencyCache,
 } from "../dedup";
-import { triggerSchedule, maybeDispatch } from "../scheduler";
+import { triggerSchedule, maybeDispatch, diagnoseTaskAssignment } from "../scheduler";
 import { notifySubmitted } from "../discord";
 import { initiateKillChain } from "../socket/stub";
 import { cancelTask, cancelGlobalTask, pauseTask, resumeTask, createRetryTask } from "../task-actions";
@@ -884,6 +884,13 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     const mark = store.setTaskMark(req.params.id, actor, patch);
     res.json(mark);
+  });
+
+  // GET /tasks/:id/assignment-diagnosis — read-only scheduler explanation.
+  router.get("/:id/assignment-diagnosis", (req: Request, res: Response) => {
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    res.json(diagnoseTaskAssignment(found.task, store.getAllStubs()));
   });
 
   // GET /tasks/:id

@@ -102,6 +102,51 @@ def _lint_single_task(spec: Mapping[str, Any], ref: str) -> list[dict[str, Any]]
             }
         )
 
+    requirements = spec.get("requirements")
+    if not isinstance(requirements, Mapping):
+        requirements = {}
+    for field in ("gpu_mem_mb", "cpu_mem_mb"):
+        value = requirements.get(field)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value <= 0
+        ):
+            warnings.append(
+                {
+                    "code": "invalid_resource_requirement",
+                    "severity": "warning",
+                    "message": (
+                        f"Task {ref!r} declares non-positive {field}; "
+                        "memory requirements must be positive MiB values."
+                    ),
+                    "ref": ref,
+                    "field": f"requirements.{field}",
+                }
+            )
+    declares_gpu_work = bool(
+        requirements.get("gpu_type")
+        or requirements.get("gpu_mem_mb")
+        or requirements.get("exclusive_gpu")
+    )
+    if (
+        declares_gpu_work
+        and not requirements.get("gpu_mem_mb")
+        and requirements.get("exclusive_gpu") is not True
+    ):
+        warnings.append(
+            {
+                "code": "gpu_memory_unreserved",
+                "severity": "warning",
+                "message": (
+                    f"Task {ref!r} declares GPU work without gpu_mem_mb; it will be scheduled exclusively. "
+                    "Set requirements.gpu_mem_mb for safe sharing or exclusive_gpu=true to make the intent explicit."
+                ),
+                "ref": ref,
+                "field": "requirements.gpu_mem_mb",
+            }
+        )
+
     return warnings
 
 

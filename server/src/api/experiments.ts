@@ -18,7 +18,7 @@ import { store } from "../store";
 import { Experiment, ExperimentDecision, ExperimentEvent, ExperimentEventKind, Grid, Task, TaskSpec, SubmissionLintIssue } from "../types";
 import { Namespace } from "socket.io";
 import { createTask } from "./tasks";
-import { triggerSchedule } from "../scheduler";
+import { triggerSchedule, diagnoseTaskAssignment } from "../scheduler";
 import { computeFingerprint } from "../dedup";
 import { evaluateCriteria } from "../criteria";
 import { validateDag } from "../dag";
@@ -675,12 +675,20 @@ function metricDeltas(
   return result;
 }
 
+function canonicalTasksForExperiment(exp: Experiment): Task[] {
+  const canonicalTaskIds = Object.values(exp.task_refs || {});
+  if (canonicalTaskIds.length > 0) {
+    return canonicalTaskIds.flatMap((taskId) => {
+      const found = store.findTask(taskId);
+      return found ? [found.task] : [];
+    });
+  }
+  return store.getGrid(exp.grid_id) ? store.getGridTasks(exp.grid_id) : [];
+}
+
 function taskCountsByStatus(exp: Experiment): Record<string, number> {
-  const grid = store.getGrid(exp.grid_id);
-  if (!grid) return {};
-  const tasks = store.getGridTasks(exp.grid_id);
   const counts: Record<string, number> = {};
-  for (const task of tasks) {
+  for (const task of canonicalTasksForExperiment(exp)) {
     counts[task.status] = (counts[task.status] ?? 0) + 1;
   }
   return counts;
@@ -722,6 +730,7 @@ interface ExperimentStatusSnapshot {
   result_artifacts: ResultArtifactSummary[];
   best_result_metrics: Record<string, BestResultMetricSummary>;
   primary_metric: PrimaryMetric | null;
+  pending_reasons: Record<string, number>;
   generated_at: string;
 }
 
@@ -750,12 +759,18 @@ function artifactRollupForExperiment(tasks: Task[], artifacts: ResultArtifactSum
 function statusSnapshotForExperiment(exp: Experiment): ExperimentStatusSnapshot {
   const reconciled = reconcileExperimentStatus(exp);
   const current = reconciled.experiment;
-  const grid = store.getGrid(current.grid_id);
-  const tasks = grid ? store.getGridTasks(current.grid_id) : [];
+  const tasks = canonicalTasksForExperiment(current);
   const taskCounts = taskCountsByStatus(current);
   const terminalCount = tasks.filter((task) => TERMINAL_TASK_STATUSES.has(task.status)).length;
   const validationBase = passFailSummary(current);
   const artifacts = resultArtifactsForExperiment(current);
+  const pendingReasons: Record<string, number> = {};
+  const stubs = store.getAllStubs();
+  for (const task of tasks.filter((candidate) => candidate.status === "pending" || candidate.status === "blocked")) {
+    const diagnosis = diagnoseTaskAssignment(task, stubs);
+    const code = diagnosis?.summary_code || diagnosis?.blocker;
+    if (code) pendingReasons[code] = (pendingReasons[code] || 0) + 1;
+  }
   return {
     id: current.id,
     name: current.name,
@@ -774,6 +789,7 @@ function statusSnapshotForExperiment(exp: Experiment): ExperimentStatusSnapshot 
     result_artifacts: artifacts,
     best_result_metrics: bestResultMetricsForExperiment(current),
     primary_metric: primaryMetricFor(current),
+    pending_reasons: pendingReasons,
     generated_at: new Date().toISOString(),
   };
 }
@@ -1934,7 +1950,12 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const latestSeriesEvents = experiments
       .flatMap((exp) => store.getExperimentEvents(exp.id))
       .filter((event) => !event.deleted_at && event.data?.scope === "series" && event.data?.family === series)
-      .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""))
+      .map((event, insertionIndex) => ({ event, insertionIndex }))
+      .sort((a, b) => (
+        (b.event.created_at ?? "").localeCompare(a.event.created_at ?? "")
+        || b.insertionIndex - a.insertionIndex
+      ))
+      .map(({ event }) => event)
       .filter((event) => {
         const key = `${event.kind}:${event.message}:${event.data?.decision ?? ""}:${event.created_at}`;
         if (seenSeriesEvents.has(key)) return false;
@@ -2015,6 +2036,37 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const grid = store.getGrid(exp.grid_id);
     const tasks = grid ? store.getGridTasks(exp.grid_id) : [];
     res.json({ ...exp, status: deriveExperimentStatus(exp), grid, tasks });
+  });
+
+  // GET /experiments/:id/assignment-diagnosis — read-only canonical-task rollup.
+  router.get("/:id/assignment-diagnosis", (req: Request, res: Response) => {
+    const exp = store.getExperiment(req.params.id);
+    if (!exp) { res.status(404).json({ error: "Experiment not found" }); return; }
+    const stubs = store.getAllStubs();
+    const tasks: Record<string, any> = {};
+    for (const [ref, taskId] of Object.entries(exp.task_refs || {})) {
+      const found = store.findTask(taskId);
+      tasks[ref] = found
+        ? diagnoseTaskAssignment(found.task, stubs)
+        : { task_id: taskId, status: "missing", schedulable: false, blocker: "task_missing" };
+    }
+    const values = Object.values(tasks) as Array<{ schedulable?: boolean; blocker?: string | null; summary_code?: string }>;
+    const groups: Record<string, string[]> = {};
+    for (const [ref, value] of Object.entries(tasks) as Array<[string, { summary_code?: string; blocker?: string | null }]>) {
+      const code = value.summary_code || value.blocker;
+      if (code) (groups[code] ||= []).push(ref);
+    }
+    res.json({
+      experiment_id: exp.id,
+      name: exp.name,
+      counts: {
+        total: values.length,
+        schedulable: values.filter((value) => value.schedulable).length,
+        blocked: values.filter((value) => Boolean(value.blocker)).length,
+      },
+      groups,
+      tasks,
+    });
   });
 
   // GET /experiments/:id/status-snapshot — watcher-friendly terminal + artifact rollup.
