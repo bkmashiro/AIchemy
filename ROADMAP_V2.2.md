@@ -657,17 +657,28 @@ Allow tasks to target `capacity_lease_id` or logical pool requirements instead o
 
 ## Updated implementation order
 
+Streams H and the I1/I2 admission core are implemented; their remaining UI, telemetry, and learned-retry work stays tracked above. The authoritative continuation roadmap is:
+
+- `docs/plans/2026-07-30-alchemy-maintenance-roadmap.md`
+
+It incorporates the collection-API performance audit and extends Streams J/M into generic A16/A30/A40/T4 capacity, persisted pre-stub Slurm allocations, queue-aware planning, Slurm observability, logical pending-capacity routing, queued campaigns, custom job names, and safe campaign-owned batch cancellation.
+
 ```text
-P0: H assignment diagnosis
-P0: I reservation-aware memory admission
-P1: J capacity leases + recommend-only autoscaler
-P1: K non-preemptive expedite API
-P1: L result contracts + native wait
-P2: M operator doctor + immutable runtime + logical lease routing
+P0: collection/API request amplification and compact pagination
+P1: K audited non-preemptive expedite/effective priority (retained)
+P1: L result contracts + native experiment wait (retained)
+P1: generic GPU target catalog + persisted Slurm allocation records
+P1: queue reason/start/partition observability + allocation-to-stub binding
+P1: queue-aware multi-GPU planner in recommend-only mode
+P1: logical lease routing + queued campaign state machine
+P2: Slurm/campaign CLI, custom job names, safe batch cancellation
+P2: M1/M2 operator doctor + immutable runtime (retained)
+P2: capacity/campaign Web UI
+P3: policy-enabled automatic acquisition after recommend-only audit
 P3: verified checkpoint/resume preemption
 ```
 
-Do not enable real autoscaling before H and I land: without explainability and reservation-aware admission, autoscaling only multiplies opaque pending states and OOMs.
+Do not enable real autoscaling before explainability, reservation-aware admission, target discovery, allocation persistence, and queue observation are all working. Otherwise automation only multiplies opaque pending states, duplicate jobs, and OOMs.
 
 ## Development operating model
 
