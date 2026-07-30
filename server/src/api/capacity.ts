@@ -2,7 +2,13 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { deployStub, type SlurmSubmitOptions } from "../deploy";
 import { store } from "../store";
-import type { CapacityTarget, DeployFileConfig, DeployResult, StubTarget } from "../types";
+import type { CapacityTarget, DeployFileConfig, DeployResult, SlurmAllocation, StubTarget } from "../types";
+import { reconcileCampaign, type CampaignDriver } from "../campaigns/reconciler";
+import {
+  reconcileCapacityPolicy,
+  type CapacityAutomationPolicy,
+  type ValidatedRecommendation,
+} from "../capacity/automation";
 
 export type CapacitySubmitter = (
   target: StubTarget,
@@ -127,7 +133,16 @@ export function reconcileSlurmAllocations(
 
 export function createCapacityRouter(
   config: DeployFileConfig | null,
-  dependencies: { submit?: CapacitySubmitter; cancel?: CapacityCanceller } = {},
+  dependencies: {
+    submit?: CapacitySubmitter;
+    cancel?: CapacityCanceller;
+    campaignDriver?: CampaignDriver;
+    automation?: {
+      policy: CapacityAutomationPolicy;
+      acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
+      release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
+    };
+  } = {},
 ): Router {
   const router = Router();
   const submit = dependencies.submit ?? deployStub;
@@ -145,6 +160,23 @@ export function createCapacityRouter(
       return;
     }
     res.json({ recommendation: recommendations[0], alternatives: recommendations.slice(1), mode: "recommend_only" });
+  });
+
+  router.post("/policy/reconcile", async (req: Request, res: Response): Promise<void> => {
+    const recommendation = req.body?.recommendation as ValidatedRecommendation | null | undefined;
+    try {
+      const result = await reconcileCapacityPolicy({
+        recommendation: recommendation ?? null,
+        allocations: store.getSlurmAllocations(),
+        policy: dependencies.automation?.policy,
+        acquire: dependencies.automation?.acquire ?? (async () => { throw new Error("Automatic acquisition backend unavailable"); }),
+        release: dependencies.automation?.release ?? (async () => { throw new Error("Automatic release backend unavailable"); }),
+        now: new Date(),
+      });
+      res.json(result);
+    } catch (error) {
+      res.status(503).json({ error: String(error) });
+    }
   });
 
   router.get("/campaigns", (_req: Request, res: Response) => {
@@ -209,6 +241,20 @@ export function createCapacityRouter(
       }],
     });
     res.json(updated);
+  });
+
+  router.post("/campaigns/:id/reconcile", async (req: Request, res: Response): Promise<void> => {
+    if (!dependencies.campaignDriver) {
+      res.status(503).json({ error: "Campaign driver unavailable" });
+      return;
+    }
+    try {
+      res.json(await reconcileCampaign(req.params.id, dependencies.campaignDriver));
+    } catch (error) {
+      const message = String(error);
+      res.status(message.toLowerCase().includes("not found") ? 404 : 500)
+        .json({ error: message });
+    }
   });
 
   router.get("/allocations", (_req: Request, res: Response) => {

@@ -1,0 +1,124 @@
+import type { CapacityTarget, SlurmAllocation } from "../types";
+import { createHash } from "crypto";
+
+export interface CapacityAutomationPolicy {
+  pool_id: string;
+  mode: "recommend" | "automatic";
+  enabled: boolean;
+  min_validated_snapshots: number;
+  max_total: number;
+  max_pending: number;
+  cooldown_seconds: number;
+  last_action_at?: string;
+}
+
+export interface ValidatedRecommendation {
+  recommendation_id?: string;
+  target: CapacityTarget;
+  resources: Record<string, unknown>;
+  validated_snapshots: number;
+}
+
+function recommendationIdentity(recommendation: ValidatedRecommendation): string {
+  if (recommendation.recommendation_id) return recommendation.recommendation_id;
+  const resources = Object.fromEntries(
+    Object.entries(recommendation.resources).sort(([a], [b]) => a.localeCompare(b)),
+  );
+  return createHash("sha256")
+    .update(JSON.stringify({ target_id: recommendation.target.id, resources }))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+export interface CapacityPolicyAction {
+  kind: "acquire" | "release";
+  allocation_id?: string;
+  target_id?: string;
+  resources?: Record<string, unknown>;
+  applied: boolean;
+  reason: string;
+  actor: "capacity_policy";
+  at: string;
+}
+
+interface AutomationInput {
+  recommendation: ValidatedRecommendation | null;
+  allocations: SlurmAllocation[];
+  policy?: CapacityAutomationPolicy;
+  acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
+  release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
+  now: Date;
+}
+
+function active(allocation: SlurmAllocation): boolean {
+  return !["released", "failed"].includes(allocation.state);
+}
+
+function cooldownActive(policy: CapacityAutomationPolicy, now: Date): boolean {
+  if (!policy.last_action_at) return false;
+  return now.getTime() - new Date(policy.last_action_at).getTime() < policy.cooldown_seconds * 1000;
+}
+
+/** Computes and optionally applies at most one ownership-safe capacity mutation. */
+export async function reconcileCapacityPolicy(input: AutomationInput): Promise<{
+  mode: "recommend" | "automatic";
+  actions: CapacityPolicyAction[];
+}> {
+  const policy = input.policy;
+  const mode = policy?.enabled && policy.mode === "automatic" ? "automatic" : "recommend";
+  const at = input.now.toISOString();
+  const allocations = input.allocations.filter(active);
+  const pending = allocations.filter((item) => ["requested", "submitted", "pending"].includes(item.state));
+
+  if (input.recommendation) {
+    const recommendation = input.recommendation;
+    const action: CapacityPolicyAction = {
+      kind: "acquire", target_id: recommendation.target.id,
+      resources: { ...recommendation.resources }, applied: false,
+      reason: "recommend_only", actor: "capacity_policy", at,
+    };
+    if (mode !== "automatic") return { mode, actions: [action] };
+    if (recommendation.validated_snapshots < (policy?.min_validated_snapshots ?? 0)) {
+      action.reason = "recommendation_not_validated";
+      return { mode, actions: [action] };
+    }
+    if (allocations.length >= policy!.max_total || pending.length >= policy!.max_pending) {
+      action.reason = "policy_cap_reached";
+      return { mode, actions: [action] };
+    }
+    if (cooldownActive(policy!, input.now)) {
+      action.reason = "cooldown_active";
+      return { mode, actions: [action] };
+    }
+    const key = `${policy!.pool_id}:acquire:${recommendationIdentity(recommendation)}`;
+    await input.acquire(recommendation, key);
+    action.applied = true;
+    action.reason = "validated_recommendation";
+    return { mode, actions: [action] };
+  }
+
+  const ownedIdle = allocations.find((allocation) => {
+    const operational = allocation as SlurmAllocation & {
+      active_task_ids?: string[];
+      campaign_cleanup_required?: boolean;
+    };
+    return allocation.managed_by === "alchemy"
+      && !allocation.pinned
+      && (operational.active_task_ids?.length ?? 0) === 0
+      && operational.campaign_cleanup_required !== true;
+  });
+  if (!ownedIdle) return { mode, actions: [] };
+
+  const action: CapacityPolicyAction = {
+    kind: "release", allocation_id: ownedIdle.id, applied: false,
+    reason: mode === "automatic" ? "idle_owned_capacity" : "recommend_only",
+    actor: "capacity_policy", at,
+  };
+  if (mode !== "automatic" || cooldownActive(policy!, input.now)) {
+    if (mode === "automatic") action.reason = "cooldown_active";
+    return { mode, actions: [action] };
+  }
+  await input.release(ownedIdle, `${policy!.pool_id}:release:${ownedIdle.id}`);
+  action.applied = true;
+  return { mode, actions: [action] };
+}

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createCapacityRouter } from "../api/capacity";
 import { store } from "../store";
 import type { DeployFileConfig, DeployResult } from "../types";
+import type { CampaignDriver } from "../campaigns/reconciler";
 
 const config: DeployFileConfig = {
   stubs: [{
@@ -120,6 +121,40 @@ describe("capacity target catalog and allocation submission", () => {
     expect(advanced.body.attempts).toBe(1);
     expect(advanced.body.history).toHaveLength(1);
     expect(store.getCapacityCampaign(created.body.id)?.state).toBe("wait_stub");
+  });
+
+  it("keeps policy reconciliation recommend-only without a server-owned automatic policy", async () => {
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config));
+    const response = await request(app).post("/capacity/policy/reconcile").send({
+      recommendation: {
+        recommendation_id: "plan-1",
+        target: { id: "slurm-a16", aliases: ["a16"], partition: "a16", tags: [], enabled: true },
+        resources: { partition: "a16", qos: "normal" },
+        validated_snapshots: 100,
+      },
+    }).expect(200);
+
+    expect(response.body.mode).toBe("recommend");
+    expect(response.body.actions[0]).toMatchObject({ kind: "acquire", applied: false, reason: "recommend_only" });
+  });
+
+  it("reconciles a campaign through the restart-safe driver endpoint", async () => {
+    const campaignDriver = {
+      acquire: vi.fn(async () => ({ allocation_id: "allocation-1" })),
+      observeStub: vi.fn(), runSmoke: vi.fn(), submitDag: vi.fn(), observeDag: vi.fn(),
+      drain: vi.fn(), release: vi.fn(), closeout: vi.fn(), cleanup: vi.fn(),
+    } as unknown as CampaignDriver;
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, { campaignDriver }));
+    const created = await request(app).post("/capacity/campaigns").send({
+      name: "automated", target_id: "slurm-a16", frozen_spec_hash: "sha256:abc",
+    }).expect(201);
+
+    const response = await request(app).post(`/capacity/campaigns/${created.body.id}/reconcile`).expect(200);
+
+    expect(response.body.state).toBe("wait_stub");
+    expect(campaignDriver.acquire).toHaveBeenCalledOnce();
   });
 
   it("reconciles persisted allocation state from a complete SLURM snapshot", async () => {
