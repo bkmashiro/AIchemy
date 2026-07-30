@@ -29,6 +29,7 @@ import {
   WebhookDeliveryOutbox,
   WebhookOutboxStatus,
   TaskMark,
+  SlurmAllocation,
 } from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
@@ -40,6 +41,7 @@ import {
   generateMnemonicAlias,
   type AliasObjectKind,
 } from "../aliases";
+import { effectiveTaskPriority, withEffectivePriority } from "../priority";
 
 const STATE_DIR = process.env.STATE_DIR || process.cwd();
 const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, "state.json");
@@ -184,7 +186,74 @@ class Store {
 
   private _decorateTask(task: Task): Task {
     task.alias = this.ensureObjectAlias("task", task.id);
-    return task;
+    return withEffectivePriority(task);
+  }
+
+  private _decorateSlurmAllocation(allocation: SlurmAllocation): SlurmAllocation {
+    allocation.alias = this.ensureObjectAlias("slurm_allocation", allocation.id);
+    return allocation;
+  }
+
+  getSlurmAllocation(id: string): SlurmAllocation | undefined {
+    const row = this.db.select({ data: schema.slurmAllocations.data })
+      .from(schema.slurmAllocations).where(eq(schema.slurmAllocations.id, id)).get();
+    return row ? this._decorateSlurmAllocation(JSON.parse(row.data) as SlurmAllocation) : undefined;
+  }
+
+  getSlurmAllocationByIdempotencyKey(key: string): SlurmAllocation | undefined {
+    const row = this.db.select({ data: schema.slurmAllocations.data })
+      .from(schema.slurmAllocations).where(eq(schema.slurmAllocations.idempotency_key, key)).get();
+    return row ? this._decorateSlurmAllocation(JSON.parse(row.data) as SlurmAllocation) : undefined;
+  }
+
+  getSlurmAllocations(): SlurmAllocation[] {
+    return this.db.select({ data: schema.slurmAllocations.data }).from(schema.slurmAllocations)
+      .orderBy(desc(schema.slurmAllocations.requested_at)).all()
+      .map((row) => this._decorateSlurmAllocation(JSON.parse(row.data) as SlurmAllocation));
+  }
+
+  createSlurmAllocation(input: Omit<SlurmAllocation, "id" | "alias" | "requested_at"> & {
+    id?: string;
+    requested_at?: string;
+  }): SlurmAllocation {
+    const existing = this.getSlurmAllocationByIdempotencyKey(input.idempotency_key);
+    if (existing) return existing;
+    const allocation: SlurmAllocation = {
+      ...input,
+      id: input.id ?? randomUUID(),
+      requested_at: input.requested_at ?? new Date().toISOString(),
+    };
+    this.db.insert(schema.slurmAllocations).values({
+      id: allocation.id,
+      idempotency_key: allocation.idempotency_key,
+      job_id: allocation.job_id ?? null,
+      campaign_id: allocation.campaign_id ?? null,
+      capacity_lease_id: allocation.capacity_lease_id ?? null,
+      managed_target_id: allocation.managed_target_id,
+      state: allocation.state,
+      stub_id: allocation.stub_id ?? null,
+      requested_at: allocation.requested_at,
+      last_observed_at: allocation.last_observed_at ?? null,
+      data: JSON.stringify(allocation),
+    }).run();
+    return this._decorateSlurmAllocation(allocation);
+  }
+
+  updateSlurmAllocation(id: string, patch: Partial<SlurmAllocation>): SlurmAllocation | undefined {
+    const current = this.getSlurmAllocation(id);
+    if (!current) return undefined;
+    const updated: SlurmAllocation = { ...current, ...patch, id: current.id, alias: current.alias };
+    this.db.update(schema.slurmAllocations).set({
+      job_id: updated.job_id ?? null,
+      campaign_id: updated.campaign_id ?? null,
+      capacity_lease_id: updated.capacity_lease_id ?? null,
+      managed_target_id: updated.managed_target_id,
+      state: updated.state,
+      stub_id: updated.stub_id ?? null,
+      last_observed_at: updated.last_observed_at ?? null,
+      data: JSON.stringify(updated),
+    }).where(eq(schema.slurmAllocations.id, id)).run();
+    return this._decorateSlurmAllocation(updated);
   }
 
   // ─── DB Initialization ──────────────────────────────────────────────────
@@ -307,6 +376,22 @@ class Store {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_object_aliases_kind_object
         ON object_aliases(object_kind, object_id);
+      CREATE TABLE IF NOT EXISTS slurm_allocations (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        job_id TEXT UNIQUE,
+        campaign_id TEXT,
+        capacity_lease_id TEXT,
+        managed_target_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        stub_id TEXT,
+        requested_at TEXT NOT NULL,
+        last_observed_at TEXT,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_slurm_allocations_state ON slurm_allocations(state);
+      CREATE INDEX IF NOT EXISTS idx_slurm_allocations_target ON slurm_allocations(managed_target_id);
+      CREATE INDEX IF NOT EXISTS idx_slurm_allocations_lease ON slurm_allocations(capacity_lease_id);
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -1269,7 +1354,8 @@ class Store {
 
   getGlobalQueue(): Task[] {
     return this._queryGlobalQueueTasks().sort((a, b) => {
-      if (b.priority !== a.priority) return b.priority - a.priority;
+      const priorityDelta = effectiveTaskPriority(b) - effectiveTaskPriority(a);
+      if (priorityDelta !== 0) return priorityDelta;
       return a.created_at.localeCompare(b.created_at);
     });
   }
@@ -1375,6 +1461,20 @@ class Store {
       }
     } catch { /* skip */ }
     return undefined;
+  }
+
+  updateTaskByRef(taskRef: string, update: Partial<Task>): Task | undefined {
+    const located = this.findTask(taskRef);
+    if (!located) return undefined;
+    if (located.stubId && !located.archived) {
+      return this.updateTask(located.stubId, located.task.id, update);
+    }
+    const updated = { ...located.task, ...update };
+    const location = located.archived ? "archive" : "global";
+    this._saveTask(updated, location);
+    this._taskIndex.set(updated.id, { location });
+    this._reindexTask(located.task, updated);
+    return this._decorateTask(updated);
   }
 
   updateArchivedTask(taskId: string, update: Partial<Task>): Task | undefined {
@@ -1881,6 +1981,7 @@ class Store {
     this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
+    this.db.delete(schema.slurmAllocations).run();
     this.db.delete(schema.objectAliases).run();
     this.aliasByObject.clear();
     this.objectByAlias.clear();
@@ -1988,6 +2089,7 @@ class Store {
     this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
+    this.db.delete(schema.slurmAllocations).run();
     this.db.delete(schema.objectAliases).run();
     this.aliasByObject.clear();
     this.objectByAlias.clear();

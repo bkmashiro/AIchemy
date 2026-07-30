@@ -24,6 +24,12 @@ log = logging.getLogger(__name__)
 STATUS_INTERVAL_S = 30
 
 
+def sanitize_job_name(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_.-]+", "-", value.strip().lower())
+    normalized = re.sub(r"-+", "-", normalized).strip(".-")
+    return normalized[:64] or "alchemy-stub"
+
+
 def _build_ssl_context() -> ssl.SSLContext | bool:
     """Respect SSL_CERT_FILE for A30 nodes."""
     cert_file = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
@@ -248,7 +254,15 @@ class ControllerDaemon:
             # sbatch output: "Submitted batch job 235166"
             job_id = result.strip().split()[-1] if result.strip() else "unknown"
             log.info("sbatch submitted job_id=%s user=%s partition=%s", job_id, user, params.get("partition"))
-            return {"job_id": job_id, "user": user}
+            return {
+                "job_id": job_id,
+                "job_name": sanitize_job_name(params.get("job_name", "alchemy-stub")),
+                "user": user,
+                "partition": params.get("partition"),
+                "qos": params.get("qos"),
+                "gres": params.get("gres"),
+                "state": "submitted",
+            }
         finally:
             try:
                 os.unlink(script_path)
@@ -268,6 +282,8 @@ class ControllerDaemon:
         token = params.get("token", "alchemy-v2-token")
         env_setup = params.get("env_setup", "")
         tags = params.get("tags", [])
+        job_name = sanitize_job_name(params.get("job_name", "alchemy-stub"))
+        qos = params.get("qos")
 
         tags_arg = f"--tags {','.join(tags)}" if tags else ""
         env_setup_arg = f'--env-setup "{env_setup}"' if env_setup else ""
@@ -277,7 +293,8 @@ class ControllerDaemon:
 #SBATCH --gres={gres}
 #SBATCH --mem={mem}
 #SBATCH --time={time_limit}
-#SBATCH --job-name=train_ct
+#SBATCH --job-name={job_name}
+{f"#SBATCH --qos={qos}" if qos else ""}
 #SBATCH --output={output_dir}/alchemy-{partition}-%j.log
 
 export PATH=/vol/bitbucket/{user}/conda-envs/jema/bin:$PATH

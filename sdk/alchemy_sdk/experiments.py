@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import time
 from typing import Any, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -230,6 +231,34 @@ class ExperimentClient:
     def summary(self, ref: str, *, refresh: bool = False) -> Any:
         exp = self.resolve(ref, refresh=refresh)
         return self._get(f"/experiments/{exp['id']}/summary")
+
+    def wait(
+        self,
+        ref: str,
+        *,
+        timeout: float = 3600.0,
+        interval: float = 5.0,
+        success_statuses: Iterable[str] = ("passed",),
+    ) -> dict[str, Any]:
+        """Wait for an experiment terminal state and enforce its result contract."""
+        if timeout < 0 or interval <= 0:
+            raise ValueError("timeout must be >= 0 and interval must be > 0")
+        success = set(success_statuses)
+        deadline = time.monotonic() + timeout
+        while True:
+            experiment = self.resolve(ref)
+            status = str(experiment.get("status") or "running")
+            if status != "running":
+                if status not in success:
+                    raise RuntimeError(
+                        f"experiment {experiment.get('alias') or experiment.get('id') or ref} "
+                        f"finished with status {status!r}; expected one of {sorted(success)}"
+                    )
+                return experiment
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for experiment {ref!r} after {timeout}s")
+            time.sleep(min(interval, remaining))
 
     def curves(
         self,

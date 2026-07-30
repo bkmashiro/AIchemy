@@ -930,22 +930,19 @@ def test_cancel_running_requires_yes(monkeypatch):
     assert code == 1
 
 
-def test_slurm_submit_t4_posts_deploy_restart(monkeypatch):
+def test_slurm_submit_t4_posts_capacity_submission(monkeypatch):
     calls = run_cli(
         monkeypatch,
         ["slurm", "submit", "t4"],
         [{"ok": True, "job_id": "123"}],
     )
 
-    assert calls == [
-        {
-            "method": "POST",
-            "url": "http://localhost:3002/api/deploy/stubs/slurm-t4/restart",
-            "body": {"server_url": "http://localhost:3002", "token": "secret-token"},
-            "auth": "Bearer secret-token",
-            "timeout": 20.0,
-        }
-    ]
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "http://localhost:3002/api/capacity/allocations/submit"
+    assert calls[0]["body"]["server_url"] == "http://localhost:3002"
+    assert calls[0]["body"]["token"] == "secret-token"
+    assert calls[0]["body"]["target"] == "t4"
+    assert calls[0]["body"]["idempotency_key"].startswith("cli-slurm:")
 
 
 def test_experiments_ls_returns_short_summary(monkeypatch):
@@ -1936,7 +1933,8 @@ def test_stubs_canary_posts_deploy_with_connection_body(monkeypatch):
         [{"ok": True, "job_id": "247"}],
     )
     assert calls[0]["method"] == "POST"
-    assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30"
+    assert calls[0]["url"] == "http://localhost:3002/api/capacity/allocations/submit"
+    assert calls[0]["body"]["target"] == "a30"
     assert calls[0]["body"]["server_url"] == "https://alchemy-v2.yuzhes.com"
     assert calls[0]["body"]["token"] == "secret-token"
     assert calls[0]["body"]["mem"] == "40G"
@@ -1950,8 +1948,34 @@ def test_slurm_submit_posts_idle_timeout_override(monkeypatch):
         [{"ok": True, "job_id": "248"}],
     )
     assert calls[0]["method"] == "POST"
-    assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30/restart"
+    assert calls[0]["url"] == "http://localhost:3002/api/capacity/allocations/submit"
     assert calls[0]["body"]["idle_timeout"] == 600
+    assert calls[0]["body"]["target"] == "a30"
+    assert calls[0]["body"]["idempotency_key"].startswith("cli-slurm:")
+
+
+def test_slurm_submit_accepts_dynamic_a16_target_and_job_metadata(monkeypatch):
+    calls = run_cli(
+        monkeypatch,
+        [
+            "slurm", "submit", "a16", "--job-name", "jema-d1-smoke",
+            "--idempotency-key", "campaign-x/card-0", "--campaign", "camp-1",
+            "--lease", "lease-1", "--yes",
+        ],
+        [{"ok": True, "job_id": "4242", "target": "slurm-a16"}],
+    )
+    assert calls[0]["url"] == "http://localhost:3002/api/capacity/allocations/submit"
+    assert calls[0]["body"]["target"] == "a16"
+    assert calls[0]["body"]["job_name"] == "jema-d1-smoke"
+    assert calls[0]["body"]["idempotency_key"] == "campaign-x/card-0"
+    assert calls[0]["body"]["campaign_id"] == "camp-1"
+    assert calls[0]["body"]["capacity_lease_id"] == "lease-1"
+
+
+def test_slurm_targets_uses_server_catalog(monkeypatch):
+    calls = run_cli(monkeypatch, ["slurm", "targets"], [[{"id": "slurm-a16", "aliases": ["a16"]}]])
+    assert calls[0]["method"] == "GET"
+    assert calls[0]["url"] == "http://localhost:3002/api/capacity/targets"
 
 
 def test_slurm_submit_uses_configured_stub_server_url_and_verbose_output(monkeypatch, tmp_path, capsys):
@@ -1993,7 +2017,7 @@ def test_slurm_submit_posts_default_output_dir_override(monkeypatch):
         [{"ok": True, "job_id": "249"}],
     )
     assert calls[0]["method"] == "POST"
-    assert calls[0]["url"] == "http://localhost:3002/api/deploy/stubs/slurm-a30/restart"
+    assert calls[0]["url"] == "http://localhost:3002/api/capacity/allocations/submit"
     assert calls[0]["body"]["default_output_dir"] == "/vol/gpudata/ys25-MySpace/alchemy-runs"
 
 

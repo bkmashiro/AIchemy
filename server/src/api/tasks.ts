@@ -80,6 +80,7 @@ export interface TaskInput {
   stub_id?: string;
   target_stub_id?: string;
   target_tags?: string[];
+  capacity_lease_id?: string;
   python_env?: string;
   submitted_by?: string;
   depends_on?: string[];
@@ -142,6 +143,7 @@ export function createTask(input: TaskInput): Task {
     priority: input.priority ?? 5,
     stub_id: input.stub_id,
     target_stub_id: input.target_stub_id,
+    capacity_lease_id: input.capacity_lease_id,
     target_tags: input.target_tags,
     grid_id: input.grid_id,
     param_overrides: input.param_overrides,
@@ -639,6 +641,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       auto_retry_on, stub_id,
       target_stub_id: _target_stub_id,
       target_tags: _target_tags,
+      capacity_lease_id,
       tags: _tags,
     } = req.body;
     // target_stub_id pins the task to a specific stub; stub_id is accepted as an alias
@@ -729,7 +732,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     const task = createTask({
       script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
-      requirements, priority, max_retries, run_dir, param_overrides, target_tags, python_env,
+      requirements, priority, max_retries, run_dir, param_overrides, target_tags, capacity_lease_id, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs, metric_schema, auto_retry_on,
       stub_id, target_stub_id, submission_warnings,
     });
@@ -797,6 +800,47 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     }
 
     res.status(201).json(task);
+  });
+
+  // POST /tasks/:id/expedite — temporary, audited, non-preemptive priority overlay
+  router.post("/:id/expedite", (req: Request, res: Response) => {
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    if (!["pending", "assigned", "paused", "blocked"].includes(found.task.status)) {
+      res.status(409).json({ error: "Only queued tasks can be expedited; running work is never preempted" });
+      return;
+    }
+    const expediteClass = req.body?.class === "elevated" ? "elevated" : req.body?.class === "urgent" ? "urgent" : undefined;
+    const ttlSeconds = Number(req.body?.ttl_seconds);
+    const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+    if (!expediteClass || !Number.isFinite(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 86_400 || !reason) {
+      res.status(400).json({ error: "class (elevated|urgent), reason, and ttl_seconds (1..86400) are required" });
+      return;
+    }
+    const now = new Date();
+    const updated = store.updateTaskByRef(req.params.id, {
+      base_priority: found.task.base_priority ?? found.task.priority,
+      expedite_class: expediteClass,
+      expedite_reason: reason,
+      expedite_actor: getActorFromBody(req),
+      expedited_at: now.toISOString(),
+      expedite_until: new Date(now.getTime() + ttlSeconds * 1000).toISOString(),
+    });
+    res.json(updated);
+  });
+
+  router.post("/:id/unexpedite", (req: Request, res: Response) => {
+    const found = store.findTask(req.params.id);
+    if (!found) { res.status(404).json({ error: "Task not found" }); return; }
+    const updated = store.updateTaskByRef(req.params.id, {
+      base_priority: found.task.base_priority ?? found.task.priority,
+      effective_priority: found.task.base_priority ?? found.task.priority,
+      expedite_class: undefined,
+      expedite_reason: undefined,
+      expedite_actor: getActorFromBody(req),
+      expedite_until: undefined,
+    });
+    res.json(updated);
   });
 
   // POST /tasks/:id/read — mark task as read for actor

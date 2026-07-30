@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import io
 from email.message import Message
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 
@@ -955,3 +955,21 @@ def test_fork_plan_does_not_mutate_parent_config(monkeypatch):
     # server-side parent_config snapshot we just received.
     plan["proposed_config"]["layers"].append(99)
     assert plan["parent_config"]["layers"] == [1, 2, 3]
+
+
+def test_wait_returns_only_after_successful_terminal_status():
+    client = ExperimentClient(server="http://example.invalid", token="token")
+    client.resolve = Mock(side_effect=[
+        {"id": "exp-1", "status": "running"},
+        {"id": "exp-1", "alias": "exp-amber-fox-1234", "status": "passed"},
+    ])
+    result = client.wait("exp-1", timeout=1, interval=0.001)
+    assert result["status"] == "passed"
+    assert client.resolve.call_count == 2
+
+
+def test_wait_raises_when_result_contract_status_fails():
+    client = ExperimentClient(server="http://example.invalid", token="token")
+    client.resolve = Mock(return_value={"id": "exp-1", "status": "failed"})
+    with pytest.raises(RuntimeError, match="finished with status 'failed'"):
+        client.wait("exp-1", timeout=1, interval=0.001)

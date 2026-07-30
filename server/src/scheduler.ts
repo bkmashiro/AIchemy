@@ -32,6 +32,7 @@ export type AssignmentReasonCode =
   | "no_online_stubs"
   | "target_stub_offline"
   | "target_stub_mismatch"
+  | "capacity_lease_mismatch"
   | "dependency_blocked"
   | "invalid_resource_requirement"
   | "slots_full"
@@ -95,6 +96,7 @@ export interface AssignmentDiagnosis {
   requested: {
     target_stub_id?: string;
     target_tags?: string[];
+    capacity_lease_id?: string;
     python_env?: string;
     gpu_type?: string[];
     gpu_mem_mb?: number;
@@ -246,6 +248,9 @@ export function evaluateStubEligibility(stub: Stub, task: Task): StubEligibility
   if (hasInvalidResourceRequirement(task)) reasons.push("invalid_resource_requirement");
 
   if (task.target_stub_id && stub.id !== task.target_stub_id) reasons.push("target_stub_mismatch");
+  if (task.capacity_lease_id && stub.capacity_lease_id !== task.capacity_lease_id) {
+    reasons.push("capacity_lease_mismatch");
+  }
   if (stub.status !== "online") {
     reasons.push(task.target_stub_id === stub.id ? "target_stub_offline" : "stub_offline");
   }
@@ -299,6 +304,7 @@ export function evaluateStubEligibility(stub: Stub, task: Task): StubEligibility
 const BLOCKER_PRIORITY: AssignmentReasonCode[] = [
   "target_stub_offline",
   "target_stub_mismatch",
+  "capacity_lease_mismatch",
   "no_online_stubs",
   "stub_draining",
   "invalid_resource_requirement",
@@ -318,6 +324,7 @@ function nextActionForBlocker(blocker: AssignmentReasonCode | null): string {
     case "no_online_stubs": return "start_compatible_stub";
     case "target_stub_offline": return "restart_target_or_retarget";
     case "target_stub_mismatch": return "fix_target_stub_id";
+    case "capacity_lease_mismatch": return "wait_for_capacity_lease_stub";
     case "stub_draining": return "wait_or_undrain_stub";
     case "invalid_resource_requirement": return "fix_positive_resource_requirements";
     case "slots_full": return "wait_for_slot";
@@ -383,6 +390,7 @@ export function diagnoseTaskAssignment(task: Task, stubs: Stub[] = store.getAllS
   const requested: AssignmentDiagnosis["requested"] = {
     target_stub_id: task.target_stub_id,
     target_tags: task.target_tags,
+    capacity_lease_id: task.capacity_lease_id,
     python_env: task.python_env,
     gpu_type: task.requirements?.gpu_type,
     gpu_mem_mb: task.requirements?.gpu_mem_mb,

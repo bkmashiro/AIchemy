@@ -442,8 +442,14 @@ def cmd_stubs_restart(args: argparse.Namespace, client: ApiClient) -> None:
 def cmd_stubs_canary(args: argparse.Namespace, client: ApiClient) -> None:
     if not args.yes:
         raise AlchError("stubs canary submits a real worker; pass --yes")
-    target = args.kind if args.kind.startswith("slurm-") else f"slurm-{args.kind}"
+    target = args.kind
     body: dict[str, Any] = deploy_connection_body(args, client)
+    body.update({
+        "target": target,
+        "idempotency_key": f"cli-canary:{uuid.uuid4()}",
+        "job_name": f"alchemy-canary-{target}",
+        "owner": os.environ.get("USER", "unknown"),
+    })
     if args.mem:
         body["mem"] = args.mem
     if args.time:
@@ -452,16 +458,27 @@ def cmd_stubs_canary(args: argparse.Namespace, client: ApiClient) -> None:
         body["idle_timeout"] = args.idle_timeout
     if getattr(args, "default_output_dir", None):
         body["default_output_dir"] = args.default_output_dir
-    print_json(summarize_deploy_result(client.post(f"/deploy/stubs/{target}", body), target=target, body=body))
+    result = client.post("/capacity/allocations/submit", body)
+    print_json(summarize_deploy_result(result, target=result.get("target") or target, body=body))
+
+
+def cmd_slurm_targets(_args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get("/capacity/targets"))
 
 
 def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
     if args.count != 1 and not args.yes:
         raise AlchError("submitting multiple SLURM stubs requires --yes")
-    target = args.kind if args.kind.startswith("slurm-") else f"slurm-{args.kind}"
+    target = args.kind
     results = []
-    for _ in range(args.count):
+    base_key = args.idempotency_key or f"cli-slurm:{uuid.uuid4()}"
+    for index in range(args.count):
         body: dict[str, Any] = deploy_connection_body(args, client)
+        body.update({
+            "target": target,
+            "idempotency_key": base_key if args.count == 1 else f"{base_key}:{index}",
+            "owner": os.environ.get("USER", "unknown"),
+        })
         if args.mem:
             body["mem"] = args.mem
         if args.time:
@@ -470,7 +487,15 @@ def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
             body["idle_timeout"] = args.idle_timeout
         if getattr(args, "default_output_dir", None):
             body["default_output_dir"] = args.default_output_dir
-        results.append(summarize_deploy_result(client.post(f"/deploy/stubs/{target}/restart", body), target=target, body=body))
+        if args.job_name:
+            body["job_name"] = args.job_name if args.count == 1 else f"{args.job_name}-{index + 1}"
+        if args.campaign:
+            body["campaign_id"] = args.campaign
+        if args.lease:
+            body["capacity_lease_id"] = args.lease
+        result = client.post("/capacity/allocations/submit", body)
+        resolved_target = result.get("target") or target
+        results.append(summarize_deploy_result(result, target=resolved_target, body=body))
     print_json(results[0] if args.count == 1 else results)
 
 
@@ -1719,7 +1744,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = stubs_sub.add_parser("undrain", help="restore a stub's max_concurrent"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("--n", type=int, default=1, help="new max_concurrent (default 1)"); p.set_defaults(func=cmd_stubs_undrain)
     p = stubs_sub.add_parser("restart", help="redeploy/restart a managed stub"); p.add_argument("name", help="deploy stub name (matches deploy-config.yaml)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (defaults to REST server)"); p.add_argument("--yes", action="store_true", help="confirm: this restarts a real worker"); p.set_defaults(func=cmd_stubs_restart)
     p = stubs_sub.add_parser("exec", help="run a shell command on a stub"); p.add_argument("stub", help="stub id, name, or hostname"); p.add_argument("command", nargs="+", help="command to run (e.g. alch stubs exec worker -- ls -la)"); p.add_argument("--timeout", dest="command_timeout", type=float, default=30.0, help="command timeout in seconds (float supported; passed to server as milliseconds)"); p.set_defaults(func=cmd_stubs_exec)
-    p = stubs_sub.add_parser("canary", help="deploy one managed SLURM stub canary with code sync"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand or full slurm-* name"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="confirm: this submits a real worker"); p.set_defaults(func=cmd_stubs_canary)
+    p = stubs_sub.add_parser("canary", help="deploy one managed SLURM stub canary with code sync"); p.add_argument("kind", help="configured GPU target alias or full slurm-* name"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="confirm: this submits a real worker"); p.set_defaults(func=cmd_stubs_canary)
 
     webhooks = sub.add_parser("webhooks", help="manage outbound webhook subscriptions")
     wh_sub = webhooks.add_subparsers(dest="cmd", required=True)
@@ -1731,7 +1756,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)
-    p = slurm_sub.add_parser("submit", help="submit/restart a SLURM stub"); p.add_argument("kind", choices=["a30", "a40", "t4", "slurm-a30", "slurm-a40", "slurm-t4"], help="GPU kind shorthand (a30/a40/t4) or full slurm-* name"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
+    p = slurm_sub.add_parser("targets", help="list configured managed GPU targets"); p.set_defaults(func=cmd_slurm_targets)
+    p = slurm_sub.add_parser("submit", help="submit a managed SLURM allocation"); p.add_argument("kind", help="configured target alias or stable ID"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--job-name", help="sanitized SLURM job name"); p.add_argument("--idempotency-key", help="stable retry key; generated when omitted"); p.add_argument("--campaign", help="owning campaign ID or alias"); p.add_argument("--lease", help="owning capacity lease ID or alias"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
 
     tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)

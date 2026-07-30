@@ -111,6 +111,25 @@ export const objectAliases = sqliteTable("object_aliases", {
   uniqueIndex("idx_object_aliases_kind_object").on(table.object_kind, table.object_id),
 ]);
 
+export const slurmAllocations = sqliteTable("slurm_allocations", {
+  id: text("id").primaryKey(),
+  idempotency_key: text("idempotency_key").notNull().unique(),
+  job_id: text("job_id"),
+  campaign_id: text("campaign_id"),
+  capacity_lease_id: text("capacity_lease_id"),
+  managed_target_id: text("managed_target_id").notNull(),
+  state: text("state").notNull(),
+  stub_id: text("stub_id"),
+  requested_at: text("requested_at").notNull(),
+  last_observed_at: text("last_observed_at"),
+  data: text("data").notNull(),
+}, (table) => [
+  uniqueIndex("idx_slurm_allocations_job_id").on(table.job_id),
+  index("idx_slurm_allocations_state").on(table.state),
+  index("idx_slurm_allocations_target").on(table.managed_target_id),
+  index("idx_slurm_allocations_lease").on(table.capacity_lease_id),
+]);
+
 export const meta = sqliteTable("meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),

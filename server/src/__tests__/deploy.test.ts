@@ -68,4 +68,14 @@ describe("SLURM deploy script generation", () => {
     expect(script).toContain("  --default-output-dir \"/vol/gpudata/ys25-MySpace/alchemy-runs\"");
     expect(script).not.toContain("/vol/bitbucket/ys25/bad-runs");
   });
+
+  it("uses the persisted custom job name verbatim", () => {
+    const script = buildSlurmStubScript(
+      makeSlurmTarget(),
+      "https://alchemy-v2.yuzhes.com",
+      "secret-token",
+      { job_name: "jema-d1-smoke" },
+    );
+    expect(script).toContain("#SBATCH --job-name=jema-d1-smoke");
+  });
 });

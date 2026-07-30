@@ -141,9 +141,17 @@ export interface Task {
   // === Scheduling ===
   status: TaskStatus;
   priority: number;
+  base_priority?: number;
+  effective_priority?: number;
+  expedite_class?: "elevated" | "urgent";
+  expedite_reason?: string;
+  expedite_actor?: string;
+  expedite_until?: string;
+  expedited_at?: string;
   stub_id?: string;
   target_stub_id?: string;       // Hard-pin task to a specific stub by ID
   target_tags?: string[];        // Tag-based routing (scheduler filters stubs by tag)
+  capacity_lease_id?: string;    // Logical capacity binding; never a guessed stub id
   dispatch_attempts?: number;    // Number of failed dispatch attempts (for retry logic)
 
   // === DAG / Experiment ===
@@ -230,6 +238,9 @@ export interface Stub {
   gpu: GpuInfo;
   system_stats?: SystemStats;
   slurm_job_id?: string;
+  slurm_allocation_id?: string;
+  capacity_lease_id?: string;
+  campaign_id?: string;
   status: "online" | "offline";
   type: "slurm" | "workstation";
   connected_at: string;
@@ -567,6 +578,7 @@ export interface ExecResponsePayload {
 
 export interface StubTarget {
   name: string;
+  aliases?: string[];
   // SSH/workstation fields
   type?: "ssh" | "slurm";
   host?: string;        // SSH: target host; optional for slurm
@@ -590,6 +602,61 @@ export interface StubTarget {
   mem?: string;
   time?: string;
   qos?: string;
+  gpu_class?: string;
+  gpu_mem_mb?: number;
+  enabled?: boolean;
+  controller_capability?: string;
+}
+
+export type SlurmAllocationState =
+  | "requested" | "submitted" | "pending" | "running" | "stub_online"
+  | "draining" | "released" | "failed";
+
+export interface SlurmAllocation {
+  id: string;
+  alias?: string;
+  idempotency_key: string;
+  job_id?: string;
+  campaign_id?: string;
+  capacity_lease_id?: string;
+  managed_target_id: string;
+  gpu_class?: string;
+  partition?: string;
+  qos?: string;
+  gres?: string;
+  requested_resources: Record<string, unknown>;
+  job_name: string;
+  owner: string;
+  managed_by: "alchemy" | "manual" | string;
+  pinned: boolean;
+  state: SlurmAllocationState;
+  raw_state?: string;
+  queue_reason?: string;
+  requested_at: string;
+  submitted_at?: string;
+  eligible_at?: string;
+  predicted_start_at?: string;
+  started_at?: string;
+  online_at?: string;
+  released_at?: string;
+  stub_id?: string;
+  last_observed_at?: string;
+  error?: string;
+}
+
+export interface CapacityTarget {
+  id: string;
+  aliases: string[];
+  partition?: string;
+  gres?: string;
+  gpu_class?: string;
+  gpu_mem_mb?: number;
+  qos?: string;
+  default_mem?: string;
+  default_walltime?: string;
+  tags: string[];
+  enabled: boolean;
+  controller_capability?: string;
 }
 
 export interface TunnelConfig {

@@ -33,6 +33,7 @@ import { startAutoRenew } from "./autorenew";
 import { loadDeployConfig } from "./deploy";
 import { createTunnelManager, TunnelManager } from "./tunnel";
 import { createDeployRouter } from "./api/deploy";
+import { createCapacityRouter } from "./api/capacity";
 import { ALCHEMY_VERSION } from "./version";
 import { startWebhookDispatcher } from "./webhooks";
 
@@ -263,6 +264,7 @@ api.use("/refs", createRefsRouter());
 api.use("/cluster", createClusterRouter());
 api.use("/webhooks", createWebhooksRouter());
 api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
+api.use("/capacity", createCapacityRouter(deployConfig));
 
 // Health check — no auth required
 app.get("/api/health", (_req, res) => {

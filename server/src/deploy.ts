@@ -167,15 +167,16 @@ async function syncCodeSlurm(
   await execAsync(`${tarLocal} | ${extractCmd}`, { timeout: 120_000, shell: "/bin/bash" });
 }
 
-interface SlurmSubmitOptions {
+export interface SlurmSubmitOptions {
   mem?: string;
   time?: string;
   idle_timeout?: number;
   default_output_dir?: string;
+  job_name?: string;
 }
 
 export function buildSlurmStubScript(target: StubTarget, serverUrl: string, token: string, overrides?: SlurmSubmitOptions): string {
-  const jobName = `train_stub_${target.name}`;
+  const jobName = overrides?.job_name ?? `alchemy-${target.name}`;
   const mem = overrides?.mem ?? target.mem ?? "60G";
   const time = overrides?.time ?? target.time ?? "24:00:00";
   const idleTimeout = overrides?.idle_timeout ?? target.idle_timeout;
