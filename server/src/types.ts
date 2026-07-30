@@ -108,6 +108,7 @@ export interface SubmissionLintIssue {
 export interface Task {
   // === Identity ===
   id: string;
+  alias?: string;
   seq: number;
   fingerprint: string;
   name?: string;
@@ -370,6 +371,7 @@ export interface ExperimentEvent {
 
 export interface Experiment {
   id: string;
+  alias?: string;
   code_id?: string;
   name: string;
   description?: string;

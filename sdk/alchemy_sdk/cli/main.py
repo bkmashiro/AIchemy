@@ -232,6 +232,7 @@ def short_task(task: dict[str, Any]) -> dict[str, Any]:
 def short_experiment(exp: dict[str, Any]) -> dict[str, Any]:
     out = {
         "id": exp.get("id"),
+        "alias": exp.get("alias"),
         "name": exp.get("name"),
         "status": exp.get("status"),
         "family": exp.get("family"),
@@ -245,8 +246,12 @@ def short_experiment(exp: dict[str, Any]) -> dict[str, Any]:
 
 
 def find_experiment(client: ApiClient, ref: str) -> dict[str, Any]:
-    experiments = client.get("/experiments")
-    return resolve_experiment(experiments, ref)
+    resolved = client.get(f"/experiments/resolve?{urlencode({'ref': ref})}")
+    if isinstance(resolved, list):
+        return resolve_experiment(resolved, ref)
+    if not isinstance(resolved, dict) or not resolved.get("id"):
+        raise AlchError(f"unexpected experiment resolver response for {ref!r}")
+    return resolved
 
 
 def resolve_experiment(experiments: list[dict[str, Any]], ref: str) -> dict[str, Any]:

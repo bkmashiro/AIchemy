@@ -665,6 +665,7 @@ It incorporates the collection-API performance audit and extends Streams J/M int
 
 ```text
 P0: collection/API request amplification and compact pagination
+P1: unified mnemonic aliases + canonical ref resolution
 P1: K audited non-preemptive expedite/effective priority (retained)
 P1: L result contracts + native experiment wait (retained)
 P1: generic GPU target catalog + persisted Slurm allocation records

@@ -181,17 +181,17 @@ def test_experiment_review_smoke_full_loop(monkeypatch, capsys, tmp_path):
         REPORT_PAYLOAD,
         # 3. CLI: alch experiments report --family alpha --format markdown
         REPORT_PAYLOAD,
-        # 4. client.research_bundle("rep-alpha-1")  → list, then bundle
-        EXPERIMENTS_LIST,
+        # 4. client.research_bundle("rep-alpha-1")  → resolve, then bundle
+        EXPERIMENTS_LIST[0],
         BUNDLE_PAYLOAD,
-        # 5. CLI: alch experiments bundle rep-alpha-1  → list, then bundle
-        EXPERIMENTS_LIST,
+        # 5. CLI: alch experiments bundle rep-alpha-1  → resolve, then bundle
+        EXPERIMENTS_LIST[0],
         BUNDLE_PAYLOAD,
-        # 6. client.fork_plan("rep-alpha-1", ...)  → list, then detail
-        EXPERIMENTS_LIST,
+        # 6. client.fork_plan("rep-alpha-1", ...)  → resolve, then detail
+        EXPERIMENTS_LIST[0],
         DETAIL_PAYLOAD,
-        # 7. CLI: alch experiments fork-plan rep-alpha-1 ...  → list, then detail
-        EXPERIMENTS_LIST,
+        # 7. CLI: alch experiments fork-plan rep-alpha-1 ...  → resolve, then detail
+        EXPERIMENTS_LIST[0],
         DETAIL_PAYLOAD,
     ]
 
@@ -317,17 +317,17 @@ def test_experiment_review_smoke_full_loop(monkeypatch, capsys, tmp_path):
         "http://server/api/experiments/research-report?family=alpha",
         # 3. CLI experiments report --format markdown
         "http://server/api/experiments/research-report?family=alpha",
-        # 4. client research_bundle → list + bundle
-        "http://server/api/experiments",
+        # 4. client research_bundle → resolve + bundle
+        "http://server/api/experiments/resolve?ref=rep-alpha-1",
         "http://server/api/experiments/exp-1/research-bundle",
-        # 5. CLI experiments bundle → list + bundle
-        "http://server/api/experiments",
+        # 5. CLI experiments bundle → resolve + bundle
+        "http://server/api/experiments/resolve?ref=rep-alpha-1",
         "http://server/api/experiments/exp-1/research-bundle",
-        # 6. client fork_plan → list + detail
-        "http://server/api/experiments",
+        # 6. client fork_plan → resolve + detail
+        "http://server/api/experiments/resolve?ref=rep-alpha-1",
         "http://server/api/experiments/exp-1",
-        # 7. CLI experiments fork-plan → list + detail
-        "http://server/api/experiments",
+        # 7. CLI experiments fork-plan → resolve + detail
+        "http://server/api/experiments/resolve?ref=rep-alpha-1",
         "http://server/api/experiments/exp-1",
     ]
     assert urls == expected_urls

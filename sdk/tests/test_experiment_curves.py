@@ -14,7 +14,7 @@ def test_curves_fetches_task_metrics_by_ref_and_param_filter(monkeypatch):
             {"ref": "train-2", "ref_template": "train-{seed}", "param_point": {"seed": 2}},
         ],
     }
-    monkeypatch.setattr(client, "list", lambda **_: [experiment])
+    monkeypatch.setattr(client, "resolve", lambda ref, **_: experiment)
 
     calls = []
 
@@ -55,7 +55,7 @@ def test_curves_uses_legacy_points_when_metrics_buffer_missing(monkeypatch):
         "task_refs": {"train": "task-1"},
         "task_specs": [{"ref": "train"}],
     }
-    monkeypatch.setattr(client, "list", lambda **_: [experiment])
+    monkeypatch.setattr(client, "resolve", lambda ref, **_: experiment)
     monkeypatch.setattr(client, "_get", lambda path: {"task_id": "task-1", "points": [{"step": 1, "loss": 0.5}]})
 
     curves = client.curves("single")

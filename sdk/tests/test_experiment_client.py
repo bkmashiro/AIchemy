@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import io
+from email.message import Message
 from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -38,7 +42,23 @@ def _patched_urlopen(queue, calls):
             call["body"] = json.loads(body)
         calls.append(call)
         assert queue, f"unexpected request {req.method} {req.full_url}"
-        return FakeResponse(queue.pop(0))
+        payload = queue.pop(0)
+        if "/api/experiments/resolve?" in req.full_url and isinstance(payload, list):
+            ref = parse_qs(urlparse(req.full_url).query)["ref"][0]
+            id_matches = [e for e in payload if e.get("id") == ref or e.get("alias") == ref]
+            name_matches = [e for e in payload if e.get("name") == ref]
+            code_matches = [e for e in payload if e.get("code_id") == ref]
+            if id_matches:
+                payload = id_matches[0]
+            elif len(name_matches) == 1:
+                payload = name_matches[0]
+            elif len(name_matches) > 1:
+                raise HTTPError(req.full_url, 409, "Conflict", Message(), io.BytesIO(b'{"error":"ambiguous experiment ref"}'))
+            elif code_matches:
+                payload = max(code_matches, key=lambda e: str(e.get("created_at") or ""))
+            else:
+                raise HTTPError(req.full_url, 404, "Not Found", Message(), io.BytesIO(b'{"error":"experiment not found"}'))
+        return FakeResponse(payload)
 
     return fake_urlopen
 
@@ -80,6 +100,25 @@ def test_list_sends_get_experiments_with_bearer(monkeypatch):
         "auth": "Bearer secret-token",
         "timeout": 20.0,
     }]
+
+
+def test_resolve_uses_direct_server_resolver_for_alias(monkeypatch):
+    client = ExperimentClient(server="http://server")
+    resolved = {
+        "id": "76f65100-0473-49e0-aadd-63ef19695323",
+        "alias": "exp-amber-otter-7k2m",
+        "name": "alpha",
+    }
+    result, calls = _run(
+        monkeypatch,
+        lambda: client.resolve("exp-amber-otter-7k2m"),
+        [resolved],
+    )
+    assert result == resolved
+    assert calls[0]["url"] == (
+        "http://server/api/experiments/resolve?ref=exp-amber-otter-7k2m"
+    )
+    assert all(not call["url"].endswith("/api/experiments") for call in calls)
 
 
 def test_resolve_by_id_and_by_name(monkeypatch):
@@ -132,7 +171,7 @@ def test_summary_resolves_then_gets_summary(monkeypatch):
         ],
     )
     assert result == {"id": "exp-1", "metrics": {"loss": 0.1}}
-    assert calls[0]["url"] == "http://server/api/experiments"
+    assert calls[0]["url"] == "http://server/api/experiments/resolve?ref=alpha"
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "http://server/api/experiments/exp-1/summary"
     assert calls[1]["auth"] == "Bearer secret-token"
@@ -150,7 +189,7 @@ def test_recommend_fetches_recommendation_endpoint(monkeypatch):
         ],
     )
     assert result == recommendation
-    assert calls[0]["url"] == "http://server/api/experiments"
+    assert calls[0]["url"] == "http://server/api/experiments/resolve?ref=alpha"
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "http://server/api/experiments/exp-1/recommendation"
 
@@ -164,8 +203,8 @@ def test_recommend_falls_back_to_summary_on_missing_endpoint(monkeypatch):
 
     def fake_urlopen(req, timeout=20.0):
         calls.append({"method": req.method, "url": req.full_url})
-        if req.full_url == "http://server/api/experiments":
-            return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+        if req.full_url == "http://server/api/experiments/resolve?ref=alpha":
+            return FakeResponse({"id": "exp-1", "name": "alpha"})
         if req.full_url == "http://server/api/experiments/exp-1/recommendation":
             raise HTTPError(
                 req.full_url,
@@ -183,7 +222,7 @@ def test_recommend_falls_back_to_summary_on_missing_endpoint(monkeypatch):
 
     assert result == {"winner": "exp-2"}
     assert [c["url"] for c in calls] == [
-        "http://server/api/experiments",
+        "http://server/api/experiments/resolve?ref=alpha",
         "http://server/api/experiments/exp-1/recommendation",
         "http://server/api/experiments/exp-1/summary",
     ]
@@ -348,25 +387,28 @@ def test_cache_disabled_by_default_refetches_experiments(monkeypatch):
     assert len(calls) == 2
 
 
-def test_cache_enabled_reuses_experiments_list_across_resolutions(monkeypatch):
+def test_resolution_bypasses_collection_cache(monkeypatch):
     client = ExperimentClient(server="http://server", cache_experiments=True)
     monkeypatch.setenv("ALCHEMY_TOKEN", "tk")
     experiments = [{"id": "exp-1", "name": "alpha"}]
     queue = [
-        experiments,          # first list()
-        {"metrics": {}},      # summary
-        {"changes": []},      # diff
+        experiments,
+        {"id": "exp-1", "name": "alpha"},
+        {"metrics": {}},
+        {"id": "exp-1", "name": "alpha"},
+        {"changes": []},
     ]
     calls: list[dict] = []
     with patch("alchemy_sdk.experiments.urlopen", _patched_urlopen(queue, calls)):
         client.list()
         client.summary("alpha")
         client.diff("exp-1")
-    # Only one /experiments call: cached list serves both name and id lookups.
     paths = [c["url"].split("/api", 1)[1] for c in calls]
     assert paths == [
         "/experiments",
+        "/experiments/resolve?ref=alpha",
         "/experiments/exp-1/summary",
+        "/experiments/resolve?ref=exp-1",
         "/experiments/exp-1/diff",
     ]
 
@@ -460,7 +502,7 @@ def test_resolve_accepts_code_id(monkeypatch):
         [[{"id": "exp-1", "name": "Atari", "code_id": "jema.atari.coverage500.v1"}]],
     )
     assert result["id"] == "exp-1"
-    assert calls[0]["url"] == "http://server/api/experiments"
+    assert calls[0]["url"] == "http://server/api/experiments/resolve?ref=jema.atari.coverage500.v1"
 
 
 def test_resolve_code_id_selects_latest_run(monkeypatch):
@@ -552,7 +594,7 @@ def test_research_bundle_resolves_and_hits_bundle_endpoint(monkeypatch):
     )
     assert result == bundle_payload
     assert [c["method"] for c in calls] == ["GET", "GET"]
-    assert calls[0]["url"] == "http://server/api/experiments"
+    assert calls[0]["url"] == "http://server/api/experiments/resolve?ref=alpha"
     assert calls[1]["url"] == "http://server/api/experiments/exp-1/research-bundle"
 
 
@@ -623,7 +665,7 @@ def test_research_bundle_refresh_bypasses_cache(monkeypatch):
     paths = [c["url"].split("/api", 1)[1] for c in calls]
     assert paths == [
         "/experiments",
-        "/experiments",
+        "/experiments/resolve?ref=beta",
         "/experiments/exp-2/research-bundle",
     ]
 

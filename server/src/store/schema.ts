@@ -2,7 +2,7 @@
  * store/schema.ts — Drizzle ORM table definitions for Alchemy v2.
  */
 
-import { sqliteTable, text, integer, index, primaryKey } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, primaryKey, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const stubs = sqliteTable("stubs", {
   id: text("id").primaryKey(),
@@ -93,6 +93,16 @@ export const webhookDeliveryOutbox = sqliteTable("webhook_delivery_outbox", {
 }, (table) => [
   index("idx_webhook_delivery_outbox_status_next_retry").on(table.status, table.next_retry_at),
   index("idx_webhook_delivery_outbox_subscription").on(table.subscription_id),
+]);
+
+export const objectAliases = sqliteTable("object_aliases", {
+  alias: text("alias").primaryKey(),
+  object_kind: text("object_kind").notNull(),
+  object_id: text("object_id").notNull(),
+  created_at: text("created_at").notNull(),
+  scheme_version: integer("scheme_version").notNull(),
+}, (table) => [
+  uniqueIndex("idx_object_aliases_kind_object").on(table.object_kind, table.object_id),
 ]);
 
 export const meta = sqliteTable("meta", {

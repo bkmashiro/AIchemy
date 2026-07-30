@@ -217,7 +217,15 @@ class ExperimentClient:
         raise RuntimeError(f"experiment not found: {ref}")
 
     def resolve(self, ref: str, *, refresh: bool = False) -> dict[str, Any]:
-        return self._resolve_one(self.list(refresh=refresh), ref)
+        del refresh  # Resolution is exact and server-backed; collection caches are irrelevant.
+        data = self._get(f"/experiments/resolve?{urlencode({'ref': ref})}")
+        if isinstance(data, list):
+            return self._resolve_one(data, ref)
+        if not isinstance(data, dict) or not data.get("id"):
+            raise RuntimeError(
+                f"unexpected experiment resolver response for {ref!r}: {type(data).__name__}"
+            )
+        return data
 
     def summary(self, ref: str, *, refresh: bool = False) -> Any:
         exp = self.resolve(ref, refresh=refresh)

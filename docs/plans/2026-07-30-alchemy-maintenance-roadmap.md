@@ -44,6 +44,7 @@
 
 ```text
 P0  Milestone 0 — stop collection/API request amplification
+P1  Milestone 0.5 — unified mnemonic aliases and ref resolution
 P1  Retained Stream K — audited non-preemptive expedite/effective priority
 P1  Retained Stream L — result contracts and native experiment waiting
 P1  Milestone 1 — generic GPU target catalog and persisted allocation records
@@ -132,6 +133,94 @@ Migrate `ExperimentClient.resolve()` and CLI `find_experiment()`.
 - A ten-minute simulated slow response never creates a second in-flight request for the same page/query.
 - Known UUID `show/summary/recommend/manifest/timeline/bundle` never accesses the collection endpoint.
 - Legacy callers remain covered until the compatibility endpoint is explicitly removed.
+
+---
+
+## Milestone 0.5 — Unified mnemonic aliases and ref resolution (P1)
+
+**User value:** Operators and agents can refer to durable objects with short, pronounceable refs instead of copying UUIDs, while UUIDs remain canonical.
+
+### 0.5.1 Canonical identity model
+
+Every supported object exposes three distinct identities:
+
+```text
+id       immutable canonical UUID
+alias    immutable server-generated mnemonic ref
+name     optional mutable/semantic display name
+```
+
+Initial object kinds are `task` and `experiment`; future `campaign`, `capacity_lease`, and `slurm_allocation` creation must use the same service. Stub semantic names remain the existing user-facing ref and do not gain a redundant alias.
+
+Alias format is type-prefixed and globally unambiguous:
+
+```text
+exp-amber-otter-7k2m
+task-cobalt-fox-2p9r
+camp-gentle-tiger-9m4x
+lease-bright-raven-3d6w
+alloc-silent-cedar-8k2p
+```
+
+The word list is versioned, curated for spelling/pronunciation, and fixed once released. Generation is deterministic from canonical ID plus collision nonce, persisted at creation/backfill, protected by a unique index, and never recomputed for display. Collision handling extends/changes the hash suffix; it never silently reassigns an existing alias.
+
+### 0.5.2 One resolver
+
+All API/CLI `<ref>` handling uses one canonical resolver with strict precedence:
+
+```text
+exact canonical ID
+-> exact alias
+-> exact domain name/code_id where supported
+-> fail not-found or fail-ambiguous
+```
+
+No prefix guessing and no first-match behavior. Resolution returns canonical `id`, `alias`, `kind`, and display name. Internal dependencies, task refs, DB relations, socket payloads, and audit events continue storing canonical IDs only.
+
+### 0.5.3 Persistence and rollout
+
+Create a generic alias registry rather than separate module-specific implementations:
+
+```text
+object_aliases(alias PRIMARY KEY, object_kind, object_id, created_at, scheme_version)
+UNIQUE(object_kind, object_id)
+```
+
+Backfill existing tasks/experiments idempotently in bounded transactions. New object creation persists the object and alias atomically. API responses add `alias` without removing `id`; list/detail/diagnosis/log output prefers alias visually but includes canonical ID where audit/debugging needs it.
+
+```text
+GET /api/refs/:ref
+GET /api/experiments/resolve?ref=...
+```
+
+Task and experiment exact routes accept canonical ID or exact alias after store-level resolution. SDK/CLI avoids collection enumeration and accepts either form.
+
+**Files:**
+- Create: `server/src/aliases.ts`
+- Modify: `server/src/store/schema.ts`
+- Modify: `server/src/store/index.ts`
+- Create: `server/src/api/refs.ts`
+- Modify: `server/src/api/tasks.ts`
+- Modify: `server/src/api/experiments.ts`
+- Modify: `server/src/types.ts`
+- Modify: `server/src/index.ts`
+- Modify: `sdk/alchemy_sdk/experiments.py`
+- Modify: `sdk/alchemy_sdk/cli/main.py`
+- Test: `server/src/__tests__/aliases.test.ts`
+- Test: `server/src/__tests__/api-tasks.test.ts`
+- Test: `server/src/__tests__/experiment-api.test.ts`
+- Test: `sdk/tests/test_cli.py`
+- Test: `sdk/tests/test_experiment_lineage.py`
+
+**Acceptance gates:**
+
+- Existing and newly created tasks/experiments have stable aliases across restart.
+- Aliases are globally unique, immutable, type-prefixed, and collision-safe.
+- Task/experiment detail routes accept alias and return both `id` and `alias`.
+- Known UUID and alias CLI operations do not enumerate collection endpoints.
+- Ambiguous names fail visibly; aliases never use name fallback.
+- Internal persisted relationships continue using canonical UUIDs.
+- Backfill is idempotent and does not rewrite task/experiment scientific payloads.
 
 ---
 

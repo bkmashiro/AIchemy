@@ -1582,6 +1582,19 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     res.status(201).json(experiment);
   });
 
+  // GET /experiments/resolve?ref= — exact UUID, alias, name, or code_id.
+  router.get("/resolve", (req: Request, res: Response) => {
+    const ref = typeof req.query.ref === "string" ? req.query.ref.trim() : "";
+    if (!ref) { res.status(400).json({ error: "ref is required" }); return; }
+    try {
+      const experiment = store.resolveExperimentReference(ref);
+      if (!experiment) { res.status(404).json({ error: `Experiment not found: ${ref}` }); return; }
+      res.json(experiment);
+    } catch (err) {
+      res.status(409).json({ error: String(err instanceof Error ? err.message : err) });
+    }
+  });
+
   // GET /experiments — optional ?family=&decision=&status= filters
   router.get("/", (req: Request, res: Response) => {
     const familyFilter = typeof req.query.family === "string" ? req.query.family : undefined;

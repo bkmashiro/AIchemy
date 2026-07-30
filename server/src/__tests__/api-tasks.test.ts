@@ -151,6 +151,20 @@ describe("GET /tasks/:id/assignment-diagnosis", () => {
   });
 });
 
+describe("GET /tasks/:id", () => {
+  it("accepts a mnemonic alias and returns canonical id plus alias", async () => {
+    const app = makeApp();
+    const task = makeTask({ id: "8730382b-bd75-4124-a3d0-a792a05c4acd" });
+    store.addToGlobalQueue(task);
+
+    const response = await request(app).get(`/tasks/${task.alias}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe(task.id);
+    expect(response.body.alias).toBe(task.alias);
+  });
+});
+
 // ─── assembleCommand ──────────────────────────────────────────────────────────
 
 describe("assembleCommand", () => {

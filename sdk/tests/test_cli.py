@@ -298,7 +298,7 @@ def test_experiments_curves_resolves_and_fetches_task_metrics(monkeypatch):
             {"metrics_buffer": {"loss": [{"step": 1, "value": 0.4}], "acc": [{"step": 1, "value": 0.2}]}},
         ],
     )
-    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/resolve?ref=alpha"
     assert calls[1]["url"] == "http://localhost:3002/api/tasks/task-1/metrics"
 
 
@@ -977,7 +977,7 @@ def test_experiments_show_resolves_name_then_fetches_detail(monkeypatch):
         ],
     )
 
-    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/resolve?ref=alpha"
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1"
 
@@ -1105,7 +1105,7 @@ def test_experiments_adopt_task_resolves_and_posts_move(monkeypatch):
         ],
     )
 
-    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/resolve?ref=retro"
     assert calls[1]["method"] == "POST"
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/tasks/adopt"
     assert calls[1]["body"] == {"task_ids": ["task-1"], "mode": "move"}
@@ -1491,8 +1491,8 @@ def test_experiments_recommend_falls_back_to_summary_if_recommendation_missing(m
 
     def fake_urlopen(req, timeout=20.0):
         calls.append({"method": req.method, "url": req.full_url})
-        if req.full_url == "http://localhost:3002/api/experiments":
-            return FakeResponse([{"id": "exp-1", "name": "alpha"}])
+        if req.full_url == "http://localhost:3002/api/experiments/resolve?ref=alpha":
+            return FakeResponse({"id": "exp-1", "name": "alpha"})
         if req.full_url == "http://localhost:3002/api/experiments/exp-1/recommendation":
             raise HTTPError(
                 req.full_url,
@@ -1510,7 +1510,7 @@ def test_experiments_recommend_falls_back_to_summary_if_recommendation_missing(m
         code = cli.main(["experiments", "recommend", "alpha"])
 
     assert code == 0
-    assert ["http://localhost:3002/api/experiments", "http://localhost:3002/api/experiments/exp-1/recommendation", "http://localhost:3002/api/experiments/exp-1/summary"] == [
+    assert ["http://localhost:3002/api/experiments/resolve?ref=alpha", "http://localhost:3002/api/experiments/exp-1/recommendation", "http://localhost:3002/api/experiments/exp-1/summary"] == [
         c["url"] for c in calls
     ]
     assert json.loads(capsys.readouterr().out) == {"best": "run"}
@@ -1563,7 +1563,7 @@ def test_experiments_bundle_fetches_research_bundle_endpoint(monkeypatch):
         ],
     )
     assert calls[0]["method"] == "GET"
-    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/resolve?ref=alpha"
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/research-bundle"
 
@@ -1632,7 +1632,7 @@ def test_experiments_bundle_markdown_prints_markdown(monkeypatch, capsys):
 
     assert len(calls) == 2
     assert calls[0]["method"] == "GET"
-    assert calls[0]["url"] == "http://localhost:3002/api/experiments"
+    assert calls[0]["url"] == "http://localhost:3002/api/experiments/resolve?ref=alpha"
     assert calls[1]["method"] == "GET"
     assert calls[1]["url"] == "http://localhost:3002/api/experiments/exp-1/research-bundle"
 

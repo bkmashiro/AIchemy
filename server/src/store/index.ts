@@ -35,6 +35,11 @@ import { writeLockTable } from "../dedup";
 import { pruneBackups, writeStateBackup } from "./backup";
 import { logger } from "../log";
 import { canTransition } from "../state-machine";
+import {
+  ALIAS_SCHEME_VERSION,
+  generateMnemonicAlias,
+  type AliasObjectKind,
+} from "../aliases";
 
 const STATE_DIR = process.env.STATE_DIR || process.cwd();
 const STATE_FILE = process.env.STATE_FILE || path.join(STATE_DIR, "state.json");
@@ -63,10 +68,108 @@ class Store {
   private seqCounter: number = 0;
   private fingerprintIndex: FingerprintIndex = new Map();
   private _taskIndex = new Map<string, { stubId?: string; location: "global" | "stub" | "archive" }>();
+  private aliasByObject = new Map<string, string>();
+  private objectByAlias = new Map<string, { kind: AliasObjectKind; id: string }>();
 
   constructor() {
     this._initDb();
     this._loadFromDb();
+  }
+
+  private _aliasKey(kind: AliasObjectKind, objectId: string): string {
+    return `${kind}\u0000${objectId}`;
+  }
+
+  private _cacheAlias(alias: string, kind: AliasObjectKind, objectId: string): void {
+    this.aliasByObject.set(this._aliasKey(kind, objectId), alias);
+    this.objectByAlias.set(alias, { kind, id: objectId });
+  }
+
+  ensureObjectAlias(kind: AliasObjectKind, objectId: string): string {
+    const cached = this.aliasByObject.get(this._aliasKey(kind, objectId));
+    if (cached) return cached;
+    const existing = this.db.select({ alias: schema.objectAliases.alias })
+      .from(schema.objectAliases)
+      .where(and(
+        eq(schema.objectAliases.object_kind, kind),
+        eq(schema.objectAliases.object_id, objectId),
+      ))
+      .get();
+    if (existing) {
+      this._cacheAlias(existing.alias, kind, objectId);
+      return existing.alias;
+    }
+
+    for (let nonce = 0; nonce < 100; nonce += 1) {
+      const alias = generateMnemonicAlias(kind, objectId, nonce);
+      const result = this.db.insert(schema.objectAliases)
+        .values({
+          alias,
+          object_kind: kind,
+          object_id: objectId,
+          created_at: new Date().toISOString(),
+          scheme_version: ALIAS_SCHEME_VERSION,
+        })
+        .onConflictDoNothing()
+        .run();
+      if (result.changes > 0) {
+        this._cacheAlias(alias, kind, objectId);
+        return alias;
+      }
+
+      const winner = this.db.select().from(schema.objectAliases)
+        .where(and(
+          eq(schema.objectAliases.object_kind, kind),
+          eq(schema.objectAliases.object_id, objectId),
+        ))
+        .get();
+      if (winner) {
+        this._cacheAlias(winner.alias, kind, objectId);
+        return winner.alias;
+      }
+    }
+    throw new Error(`unable to allocate alias for ${kind}:${objectId}`);
+  }
+
+  resolveObjectRef(
+    ref: string,
+    kind?: AliasObjectKind,
+  ): { id: string; alias: string; kind: AliasObjectKind; name?: string } | undefined {
+    let aliasObject = this.objectByAlias.get(ref);
+    if (!aliasObject) {
+      const aliasRow = this.db.select().from(schema.objectAliases)
+        .where(eq(schema.objectAliases.alias, ref))
+        .get();
+      if (aliasRow) {
+        aliasObject = { kind: aliasRow.object_kind as AliasObjectKind, id: aliasRow.object_id };
+        this._cacheAlias(aliasRow.alias, aliasObject.kind, aliasObject.id);
+      }
+    }
+    if (aliasObject) {
+      const rowKind = aliasObject.kind;
+      if (kind && rowKind !== kind) return undefined;
+      const name = rowKind === "experiment" ? this.experiments.get(aliasObject.id)?.name : undefined;
+      return { id: aliasObject.id, alias: ref, kind: rowKind, name };
+    }
+
+    const kinds: AliasObjectKind[] = kind ? [kind] : ["experiment", "task"];
+    for (const candidate of kinds) {
+      const exists = candidate === "experiment"
+        ? this.experiments.has(ref)
+        : candidate === "task"
+          ? Boolean(this.db.select({ id: schema.tasks.id }).from(schema.tasks).where(eq(schema.tasks.id, ref)).get())
+          : false;
+      if (!exists) continue;
+      const alias = this.ensureObjectAlias(candidate, ref);
+      const name = candidate === "experiment" ? this.experiments.get(ref)?.name : undefined;
+      return { id: ref, alias, kind: candidate, name };
+    }
+    return undefined;
+  }
+
+  private _decorateTask(task: Task): Task {
+    task.alias = this.ensureObjectAlias("task", task.id);
+    return task;
   }
 
   // ─── DB Initialization ──────────────────────────────────────────────────
@@ -177,6 +280,15 @@ class Store {
         ON webhook_delivery_outbox(status, next_retry_at);
       CREATE INDEX IF NOT EXISTS idx_webhook_delivery_outbox_subscription
         ON webhook_delivery_outbox(subscription_id);
+      CREATE TABLE IF NOT EXISTS object_aliases (
+        alias TEXT PRIMARY KEY,
+        object_kind TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        scheme_version INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_object_aliases_kind_object
+        ON object_aliases(object_kind, object_id);
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -193,6 +305,10 @@ class Store {
 
   private _loadFromDb(): void {
     try {
+      for (const row of this.db.select().from(schema.objectAliases).all()) {
+        this._cacheAlias(row.alias, row.object_kind as AliasObjectKind, row.object_id);
+      }
+
       // stubs
       for (const row of this.db.select({ data: schema.stubs.data }).from(schema.stubs).all()) {
         const stub: Stub = JSON.parse(row.data);
@@ -216,7 +332,13 @@ class Store {
       // experiments
       for (const row of this.db.select({ data: schema.experiments.data }).from(schema.experiments).all()) {
         const exp: Experiment = JSON.parse(row.data);
+        exp.alias = this.ensureObjectAlias("experiment", exp.id);
         this.experiments.set(exp.id, exp);
+      }
+
+      // Backfill the alias registry without rewriting historical task payloads.
+      for (const row of this.db.select({ id: schema.tasks.id }).from(schema.tasks).all()) {
+        this.ensureObjectAlias("task", row.id);
       }
 
       // webhook subscriptions
@@ -238,7 +360,7 @@ class Store {
         .where(eq(schema.tasks.location, "stub"))
         .all();
       for (const row of stubTaskRows) {
-        const task: Task = JSON.parse(row.data);
+        const task: Task = this._decorateTask(JSON.parse(row.data));
         if (task.stub_id) {
           const stub = this.stubs.get(task.stub_id);
           if (stub && this._isActive(task.status)) {
@@ -284,6 +406,7 @@ class Store {
    * should let the error propagate so the transaction rolls back.
    */
   private _saveTask(task: Task, location: "global" | "stub" | "archive"): void {
+    this._decorateTask(task);
     this.db.insert(schema.tasks)
       .values({
         id: task.id,
@@ -362,7 +485,7 @@ class Store {
       .all();
     const tasks: Task[] = [];
     for (const row of rows) {
-      try { tasks.push(JSON.parse(row.data) as Task); } catch { /* skip corrupt */ }
+      try { tasks.push(this._decorateTask(JSON.parse(row.data) as Task)); } catch { /* skip corrupt */ }
     }
     return tasks;
   }
@@ -374,7 +497,7 @@ class Store {
       .all();
     const tasks: Task[] = [];
     for (const row of rows) {
-      try { tasks.push(JSON.parse(row.data) as Task); } catch { /* skip corrupt */ }
+      try { tasks.push(this._decorateTask(JSON.parse(row.data) as Task)); } catch { /* skip corrupt */ }
     }
     return tasks;
   }
@@ -385,7 +508,7 @@ class Store {
       .where(eq(schema.tasks.id, taskId))
       .get();
     if (!row) return undefined;
-    try { return JSON.parse(row.data) as Task; } catch { return undefined; }
+    try { return this._decorateTask(JSON.parse(row.data) as Task); } catch { return undefined; }
   }
 
   private _findGlobalQueueTaskInDb(taskId: string): Task | undefined {
@@ -394,7 +517,7 @@ class Store {
       .where(and(eq(schema.tasks.id, taskId), eq(schema.tasks.location, "global")))
       .get();
     if (!row) return undefined;
-    try { return JSON.parse(row.data) as Task; } catch { return undefined; }
+    try { return this._decorateTask(JSON.parse(row.data) as Task); } catch { return undefined; }
   }
 
   // ─── Seq Counter ────────────────────────────────────────────────────────
@@ -899,7 +1022,7 @@ class Store {
         .all();
       for (const row of dbRows) {
         try {
-          const task = JSON.parse(row.data) as Task;
+          const task = this._decorateTask(JSON.parse(row.data) as Task);
           if (!seenIds.has(task.id)) {
             tasks.push(task);
             seenIds.add(task.id);
@@ -925,6 +1048,7 @@ class Store {
   }
 
   setArchive(tasks: Task[]): void {
+    for (const task of tasks) this._decorateTask(task);
     this.db.transaction((tx) => {
       // Delete all current archive tasks
       tx.delete(schema.tasks).where(eq(schema.tasks.location, "archive")).run();
@@ -1107,6 +1231,7 @@ class Store {
   }
 
   findTask(taskId: string): { task: Task; stubId: string | null; archived?: boolean } | undefined {
+    taskId = this.resolveObjectRef(taskId, "task")?.id ?? taskId;
     const entry = this._taskIndex.get(taskId);
     if (entry) {
       if (entry.location === "stub" && entry.stubId) {
@@ -1136,7 +1261,7 @@ class Store {
         .where(eq(schema.tasks.id, taskId))
         .get();
       if (row) {
-        const task = JSON.parse(row.data) as Task;
+        const task = this._decorateTask(JSON.parse(row.data) as Task);
         if (row.location === "global") {
           this._taskIndex.set(taskId, { location: "global" });
           return { task, stubId: null };
@@ -1383,7 +1508,7 @@ class Store {
     const archived: Task[] = [];
     for (const row of archiveRows) {
       try {
-        const t = JSON.parse(row.data) as Task;
+        const t = this._decorateTask(JSON.parse(row.data) as Task);
         if (t.grid_id === gridId && !seenIds.has(t.id)) {
           archived.push(t);
         }
@@ -1422,6 +1547,7 @@ class Store {
   // ─── Experiments ────────────────────────────────────────────────────────
 
   getExperiment(id: string): Experiment | undefined {
+    id = this.resolveObjectRef(id, "experiment")?.id ?? id;
     return this.experiments.get(id);
   }
 
@@ -1429,7 +1555,21 @@ class Store {
     return Array.from(this.experiments.values());
   }
 
+  resolveExperimentReference(ref: string): Experiment | undefined {
+    const exact = this.getExperiment(ref);
+    if (exact) return exact;
+
+    const nameMatches = Array.from(this.experiments.values()).filter((exp) => exp.name === ref);
+    if (nameMatches.length > 1) throw new Error(`ambiguous experiment ref: ${ref}`);
+    if (nameMatches.length === 1) return nameMatches[0];
+
+    const codeMatches = Array.from(this.experiments.values()).filter((exp) => exp.code_id === ref);
+    if (codeMatches.length === 0) return undefined;
+    return codeMatches.reduce((latest, exp) => exp.created_at > latest.created_at ? exp : latest);
+  }
+
   setExperiment(exp: Experiment): void {
+    exp.alias = this.ensureObjectAlias("experiment", exp.id);
     this.experiments.set(exp.id, exp);
     try {
       this.db.insert(schema.experiments)
@@ -1606,6 +1746,9 @@ class Store {
     this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
+    this.db.delete(schema.objectAliases).run();
+    this.aliasByObject.clear();
+    this.objectByAlias.clear();
     this.db.delete(schema.meta).run();
     this.db.delete(schema.taskMarks).run();
 
@@ -1710,6 +1853,9 @@ class Store {
     this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
+    this.db.delete(schema.objectAliases).run();
+    this.aliasByObject.clear();
+    this.objectByAlias.clear();
     this.db.delete(schema.meta).run();
     this.db.delete(schema.taskMarks).run();
   }
