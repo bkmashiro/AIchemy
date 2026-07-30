@@ -271,6 +271,15 @@ class Store {
       .map((row) => JSON.parse(row.data) as CapacityPolicyEvent);
   }
 
+  getLatestAppliedCapacityPolicyEvent(poolId: string): CapacityPolicyEvent | undefined {
+    return this.db.select({ data: schema.capacityPolicyEvents.data })
+      .from(schema.capacityPolicyEvents)
+      .orderBy(desc(schema.capacityPolicyEvents.created_at))
+      .all()
+      .map((row) => JSON.parse(row.data) as CapacityPolicyEvent)
+      .find((event) => event.pool_id === poolId && event.applied && ["acquire", "release"].includes(event.kind));
+  }
+
   disableCapacityPolicy(poolId: string): void {
     this.db.insert(schema.meta)
       .values({ key: `capacity_policy_disabled:${poolId}`, value: new Date().toISOString() })
@@ -2082,6 +2091,27 @@ class Store {
   }
 
   loadFromState(state: ServerState): void {
+    const requiredArrays = ["stubs", "tokens", "grids", "experiments", "archive", "global_queue"] as const;
+    if (!state || typeof state !== "object" || requiredArrays.some((field) => !Array.isArray(state[field]))) {
+      throw new Error("Invalid backup: required collections must be arrays");
+    }
+    for (const field of ["slurm_allocations", "capacity_campaigns", "capacity_policy_events", "disabled_capacity_policy_pools", "object_aliases"] as const) {
+      if (state[field] !== undefined && !Array.isArray(state[field])) throw new Error(`Invalid backup: ${field} must be an array`);
+    }
+    const identityFields: Array<[keyof ServerState, string]> = [
+      ["stubs", "id"], ["tokens", "token"], ["grids", "id"], ["experiments", "id"],
+      ["archive", "id"], ["global_queue", "id"], ["slurm_allocations", "id"],
+      ["capacity_campaigns", "id"], ["capacity_policy_events", "id"], ["object_aliases", "alias"],
+    ];
+    for (const [field, identity] of identityFields) {
+      const items = state[field] as unknown[] | undefined;
+      if (items?.some((item) => !item || typeof item !== "object" || typeof (item as Record<string, unknown>)[identity] !== "string")) {
+        throw new Error(`Invalid backup: ${String(field)} entries require string ${identity}`);
+      }
+      const values = items?.map((item) => (item as Record<string, unknown>)[identity]);
+      if (values && new Set(values).size !== values.length) throw new Error(`Invalid backup: duplicate ${String(field)} ${identity}`);
+    }
+    const latchedDisabledPools = this.exportState().disabled_capacity_policy_pools ?? [];
     this.stubs.clear();
     this.tokens.clear();
     this.grids.clear();
@@ -2111,6 +2141,7 @@ class Store {
     this.db.delete(schema.taskMarks).run();
 
     this._applyState(state);
+    for (const poolId of latchedDisabledPools) this.disableCapacityPolicy(poolId);
     logger.info("state.restore", { stubs: this.stubs.size });
   }
 

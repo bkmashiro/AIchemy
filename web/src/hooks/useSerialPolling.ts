@@ -15,17 +15,19 @@ export function useSerialPolling(
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let controller: AbortController | undefined;
+    let running = false;
 
     const schedule = () => {
       if (stopped) return;
       timer = setTimeout(run, intervalMs);
     };
     const run = async () => {
-      if (stopped) return;
+      if (stopped || running) return;
       if (document.visibilityState === "hidden") {
         schedule();
         return;
       }
+      running = true;
       controller = new AbortController();
       try {
         await pollRef.current(controller.signal);
@@ -33,6 +35,7 @@ export function useSerialPolling(
         // Callers own visible error state; polling itself must keep running.
       } finally {
         controller = undefined;
+        running = false;
         schedule();
       }
     };

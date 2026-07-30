@@ -495,6 +495,25 @@ describe("experiment lineage API", () => {
     expect(reloaded.body.code_id).toBe(sdkSpec.code_id);
   });
 
+  it("rejects task execution fields that diverge from an immutable SDK runtime", async () => {
+    const app = makeApp();
+    const runtime = {
+      name: "release", immutable: true, runtime_id: "runtime-123", cwd: "/runtime",
+      python_env: "jema", env_setup: "locked", env: { MODE: "release" },
+      git_sha: "a".repeat(40), dependency_lock_sha256: "b".repeat(64),
+      artifact_uri: `oci://registry.invalid/jema@sha256:${"c".repeat(64)}`,
+    };
+    const response = await request(app).post("/experiments").send({
+      name: "forged-runtime",
+      sdk_spec: { name: "forged-runtime", runtime, tasks: [] },
+      task_specs: [{ ref: "train", script: "train.py", cwd: "/other", python_env: "jema", env_setup: "locked", env: { MODE: "release" } }],
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/immutable runtime/i);
+    expect(store.findExperimentByName("forged-runtime")).toBeUndefined();
+  });
+
   it("allows repeated runs of the same code_id and resolves the latest run", async () => {
     const app = makeApp();
     const first = await request(app)

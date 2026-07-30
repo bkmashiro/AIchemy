@@ -1072,6 +1072,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       ref: task.ref,
       args_template: task.args_template,
       experiment_id: task.experiment_id,
+      capacity_lease_id: task.capacity_lease_id,
       outputs: task.outputs,
     });
 

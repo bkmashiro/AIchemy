@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { reconcileCampaign, startCampaignReconciler, type CampaignDriver } from "../campaigns/reconciler";
+import { reconcileActiveCampaigns, reconcileCampaign, startCampaignReconciler, type CampaignDriver } from "../campaigns/reconciler";
 import { store } from "../store";
 
 function createCampaign(overrides: Record<string, unknown> = {}) {
-  return store.createCapacityCampaign({
+  const campaign = store.createCapacityCampaign({
     name: "safe-campaign",
     state: "acquire",
     target_id: "slurm-a16",
@@ -14,6 +14,13 @@ function createCampaign(overrides: Record<string, unknown> = {}) {
     max_runtime_seconds: 3600,
     ...overrides,
   });
+  store.createSlurmAllocation({
+    id: "allocation-1", idempotency_key: "campaign-acquire", campaign_id: campaign.id,
+    capacity_lease_id: campaign.capacity_lease_id, managed_target_id: campaign.target_id,
+    requested_resources: {}, job_name: "campaign", owner: "tester", managed_by: "alchemy",
+    pinned: false, state: "requested",
+  });
+  return campaign;
 }
 
 function driver(overrides: Partial<CampaignDriver> = {}): CampaignDriver {
@@ -24,7 +31,10 @@ function driver(overrides: Partial<CampaignDriver> = {}): CampaignDriver {
     submitDag: vi.fn(async () => ({ experiment_id: "experiment-1" })),
     observeDag: vi.fn(async () => ({ status: "running" as const, active_task_ids: ["task-1"] })),
     drain: vi.fn(async () => ({ drained: true, active_task_ids: [] })),
-    release: vi.fn(async () => ({ released: true })),
+    release: vi.fn(async (campaign) => {
+      if (campaign.allocation_id) store.updateSlurmAllocation(campaign.allocation_id, { state: "released", released_at: new Date().toISOString() });
+      return { released: true };
+    }),
     closeout: vi.fn(async () => ({ closed: true, active_task_ids: [], allocations_terminal: true })),
     cleanup: vi.fn(async () => ({ cleaned: true })),
     ...overrides,
@@ -56,6 +66,21 @@ describe("restart-safe campaign reconciliation", () => {
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("release");
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("closeout");
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("completed");
+  });
+
+  it("rejects an allocation returned for another campaign", async () => {
+    const campaign = createCampaign();
+    store.createSlurmAllocation({
+      id: "foreign", idempotency_key: "foreign", campaign_id: "other", capacity_lease_id: "other-lease",
+      managed_target_id: campaign.target_id, requested_resources: {}, job_name: "foreign", owner: "tester",
+      managed_by: "alchemy", pinned: false, state: "requested",
+    });
+    const d = driver({ acquire: vi.fn(async () => ({ allocation_id: "foreign" })) });
+
+    const result = await reconcileCampaign(campaign.id, d);
+
+    expect(result.state).toBe("acquire");
+    expect(result.last_error).toMatch(/ownership/i);
   });
 
   it("bounds retries and performs owned cleanup after a side-effect failure", async () => {
@@ -130,6 +155,17 @@ describe("restart-safe campaign reconciliation", () => {
 
     expect(result.state).toBe("drain");
     expect(d.release).not.toHaveBeenCalled();
+  });
+
+  it("automatically retries failed campaigns with cleanup obligations", async () => {
+    createCampaign({ state: "failed", cleanup_required: true, last_error: "cleanup incomplete" });
+    const d = driver({ cleanup: vi.fn(async () => ({ cleaned: true })) });
+
+    const reconciled = await reconcileActiveCampaigns(d);
+
+    expect(reconciled).toHaveLength(1);
+    expect(reconciled[0].cleanup_required).toBe(false);
+    expect(d.cleanup).toHaveBeenCalledOnce();
   });
 
   it("runs automated reconciliation serially and can be stopped", async () => {

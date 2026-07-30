@@ -106,6 +106,31 @@ def test_immutable_runtime_profile_rejects_mutable_or_malformed_identity():
         })
 
 
+def test_immutable_runtime_profile_rejects_task_level_runtime_overrides():
+    profile = RuntimeProfile(
+        name="release",
+        immutable=True,
+        cwd="/runtime",
+        python_env="jema",
+        env_setup="install-locked-runtime",
+        env={"MODE": "release"},
+        git_sha="a" * 40,
+        dependency_lock_sha256="b" * 64,
+        artifact_uri="oci://registry.invalid/jema@sha256:" + "c" * 64,
+    )
+    for override in (
+        {"cwd": "/other"},
+        {"python_env": "other"},
+        {"env_setup": "mutable"},
+        {"env": {"MODE": "debug"}},
+        {"env_overrides": {"MODE": "debug"}},
+    ):
+        exp = Experiment("immutable-task").runtime(profile)
+        exp.task("train", script="train.py", **override)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="immutable runtime"):
+            exp.to_spec()
+
+
 def test_task_values_override_runtime_profile_without_mutating_it():
     profile = RuntimeProfile(
         name="base",
@@ -128,6 +153,12 @@ def test_task_values_override_runtime_profile_without_mutating_it():
     assert task["python_env"] == "/task/python"
     assert task["env"] == {"MODE": "task", "KEEP": "yes"}
     assert profile.env == {"MODE": "base", "KEEP": "yes"}
+
+
+def test_task_capacity_lease_is_materialized_in_sdk_spec():
+    exp = Experiment("leased")
+    exp.task("train", script="train.py", capacity_lease_id="lease-1")
+    assert exp.to_spec()["tasks"][0]["capacity_lease_id"] == "lease-1"
 
 
 def test_decision_policy_is_declared_in_spec_and_chainable():

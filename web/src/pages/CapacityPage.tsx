@@ -26,6 +26,7 @@ export default function CapacityPage() {
   const [policyEvents, setPolicyEvents] = useState<CapacityPolicyEvent[]>([]);
   const [activeTasks, setActiveTasks] = useState<Task[]>([]);
   const [minimumGpuMemory, setMinimumGpuMemory] = useState("");
+  const [plannerSnapshot, setPlannerSnapshot] = useState<Record<string, unknown>>({});
   const [plan, setPlan] = useState<CapacityPlan | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -36,7 +37,19 @@ export default function CapacityPage() {
         capacityApi.targets(signal), capacityApi.allocations(signal), capacityApi.campaigns(signal), capacityApi.policyEvents(signal),
         tasksApi.list({ status_group: "active", limit: 500 }, signal),
       ]);
-      setTargets(nextTargets); setAllocations(nextAllocations); setCampaigns(nextCampaigns); setPolicyEvents(nextPolicyEvents); setActiveTasks(nextTasks.tasks); setError(null);
+      setTargets(nextTargets); setAllocations(nextAllocations); setCampaigns(nextCampaigns); setPolicyEvents(nextPolicyEvents); setActiveTasks(nextTasks.tasks);
+      setPlannerSnapshot({ partitions: nextTargets.map((target) => {
+        const observed = nextAllocations.filter((allocation) => allocation.managed_target_id === target.id && allocation.last_observed_at);
+        const pending = observed.filter((allocation) => ["requested", "submitted", "pending"].includes(allocation.state));
+        return {
+          name: target.partition,
+          pending_jobs: pending.length,
+          observed_at: observed.map((allocation) => allocation.last_observed_at).filter(Boolean).sort().slice(-1)[0],
+          queue_reason: pending.map((allocation) => allocation.queue_reason).find(Boolean),
+          predicted_start_at: pending.map((allocation) => allocation.predicted_start_at).filter(Boolean).sort()[0],
+        };
+      }) });
+      setError(null);
     } catch (cause) {
       if (!signal.aborted) setError(String(cause));
     }
@@ -54,7 +67,7 @@ export default function CapacityPage() {
     const parsedMemory = Number(minimumGpuMemory);
     const resources = Number.isFinite(parsedMemory) && parsedMemory > 0 ? { gpu_mem_mb: parsedMemory } : {};
     try {
-      setPlan(await capacityApi.recommend(resources, {}));
+      setPlan(await capacityApi.recommend(resources, plannerSnapshot));
       setError(null);
     } catch (cause) {
       const response = (cause as { response?: { data?: Partial<CapacityPlan> } })?.response?.data;

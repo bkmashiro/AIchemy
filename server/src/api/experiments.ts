@@ -26,6 +26,26 @@ import { logger } from "../log";
 import { initExperimentManifest, readExperimentManifest } from "../git-tracking";
 import { lintTaskSpecs } from "../submission-lint";
 
+function validateImmutableRuntimeSpec(sdkSpec: unknown, taskSpecs: TaskSpec[]): string | undefined {
+  if (!isPlainObject(sdkSpec) || !isPlainObject(sdkSpec.runtime) || sdkSpec.runtime.immutable !== true) return undefined;
+  const runtime = sdkSpec.runtime;
+  if (typeof runtime.git_sha !== "string" || !/^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/.test(runtime.git_sha)
+    || typeof runtime.dependency_lock_sha256 !== "string" || !/^[0-9a-fA-F]{64}$/.test(runtime.dependency_lock_sha256)
+    || typeof runtime.artifact_uri !== "string" || !/(?:@sha256:|[?#&]sha256=)[0-9a-fA-F]{64}(?:$|[?#&])/.test(runtime.artifact_uri)) {
+    return "immutable runtime requires full content-addressed git, dependency lock, and artifact identities";
+  }
+  for (const spec of taskSpecs) {
+    for (const field of ["cwd", "python_env", "env_setup"] as const) {
+      if (spec[field] !== runtime[field]) return `immutable runtime requires task ${spec.ref} ${field} to match the runtime profile`;
+    }
+    if (spec.env_overrides !== undefined) return `immutable runtime forbids task ${spec.ref} env_overrides`;
+    if (JSON.stringify(spec.env ?? {}) !== JSON.stringify(runtime.env ?? {})) {
+      return `immutable runtime requires task ${spec.ref} env to match the runtime profile`;
+    }
+  }
+  return undefined;
+}
+
 // ─── Cartesian product (same as grids.ts) ────────────────────────────────────
 
 function cartesianProduct(params: Record<string, any[]>): Record<string, any>[] {
@@ -1320,6 +1340,10 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       if (!dagResult.valid) {
         res.status(400).json({ error: `Invalid DAG: ${dagResult.error}` }); return;
       }
+      const immutableRuntimeError = validateImmutableRuntimeSpec(sdk_spec, task_specs as TaskSpec[]);
+      if (immutableRuntimeError) {
+        res.status(400).json({ error: immutableRuntimeError }); return;
+      }
 
       const experimentId = uuidv4();
       const gridId = uuidv4();
@@ -1371,6 +1395,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           requirements: spec.requirements,
           target_tags: spec.target_tags ?? target_tags,
           target_stub_id: spec.target_stub_id,
+          capacity_lease_id: spec.capacity_lease_id,
           max_retries: spec.max_retries ?? 0,
           priority: spec.priority,
           outputs: spec.outputs,

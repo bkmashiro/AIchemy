@@ -85,7 +85,7 @@ describe("capacity target catalog and allocation submission", () => {
     expect(first.body.allocation.id).toBe(second.body.allocation.id);
     expect(first.body.allocation.job_id).toBe("4242");
     expect(first.body.allocation.state).toBe("submitted");
-    expect(first.body.allocation.job_name).toBe("jema-d1-smoke-unsafe-chars");
+    expect(first.body.allocation.job_name).toMatch(/^jema-d1-smoke-unsafe-chars-[a-f0-9]{10}$/);
     expect(first.body.allocation.alias).toMatch(/^alloc-/);
     expect(second.body.reused).toBe(true);
     expect(submit).toHaveBeenCalledTimes(1);
@@ -94,8 +94,9 @@ describe("capacity target catalog and allocation submission", () => {
 
   it("bulk cancellation is dry-run by default and excludes manual or pinned jobs", async () => {
     const cancel = vi.fn(async () => ({ ok: true }));
+    const prepareRelease = vi.fn(async () => undefined);
     const app = express(); app.use(express.json());
-    app.use("/capacity", createCapacityRouter(config, { cancel }));
+    app.use("/capacity", createCapacityRouter(config, { cancel, prepareRelease }));
     for (const [id, managedBy, pinned] of [
       ["managed", "alchemy", false], ["manual", "manual", false], ["pinned", "alchemy", true],
     ] as const) {
@@ -114,6 +115,27 @@ describe("capacity target catalog and allocation submission", () => {
       .send({ allocations: ["job-managed"], apply: true }).expect(200);
     expect(applied.body.cancelled).toHaveLength(1);
     expect(cancel).toHaveBeenCalledWith("job-managed");
+  });
+
+  it("blocks release while an owned campaign is unresolved", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "busy-campaign", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "busy", owner: "tester", managed_by: "alchemy", pinned: false, state: "running", job_id: "job-busy",
+      capacity_lease_id: "lease-busy",
+    });
+    store.createCapacityCampaign({
+      name: "busy", state: "wait_dag", target_id: "slurm-a16", frozen_spec_hash: "sha256:x",
+      capacity_lease_id: "lease-busy", allocation_id: allocation.id, attempts: 0, max_attempts: 2, max_runtime_seconds: 60,
+    });
+    const cancel = vi.fn(async () => ({ ok: true }));
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, { cancel, prepareRelease: vi.fn(async () => undefined) }));
+
+    const preview = await request(app).post("/capacity/allocations/cancel").send({ allocations: [allocation.id] }).expect(200);
+    expect(preview.body.eligible).toHaveLength(0);
+    expect(preview.body.skipped[0].reason).toBe("campaign_unresolved");
+    await request(app).post("/capacity/allocations/cancel").send({ allocations: [allocation.id], apply: true }).expect(200);
+    expect(cancel).not.toHaveBeenCalled();
   });
 
   it("persists campaign transitions and rejects skipped states", async () => {
@@ -229,6 +251,20 @@ describe("capacity target catalog and allocation submission", () => {
     }));
     await request(forgedProviderApp).post("/capacity/policy/reconcile").send({}).expect(503);
     expect(acquire).not.toHaveBeenCalled();
+
+    const forgedResourcesApp = express(); forgedResourcesApp.use(express.json());
+    forgedResourcesApp.use("/capacity", createCapacityRouter(config, {
+      automation: {
+        policy: { pool_id: "general", mode: "automatic", enabled: true, min_validated_snapshots: 1, max_total: 3, max_pending: 2, cooldown_seconds: 0 },
+        recommendationProvider: async () => ({
+          recommendation_id: "forged-resources", target: capacityTargets(config)[0],
+          resources: { partition: "gpu-small", qos: "normal", gres: "gpu:h100:8" }, validated_snapshots: 2,
+        }),
+        acquire, release,
+      },
+    }));
+    await request(forgedResourcesApp).post("/capacity/policy/reconcile").send({}).expect(503);
+    expect(acquire).not.toHaveBeenCalled();
   });
 
   it("records immutable intent and outcome around automatic mutations", async () => {
@@ -320,6 +356,21 @@ describe("capacity target catalog and allocation submission", () => {
     expect(store.isCapacityPolicyDisabled("general")).toBe(true);
   });
 
+  it("validates restore before mutation and never rolls back an active kill switch", () => {
+    store.createSlurmAllocation({
+      idempotency_key: "existing", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "existing", owner: "tester", managed_by: "alchemy", pinned: false, state: "pending",
+    });
+    const before = store.exportState();
+    expect(() => store.loadFromState({ ...before, stubs: "broken" } as any)).toThrow(/invalid backup/i);
+    expect(store.exportState().slurm_allocations).toEqual(before.slurm_allocations);
+
+    const preDisableBackup = store.exportState();
+    store.disableCapacityPolicy("general");
+    store.loadFromState(preDisableBackup);
+    expect(store.isCapacityPolicyDisabled("general")).toBe(true);
+  });
+
   it("reconciles a campaign through the restart-safe driver endpoint", async () => {
     const campaignDriver = {
       acquire: vi.fn(async () => ({ allocation_id: "allocation-1" })),
@@ -331,6 +382,11 @@ describe("capacity target catalog and allocation submission", () => {
     const created = await request(app).post("/capacity/campaigns").send({
       name: "automated", target_id: "slurm-a16", frozen_spec_hash: "sha256:abc",
     }).expect(201);
+    store.createSlurmAllocation({
+      id: "allocation-1", idempotency_key: "automated-acquire", campaign_id: created.body.id,
+      capacity_lease_id: created.body.capacity_lease_id, managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "automated", owner: "tester", managed_by: "alchemy", pinned: false, state: "requested",
+    });
 
     const response = await request(app).post(`/capacity/campaigns/${created.body.id}/reconcile`).expect(200);
 

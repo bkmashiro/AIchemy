@@ -56,6 +56,17 @@ async function fail(
   }, reason);
 }
 
+function requireOwnedAllocation(campaign: CapacityCampaign, allocationId: string) {
+  const allocation = store.getSlurmAllocation(allocationId);
+  if (!allocation || allocation.managed_by !== "alchemy" || allocation.pinned
+    || allocation.campaign_id !== campaign.id
+    || allocation.capacity_lease_id !== campaign.capacity_lease_id
+    || allocation.managed_target_id !== campaign.target_id) {
+    throw new Error(`Campaign allocation ownership mismatch: ${allocationId}`);
+  }
+  return allocation;
+}
+
 /** Performs at most one persisted campaign state transition. Safe to call after restart. */
 export async function reconcileCampaign(
   campaignRef: string,
@@ -90,6 +101,7 @@ export async function reconcileCampaign(
         const attempt = campaign.attempts + 1;
         if (attempt > campaign.max_attempts) return fail(campaign, driver, "Campaign retry limit exceeded");
         const result = await driver.acquire(campaign, `${campaign.id}:acquire`);
+        requireOwnedAllocation(campaign, result.allocation_id);
         return update(campaign, "wait_stub", { allocation_id: result.allocation_id, attempts: attempt });
       }
       case "wait_stub": {
@@ -123,12 +135,22 @@ export async function reconcileCampaign(
         return result.drained && result.active_task_ids.length === 0 ? update(campaign, "release") : campaign;
       }
       case "release": {
+        if (!campaign.allocation_id) throw new Error("Campaign release requires an owned allocation");
+        requireOwnedAllocation(campaign, campaign.allocation_id);
         const result = await driver.release(campaign, `${campaign.id}:release`);
-        return result.released ? update(campaign, "closeout") : campaign;
+        const allocation = requireOwnedAllocation(campaign, campaign.allocation_id);
+        return result.released && allocation && ["released", "failed"].includes(allocation.state)
+          ? update(campaign, "closeout") : campaign;
       }
       case "closeout": {
         const result = await driver.closeout(campaign);
+        const activeTasks = store.getActiveTasks().filter((task) =>
+          task.capacity_lease_id === campaign.capacity_lease_id || Boolean(campaign.stub_id && task.stub_id === campaign.stub_id),
+        );
+        const allocation = campaign.allocation_id ? requireOwnedAllocation(campaign, campaign.allocation_id) : undefined;
+        const allocationTerminal = Boolean(allocation && ["released", "failed"].includes(allocation.state));
         return result.closed && result.active_task_ids.length === 0 && result.allocations_terminal
+          && activeTasks.length === 0 && allocationTerminal
           ? update(campaign, "completed")
           : campaign;
       }
@@ -144,7 +166,9 @@ export async function reconcileCampaign(
 
 export async function reconcileActiveCampaigns(driver: CampaignDriver): Promise<CapacityCampaign[]> {
   const results: CapacityCampaign[] = [];
-  for (const campaign of store.getCapacityCampaigns().filter((item) => !["completed", "failed"].includes(item.state))) {
+  for (const campaign of store.getCapacityCampaigns().filter((item) =>
+    item.state !== "completed" && (item.state !== "failed" || item.cleanup_required === true),
+  )) {
     results.push(await reconcileCampaign(campaign.id, driver));
   }
   return results;

@@ -59,7 +59,10 @@ describe("CapacityPage", () => {
       await userEvent.click(screen.getByRole("button", { name: "Plan capacity" }));
     });
 
-    expect(capacityApi.recommend).toHaveBeenCalledWith({ gpu_mem_mb: 32768 }, {});
+    expect(capacityApi.recommend).toHaveBeenCalledWith(
+      { gpu_mem_mb: 32768 },
+      expect.objectContaining({ partitions: [expect.objectContaining({ name: "gpu-small", pending_jobs: 0 })] }),
+    );
     expect(await screen.findByText(/Best target: slurm-a40/)).toBeInTheDocument();
     expect(screen.getByText(/slurm-a16.*gpu_mem_mb 16384 < 32768/)).toBeInTheDocument();
   });

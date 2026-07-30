@@ -53,6 +53,7 @@ interface AutomationInput {
   policy?: CapacityAutomationPolicy;
   acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
   release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
+  prepareRelease?: (allocation: SlurmAllocation) => Promise<boolean>;
   beforeApply?: (action: CapacityPolicyAction) => void;
   applyFailed?: (action: CapacityPolicyAction) => void;
   now: Date;
@@ -138,6 +139,14 @@ export async function reconcileCapacityPolicy(input: AutomationInput): Promise<{
   };
   if (mode !== "automatic" || cooldownActive(policy!, input.now)) {
     if (mode === "automatic") action.reason = "cooldown_active";
+    return { mode, actions: [action] };
+  }
+  if (!input.prepareRelease) {
+    action.reason = "release_barrier_unavailable";
+    return { mode, actions: [action] };
+  }
+  if (!await input.prepareRelease(ownedIdle)) {
+    action.reason = "release_blocked_after_barrier";
     return { mode, actions: [action] };
   }
   const key = `${policy!.pool_id}:release:${ownedIdle.id}`;

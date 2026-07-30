@@ -34,6 +34,7 @@ import { loadDeployConfig } from "./deploy";
 import { createTunnelManager, TunnelManager } from "./tunnel";
 import { createDeployRouter } from "./api/deploy";
 import { createCapacityRouter } from "./api/capacity";
+import { reliableEmitToStub } from "./reliable";
 import { createOperatorRouter } from "./api/operator";
 import { ALCHEMY_VERSION } from "./version";
 import { startWebhookDispatcher } from "./webhooks";
@@ -267,6 +268,14 @@ api.use("/webhooks", createWebhooksRouter());
 api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
 api.use("/capacity", createCapacityRouter(deployConfig, {
   cancel: async (jobId) => emitToController("slurm.cancel", { job_id: jobId }),
+  prepareRelease: async (allocation) => {
+    if (!allocation.stub_id) return;
+    const stub = store.getStub(allocation.stub_id);
+    if (!stub) throw new Error(`Bound stub not found: ${allocation.stub_id}`);
+    stub.max_concurrent = 0;
+    store.setStub(stub);
+    await reliableEmitToStub(stub.id, "config.update", { max_concurrent: 0 });
+  },
 }));
 api.use("/operator", createOperatorRouter());
 

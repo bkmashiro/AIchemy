@@ -331,6 +331,12 @@ class Experiment:
             for spec in rendered_refs:
                 if self._runtime is not None:
                     runtime = self._runtime.to_spec()
+                    if runtime.get("immutable"):
+                        for field_name in ("cwd", "python_env", "env_setup"):
+                            if field_name in spec and spec[field_name] != runtime.get(field_name):
+                                raise ValueError(f"immutable runtime forbids task-level {field_name} override")
+                        if "env" in spec or "env_overrides" in spec:
+                            raise ValueError("immutable runtime forbids task-level environment overrides")
                     for field_name in ("cwd", "python_env", "env_setup"):
                         if field_name not in spec and field_name in runtime:
                             spec[field_name] = runtime[field_name]
@@ -445,6 +451,7 @@ class Experiment:
         requirements: Optional[dict] = None,
         target_tags: Optional[list[str]] = None,
         target_stub_id: Optional[str] = None,
+        capacity_lease_id: Optional[str] = None,
         max_retries: int = 0,
         priority: int = 5,
         outputs: Optional[list[str]] = None,
@@ -473,6 +480,7 @@ class Experiment:
         if requirements:       spec["requirements"] = requirements
         if target_tags:        spec["target_tags"] = target_tags
         if target_stub_id:     spec["target_stub_id"] = target_stub_id
+        if capacity_lease_id:  spec["capacity_lease_id"] = capacity_lease_id
         if max_retries:        spec["max_retries"] = max_retries
         if priority != 5:      spec["priority"] = priority
         if outputs:            spec["outputs"] = outputs

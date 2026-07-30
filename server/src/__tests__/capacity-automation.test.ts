@@ -103,7 +103,7 @@ describe("policy-gated capacity automation", () => {
       activeTasks: [{ id: "task-1", stub_id: "stub-busy" }],
       campaigns: [{ id: "campaign-1", state: "failed", allocation_id: "cleanup" }],
       policy: { pool_id: "general", mode: "automatic", enabled: true, min_validated_snapshots: 0, max_total: 3, max_pending: 2, cooldown_seconds: 0 },
-      acquire: vi.fn(), release, now: new Date("2026-07-30T00:00:00Z"),
+      acquire: vi.fn(), release, prepareRelease: vi.fn(async () => true), now: new Date("2026-07-30T00:00:00Z"),
     });
     expect(release).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledWith(expect.objectContaining({ id: "owned-idle" }), expect.any(String));

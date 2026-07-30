@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { deployStub, type SlurmSubmitOptions } from "../deploy";
 import { store } from "../store";
 import type { CapacityTarget, DeployFileConfig, DeployResult, SlurmAllocation, StubTarget } from "../types";
@@ -75,11 +75,18 @@ export function capacityTargetRejections(
   const explicitQos = typeof resources.qos === "string" ? resources.qos : undefined;
   const gpuClass = typeof resources.gpu_class === "string" ? resources.gpu_class.toUpperCase() : undefined;
   const minMemory = Number(resources.gpu_mem_mb ?? 0);
+  const allowed = new Set(["partition", "qos", "gpu_class", "gpu_mem_mb", "gres", "gpus", "mem", "time"]);
+  for (const key of Object.keys(resources)) if (!allowed.has(key)) reasons.push(`unsupported resource field ${key}`);
   if (target.enabled === false) reasons.push("target disabled");
   if (explicitPartition && target.partition !== explicitPartition) reasons.push(`partition ${target.partition ?? "unspecified"} != ${explicitPartition}`);
   if (explicitQos && target.qos !== explicitQos) reasons.push(`qos ${target.qos ?? "default"} != ${explicitQos}`);
   if (gpuClass && target.gpu_class?.toUpperCase() !== gpuClass) reasons.push(`gpu_class ${target.gpu_class ?? "unknown"} != ${gpuClass}`);
   if (minMemory && (target.gpu_mem_mb ?? 0) < minMemory) reasons.push(`gpu_mem_mb ${target.gpu_mem_mb ?? 0} < ${minMemory}`);
+  if (resources.gres !== undefined && resources.gres !== target.gres) reasons.push(`gres ${String(resources.gres)} != ${target.gres ?? "unspecified"}`);
+  const configuredGpus = Number(target.gres?.match(/:(\d+)$/)?.[1] ?? 1);
+  if (resources.gpus !== undefined && Number(resources.gpus) !== configuredGpus) reasons.push(`gpus ${String(resources.gpus)} != ${configuredGpus}`);
+  if (resources.mem !== undefined && resources.mem !== target.default_mem) reasons.push(`mem ${String(resources.mem)} != ${target.default_mem ?? "unspecified"}`);
+  if (resources.time !== undefined && resources.time !== target.default_walltime) reasons.push(`time ${String(resources.time)} != ${target.default_walltime ?? "unspecified"}`);
   return reasons;
 }
 
@@ -112,13 +119,14 @@ export function recommendCapacity(
 }
 
 export function reconcileSlurmAllocations(
-  jobs: Array<{ job_id?: string; state?: string; partition?: string; name?: string }>,
+  jobs: Array<{ job_id?: string; state?: string; partition?: string; name?: string; reason?: string; predicted_start_at?: string; eligible_at?: string }>,
   complete: boolean,
 ): { reconciled: Array<ReturnType<typeof store.updateSlurmAllocation>>; observed_jobs: number; observed_at: string } {
   const jobsById = new Map(jobs.filter((job) => job.job_id).map((job) => [String(job.job_id), job]));
+  const jobsByName = new Map(jobs.filter((job) => job.name).map((job) => [String(job.name), job]));
   const now = new Date().toISOString();
   const reconciled = store.getSlurmAllocations().map((allocation) => {
-    const job = allocation.job_id ? jobsById.get(allocation.job_id) : undefined;
+    const job = allocation.job_id ? jobsById.get(allocation.job_id) : jobsByName.get(allocation.job_name);
     let state = allocation.state;
     if (job) {
       const slurmState = String(job.state ?? "").toUpperCase();
@@ -127,9 +135,12 @@ export function reconcileSlurmAllocations(
       else if (["COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"].includes(slurmState)) state = "released";
     } else if (complete && ["pending", "running"].includes(state)) {
       state = "released";
+    } else if (complete && !allocation.job_id && ["requested", "failed"].includes(state)) {
+      state = "failed";
     }
-    const stub = allocation.job_id
-      ? store.getAllStubs().find((candidate) => candidate.slurm_job_id === allocation.job_id)
+    const observedJobId = job?.job_id ? String(job.job_id) : allocation.job_id;
+    const stub = observedJobId
+      ? store.getAllStubs().find((candidate) => candidate.slurm_job_id === observedJobId)
       : undefined;
     if (stub && stub.slurm_allocation_id !== allocation.id) {
       stub.slurm_allocation_id = allocation.id;
@@ -139,12 +150,35 @@ export function reconcileSlurmAllocations(
     }
     return store.updateSlurmAllocation(allocation.id, {
       state,
+      job_id: observedJobId,
+      partition: job?.partition ?? allocation.partition,
       stub_id: stub?.id ?? allocation.stub_id,
       last_observed_at: now,
       raw_state: job?.state ?? allocation.raw_state,
+      queue_reason: job?.reason ?? allocation.queue_reason,
+      predicted_start_at: job?.predicted_start_at ?? allocation.predicted_start_at,
+      eligible_at: job?.eligible_at ?? allocation.eligible_at,
+      error: !job && complete && !allocation.job_id && ["requested", "failed"].includes(allocation.state)
+        ? "controller_verified_absent" : allocation.error,
     });
   });
   return { reconciled, observed_jobs: jobs.length, observed_at: now };
+}
+
+function releaseBlockReason(allocation: SlurmAllocation): string | undefined {
+  if (allocation.pinned) return "pinned";
+  if (allocation.managed_by !== "alchemy") return "manual";
+  if (!allocation.job_id || ["released", "failed"].includes(allocation.state)) return "inactive_or_missing_job";
+  const busy = store.getActiveTasks().some((task) =>
+    (allocation.stub_id && task.stub_id === allocation.stub_id)
+    || (allocation.capacity_lease_id && task.capacity_lease_id === allocation.capacity_lease_id),
+  );
+  if (busy) return "busy";
+  const unresolved = store.getCapacityCampaigns().some((campaign) =>
+    campaign.state !== "completed" && (campaign.allocation_id === allocation.id
+      || Boolean(allocation.capacity_lease_id && campaign.capacity_lease_id === allocation.capacity_lease_id)),
+  );
+  return unresolved ? "campaign_unresolved" : undefined;
 }
 
 function auditSafeResources(resources?: Record<string, unknown>): Record<string, unknown> | undefined {
@@ -158,12 +192,14 @@ export function createCapacityRouter(
   dependencies: {
     submit?: CapacitySubmitter;
     cancel?: CapacityCanceller;
+    prepareRelease?: (allocation: SlurmAllocation) => Promise<void>;
     campaignDriver?: CampaignDriver;
     automation?: {
       policy: CapacityAutomationPolicy;
       recommendationProvider?: () => Promise<ValidatedRecommendation | null>;
       acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
       release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
+      prepareRelease?: (allocation: SlurmAllocation) => Promise<boolean>;
     };
   } = {},
 ): Router {
@@ -173,8 +209,8 @@ export function createCapacityRouter(
     dependencies.automation.policy.enabled = false;
     dependencies.automation.policy.mode = "recommend";
   } else if (dependencies.automation && !dependencies.automation.policy.last_action_at) {
-    dependencies.automation.policy.last_action_at = store.getCapacityPolicyEvents(200)
-      .find((event) => event.applied && event.pool_id === dependencies.automation!.policy.pool_id)?.created_at;
+    dependencies.automation.policy.last_action_at = store
+      .getLatestAppliedCapacityPolicyEvent(dependencies.automation.policy.pool_id)?.created_at;
   }
 
   router.get("/targets", (_req: Request, res: Response) => {
@@ -252,6 +288,7 @@ export function createCapacityRouter(
         policy: dependencies.automation?.policy,
         acquire: dependencies.automation?.acquire ?? (async () => { throw new Error("Automatic acquisition backend unavailable"); }),
         release: dependencies.automation?.release ?? (async () => { throw new Error("Automatic release backend unavailable"); }),
+        prepareRelease: dependencies.automation?.prepareRelease,
         beforeApply: appendActionEvent,
         applyFailed: appendActionEvent,
         now: new Date(),
@@ -408,22 +445,29 @@ export function createCapacityRouter(
     const selected = store.getSlurmAllocations().filter((allocation) => refs.length === 0
       || refs.includes(allocation.id) || (allocation.alias ? refs.includes(allocation.alias) : false)
       || (allocation.job_id ? refs.includes(allocation.job_id) : false));
-    const eligible = selected.filter((allocation) => allocation.managed_by === "alchemy" && !allocation.pinned
-      && Boolean(allocation.job_id) && !["released", "failed"].includes(allocation.state));
-    const eligibleIds = new Set(eligible.map((allocation) => allocation.id));
-    const skipped: Array<{ id: string; reason: string }> = selected.filter((allocation) => !eligibleIds.has(allocation.id))
-      .map((allocation) => ({
-        id: allocation.id,
-        reason: allocation.pinned ? "pinned" : allocation.managed_by !== "alchemy" ? "manual" : "inactive_or_missing_job",
-      }));
+    const eligibility = selected.map((allocation) => ({ allocation, reason: releaseBlockReason(allocation) }));
+    const eligible = eligibility.filter((item) => !item.reason).map((item) => item.allocation);
+    const skipped: Array<{ id: string; reason: string }> = eligibility.filter((item) => item.reason)
+      .map((item) => ({ id: item.allocation.id, reason: item.reason! }));
     if (!apply) { res.json({ dry_run: true, eligible, skipped }); return; }
     if (!dependencies.cancel) {
       res.status(503).json({ error: "SLURM cancellation backend unavailable", dry_run: false, eligible, skipped });
       return;
     }
+    if (!dependencies.prepareRelease) {
+      res.status(503).json({ error: "Release admission barrier unavailable", dry_run: false, eligible, skipped });
+      return;
+    }
     const cancelled = [];
     for (const allocation of eligible) {
-      const result = await dependencies.cancel(allocation.job_id!);
+      await dependencies.prepareRelease(allocation);
+      const current = store.getSlurmAllocation(allocation.id);
+      const postBarrierReason = current ? releaseBlockReason(current) : "allocation_missing";
+      if (!current || postBarrierReason) {
+        skipped.push({ id: allocation.id, reason: postBarrierReason ?? "release_blocked" });
+        continue;
+      }
+      const result = await dependencies.cancel(current.job_id!);
       if (result.ok) {
         cancelled.push(store.updateSlurmAllocation(allocation.id, {
           state: "released", released_at: new Date().toISOString(),
@@ -448,7 +492,8 @@ export function createCapacityRouter(
       return;
     }
     const existing = store.getSlurmAllocationByIdempotencyKey(idempotencyKey);
-    if (existing) {
+    const controllerVerifiedRetry = existing?.state === "failed" && existing.error === "controller_verified_absent";
+    if (existing && !controllerVerifiedRetry) {
       res.status(200).json({
         ok: existing.state !== "failed",
         target: existing.managed_target_id,
@@ -464,8 +509,11 @@ export function createCapacityRouter(
       res.status(400).json({ error: "server_url and token are required for submission" });
       return;
     }
-    const jobName = sanitizeSlurmJobName(req.body?.job_name || `alchemy-${target.name}`);
-    const allocation = store.createSlurmAllocation({
+    const nameSuffix = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 10);
+    const jobName = existing?.job_name ?? sanitizeSlurmJobName(`${req.body?.job_name || `alchemy-${target.name}`}-${nameSuffix}`);
+    const allocation = existing
+      ? store.updateSlurmAllocation(existing.id, { state: "requested", error: undefined, last_observed_at: undefined })!
+      : store.createSlurmAllocation({
       idempotency_key: idempotencyKey,
       campaign_id: req.body?.campaign_id,
       capacity_lease_id: req.body?.capacity_lease_id,

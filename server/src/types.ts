@@ -327,6 +327,7 @@ export interface TaskSpec {
   requirements?: Task["requirements"];
   target_tags?: string[];
   target_stub_id?: string;
+  capacity_lease_id?: string;
   max_retries?: number;
   priority?: number;
   outputs?: string[];     // Declared output file paths for artifact rollback
