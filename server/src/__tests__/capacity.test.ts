@@ -78,6 +78,26 @@ describe("capacity target catalog and allocation submission", () => {
     expect(store.getSlurmAllocations()).toHaveLength(1);
   });
 
+  it("persists campaign transitions and rejects skipped states", async () => {
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config));
+    const created = await request(app).post("/capacity/campaigns").send({
+      name: "jema-d1", target_id: "slurm-a16", frozen_spec_hash: "sha256:abc",
+      max_attempts: 2, max_runtime_seconds: 3600,
+    }).expect(201);
+    expect(created.body.state).toBe("acquire");
+    expect(created.body.alias).toMatch(/^camp-/);
+
+    await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
+      .send({ to: "submit_dag", actor: "tester" }).expect(409);
+    const advanced = await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
+      .send({ to: "wait_stub", actor: "tester", allocation_id: "alloc-1" }).expect(200);
+    expect(advanced.body.state).toBe("wait_stub");
+    expect(advanced.body.attempts).toBe(1);
+    expect(advanced.body.history).toHaveLength(1);
+    expect(store.getCapacityCampaign(created.body.id)?.state).toBe("wait_stub");
+  });
+
   it("reconciles persisted allocation state from a complete SLURM snapshot", async () => {
     const app = express(); app.use(express.json());
     app.use("/capacity", createCapacityRouter(config));

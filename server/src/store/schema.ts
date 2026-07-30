@@ -111,6 +111,15 @@ export const objectAliases = sqliteTable("object_aliases", {
   uniqueIndex("idx_object_aliases_kind_object").on(table.object_kind, table.object_id),
 ]);
 
+export const capacityCampaigns = sqliteTable("capacity_campaigns", {
+  id: text("id").primaryKey(),
+  state: text("state").notNull(),
+  target_id: text("target_id").notNull(),
+  capacity_lease_id: text("capacity_lease_id").notNull(),
+  updated_at: text("updated_at").notNull(),
+  data: text("data").notNull(),
+});
+
 export const slurmAllocations = sqliteTable("slurm_allocations", {
   id: text("id").primaryKey(),
   idempotency_key: text("idempotency_key").notNull().unique(),

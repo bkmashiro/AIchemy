@@ -466,6 +466,35 @@ def cmd_slurm_targets(_args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.get("/capacity/targets"))
 
 
+def cmd_slurm_ls(_args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get("/capacity/allocations"))
+
+
+def cmd_campaign_ls(_args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get("/capacity/campaigns"))
+
+
+def cmd_campaign_get(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get(f"/capacity/campaigns/{args.campaign}"))
+
+
+def cmd_campaign_create(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post("/capacity/campaigns", {
+        "name": args.name,
+        "target_id": args.target,
+        "frozen_spec_hash": args.spec_hash,
+        "max_attempts": args.max_attempts,
+        "max_runtime_seconds": args.max_runtime,
+    }))
+
+
+def cmd_campaign_advance(args: argparse.Namespace, client: ApiClient) -> None:
+    body: dict[str, Any] = {"to": args.to, "actor": args.actor}
+    if args.reason:
+        body["reason"] = args.reason
+    print_json(client.post(f"/capacity/campaigns/{args.campaign}/advance", body))
+
+
 def cmd_slurm_submit(args: argparse.Namespace, client: ApiClient) -> None:
     if args.count != 1 and not args.yes:
         raise AlchError("submitting multiple SLURM stubs requires --yes")
@@ -1757,7 +1786,15 @@ def build_parser() -> argparse.ArgumentParser:
     slurm = sub.add_parser("slurm", help="SLURM-specific stub submission")
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)
     p = slurm_sub.add_parser("targets", help="list configured managed GPU targets"); p.set_defaults(func=cmd_slurm_targets)
+    p = slurm_sub.add_parser("ls", help="list persisted managed allocations"); p.set_defaults(func=cmd_slurm_ls)
     p = slurm_sub.add_parser("submit", help="submit a managed SLURM allocation"); p.add_argument("kind", help="configured target alias or stable ID"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--job-name", help="sanitized SLURM job name"); p.add_argument("--idempotency-key", help="stable retry key; generated when omitted"); p.add_argument("--campaign", help="owning campaign ID or alias"); p.add_argument("--lease", help="owning capacity lease ID or alias"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
+
+    campaigns = sub.add_parser("campaigns", help="inspect and advance persisted capacity campaigns")
+    campaign_sub = campaigns.add_subparsers(dest="cmd", required=True)
+    p = campaign_sub.add_parser("ls", help="list campaigns"); p.set_defaults(func=cmd_campaign_ls)
+    p = campaign_sub.add_parser("get", help="show a campaign"); p.add_argument("campaign"); p.set_defaults(func=cmd_campaign_get)
+    p = campaign_sub.add_parser("create", help="create a frozen campaign"); p.add_argument("name"); p.add_argument("--target", required=True); p.add_argument("--spec-hash", required=True); p.add_argument("--max-attempts", type=int, default=3); p.add_argument("--max-runtime", type=int, default=86400); p.set_defaults(func=cmd_campaign_create)
+    p = campaign_sub.add_parser("advance", help="perform one validated state transition"); p.add_argument("campaign"); p.add_argument("--to", required=True, choices=["wait_stub", "cuda_smoke", "submit_dag", "wait_dag", "drain", "release", "closeout", "completed", "failed"]); p.add_argument("--actor", default="akashi"); p.add_argument("--reason"); p.set_defaults(func=cmd_campaign_advance)
 
     tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")
     tasks_sub = tasks.add_subparsers(dest="cmd", required=True)

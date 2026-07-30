@@ -1978,6 +1978,24 @@ def test_slurm_targets_uses_server_catalog(monkeypatch):
     assert calls[0]["url"] == "http://localhost:3002/api/capacity/targets"
 
 
+def test_campaign_create_and_advance_use_persisted_state_api(monkeypatch):
+    created = run_cli(
+        monkeypatch,
+        ["campaigns", "create", "jema-d1", "--target", "slurm-a16", "--spec-hash", "sha256:abc"],
+        [{"id": "camp-1", "state": "acquire"}],
+    )
+    assert created[0]["url"] == "http://localhost:3002/api/capacity/campaigns"
+    assert created[0]["body"]["frozen_spec_hash"] == "sha256:abc"
+
+    advanced = run_cli(
+        monkeypatch,
+        ["campaigns", "advance", "camp-1", "--to", "wait_stub", "--actor", "tester"],
+        [{"id": "camp-1", "state": "wait_stub"}],
+    )
+    assert advanced[0]["url"] == "http://localhost:3002/api/capacity/campaigns/camp-1/advance"
+    assert advanced[0]["body"] == {"to": "wait_stub", "actor": "tester"}
+
+
 def test_slurm_submit_uses_configured_stub_server_url_and_verbose_output(monkeypatch, tmp_path, capsys):
     config_path = tmp_path / "alch-config.json"
     config_path.write_text(json.dumps({"stub_server_url": "https://alchemy-v2.yuzhes.com"}))

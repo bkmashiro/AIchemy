@@ -30,6 +30,7 @@ import {
   WebhookOutboxStatus,
   TaskMark,
   SlurmAllocation,
+  CapacityCampaign,
 } from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
@@ -192,6 +193,58 @@ class Store {
   private _decorateSlurmAllocation(allocation: SlurmAllocation): SlurmAllocation {
     allocation.alias = this.ensureObjectAlias("slurm_allocation", allocation.id);
     return allocation;
+  }
+
+  private _decorateCampaign(campaign: CapacityCampaign): CapacityCampaign {
+    campaign.alias = this.ensureObjectAlias("campaign", campaign.id);
+    return campaign;
+  }
+
+  getCapacityCampaign(idOrAlias: string): CapacityCampaign | undefined {
+    const resolved = this.resolveObjectRef(idOrAlias, "campaign")?.id ?? idOrAlias;
+    const row = this.db.select({ data: schema.capacityCampaigns.data })
+      .from(schema.capacityCampaigns).where(eq(schema.capacityCampaigns.id, resolved)).get();
+    return row ? this._decorateCampaign(JSON.parse(row.data) as CapacityCampaign) : undefined;
+  }
+
+  getCapacityCampaigns(): CapacityCampaign[] {
+    return this.db.select({ data: schema.capacityCampaigns.data }).from(schema.capacityCampaigns)
+      .orderBy(desc(schema.capacityCampaigns.updated_at)).all()
+      .map((row) => this._decorateCampaign(JSON.parse(row.data) as CapacityCampaign));
+  }
+
+  createCapacityCampaign(input: Omit<CapacityCampaign, "id" | "alias" | "created_at" | "updated_at" | "history">): CapacityCampaign {
+    const now = new Date().toISOString();
+    const campaign: CapacityCampaign = { ...input, id: randomUUID(), created_at: now, updated_at: now, history: [] };
+    this.db.insert(schema.capacityCampaigns).values({
+      id: campaign.id,
+      state: campaign.state,
+      target_id: campaign.target_id,
+      capacity_lease_id: campaign.capacity_lease_id,
+      updated_at: campaign.updated_at,
+      data: JSON.stringify(campaign),
+    }).run();
+    return this._decorateCampaign(campaign);
+  }
+
+  updateCapacityCampaign(id: string, patch: Partial<CapacityCampaign>): CapacityCampaign | undefined {
+    const current = this.getCapacityCampaign(id);
+    if (!current) return undefined;
+    const updated: CapacityCampaign = {
+      ...current,
+      ...patch,
+      id: current.id,
+      alias: current.alias,
+      updated_at: new Date().toISOString(),
+    };
+    this.db.update(schema.capacityCampaigns).set({
+      state: updated.state,
+      target_id: updated.target_id,
+      capacity_lease_id: updated.capacity_lease_id,
+      updated_at: updated.updated_at,
+      data: JSON.stringify(updated),
+    }).where(eq(schema.capacityCampaigns.id, current.id)).run();
+    return this._decorateCampaign(updated);
   }
 
   getSlurmAllocation(id: string): SlurmAllocation | undefined {
@@ -376,6 +429,15 @@ class Store {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS idx_object_aliases_kind_object
         ON object_aliases(object_kind, object_id);
+      CREATE TABLE IF NOT EXISTS capacity_campaigns (
+        id TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        capacity_lease_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_capacity_campaigns_state ON capacity_campaigns(state, updated_at);
       CREATE TABLE IF NOT EXISTS slurm_allocations (
         id TEXT PRIMARY KEY,
         idempotency_key TEXT NOT NULL UNIQUE,
@@ -1982,6 +2044,7 @@ class Store {
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.slurmAllocations).run();
+    this.db.delete(schema.capacityCampaigns).run();
     this.db.delete(schema.objectAliases).run();
     this.aliasByObject.clear();
     this.objectByAlias.clear();
@@ -2090,6 +2153,7 @@ class Store {
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
     this.db.delete(schema.slurmAllocations).run();
+    this.db.delete(schema.capacityCampaigns).run();
     this.db.delete(schema.objectAliases).run();
     this.aliasByObject.clear();
     this.objectByAlias.clear();

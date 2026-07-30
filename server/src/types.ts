@@ -608,6 +608,31 @@ export interface StubTarget {
   controller_capability?: string;
 }
 
+export type CampaignState =
+  | "acquire" | "wait_stub" | "cuda_smoke" | "submit_dag" | "wait_dag"
+  | "drain" | "release" | "closeout" | "completed" | "failed";
+
+export interface CapacityCampaign {
+  id: string;
+  alias?: string;
+  name: string;
+  state: CampaignState;
+  target_id: string;
+  frozen_spec_hash: string;
+  capacity_lease_id: string;
+  allocation_id?: string;
+  stub_id?: string;
+  smoke_task_id?: string;
+  experiment_id?: string;
+  max_attempts: number;
+  attempts: number;
+  max_runtime_seconds: number;
+  created_at: string;
+  updated_at: string;
+  last_error?: string;
+  history: Array<{ at: string; from: CampaignState; to: CampaignState; actor: string; reason?: string }>;
+}
+
 export type SlurmAllocationState =
   | "requested" | "submitted" | "pending" | "running" | "stub_online"
   | "draining" | "released" | "failed";

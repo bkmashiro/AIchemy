@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import { randomUUID } from "crypto";
 import { deployStub, type SlurmSubmitOptions } from "../deploy";
 import { store } from "../store";
 import type { CapacityTarget, DeployFileConfig, DeployResult, StubTarget } from "../types";
@@ -143,6 +144,70 @@ export function createCapacityRouter(
       return;
     }
     res.json({ recommendation: recommendations[0], alternatives: recommendations.slice(1), mode: "recommend_only" });
+  });
+
+  router.get("/campaigns", (_req: Request, res: Response) => {
+    res.json(store.getCapacityCampaigns());
+  });
+
+  router.get("/campaigns/:id", (req: Request, res: Response) => {
+    const campaign = store.getCapacityCampaign(req.params.id);
+    if (!campaign) { res.status(404).json({ error: "Campaign not found" }); return; }
+    res.json(campaign);
+  });
+
+  router.post("/campaigns", (req: Request, res: Response) => {
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const targetId = typeof req.body?.target_id === "string" ? req.body.target_id : "";
+    const frozenSpecHash = typeof req.body?.frozen_spec_hash === "string" ? req.body.frozen_spec_hash : "";
+    if (!name || !targetId || !frozenSpecHash) {
+      res.status(400).json({ error: "name, target_id, and frozen_spec_hash are required" });
+      return;
+    }
+    const campaign = store.createCapacityCampaign({
+      name,
+      state: "acquire",
+      target_id: targetId,
+      frozen_spec_hash: frozenSpecHash,
+      capacity_lease_id: req.body?.capacity_lease_id || randomUUID(),
+      max_attempts: Math.max(1, Number(req.body?.max_attempts) || 3),
+      attempts: 0,
+      max_runtime_seconds: Math.max(60, Number(req.body?.max_runtime_seconds) || 86_400),
+    });
+    res.status(201).json(campaign);
+  });
+
+  router.post("/campaigns/:id/advance", (req: Request, res: Response) => {
+    const campaign = store.getCapacityCampaign(req.params.id);
+    if (!campaign) { res.status(404).json({ error: "Campaign not found" }); return; }
+    const transitions: Record<string, string> = {
+      acquire: "wait_stub", wait_stub: "cuda_smoke", cuda_smoke: "submit_dag",
+      submit_dag: "wait_dag", wait_dag: "drain", drain: "release",
+      release: "closeout", closeout: "completed",
+    };
+    const to = String(req.body?.to ?? "");
+    if (campaign.state === to) { res.json({ ...campaign, reused: true }); return; }
+    const failure = to === "failed" && typeof req.body?.reason === "string" && Boolean(req.body.reason.trim());
+    if (transitions[campaign.state] !== to && !failure) {
+      res.status(409).json({ error: "Invalid campaign transition", from: campaign.state, expected: transitions[campaign.state], requested: to });
+      return;
+    }
+    const at = new Date().toISOString();
+    const updated = store.updateCapacityCampaign(campaign.id, {
+      state: to as typeof campaign.state,
+      allocation_id: req.body?.allocation_id ?? campaign.allocation_id,
+      stub_id: req.body?.stub_id ?? campaign.stub_id,
+      smoke_task_id: req.body?.smoke_task_id ?? campaign.smoke_task_id,
+      experiment_id: req.body?.experiment_id ?? campaign.experiment_id,
+      attempts: to === "wait_stub" ? campaign.attempts + 1 : campaign.attempts,
+      last_error: failure ? String(req.body.reason) : campaign.last_error,
+      history: [...campaign.history, {
+        at, from: campaign.state, to: to as typeof campaign.state,
+        actor: typeof req.body?.actor === "string" ? req.body.actor : "unknown",
+        reason: typeof req.body?.reason === "string" ? req.body.reason : undefined,
+      }],
+    });
+    res.json(updated);
   });
 
   router.get("/allocations", (_req: Request, res: Response) => {
