@@ -1978,6 +1978,15 @@ def test_slurm_targets_uses_server_catalog(monkeypatch):
     assert calls[0]["url"] == "http://localhost:3002/api/capacity/targets"
 
 
+def test_slurm_cancel_is_dry_run_unless_apply_is_explicit(monkeypatch):
+    dry = run_cli(monkeypatch, ["slurm", "cancel", "alloc-1"], [{"dry_run": True}])
+    assert dry[0]["url"] == "http://localhost:3002/api/capacity/allocations/cancel"
+    assert dry[0]["body"] == {"allocations": ["alloc-1"], "apply": False}
+
+    applied = run_cli(monkeypatch, ["slurm", "cancel", "alloc-1", "--apply"], [{"dry_run": False}])
+    assert applied[0]["body"]["apply"] is True
+
+
 def test_campaign_create_and_advance_use_persisted_state_api(monkeypatch):
     created = run_cli(
         monkeypatch,

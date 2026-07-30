@@ -12,6 +12,7 @@ export type CapacitySubmitter = (
   stubLocalPath?: string,
   overrides?: SlurmSubmitOptions,
 ) => Promise<DeployResult>;
+export type CapacityCanceller = (jobId: string) => Promise<{ ok: boolean; error?: string }>;
 
 export function sanitizeSlurmJobName(value: string): string {
   const normalized = value.trim().toLowerCase()
@@ -126,7 +127,7 @@ export function reconcileSlurmAllocations(
 
 export function createCapacityRouter(
   config: DeployFileConfig | null,
-  dependencies: { submit?: CapacitySubmitter } = {},
+  dependencies: { submit?: CapacitySubmitter; cancel?: CapacityCanceller } = {},
 ): Router {
   const router = Router();
   const submit = dependencies.submit ?? deployStub;
@@ -219,6 +220,39 @@ export function createCapacityRouter(
       ?? store.getSlurmAllocations().find((item) => item.alias === req.params.id || item.job_id === req.params.id);
     if (!allocation) { res.status(404).json({ error: "Allocation not found" }); return; }
     res.json(allocation);
+  });
+
+  router.post("/allocations/cancel", async (req: Request, res: Response): Promise<void> => {
+    const refs = Array.isArray(req.body?.allocations) ? req.body.allocations.map(String) : [];
+    const apply = req.body?.apply === true;
+    const selected = store.getSlurmAllocations().filter((allocation) => refs.length === 0
+      || refs.includes(allocation.id) || (allocation.alias ? refs.includes(allocation.alias) : false)
+      || (allocation.job_id ? refs.includes(allocation.job_id) : false));
+    const eligible = selected.filter((allocation) => allocation.managed_by === "alchemy" && !allocation.pinned
+      && Boolean(allocation.job_id) && !["released", "failed"].includes(allocation.state));
+    const eligibleIds = new Set(eligible.map((allocation) => allocation.id));
+    const skipped: Array<{ id: string; reason: string }> = selected.filter((allocation) => !eligibleIds.has(allocation.id))
+      .map((allocation) => ({
+        id: allocation.id,
+        reason: allocation.pinned ? "pinned" : allocation.managed_by !== "alchemy" ? "manual" : "inactive_or_missing_job",
+      }));
+    if (!apply) { res.json({ dry_run: true, eligible, skipped }); return; }
+    if (!dependencies.cancel) {
+      res.status(503).json({ error: "SLURM cancellation backend unavailable", dry_run: false, eligible, skipped });
+      return;
+    }
+    const cancelled = [];
+    for (const allocation of eligible) {
+      const result = await dependencies.cancel(allocation.job_id!);
+      if (result.ok) {
+        cancelled.push(store.updateSlurmAllocation(allocation.id, {
+          state: "released", released_at: new Date().toISOString(),
+        }));
+      } else {
+        skipped.push({ id: allocation.id, reason: result.error ?? "cancel_failed" });
+      }
+    }
+    res.json({ dry_run: false, cancelled, skipped });
   });
 
   router.post("/allocations/submit", async (req: Request, res: Response): Promise<void> => {

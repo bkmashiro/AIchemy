@@ -470,6 +470,13 @@ def cmd_slurm_ls(_args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.get("/capacity/allocations"))
 
 
+def cmd_slurm_cancel(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post("/capacity/allocations/cancel", {
+        "allocations": args.allocations,
+        "apply": args.apply,
+    }))
+
+
 def cmd_campaign_ls(_args: argparse.Namespace, client: ApiClient) -> None:
     print_json(client.get("/capacity/campaigns"))
 
@@ -1787,6 +1794,7 @@ def build_parser() -> argparse.ArgumentParser:
     slurm_sub = slurm.add_subparsers(dest="cmd", required=True)
     p = slurm_sub.add_parser("targets", help="list configured managed GPU targets"); p.set_defaults(func=cmd_slurm_targets)
     p = slurm_sub.add_parser("ls", help="list persisted managed allocations"); p.set_defaults(func=cmd_slurm_ls)
+    p = slurm_sub.add_parser("cancel", help="preview or cancel only managed, unpinned allocations"); p.add_argument("allocations", nargs="*", help="allocation IDs, aliases, or job IDs; empty selects all eligible"); p.add_argument("--apply", action="store_true", help="execute cancellation; default is dry-run"); p.set_defaults(func=cmd_slurm_cancel)
     p = slurm_sub.add_parser("submit", help="submit a managed SLURM allocation"); p.add_argument("kind", help="configured target alias or stable ID"); p.add_argument("--count", type=int, default=1, help="number of stubs to submit (default 1)"); p.add_argument("--mem", help="optional SLURM mem override"); p.add_argument("--time", help="optional SLURM walltime override"); p.add_argument("--idle-timeout", type=int, default=None, help="stub idle timeout in seconds (SLURM default 600; 0 disables)"); p.add_argument("--default-output-dir", help="base directory for server-computed task run_dir paths"); p.add_argument("--stub-server-url", help="server URL that the remote stub should connect to (e.g. public tunnel)"); p.add_argument("--job-name", help="sanitized SLURM job name"); p.add_argument("--idempotency-key", help="stable retry key; generated when omitted"); p.add_argument("--campaign", help="owning campaign ID or alias"); p.add_argument("--lease", help="owning capacity lease ID or alias"); p.add_argument("--yes", action="store_true", help="required when --count > 1"); p.set_defaults(func=cmd_slurm_submit)
 
     campaigns = sub.add_parser("campaigns", help="inspect and advance persisted capacity campaigns")

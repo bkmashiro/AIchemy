@@ -14,7 +14,7 @@ import { v4 as uuidv4 } from "uuid";
 import { store } from "./store";
 import { setupStubNamespace } from "./socket/stub";
 import { setupWebNamespace } from "./socket/web";
-import { setupControllerNamespace } from "./socket/controller";
+import { emitToController, setupControllerNamespace } from "./socket/controller";
 import { createGlobalTasksRouter } from "./api/tasks";
 import { createStubsRouter } from "./api/stubs";
 import { createGridsRouter } from "./api/grids";
@@ -264,7 +264,9 @@ api.use("/refs", createRefsRouter());
 api.use("/cluster", createClusterRouter());
 api.use("/webhooks", createWebhooksRouter());
 api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
-api.use("/capacity", createCapacityRouter(deployConfig));
+api.use("/capacity", createCapacityRouter(deployConfig, {
+  cancel: async (jobId) => emitToController("slurm.cancel", { job_id: jobId }),
+}));
 
 // Health check — no auth required
 app.get("/api/health", (_req, res) => {

@@ -18,7 +18,7 @@
 - [x] Milestone 2 — controller snapshots automatically reconcile allocation state and exact `job_id -> stub_id` binding.
 - [x] Milestone 3 — recommend-only planner preserves explicit partition/QOS/GPU constraints and explains observed ranking.
 - [~] Milestone 4 — logical capacity-lease routing and restart-safe campaign state/history are persisted; automated smoke/DAG/drain/release drivers remain.
-- [~] Milestone 5 — target/allocation/campaign CLI inspection and validated transitions landed; safe managed-only bulk cancellation remains.
+- [x] Milestone 5 — target/allocation/campaign CLI controls and managed-only, pinned-safe bulk cancellation with default dry-run.
 - [ ] Milestones 6–7 — Web operations UI and audited automation remain; no production rollout is implied.
 
 ---

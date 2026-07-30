@@ -78,6 +78,30 @@ describe("capacity target catalog and allocation submission", () => {
     expect(store.getSlurmAllocations()).toHaveLength(1);
   });
 
+  it("bulk cancellation is dry-run by default and excludes manual or pinned jobs", async () => {
+    const cancel = vi.fn(async () => ({ ok: true }));
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, { cancel }));
+    for (const [id, managedBy, pinned] of [
+      ["managed", "alchemy", false], ["manual", "manual", false], ["pinned", "alchemy", true],
+    ] as const) {
+      store.createSlurmAllocation({
+        idempotency_key: id, managed_target_id: "slurm-a16", requested_resources: {},
+        job_name: id, owner: "tester", managed_by: managedBy, pinned, state: "running", job_id: `job-${id}`,
+      });
+    }
+    const preview = await request(app).post("/capacity/allocations/cancel").send({ allocations: [] }).expect(200);
+    expect(preview.body.dry_run).toBe(true);
+    expect(preview.body.eligible).toHaveLength(1);
+    expect(preview.body.skipped.map((item: any) => item.reason).sort()).toEqual(["manual", "pinned"]);
+    expect(cancel).not.toHaveBeenCalled();
+
+    const applied = await request(app).post("/capacity/allocations/cancel")
+      .send({ allocations: ["job-managed"], apply: true }).expect(200);
+    expect(applied.body.cancelled).toHaveLength(1);
+    expect(cancel).toHaveBeenCalledWith("job-managed");
+  });
+
   it("persists campaign transitions and rejects skipped states", async () => {
     const app = express(); app.use(express.json());
     app.use("/capacity", createCapacityRouter(config));
