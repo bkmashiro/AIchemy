@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { capacityApi } from "../../lib/api";
 import CapacityPage from "../CapacityPage";
@@ -33,7 +33,9 @@ describe("CapacityPage", () => {
   it("previews release and never applies from the first click", async () => {
     render(<CapacityPage />);
     await screen.findByText("campaign-card");
-    await userEvent.click(screen.getByRole("button", { name: "Preview release campaign-card" }));
+    await act(async () => {
+      await userEvent.click(screen.getByRole("button", { name: "Preview release campaign-card" }));
+    });
     expect(capacityApi.previewCancel).toHaveBeenCalledWith(["alloc-1"]);
     expect(await screen.findByText(/busy/)).toBeInTheDocument();
   });
