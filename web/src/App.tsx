@@ -16,6 +16,7 @@ const StubsPage = lazy(() => import("./pages/StubsPage"));
 const ExperimentsPage = lazy(() => import("./pages/ExperimentsPage"));
 const DeployPage = lazy(() => import("./pages/DeployPage"));
 const OperationsDoctorPage = lazy(() => import("./pages/OperationsDoctorPage"));
+const CapacityPage = lazy(() => import("./pages/CapacityPage"));
 const ExperimentLineageDemo = lazy(() => import("./pages/ExperimentLineageDemo"));
 
 function RouteFallback() {
@@ -83,6 +84,7 @@ function AppInner(_props: { onLogout: () => void }) {
           <NavItem to="/grids" label="Grids" />
           <NavItem to="/experiments" label="Experiments" />
           <NavItem to="/resources" label="Resources" />
+          <NavItem to="/capacity" label="Capacity" />
           <NavItem to="/ops" label="Ops" />
           <NavItem to="/deploy" label="Deploy" />
         </nav>
@@ -144,6 +146,7 @@ function AppInner(_props: { onLogout: () => void }) {
               <Route path="/experiments/:id" element={<ExperimentsPage />} />
               <Route path="/deploy" element={<DeployPage />} />
               <Route path="/ops" element={<OperationsDoctorPage />} />
+              <Route path="/capacity" element={<CapacityPage />} />
               <Route
                 path="/resources"
                 element={

@@ -65,6 +65,26 @@ export interface HealthStatus {
   [key: string]: unknown;
 }
 
+export interface CapacityTarget {
+  id: string; aliases: string[]; partition?: string; qos?: string; gres?: string;
+  gpu_class?: string; gpu_mem_mb?: number; tags: string[]; enabled: boolean;
+}
+
+export interface SlurmAllocation {
+  id: string; job_id?: string; campaign_id?: string; capacity_lease_id?: string;
+  managed_target_id: string; requested_resources: Record<string, unknown>; job_name: string;
+  owner: string; managed_by: string; pinned: boolean; state: string; queue_reason?: string;
+  requested_at: string; predicted_start_at?: string; stub_id?: string; last_observed_at?: string;
+}
+
+export interface CapacityCampaign {
+  id: string; alias?: string; name: string; state: string; target_id: string;
+  frozen_spec_hash: string; capacity_lease_id: string; allocation_id?: string; stub_id?: string;
+  smoke_task_id?: string; experiment_id?: string; max_attempts: number; attempts: number;
+  max_runtime_seconds: number; created_at: string; updated_at: string; last_error?: string;
+  history: Array<{ at: string; from: string; to: string; actor: string; reason?: string }>;
+}
+
 // ─── Data Models (spec §1) ────────────────────────────────────────────────────
 
 export type TaskStatus =
@@ -329,6 +349,14 @@ export const tasksApi = {
 
 export const healthApi = {
   get: () => rootApi.get<HealthStatus>("/health").then((r) => r.data),
+};
+
+export const capacityApi = {
+  targets: (signal?: AbortSignal) => api.get<CapacityTarget[]>("/capacity/targets", { signal }).then((r) => r.data),
+  allocations: (signal?: AbortSignal) => api.get<SlurmAllocation[]>("/capacity/allocations", { signal }).then((r) => r.data),
+  campaigns: (signal?: AbortSignal) => api.get<CapacityCampaign[]>("/capacity/campaigns", { signal }).then((r) => r.data),
+  previewCancel: (allocations: string[]) => api.post("/capacity/allocations/cancel", { allocations, apply: false }).then((r) => r.data),
+  reconcileCampaign: (id: string) => api.post<CapacityCampaign>(`/capacity/campaigns/${id}/reconcile`).then((r) => r.data),
 };
 
 export const stubsApi = {
