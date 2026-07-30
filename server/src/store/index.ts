@@ -31,6 +31,7 @@ import {
   TaskMark,
   SlurmAllocation,
   CapacityCampaign,
+  CapacityPolicyEvent,
 } from "../types";
 import { alchemyEvents } from "../events";
 import { writeLockTable } from "../dedup";
@@ -247,6 +248,45 @@ class Store {
     return this._decorateCampaign(updated);
   }
 
+  appendCapacityPolicyEvents(events: Omit<CapacityPolicyEvent, "id" | "created_at">[]): CapacityPolicyEvent[] {
+    return events.map((input) => {
+      const event: CapacityPolicyEvent = { ...input, id: randomUUID(), created_at: new Date().toISOString() };
+      this.db.insert(schema.capacityPolicyEvents).values({
+        id: event.id,
+        kind: event.kind,
+        applied: event.applied,
+        created_at: event.created_at,
+        data: JSON.stringify(event),
+      }).run();
+      return event;
+    });
+  }
+
+  getCapacityPolicyEvents(limit = 200): CapacityPolicyEvent[] {
+    return this.db.select({ data: schema.capacityPolicyEvents.data })
+      .from(schema.capacityPolicyEvents)
+      .orderBy(desc(schema.capacityPolicyEvents.created_at))
+      .limit(Math.max(1, Math.min(limit, 1000)))
+      .all()
+      .map((row) => JSON.parse(row.data) as CapacityPolicyEvent);
+  }
+
+  disableCapacityPolicy(poolId: string): void {
+    this.db.insert(schema.meta)
+      .values({ key: `capacity_policy_disabled:${poolId}`, value: new Date().toISOString() })
+      .onConflictDoUpdate({
+        target: schema.meta.key,
+        set: { value: new Date().toISOString() },
+      }).run();
+  }
+
+  isCapacityPolicyDisabled(poolId: string): boolean {
+    return Boolean(this.db.select({ value: schema.meta.value })
+      .from(schema.meta)
+      .where(eq(schema.meta.key, `capacity_policy_disabled:${poolId}`))
+      .get());
+  }
+
   getSlurmAllocation(id: string): SlurmAllocation | undefined {
     const row = this.db.select({ data: schema.slurmAllocations.data })
       .from(schema.slurmAllocations).where(eq(schema.slurmAllocations.id, id)).get();
@@ -438,6 +478,15 @@ class Store {
         data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_capacity_campaigns_state ON capacity_campaigns(state, updated_at);
+      CREATE TABLE IF NOT EXISTS capacity_policy_events (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        applied INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_capacity_policy_events_created_at
+        ON capacity_policy_events(created_at);
       CREATE TABLE IF NOT EXISTS slurm_allocations (
         id TEXT PRIMARY KEY,
         idempotency_key TEXT NOT NULL UNIQUE,
@@ -2043,6 +2092,7 @@ class Store {
     this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
+    this.db.delete(schema.capacityPolicyEvents).run();
     this.db.delete(schema.slurmAllocations).run();
     this.db.delete(schema.capacityCampaigns).run();
     this.db.delete(schema.objectAliases).run();
@@ -2152,6 +2202,7 @@ class Store {
     this.db.delete(schema.webhookDeliveries).run();
     this.db.delete(schema.webhookDeliveryOutbox).run();
     this.db.delete(schema.experimentEvents).run();
+    this.db.delete(schema.capacityPolicyEvents).run();
     this.db.delete(schema.slurmAllocations).run();
     this.db.delete(schema.capacityCampaigns).run();
     this.db.delete(schema.objectAliases).run();

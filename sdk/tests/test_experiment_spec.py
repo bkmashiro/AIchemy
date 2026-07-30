@@ -85,6 +85,22 @@ def test_immutable_runtime_profile_rejects_missing_content_identity():
         RuntimeProfile(name="broken", immutable=True)
 
 
+def test_immutable_runtime_profile_rejects_mutable_or_malformed_identity():
+    valid = {
+        "name": "release",
+        "git_sha": "a" * 40,
+        "dependency_lock_sha256": "b" * 64,
+        "artifact_uri": "oci://registry.invalid/jema@sha256:" + "c" * 64,
+        "immutable": True,
+    }
+    with pytest.raises(ValueError, match="git_sha"):
+        RuntimeProfile(**{**valid, "git_sha": "release-main"})
+    with pytest.raises(ValueError, match="dependency_lock_sha256"):
+        RuntimeProfile(**{**valid, "dependency_lock_sha256": "z" * 64})
+    with pytest.raises(ValueError, match="content-addressed"):
+        RuntimeProfile(**{**valid, "artifact_uri": "oci://registry.invalid/jema:latest"})
+
+
 def test_task_values_override_runtime_profile_without_mutating_it():
     profile = RuntimeProfile(
         name="base",

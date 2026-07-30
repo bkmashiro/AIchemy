@@ -70,6 +70,19 @@ describe("restart-safe campaign reconciliation", () => {
     expect(d.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: campaign.id }), `${campaign.id}:cleanup`);
   });
 
+  it("persists unresolved cleanup obligations on failure", async () => {
+    const campaign = createCampaign({ max_attempts: 1, allocation_id: "allocation-1" });
+    const d = driver({
+      acquire: vi.fn(async () => { throw new Error("controller unavailable"); }),
+      cleanup: vi.fn(async () => ({ cleaned: false })),
+    });
+
+    const result = await reconcileCampaign(campaign.id, d);
+
+    expect(result.state).toBe("failed");
+    expect(result.cleanup_required).toBe(true);
+  });
+
   it("fails expired campaigns without launching another side effect", async () => {
     const campaign = createCampaign({ max_runtime_seconds: 60 });
     store.updateCapacityCampaign(campaign.id, { created_at: "2000-01-01T00:00:00.000Z" });

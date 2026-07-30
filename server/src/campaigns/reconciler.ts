@@ -41,13 +41,17 @@ async function fail(
   attempts = campaign.attempts,
 ): Promise<CapacityCampaign> {
   let cleanupError: string | undefined;
+  let cleanupRequired = true;
   try {
-    await driver.cleanup(campaign, `${campaign.id}:cleanup`);
+    const result = await driver.cleanup(campaign, `${campaign.id}:cleanup`);
+    cleanupRequired = !result.cleaned;
+    if (cleanupRequired) cleanupError = "; cleanup incomplete";
   } catch (error) {
     cleanupError = `; cleanup failed: ${String(error)}`;
   }
   return update(campaign, "failed", {
     attempts,
+    cleanup_required: cleanupRequired,
     last_error: `${reason}${cleanupError ?? ""}`,
   }, reason);
 }

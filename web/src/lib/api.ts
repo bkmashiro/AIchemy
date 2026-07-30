@@ -82,7 +82,21 @@ export interface CapacityCampaign {
   frozen_spec_hash: string; capacity_lease_id: string; allocation_id?: string; stub_id?: string;
   smoke_task_id?: string; experiment_id?: string; max_attempts: number; attempts: number;
   max_runtime_seconds: number; created_at: string; updated_at: string; last_error?: string;
+  cleanup_required?: boolean;
   history: Array<{ at: string; from: string; to: string; actor: string; reason?: string }>;
+}
+
+export interface CapacityPlan {
+  mode: "recommend_only";
+  recommendation: { target: CapacityTarget; score: number; reasons: string[]; observed: Record<string, unknown> } | null;
+  alternatives: Array<{ target: CapacityTarget; score: number; reasons: string[]; observed: Record<string, unknown> }>;
+  rejections: Array<{ target_id: string; reasons: string[] }>;
+}
+
+export interface CapacityPolicyEvent {
+  id: string; kind: "acquire" | "release"; applied: boolean; reason: string;
+  actor: "capacity_policy"; mode: "recommend" | "automatic";
+  target_id?: string; allocation_id?: string; created_at: string;
 }
 
 // ─── Data Models (spec §1) ────────────────────────────────────────────────────
@@ -355,6 +369,8 @@ export const capacityApi = {
   targets: (signal?: AbortSignal) => api.get<CapacityTarget[]>("/capacity/targets", { signal }).then((r) => r.data),
   allocations: (signal?: AbortSignal) => api.get<SlurmAllocation[]>("/capacity/allocations", { signal }).then((r) => r.data),
   campaigns: (signal?: AbortSignal) => api.get<CapacityCampaign[]>("/capacity/campaigns", { signal }).then((r) => r.data),
+  policyEvents: (signal?: AbortSignal) => api.get<CapacityPolicyEvent[]>("/capacity/policy/events", { signal }).then((r) => r.data),
+  recommend: (resources: Record<string, unknown>, snapshot: Record<string, unknown> = {}) => api.post<CapacityPlan>("/capacity/recommend", { resources, snapshot }).then((r) => r.data),
   previewCancel: (allocations: string[]) => api.post("/capacity/allocations/cancel", { allocations, apply: false }).then((r) => r.data),
   reconcileCampaign: (id: string) => api.post<CapacityCampaign>(`/capacity/campaigns/${id}/reconcile`).then((r) => r.data),
 };

@@ -139,6 +139,16 @@ export const slurmAllocations = sqliteTable("slurm_allocations", {
   index("idx_slurm_allocations_lease").on(table.capacity_lease_id),
 ]);
 
+export const capacityPolicyEvents = sqliteTable("capacity_policy_events", {
+  id: text("id").primaryKey(),
+  kind: text("kind").notNull(),
+  applied: integer("applied", { mode: "boolean" }).notNull(),
+  created_at: text("created_at").notNull(),
+  data: text("data").notNull(),
+}, (table) => [
+  index("idx_capacity_policy_events_created_at").on(table.created_at),
+]);
+
 export const meta = sqliteTable("meta", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),

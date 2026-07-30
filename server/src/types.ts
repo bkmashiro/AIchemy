@@ -630,7 +630,21 @@ export interface CapacityCampaign {
   created_at: string;
   updated_at: string;
   last_error?: string;
+  cleanup_required?: boolean;
   history: Array<{ at: string; from: CampaignState; to: CampaignState; actor: string; reason?: string }>;
+}
+
+export interface CapacityPolicyEvent {
+  id: string;
+  kind: "acquire" | "release";
+  applied: boolean;
+  reason: string;
+  actor: "capacity_policy";
+  mode: "recommend" | "automatic";
+  target_id?: string;
+  allocation_id?: string;
+  resources?: Record<string, unknown>;
+  created_at: string;
 }
 
 export type SlurmAllocationState =

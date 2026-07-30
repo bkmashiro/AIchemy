@@ -44,6 +44,8 @@ export interface CapacityPolicyAction {
 interface AutomationInput {
   recommendation: ValidatedRecommendation | null;
   allocations: SlurmAllocation[];
+  activeTasks?: Array<{ id: string; stub_id?: string; capacity_lease_id?: string }>;
+  campaigns?: Array<{ id: string; state: string; allocation_id?: string; capacity_lease_id?: string }>;
   policy?: CapacityAutomationPolicy;
   acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
   release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
@@ -98,14 +100,19 @@ export async function reconcileCapacityPolicy(input: AutomationInput): Promise<{
   }
 
   const ownedIdle = allocations.find((allocation) => {
-    const operational = allocation as SlurmAllocation & {
-      active_task_ids?: string[];
-      campaign_cleanup_required?: boolean;
-    };
+    const hasActiveTask = (input.activeTasks ?? []).some((task) =>
+      (allocation.stub_id && task.stub_id === allocation.stub_id)
+      || (allocation.capacity_lease_id && task.capacity_lease_id === allocation.capacity_lease_id),
+    );
+    const hasUnresolvedCampaign = (input.campaigns ?? []).some((campaign) =>
+      campaign.state !== "completed"
+      && (campaign.allocation_id === allocation.id
+        || Boolean(allocation.capacity_lease_id && campaign.capacity_lease_id === allocation.capacity_lease_id)),
+    );
     return allocation.managed_by === "alchemy"
       && !allocation.pinned
-      && (operational.active_task_ids?.length ?? 0) === 0
-      && operational.campaign_cleanup_required !== true;
+      && !hasActiveTask
+      && !hasUnresolvedCampaign;
   });
   if (!ownedIdle) return { mode, actions: [] };
 

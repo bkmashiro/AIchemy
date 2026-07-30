@@ -63,12 +63,14 @@ describe("policy-gated capacity automation", () => {
     const allocations = [
       allocation({ id: "manual", managed_by: "manual" }),
       allocation({ id: "pinned", pinned: true }),
-      allocation({ id: "busy", active_task_ids: ["task-1"] } as Partial<SlurmAllocation>),
-      allocation({ id: "cleanup", campaign_cleanup_required: true } as Partial<SlurmAllocation>),
+      allocation({ id: "busy", stub_id: "stub-busy" }),
+      allocation({ id: "cleanup", campaign_id: "campaign-1" }),
       allocation({ id: "owned-idle" }),
     ];
     const result = await reconcileCapacityPolicy({
       recommendation: null, allocations,
+      activeTasks: [{ id: "task-1", stub_id: "stub-busy" }],
+      campaigns: [{ id: "campaign-1", state: "failed", allocation_id: "cleanup" }],
       policy: { pool_id: "general", mode: "automatic", enabled: true, min_validated_snapshots: 0, max_total: 3, max_pending: 2, cooldown_seconds: 0 },
       acquire: vi.fn(), release, now: new Date("2026-07-30T00:00:00Z"),
     });

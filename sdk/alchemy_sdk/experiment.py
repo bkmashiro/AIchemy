@@ -15,6 +15,20 @@ from .submission_lint import lint_task_specs
 from .operator_config import resolve_server
 
 
+def _is_hex_digest(value: Optional[str], lengths: tuple[int, ...]) -> bool:
+    if value is None or len(value) not in lengths:
+        return False
+    return all(character in "0123456789abcdefABCDEF" for character in value)
+
+
+def _has_sha256_identity(uri: str) -> bool:
+    for marker in ("sha256:", "sha256="):
+        if marker in uri:
+            digest = uri.split(marker, 1)[1][:64]
+            return _is_hex_digest(digest, (64,))
+    return False
+
+
 @dataclass
 class TaskNode:
     """A node in the experiment DAG. Created by Experiment.task()."""
@@ -56,12 +70,12 @@ class RuntimeProfile:
             if not isinstance(value, str):
                 raise ValueError("runtime profile env values must be strings")
         if self.immutable:
-            if not self.git_sha or len(self.git_sha) < 7:
-                raise ValueError("immutable runtime profile requires git_sha")
-            if not self.dependency_lock_sha256 or len(self.dependency_lock_sha256) != 64:
-                raise ValueError("immutable runtime profile requires dependency_lock_sha256")
-            if not self.artifact_uri:
-                raise ValueError("immutable runtime profile requires artifact_uri")
+            if not _is_hex_digest(self.git_sha, (40, 64)):
+                raise ValueError("immutable runtime profile requires a full hexadecimal git_sha")
+            if not _is_hex_digest(self.dependency_lock_sha256, (64,)):
+                raise ValueError("immutable runtime profile requires hexadecimal dependency_lock_sha256")
+            if not self.artifact_uri or not _has_sha256_identity(self.artifact_uri):
+                raise ValueError("immutable runtime profile requires a content-addressed sha256 artifact_uri")
             if "PYTHONPATH" in self.env:
                 raise ValueError("immutable runtime profile must install packages instead of setting PYTHONPATH")
 

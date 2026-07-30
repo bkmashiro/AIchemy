@@ -60,22 +60,37 @@ export interface CapacityRecommendation {
   observed: Record<string, unknown>;
 }
 
+export interface CapacityRejection {
+  target_id: string;
+  reasons: string[];
+}
+
+export function capacityTargetRejections(
+  target: CapacityTarget,
+  resources: Record<string, unknown>,
+): string[] {
+  const reasons: string[] = [];
+  const explicitPartition = typeof resources.partition === "string" ? resources.partition : undefined;
+  const explicitQos = typeof resources.qos === "string" ? resources.qos : undefined;
+  const gpuClass = typeof resources.gpu_class === "string" ? resources.gpu_class.toUpperCase() : undefined;
+  const minMemory = Number(resources.gpu_mem_mb ?? 0);
+  if (target.enabled === false) reasons.push("target disabled");
+  if (explicitPartition && target.partition !== explicitPartition) reasons.push(`partition ${target.partition ?? "unspecified"} != ${explicitPartition}`);
+  if (explicitQos && target.qos !== explicitQos) reasons.push(`qos ${target.qos ?? "default"} != ${explicitQos}`);
+  if (gpuClass && target.gpu_class?.toUpperCase() !== gpuClass) reasons.push(`gpu_class ${target.gpu_class ?? "unknown"} != ${gpuClass}`);
+  if (minMemory && (target.gpu_mem_mb ?? 0) < minMemory) reasons.push(`gpu_mem_mb ${target.gpu_mem_mb ?? 0} < ${minMemory}`);
+  return reasons;
+}
+
 export function recommendCapacity(
   targets: CapacityTarget[],
   resources: Record<string, unknown>,
   snapshot: { partitions?: Array<Record<string, unknown>> },
 ): CapacityRecommendation[] {
-  const explicitPartition = typeof resources.partition === "string" ? resources.partition : undefined;
   const explicitQos = typeof resources.qos === "string" ? resources.qos : undefined;
-  const gpuClass = typeof resources.gpu_class === "string" ? resources.gpu_class.toUpperCase() : undefined;
-  const minMemory = Number(resources.gpu_mem_mb ?? 0);
   const partitions = new Map((snapshot.partitions ?? []).map((item) => [String(item.name), item]));
 
-  return targets.filter((target) => target.enabled !== false)
-    .filter((target) => !explicitPartition || target.partition === explicitPartition)
-    .filter((target) => !explicitQos || target.qos === explicitQos)
-    .filter((target) => !gpuClass || target.gpu_class?.toUpperCase() === gpuClass)
-    .filter((target) => !minMemory || (target.gpu_mem_mb ?? 0) >= minMemory)
+  return targets.filter((target) => capacityTargetRejections(target, resources).length === 0)
     .map((target) => {
       const observed = partitions.get(String(target.partition)) ?? {};
       const available = Number(observed.available_gpus ?? 0);
@@ -131,6 +146,12 @@ export function reconcileSlurmAllocations(
   return { reconciled, observed_jobs: jobs.length, observed_at: now };
 }
 
+function auditSafeResources(resources?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!resources) return undefined;
+  const allowed = new Set(["partition", "qos", "gres", "gpu_class", "gpu_mem_mb", "gpus", "mem", "time"]);
+  return Object.fromEntries(Object.entries(resources).filter(([key]) => allowed.has(key)));
+}
+
 export function createCapacityRouter(
   config: DeployFileConfig | null,
   dependencies: {
@@ -139,6 +160,7 @@ export function createCapacityRouter(
     campaignDriver?: CampaignDriver;
     automation?: {
       policy: CapacityAutomationPolicy;
+      recommendationProvider?: () => Promise<ValidatedRecommendation | null>;
       acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
       release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
     };
@@ -146,6 +168,10 @@ export function createCapacityRouter(
 ): Router {
   const router = Router();
   const submit = dependencies.submit ?? deployStub;
+  if (dependencies.automation && store.isCapacityPolicyDisabled(dependencies.automation.policy.pool_id)) {
+    dependencies.automation.policy.enabled = false;
+    dependencies.automation.policy.mode = "recommend";
+  }
 
   router.get("/targets", (_req: Request, res: Response) => {
     res.json(capacityTargets(config));
@@ -154,25 +180,73 @@ export function createCapacityRouter(
   router.post("/recommend", (req: Request, res: Response) => {
     const resources = req.body?.resources && typeof req.body.resources === "object" ? req.body.resources : {};
     const snapshot = req.body?.snapshot && typeof req.body.snapshot === "object" ? req.body.snapshot : {};
-    const recommendations = recommendCapacity(capacityTargets(config), resources, snapshot);
+    const targets = capacityTargets(config);
+    const recommendations = recommendCapacity(targets, resources, snapshot);
+    const rejections: CapacityRejection[] = targets
+      .map((target) => ({ target_id: target.id, reasons: capacityTargetRejections(target, resources) }))
+      .filter((item) => item.reasons.length > 0);
     if (recommendations.length === 0) {
-      res.status(409).json({ error: "No managed target satisfies the explicit resource constraints", resources });
+      res.status(409).json({ error: "No managed target satisfies the explicit resource constraints", resources, rejections });
       return;
     }
-    res.json({ recommendation: recommendations[0], alternatives: recommendations.slice(1), mode: "recommend_only" });
+    res.json({ recommendation: recommendations[0], alternatives: recommendations.slice(1), rejections, mode: "recommend_only" });
+  });
+
+  router.get("/policy/events", (req: Request, res: Response) => {
+    const limit = Number(req.query.limit ?? 200);
+    res.json(store.getCapacityPolicyEvents(Number.isFinite(limit) ? limit : 200));
+  });
+
+  router.post("/policy/disable", (_req: Request, res: Response) => {
+    if (!dependencies.automation) {
+      res.status(404).json({ error: "No automatic capacity policy configured" });
+      return;
+    }
+    store.disableCapacityPolicy(dependencies.automation.policy.pool_id);
+    dependencies.automation.policy.enabled = false;
+    dependencies.automation.policy.mode = "recommend";
+    res.json({ pool_id: dependencies.automation.policy.pool_id, mode: "recommend", enabled: false });
   });
 
   router.post("/policy/reconcile", async (req: Request, res: Response): Promise<void> => {
-    const recommendation = req.body?.recommendation as ValidatedRecommendation | null | undefined;
     try {
+      const automatic = dependencies.automation?.policy.enabled
+        && dependencies.automation.policy.mode === "automatic";
+      if (automatic && !dependencies.automation?.recommendationProvider) {
+        res.status(503).json({ error: "Server-owned automatic recommendation provider unavailable" });
+        return;
+      }
+      let recommendation = automatic
+        ? await dependencies.automation!.recommendationProvider!()
+        : req.body?.recommendation as ValidatedRecommendation | null | undefined;
+      if (automatic && recommendation) {
+        const trustedTarget = capacityTargets(config).find((target) => target.id === recommendation!.target.id && target.enabled);
+        const rejections = trustedTarget ? capacityTargetRejections(trustedTarget, recommendation.resources) : ["unknown or disabled target"];
+        if (!trustedTarget || rejections.length > 0) {
+          throw new Error(`Automatic recommendation failed server catalog validation: ${rejections.join("; ")}`);
+        }
+        recommendation = { ...recommendation, target: trustedTarget };
+      }
       const result = await reconcileCapacityPolicy({
         recommendation: recommendation ?? null,
         allocations: store.getSlurmAllocations(),
+        activeTasks: store.getActiveTasks(),
+        campaigns: store.getCapacityCampaigns(),
         policy: dependencies.automation?.policy,
         acquire: dependencies.automation?.acquire ?? (async () => { throw new Error("Automatic acquisition backend unavailable"); }),
         release: dependencies.automation?.release ?? (async () => { throw new Error("Automatic release backend unavailable"); }),
         now: new Date(),
       });
+      store.appendCapacityPolicyEvents(result.actions.map((action) => ({
+        kind: action.kind,
+        applied: action.applied,
+        reason: action.reason,
+        actor: action.actor,
+        mode: result.mode,
+        target_id: action.target_id,
+        allocation_id: action.allocation_id,
+        resources: auditSafeResources(action.resources),
+      })));
       res.json(result);
     } catch (error) {
       res.status(503).json({ error: String(error) });
@@ -223,6 +297,38 @@ export function createCapacityRouter(
     const failure = to === "failed" && typeof req.body?.reason === "string" && Boolean(req.body.reason.trim());
     if (transitions[campaign.state] !== to && !failure) {
       res.status(409).json({ error: "Invalid campaign transition", from: campaign.state, expected: transitions[campaign.state], requested: to });
+      return;
+    }
+    if (["release", "closeout", "completed"].includes(to)) {
+      res.status(409).json({ error: "Destructive campaign transitions require the audited reconciler", from: campaign.state, requested: to });
+      return;
+    }
+    if (typeof req.body?.allocation_id === "string") {
+      const allocation = store.getSlurmAllocation(req.body.allocation_id);
+      if (!allocation
+        || allocation.managed_by !== "alchemy"
+        || allocation.campaign_id !== campaign.id
+        || allocation.capacity_lease_id !== campaign.capacity_lease_id) {
+        res.status(409).json({ error: "Allocation is not canonically owned by this campaign and lease" });
+        return;
+      }
+    }
+    if (typeof req.body?.stub_id === "string") {
+      const stub = store.getStub(req.body.stub_id);
+      if (!stub || stub.capacity_lease_id !== campaign.capacity_lease_id) {
+        res.status(409).json({ error: "Stub is not canonically bound to this campaign lease" });
+        return;
+      }
+    }
+    if (typeof req.body?.smoke_task_id === "string") {
+      const task = store.getAllTasks().find((item) => item.id === req.body.smoke_task_id);
+      if (!task || task.capacity_lease_id !== campaign.capacity_lease_id) {
+        res.status(409).json({ error: "Smoke task is not canonically bound to this campaign lease" });
+        return;
+      }
+    }
+    if (typeof req.body?.experiment_id === "string" && !store.getExperiment(req.body.experiment_id)) {
+      res.status(409).json({ error: "Experiment must be an existing canonical experiment ID" });
       return;
     }
     const at = new Date().toISOString();

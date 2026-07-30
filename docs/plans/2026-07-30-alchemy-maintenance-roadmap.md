@@ -17,10 +17,10 @@
 - [x] Milestone 1 — configuration-driven GPU target catalog, durable idempotent allocation records, custom job names, and canonical managed submission path.
 - [x] Milestone 2 — controller snapshots automatically reconcile allocation state and exact `job_id -> stub_id` binding.
 - [x] Milestone 3 — recommend-only planner preserves explicit partition/QOS/GPU constraints and explains observed ranking.
-- [~] Milestone 4 — logical routing plus a restart-safe, serial campaign reconciler now cover the full bounded lifecycle with stable side-effect keys and failure cleanup; concrete production smoke/DAG/acquire/release adapters remain intentionally unwired.
+- [~] Milestone 4 — logical routing plus a restart-safe, serial campaign reconciler now cover the full bounded lifecycle with stable side-effect keys, bounded retries/runtime, release/closeout proof, and persisted unresolved cleanup obligations; concrete production smoke/DAG/acquire/release adapters remain intentionally unwired.
 - [x] Milestone 5 — target/allocation/campaign CLI controls and managed-only, pinned-safe bulk cancellation with default dry-run.
-- [x] Milestone 6 — Capacity & Campaigns Web operations view with serial polling, inventory, ownership/binding, queue state, campaign progress, and dry-run release previews.
-- [x] Milestone 7 — audited policy engine is gated by validated recommendations and server-owned policy injection; default remains recommend-only and no automatic production policy is configured.
+- [x] Milestone 6 — Capacity & Campaigns Web operations view with serial polling, target snapshot timestamps, planner recommendations/rejections, ownership and allocation→stub→active-task binding, predicted queue start, policy audit events, campaign transition timeline/cleanup obligations, and dry-run release previews.
+- [x] Milestone 7 — append-only policy audit events, stable recommendation idempotency, exact server-catalog validation, server-owned recommendation injection, real active-task/campaign cleanup release guards, and a persisted one-way kill switch; default remains recommend-only and no automatic production policy is configured.
 
 ---
 
@@ -596,7 +596,7 @@ alch campaigns reconcile <id>
 
 ## Milestone 6 — Web operations UI (P2)
 
-**Implementation status (2026-07-30): complete.** The combined Capacity & Campaigns view uses the Milestone 0 serial polling hook and exposes only dry-run release previews.
+**Implementation status (2026-07-30): complete.** The combined Capacity & Campaigns view uses the Milestone 0 serial polling hook and exposes target observation timestamps, explicit planner recommendations and rejection explanations, ownership and allocation→stub→active-task links, predicted queue starts, policy audit events, campaign transition timelines and cleanup obligations, plus dry-run-only release previews.
 
 Add Capacity and Campaign views using server snapshots, not browser-triggered SSH:
 
@@ -627,7 +627,7 @@ Use the non-overlapping polling contract from Milestone 0.
 
 ## Milestone 7 — Policy-enabled automatic acquisition (P3)
 
-**Implementation status (2026-07-30): policy substrate complete, rollout disabled.** Policy reconciliation applies at most one action, preserves recommendation resources, requires a validated recommendation and server-owned automatic policy, and restricts release to idle Alchemy-owned unpinned allocations without cleanup obligations. No automatic policy is wired in the server, so the effective default remains recommend-only pending the required operational audit.
+**Implementation status (2026-07-30): policy substrate complete, rollout disabled.** Policy reconciliation applies at most one action, preserves explicit recommendation resources, uses stable recommendation identities for idempotent retries, rejects non-catalog server recommendations, and requires a server-owned provider before automatic acquisition. Release eligibility is derived from persisted active tasks and campaign state rather than caller-injected pseudo-fields, and therefore excludes manual, pinned, busy, and unresolved-campaign allocations. Every recommendation/action is appended to an immutable policy-event ledger, and `/policy/disable` persists a one-way kill switch to recommend-only across restarts. No automatic policy is wired in the server, so no production acquisition or release is enabled.
 
 Only after several days of recommend-only snapshots match operator decisions:
 
