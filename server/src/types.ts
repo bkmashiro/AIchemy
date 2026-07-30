@@ -435,6 +435,17 @@ export interface ServerState {
   seq_counter: number;
   archive?: Task[];
   global_queue?: Task[];
+  slurm_allocations?: SlurmAllocation[];
+  capacity_campaigns?: CapacityCampaign[];
+  capacity_policy_events?: CapacityPolicyEvent[];
+  disabled_capacity_policy_pools?: string[];
+  object_aliases?: Array<{
+    alias: string;
+    object_kind: string;
+    object_id: string;
+    created_at: string;
+    scheme_version: number;
+  }>;
 }
 
 // ─── Reliable Messaging ──────────────────────────────────────────────────────
@@ -641,9 +652,11 @@ export interface CapacityPolicyEvent {
   reason: string;
   actor: "capacity_policy";
   mode: "recommend" | "automatic";
+  pool_id?: string;
   target_id?: string;
   allocation_id?: string;
   resources?: Record<string, unknown>;
+  idempotency_key?: string;
   created_at: string;
 }
 

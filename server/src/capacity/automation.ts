@@ -20,12 +20,15 @@ export interface ValidatedRecommendation {
 }
 
 function recommendationIdentity(recommendation: ValidatedRecommendation): string {
-  if (recommendation.recommendation_id) return recommendation.recommendation_id;
   const resources = Object.fromEntries(
     Object.entries(recommendation.resources).sort(([a], [b]) => a.localeCompare(b)),
   );
   return createHash("sha256")
-    .update(JSON.stringify({ target_id: recommendation.target.id, resources }))
+    .update(JSON.stringify({
+      recommendation_id: recommendation.recommendation_id,
+      target_id: recommendation.target.id,
+      resources,
+    }))
     .digest("hex")
     .slice(0, 16);
 }
@@ -39,6 +42,7 @@ export interface CapacityPolicyAction {
   reason: string;
   actor: "capacity_policy";
   at: string;
+  idempotency_key?: string;
 }
 
 interface AutomationInput {
@@ -49,6 +53,8 @@ interface AutomationInput {
   policy?: CapacityAutomationPolicy;
   acquire: (recommendation: ValidatedRecommendation, idempotencyKey: string) => Promise<unknown>;
   release: (allocation: SlurmAllocation, idempotencyKey: string) => Promise<unknown>;
+  beforeApply?: (action: CapacityPolicyAction) => void;
+  applyFailed?: (action: CapacityPolicyAction) => void;
   now: Date;
 }
 
@@ -93,9 +99,18 @@ export async function reconcileCapacityPolicy(input: AutomationInput): Promise<{
       return { mode, actions: [action] };
     }
     const key = `${policy!.pool_id}:acquire:${recommendationIdentity(recommendation)}`;
-    await input.acquire(recommendation, key);
+    action.idempotency_key = key;
+    action.reason = "apply_intent";
+    input.beforeApply?.({ ...action });
+    try {
+      await input.acquire(recommendation, key);
+    } catch (error) {
+      input.applyFailed?.({ ...action, reason: "apply_failed" });
+      throw error;
+    }
     action.applied = true;
     action.reason = "validated_recommendation";
+    policy!.last_action_at = at;
     return { mode, actions: [action] };
   }
 
@@ -125,7 +140,18 @@ export async function reconcileCapacityPolicy(input: AutomationInput): Promise<{
     if (mode === "automatic") action.reason = "cooldown_active";
     return { mode, actions: [action] };
   }
-  await input.release(ownedIdle, `${policy!.pool_id}:release:${ownedIdle.id}`);
+  const key = `${policy!.pool_id}:release:${ownedIdle.id}`;
+  action.idempotency_key = key;
+  action.reason = "apply_intent";
+  input.beforeApply?.({ ...action });
+  try {
+    await input.release(ownedIdle, key);
+  } catch (error) {
+    input.applyFailed?.({ ...action, reason: "apply_failed" });
+    throw error;
+  }
   action.applied = true;
+  action.reason = "idle_owned_capacity";
+  policy!.last_action_at = at;
   return { mode, actions: [action] };
 }

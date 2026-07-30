@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createCapacityRouter } from "../api/capacity";
+import { capacityTargets, createCapacityRouter } from "../api/capacity";
 import { store } from "../store";
 import type { DeployFileConfig, DeployResult } from "../types";
 import type { CampaignDriver } from "../campaigns/reconciler";
@@ -125,8 +125,7 @@ describe("capacity target catalog and allocation submission", () => {
     }).expect(201);
     expect(created.body.state).toBe("acquire");
     expect(created.body.alias).toMatch(/^camp-/);
-
-    await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
+    await request(app).post(`/capacity/campaigns/${created.body.id}/advance`)
       .send({ to: "submit_dag", actor: "tester" }).expect(409);
     await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
       .send({ to: "wait_stub", actor: "tester", allocation_id: "alloc-forged" }).expect(409);
@@ -148,7 +147,13 @@ describe("capacity target catalog and allocation submission", () => {
     expect(advanced.body.state).toBe("wait_stub");
     expect(advanced.body.attempts).toBe(1);
     expect(advanced.body.history).toHaveLength(1);
-    expect(store.getCapacityCampaign(created.body.id)?.state).toBe("wait_stub");
+    expect(advanced.body.history[0]).toMatchObject({ from: "acquire", to: "wait_stub", actor: "tester" });
+    await request(app).post(`/capacity/campaigns/${created.body.id}/advance`)
+      .send({ to: "submit_dag", actor: "tester" }).expect(409);
+    const failed = await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
+      .send({ to: "failed", actor: "tester", reason: "operator stop" }).expect(200);
+    expect(failed.body.cleanup_required).toBe(true);
+    expect(store.getCapacityCampaign(created.body.id)?.state).toBe("failed");
   });
 
   it("requires the audited reconciler for destructive campaign transitions", async () => {
@@ -226,6 +231,28 @@ describe("capacity target catalog and allocation submission", () => {
     expect(acquire).not.toHaveBeenCalled();
   });
 
+  it("records immutable intent and outcome around automatic mutations", async () => {
+    const acquire = vi.fn(async () => ({ ok: true }));
+    const automaticApp = express(); automaticApp.use(express.json());
+    automaticApp.use("/capacity", createCapacityRouter(config, {
+      automation: {
+        policy: { pool_id: "general", mode: "automatic", enabled: true, min_validated_snapshots: 1, max_total: 2, max_pending: 2, cooldown_seconds: 0 },
+        recommendationProvider: async () => ({
+          recommendation_id: "verified-plan", target: capacityTargets(config)[0],
+          resources: { partition: "gpu-small", qos: "normal" }, validated_snapshots: 5,
+        }),
+        acquire,
+        release: vi.fn(),
+      },
+    }));
+
+    await request(automaticApp).post("/capacity/policy/reconcile").send({}).expect(200);
+    const events = store.getCapacityPolicyEvents();
+    expect(events.map((event) => event.reason)).toEqual(["validated_recommendation", "apply_intent"]);
+    expect(events[0]).toMatchObject({ applied: true, pool_id: "general", idempotency_key: expect.any(String) });
+    expect(events[1]).toMatchObject({ applied: false, pool_id: "general", idempotency_key: events[0].idempotency_key });
+  });
+
   it("provides a one-way runtime kill switch back to recommend-only", async () => {
     const policy = { pool_id: "general", mode: "automatic" as const, enabled: true, min_validated_snapshots: 1, max_total: 3, max_pending: 2, cooldown_seconds: 0 };
     const acquire = vi.fn(async () => ({ id: "new" }));
@@ -264,6 +291,33 @@ describe("capacity target catalog and allocation submission", () => {
     const afterRestart = await request(restartedApp).post("/capacity/policy/reconcile").send({}).expect(200);
     expect(afterRestart.body.mode).toBe("recommend");
     expect(acquire).not.toHaveBeenCalled();
+  });
+
+  it("preserves capacity audit state and aliases across backup restore", () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "backup-allocation", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "backup", owner: "tester", managed_by: "alchemy", pinned: false, state: "pending",
+    });
+    const campaign = store.createCapacityCampaign({
+      name: "backup-campaign", state: "wait_stub", target_id: "slurm-a16", frozen_spec_hash: "sha256:backup",
+      capacity_lease_id: "lease-backup", allocation_id: allocation.id, attempts: 0, max_attempts: 2,
+      max_runtime_seconds: 60,
+    });
+    store.appendCapacityPolicyEvents([{
+      kind: "acquire", applied: false, reason: "backup-test", actor: "capacity_policy", mode: "recommend",
+      target_id: "slurm-a16",
+    }]);
+    store.disableCapacityPolicy("general");
+    const state = store.exportState();
+
+    store.reset();
+    store.loadFromState(state);
+
+    expect(store.resolveObjectRef(allocation.alias!, "slurm_allocation")).toMatchObject({ id: allocation.id });
+    expect(store.getSlurmAllocation(allocation.id)).toMatchObject({ id: allocation.id });
+    expect(store.getCapacityCampaign(campaign.alias!)).toMatchObject({ id: campaign.id });
+    expect(store.getCapacityPolicyEvents()).toHaveLength(1);
+    expect(store.isCapacityPolicyDisabled("general")).toBe(true);
   });
 
   it("reconciles a campaign through the restart-safe driver endpoint", async () => {

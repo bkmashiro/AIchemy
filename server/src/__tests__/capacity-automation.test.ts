@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { reconcileCapacityPolicy } from "../capacity/automation";
+import { reconcileCapacityPolicy, type CapacityAutomationPolicy } from "../capacity/automation";
 import type { CapacityTarget, SlurmAllocation } from "../types";
 
 const target: CapacityTarget = {
@@ -55,7 +55,38 @@ describe("policy-gated capacity automation", () => {
     await reconcileCapacityPolicy({ recommendation, allocations: [], policy, acquire, release: vi.fn(), now: new Date("2026-07-30T00:05:00Z") });
 
     const keys = acquire.mock.calls as unknown as Array<[unknown, string]>;
-    expect(keys.map((call) => call[1])).toEqual(["general:acquire:plan-42", "general:acquire:plan-42"]);
+    expect(keys[0][1]).toBe(keys[1][1]);
+    expect(keys[0][1]).toMatch(/^general:acquire:[0-9a-f]{16}$/);
+
+    await reconcileCapacityPolicy({
+      recommendation: { ...recommendation, resources: { partition: "gpu-large" } },
+      allocations: [], policy, acquire, release: vi.fn(), now: new Date("2026-07-30T00:10:00Z"),
+    });
+    expect((acquire.mock.calls as unknown as Array<[unknown, string]>)[2][1]).not.toBe(keys[0][1]);
+  });
+
+  it("audits intent before applying and activates cooldown after success", async () => {
+    const acquire = vi.fn(async () => ({ id: "new" }));
+    const beforeApply = vi.fn();
+    const policy: CapacityAutomationPolicy = { pool_id: "general", mode: "automatic", enabled: true, min_validated_snapshots: 1, max_total: 3, max_pending: 2, cooldown_seconds: 300 };
+    const recommendation = { target, resources: { partition: "gpu-small" }, validated_snapshots: 3 };
+
+    const applied = await reconcileCapacityPolicy({
+      recommendation, allocations: [], policy, acquire, release: vi.fn(), beforeApply,
+      now: new Date("2026-07-30T00:00:00Z"),
+    });
+    expect(beforeApply).toHaveBeenCalledWith(expect.objectContaining({
+      applied: false, reason: "apply_intent", idempotency_key: expect.any(String),
+    }));
+    expect(applied.actions[0]).toMatchObject({ applied: true, reason: "validated_recommendation" });
+    expect(policy.last_action_at).toBe("2026-07-30T00:00:00.000Z");
+
+    const cooledDown = await reconcileCapacityPolicy({
+      recommendation, allocations: [], policy, acquire, release: vi.fn(),
+      now: new Date("2026-07-30T00:01:00Z"),
+    });
+    expect(cooledDown.actions[0]).toMatchObject({ applied: false, reason: "cooldown_active" });
+    expect(acquire).toHaveBeenCalledOnce();
   });
 
   it("never auto-releases manual, pinned, busy, or campaign-cleanup allocations", async () => {

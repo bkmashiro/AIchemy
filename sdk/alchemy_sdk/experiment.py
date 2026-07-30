@@ -6,6 +6,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
@@ -22,11 +23,9 @@ def _is_hex_digest(value: Optional[str], lengths: tuple[int, ...]) -> bool:
 
 
 def _has_sha256_identity(uri: str) -> bool:
-    for marker in ("sha256:", "sha256="):
-        if marker in uri:
-            digest = uri.split(marker, 1)[1][:64]
-            return _is_hex_digest(digest, (64,))
-    return False
+    # Accept standard content-addressed URI forms only. A digest-looking substring
+    # in an arbitrary query value is not an immutable artifact identity.
+    return re.search(r"(?:@sha256:|[?#&]sha256=)[0-9a-fA-F]{64}(?:$|[?#&])", uri) is not None
 
 
 @dataclass

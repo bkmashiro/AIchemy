@@ -2037,6 +2037,15 @@ class Store {
       seq_counter: this.seqCounter,
       archive: this._queryArchiveTasks(),
       global_queue: this._queryGlobalQueueTasks(),
+      slurm_allocations: this.getSlurmAllocations(),
+      capacity_campaigns: this.getCapacityCampaigns(),
+      capacity_policy_events: this.db.select({ data: schema.capacityPolicyEvents.data })
+        .from(schema.capacityPolicyEvents).orderBy(asc(schema.capacityPolicyEvents.created_at)).all()
+        .map((row) => JSON.parse(row.data) as CapacityPolicyEvent),
+      disabled_capacity_policy_pools: (this.sqlite.prepare(
+        "SELECT key FROM meta WHERE key LIKE 'capacity_policy_disabled:%' ORDER BY key",
+      ).all() as Array<{ key: string }>).map((row) => row.key.slice("capacity_policy_disabled:".length)),
+      object_aliases: this.db.select().from(schema.objectAliases).all(),
     };
   }
 
@@ -2155,6 +2164,53 @@ class Store {
           .run();
       }
 
+      for (const alias of state.object_aliases ?? []) {
+        tx.insert(schema.objectAliases).values({
+          ...alias,
+          object_kind: alias.object_kind as AliasObjectKind,
+        }).onConflictDoNothing().run();
+      }
+      for (const allocation of state.slurm_allocations ?? []) {
+        tx.insert(schema.slurmAllocations).values({
+          id: allocation.id,
+          idempotency_key: allocation.idempotency_key,
+          job_id: allocation.job_id,
+          campaign_id: allocation.campaign_id,
+          capacity_lease_id: allocation.capacity_lease_id,
+          managed_target_id: allocation.managed_target_id,
+          state: allocation.state,
+          stub_id: allocation.stub_id,
+          requested_at: allocation.requested_at,
+          last_observed_at: allocation.last_observed_at,
+          data: JSON.stringify(allocation),
+        }).run();
+      }
+      for (const campaign of state.capacity_campaigns ?? []) {
+        tx.insert(schema.capacityCampaigns).values({
+          id: campaign.id,
+          state: campaign.state,
+          target_id: campaign.target_id,
+          capacity_lease_id: campaign.capacity_lease_id,
+          updated_at: campaign.updated_at,
+          data: JSON.stringify(campaign),
+        }).run();
+      }
+      for (const event of state.capacity_policy_events ?? []) {
+        tx.insert(schema.capacityPolicyEvents).values({
+          id: event.id,
+          kind: event.kind,
+          applied: event.applied,
+          created_at: event.created_at,
+          data: JSON.stringify(event),
+        }).run();
+      }
+      for (const poolId of state.disabled_capacity_policy_pools ?? []) {
+        tx.insert(schema.meta).values({
+          key: `capacity_policy_disabled:${poolId}`,
+          value: new Date().toISOString(),
+        }).onConflictDoNothing().run();
+      }
+
       for (const stub of this.stubs.values()) {
         const terminal = stub.tasks.filter((t) => !this._isActive(t.status));
         if (terminal.length > 0) {
@@ -2168,6 +2224,14 @@ class Store {
         for (const t of stub.tasks) this._saveTask(t, "stub");
       }
     });
+
+    for (const alias of state.object_aliases ?? []) {
+      this._cacheAlias(alias.alias, alias.object_kind as AliasObjectKind, alias.object_id);
+    }
+    for (const experiment of this.experiments.values()) this.ensureObjectAlias("experiment", experiment.id);
+    for (const task of this.getAllTasks()) this.ensureObjectAlias("task", task.id);
+    for (const allocation of state.slurm_allocations ?? []) this.ensureObjectAlias("slurm_allocation", allocation.id);
+    for (const campaign of state.capacity_campaigns ?? []) this.ensureObjectAlias("campaign", campaign.id);
 
     this._pruneArchive();
     this.rebuildFingerprintIndex();

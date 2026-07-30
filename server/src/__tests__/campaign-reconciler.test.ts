@@ -39,7 +39,7 @@ describe("restart-safe campaign reconciliation", () => {
     const d = driver();
 
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("wait_stub");
-    expect(d.acquire).toHaveBeenCalledWith(expect.objectContaining({ id: campaign.id }), `${campaign.id}:acquire:1`);
+    expect(d.acquire).toHaveBeenCalledWith(expect.objectContaining({ id: campaign.id }), `${campaign.id}:acquire`);
 
     vi.mocked(d.observeStub).mockResolvedValue({ online: true, stub_id: "stub-1" });
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("cuda_smoke");
@@ -68,6 +68,32 @@ describe("restart-safe campaign reconciliation", () => {
     expect(result.attempts).toBe(1);
     expect(result.last_error).toContain("controller unavailable");
     expect(d.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: campaign.id }), `${campaign.id}:cleanup`);
+  });
+
+  it("reuses the same acquire key after an ambiguous timeout", async () => {
+    const campaign = createCampaign();
+    const d = driver();
+    vi.mocked(d.acquire)
+      .mockRejectedValueOnce(new Error("timeout after submit"))
+      .mockResolvedValueOnce({ allocation_id: "allocation-1" });
+
+    expect((await reconcileCampaign(campaign.id, d)).state).toBe("acquire");
+    expect((await reconcileCampaign(campaign.id, d)).state).toBe("wait_stub");
+    expect(vi.mocked(d.acquire).mock.calls.map((call) => call[1])).toEqual([
+      `${campaign.id}:acquire`, `${campaign.id}:acquire`,
+    ]);
+  });
+
+  it("retries persisted cleanup obligations without replaying the campaign", async () => {
+    const campaign = createCampaign({ state: "failed", cleanup_required: true, last_error: "cleanup incomplete" });
+    const d = driver({ cleanup: vi.fn(async () => ({ cleaned: true })) });
+
+    const reconciled = await reconcileCampaign(campaign.id, d);
+
+    expect(reconciled.state).toBe("failed");
+    expect(reconciled.cleanup_required).toBe(false);
+    expect(d.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: campaign.id }), `${campaign.id}:cleanup`);
+    expect(d.acquire).not.toHaveBeenCalled();
   });
 
   it("persists unresolved cleanup obligations on failure", async () => {

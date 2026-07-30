@@ -64,7 +64,20 @@ export async function reconcileCampaign(
 ): Promise<CapacityCampaign> {
   const campaign = store.getCapacityCampaign(campaignRef);
   if (!campaign) throw new Error(`Campaign not found: ${campaignRef}`);
-  if (["completed", "failed"].includes(campaign.state)) return campaign;
+  if (campaign.state === "completed") return campaign;
+  if (campaign.state === "failed") {
+    if (!campaign.cleanup_required) return campaign;
+    try {
+      const result = await driver.cleanup(campaign, `${campaign.id}:cleanup`);
+      return result.cleaned
+        ? store.updateCapacityCampaign(campaign.id, { cleanup_required: false })!
+        : campaign;
+    } catch (error) {
+      return store.updateCapacityCampaign(campaign.id, {
+        last_error: `${campaign.last_error ?? "Campaign failed"}; cleanup retry failed: ${String(error)}`,
+      })!;
+    }
+  }
 
   const ageMs = now.getTime() - new Date(campaign.created_at).getTime();
   if (!Number.isFinite(ageMs) || ageMs >= campaign.max_runtime_seconds * 1000) {
@@ -76,7 +89,7 @@ export async function reconcileCampaign(
       case "acquire": {
         const attempt = campaign.attempts + 1;
         if (attempt > campaign.max_attempts) return fail(campaign, driver, "Campaign retry limit exceeded");
-        const result = await driver.acquire(campaign, `${campaign.id}:acquire:${attempt}`);
+        const result = await driver.acquire(campaign, `${campaign.id}:acquire`);
         return update(campaign, "wait_stub", { allocation_id: result.allocation_id, attempts: attempt });
       }
       case "wait_stub": {

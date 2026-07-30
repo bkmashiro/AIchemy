@@ -7,6 +7,7 @@ import { reconcileCampaign, type CampaignDriver } from "../campaigns/reconciler"
 import {
   reconcileCapacityPolicy,
   type CapacityAutomationPolicy,
+  type CapacityPolicyAction,
   type ValidatedRecommendation,
 } from "../capacity/automation";
 
@@ -171,6 +172,9 @@ export function createCapacityRouter(
   if (dependencies.automation && store.isCapacityPolicyDisabled(dependencies.automation.policy.pool_id)) {
     dependencies.automation.policy.enabled = false;
     dependencies.automation.policy.mode = "recommend";
+  } else if (dependencies.automation && !dependencies.automation.policy.last_action_at) {
+    dependencies.automation.policy.last_action_at = store.getCapacityPolicyEvents(200)
+      .find((event) => event.applied && event.pool_id === dependencies.automation!.policy.pool_id)?.created_at;
   }
 
   router.get("/targets", (_req: Request, res: Response) => {
@@ -227,6 +231,19 @@ export function createCapacityRouter(
         }
         recommendation = { ...recommendation, target: trustedTarget };
       }
+      const policyMode = automatic ? "automatic" as const : "recommend" as const;
+      const appendActionEvent = (action: CapacityPolicyAction) => store.appendCapacityPolicyEvents([{
+        kind: action.kind,
+        applied: action.applied,
+        reason: action.reason,
+        actor: action.actor,
+        mode: policyMode,
+        pool_id: dependencies.automation?.policy.pool_id,
+        target_id: action.target_id,
+        allocation_id: action.allocation_id,
+        resources: auditSafeResources(action.resources),
+        idempotency_key: action.idempotency_key,
+      }]);
       const result = await reconcileCapacityPolicy({
         recommendation: recommendation ?? null,
         allocations: store.getSlurmAllocations(),
@@ -235,6 +252,8 @@ export function createCapacityRouter(
         policy: dependencies.automation?.policy,
         acquire: dependencies.automation?.acquire ?? (async () => { throw new Error("Automatic acquisition backend unavailable"); }),
         release: dependencies.automation?.release ?? (async () => { throw new Error("Automatic release backend unavailable"); }),
+        beforeApply: appendActionEvent,
+        applyFailed: appendActionEvent,
         now: new Date(),
       });
       store.appendCapacityPolicyEvents(result.actions.map((action) => ({
@@ -243,9 +262,11 @@ export function createCapacityRouter(
         reason: action.reason,
         actor: action.actor,
         mode: result.mode,
+        pool_id: dependencies.automation?.policy.pool_id,
         target_id: action.target_id,
         allocation_id: action.allocation_id,
         resources: auditSafeResources(action.resources),
+        idempotency_key: action.idempotency_key,
       })));
       res.json(result);
     } catch (error) {
@@ -332,6 +353,12 @@ export function createCapacityRouter(
       return;
     }
     const at = new Date().toISOString();
+    const cleanupRequired = failure && store.getSlurmAllocations().some((allocation) =>
+      !["released", "failed"].includes(allocation.state)
+      && (allocation.id === (req.body?.allocation_id ?? campaign.allocation_id)
+        || allocation.campaign_id === campaign.id
+        || Boolean(allocation.capacity_lease_id && allocation.capacity_lease_id === campaign.capacity_lease_id)),
+    );
     const updated = store.updateCapacityCampaign(campaign.id, {
       state: to as typeof campaign.state,
       allocation_id: req.body?.allocation_id ?? campaign.allocation_id,
@@ -340,6 +367,7 @@ export function createCapacityRouter(
       experiment_id: req.body?.experiment_id ?? campaign.experiment_id,
       attempts: to === "wait_stub" ? campaign.attempts + 1 : campaign.attempts,
       last_error: failure ? String(req.body.reason) : campaign.last_error,
+      cleanup_required: failure ? cleanupRequired : campaign.cleanup_required,
       history: [...campaign.history, {
         at, from: campaign.state, to: to as typeof campaign.state,
         actor: typeof req.body?.actor === "string" ? req.body.actor : "unknown",

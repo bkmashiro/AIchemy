@@ -99,6 +99,11 @@ def test_immutable_runtime_profile_rejects_mutable_or_malformed_identity():
         RuntimeProfile(**{**valid, "dependency_lock_sha256": "z" * 64})
     with pytest.raises(ValueError, match="content-addressed"):
         RuntimeProfile(**{**valid, "artifact_uri": "oci://registry.invalid/jema:latest"})
+    with pytest.raises(ValueError, match="content-addressed"):
+        RuntimeProfile(**{
+            **valid,
+            "artifact_uri": "https://example.invalid/runtime?note=sha256=" + "c" * 64 + "-mutable",
+        })
 
 
 def test_task_values_override_runtime_profile_without_mutating_it():
