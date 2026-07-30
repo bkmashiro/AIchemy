@@ -392,6 +392,7 @@ def test_doctor_collects_read_only_health_and_counts(monkeypatch, capsys):
                 ]
             },
             [{"id": "sub-1", "enabled": True}],
+            {"state_db_path": "/var/lib/alchemy/state.db", "capacity_capable": True},
         ],
     )
 
@@ -401,9 +402,18 @@ def test_doctor_collects_read_only_health_and_counts(monkeypatch, capsys):
         ("GET", "http://localhost:3002/api/tasks?limit=50&logs=false&sort=seq&order=desc&status_group=active"),
         ("GET", "http://localhost:3002/api/tasks?limit=5&logs=false&sort=seq&order=desc&status=failed"),
         ("GET", "http://localhost:3002/api/webhooks"),
+        ("GET", "http://localhost:3002/api/operator/config"),
     ]
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True
+    assert out["operator_config"] == {
+        "config_path": os.environ["ALCHEMY_CLI_CONFIG"],
+        "auth_source": "environment",
+        "credential_discovered": True,
+        "state_db_path": "/var/lib/alchemy/state.db",
+        "capacity_capable": True,
+    }
+    assert "secret-token" not in json.dumps(out)
     assert out["counts"] == {
         "active_tasks": 3,
         "blocked_tasks": 1,
@@ -442,6 +452,7 @@ def test_doctor_includes_task_triage_diagnostics(monkeypatch, capsys):
                 ]
             },
             [{"id": "sub-1", "enabled": True}],
+            {"state_db_path": "/var/lib/alchemy/state.db", "capacity_capable": True},
         ],
     )
 

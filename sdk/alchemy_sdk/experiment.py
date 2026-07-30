@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import json
 import os
@@ -35,6 +36,12 @@ class RuntimeProfile:
     python_env: Optional[str] = None
     env_setup: Optional[str] = None
     env: Mapping[str, str] = field(default_factory=dict)
+    immutable: bool = False
+    git_sha: Optional[str] = None
+    dependency_lock_sha256: Optional[str] = None
+    artifact_uri: Optional[str] = None
+    build_status: Optional[str] = None
+    cache_status: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -48,6 +55,15 @@ class RuntimeProfile:
                 raise ValueError("runtime profile env keys must be non-empty strings")
             if not isinstance(value, str):
                 raise ValueError("runtime profile env values must be strings")
+        if self.immutable:
+            if not self.git_sha or len(self.git_sha) < 7:
+                raise ValueError("immutable runtime profile requires git_sha")
+            if not self.dependency_lock_sha256 or len(self.dependency_lock_sha256) != 64:
+                raise ValueError("immutable runtime profile requires dependency_lock_sha256")
+            if not self.artifact_uri:
+                raise ValueError("immutable runtime profile requires artifact_uri")
+            if "PYTHONPATH" in self.env:
+                raise ValueError("immutable runtime profile must install packages instead of setting PYTHONPATH")
 
     def to_spec(self) -> dict[str, Any]:
         spec: dict[str, Any] = {"name": self.name.strip()}
@@ -59,6 +75,17 @@ class RuntimeProfile:
             spec["env_setup"] = self.env_setup
         if self.env:
             spec["env"] = copy.deepcopy(dict(self.env))
+        if self.immutable:
+            identity = f"{self.git_sha}:{self.dependency_lock_sha256}:{self.artifact_uri}"
+            spec.update({
+                "immutable": True,
+                "runtime_id": f"runtime-{hashlib.sha256(identity.encode()).hexdigest()[:16]}",
+                "git_sha": self.git_sha,
+                "dependency_lock_sha256": self.dependency_lock_sha256,
+                "artifact_uri": self.artifact_uri,
+                "build_status": self.build_status or "unknown",
+                "cache_status": self.cache_status or "unknown",
+            })
         return spec
 
 

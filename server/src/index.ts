@@ -34,6 +34,7 @@ import { loadDeployConfig } from "./deploy";
 import { createTunnelManager, TunnelManager } from "./tunnel";
 import { createDeployRouter } from "./api/deploy";
 import { createCapacityRouter } from "./api/capacity";
+import { createOperatorRouter } from "./api/operator";
 import { ALCHEMY_VERSION } from "./version";
 import { startWebhookDispatcher } from "./webhooks";
 
@@ -267,6 +268,7 @@ api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
 api.use("/capacity", createCapacityRouter(deployConfig, {
   cancel: async (jobId) => emitToController("slurm.cancel", { job_id: jobId }),
 }));
+api.use("/operator", createOperatorRouter());
 
 // Health check — no auth required
 app.get("/api/health", (_req, res) => {

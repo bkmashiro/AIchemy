@@ -577,6 +577,7 @@ def cmd_doctor(_args: argparse.Namespace, client: ApiClient) -> None:
     stubs = client.get("/stubs")
     task_triage = build_task_top_payload(client, active_limit=50, failed_limit=5)
     webhooks = client.get("/webhooks")
+    operator = client.get("/operator/config")
     counts = {
         "online_stubs": sum(1 for stub in stubs if stub.get("status") == "online"),
         "active_tasks": task_triage["counts"]["active"],
@@ -591,10 +592,19 @@ def cmd_doctor(_args: argparse.Namespace, client: ApiClient) -> None:
         {"name": "tasks", "ok": True},
         {"name": "webhooks", "ok": True},
     ]
+    auth_source = "environment" if os.environ.get("ALCHEMY_TOKEN") else "operator_config"
+    operator_config = {
+        "config_path": str(config_path()),
+        "auth_source": auth_source,
+        "credential_discovered": bool(client.token),
+        "state_db_path": operator.get("state_db_path") if isinstance(operator, dict) else None,
+        "capacity_capable": bool(operator.get("capacity_capable", False)) if isinstance(operator, dict) else False,
+    }
     print_json({
         "ok": all(check["ok"] for check in checks),
         "server": client.server,
         "health": health,
+        "operator_config": operator_config,
         "counts": counts,
         "task_triage": task_triage,
         "checks": checks,

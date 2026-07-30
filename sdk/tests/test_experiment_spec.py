@@ -60,6 +60,31 @@ def test_runtime_profile_materializes_shared_execution_environment():
     ]
 
 
+def test_immutable_runtime_profile_binds_git_and_dependency_identity():
+    profile = RuntimeProfile(
+        name="jema-release",
+        immutable=True,
+        git_sha="a" * 40,
+        dependency_lock_sha256="b" * 64,
+        artifact_uri="oci://registry.invalid/jema@sha256:" + "c" * 64,
+        build_status="ready",
+        cache_status="cached",
+    )
+
+    spec = profile.to_spec()
+
+    assert spec["immutable"] is True
+    assert spec["runtime_id"].startswith("runtime-")
+    assert spec["git_sha"] == "a" * 40
+    assert spec["dependency_lock_sha256"] == "b" * 64
+    assert "PYTHONPATH" not in spec.get("env", {})
+
+
+def test_immutable_runtime_profile_rejects_missing_content_identity():
+    with pytest.raises(ValueError, match="git_sha"):
+        RuntimeProfile(name="broken", immutable=True)
+
+
 def test_task_values_override_runtime_profile_without_mutating_it():
     profile = RuntimeProfile(
         name="base",
