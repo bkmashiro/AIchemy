@@ -8,6 +8,12 @@
 
 **Tech stack:** Node.js/TypeScript + Express + Socket.IO + SQLite/Drizzle, Python controller and SDK/CLI, React/Vite.
 
+**Implementation status (2026-07-30):**
+
+- [x] Milestone 0 — bounded SQLite-backed collection queries, brief pagination, one-pass status aggregation, and non-overlapping visibility-aware Web polling.
+- [x] Milestone 0.5 — stable mnemonic aliases and direct canonical ref resolution for Experiment/Task.
+- [ ] Retained Streams K/L and Milestones 1–7 — implementation continues in priority order below; no production rollout is implied.
+
 ---
 
 ## 1. Product boundaries

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { Grid, gridsApi } from "../lib/api";
 import { formatRelTime } from "../lib/format";
+import { useSerialPolling } from "../hooks/useSerialPolling";
 
 const STATUS_BADGE: Record<string, string> = {
   pending:   "bg-yellow-900/30 text-yellow-400 border-yellow-700/40",
@@ -13,21 +14,24 @@ const STATUS_BADGE: Record<string, string> = {
 
 export default function GridsPage() {
   const [grids, setGrids] = useState<Grid[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const load = () => {
-    gridsApi.list()
-      .then(setGrids)
-      .catch(() => setError("Failed to load grids"))
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(() => {
-    load();
-    const t = setInterval(load, 15000);
-    return () => clearInterval(t);
-  }, []);
+  const limit = 50;
+  useSerialPolling(async (signal) => {
+    try {
+      const response = await gridsApi.listPage({ limit, offset: page * limit }, signal);
+      setGrids(response.items);
+      setTotal(response.total);
+      setError("");
+    } catch {
+      setError("Failed to load grids");
+    } finally {
+      setLoading(false);
+    }
+  }, 15000, page);
 
   if (loading && grids.length === 0) {
     return (
@@ -49,7 +53,7 @@ export default function GridsPage() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-white">Grids</h1>
-        <span className="text-xs text-gray-500">{grids.length} total</span>
+        <span className="text-xs text-gray-500">{grids.length} on page · {total} total</span>
       </div>
 
       {grids.length === 0 ? (
@@ -103,6 +107,11 @@ export default function GridsPage() {
           </table>
         </div>
       )}
+      <div className="flex items-center justify-end gap-2 text-xs text-gray-500">
+        <button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))} className="px-2 py-1 rounded border border-gray-800 disabled:opacity-40">Previous</button>
+        <span>{page + 1} / {Math.max(1, Math.ceil(total / limit))}</span>
+        <button disabled={(page + 1) * limit >= total} onClick={() => setPage((value) => value + 1)} className="px-2 py-1 rounded border border-gray-800 disabled:opacity-40">Next</button>
+      </div>
     </div>
   );
 }

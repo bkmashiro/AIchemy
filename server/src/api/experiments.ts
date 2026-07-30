@@ -46,22 +46,22 @@ function cartesianProduct(params: Record<string, any[]>): Record<string, any>[] 
 
 // ─── Experiment status derivation ────────────────────────────────────────────
 
-export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
+function deriveExperimentStatusFromCounts(
+  exp: Experiment,
+  counts: Record<string, number>,
+): Experiment["status"] {
   const grid = store.getGrid(exp.grid_id);
   if (!grid) return "running";
 
   const totalTasks = grid.task_ids.length;
   const validated = Object.values(exp.results);
-  const passed = validated.filter((v) => v.passed).length;
-  const failed = validated.filter((v) => !v.passed).length;
-
-  // Check if all tasks in grid are terminal
-  const tasks = store.getGridTasks(exp.grid_id);
-  const allDone = tasks.length > 0 && tasks.every((t) =>
-    ["completed", "failed", "cancelled"].includes(t.status)
-  );
-  const completed = tasks.filter((t) => t.status === "completed").length;
-  const terminalFailed = tasks.filter((t) => ["failed", "cancelled"].includes(t.status)).length;
+  const passed = validated.filter((value) => value.passed).length;
+  const failed = validated.length - passed;
+  const taskCount = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  const completed = counts.completed ?? 0;
+  const terminalFailed = (counts.failed ?? 0) + (counts.cancelled ?? 0);
+  const terminal = completed + terminalFailed;
+  const allDone = taskCount > 0 && terminal === taskCount;
 
   if (passed === totalTasks && totalTasks > 0) return "passed";
   if (allDone) {
@@ -70,6 +70,10 @@ export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
     return completed > 0 && terminalFailed > 0 ? "partial" : "failed";
   }
   return "running";
+}
+
+export function deriveExperimentStatus(exp: Experiment): Experiment["status"] {
+  return deriveExperimentStatusFromCounts(exp, store.getTaskStatusCounts(exp.grid_id));
 }
 
 export interface ReconciledExperimentStatus {
@@ -280,10 +284,12 @@ function diffSummaryForExperiment(
   };
 }
 
-export function experimentBrief(exp: Experiment): ExperimentBrief {
-  const allExperiments = store.getAllExperiments();
+export function experimentBrief(
+  exp: Experiment,
+  allExperiments: Experiment[] = store.getAllExperiments(),
+  status: Experiment["status"] = deriveExperimentStatus(exp),
+): ExperimentBrief {
   const recommendation = recommendationForExperiment(exp, allExperiments);
-  const status = deriveExperimentStatus(exp);
 
   return {
     id: exp.id,
@@ -1595,14 +1601,16 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     }
   });
 
-  // GET /experiments — optional ?family=&decision=&status= filters
+  // GET /experiments — optional filters and paginated brief projection.
+  // Legacy callers without pagination/projection params continue to receive an array.
   router.get("/", (req: Request, res: Response) => {
     const familyFilter = typeof req.query.family === "string" ? req.query.family : undefined;
     const decisionFilter = typeof req.query.decision === "string" ? req.query.decision : undefined;
     const statusFilter = typeof req.query.status === "string" ? req.query.status : undefined;
+    const aggregate = store.getTaskStatusCountsByGrid();
     let experiments = store.getAllExperiments().map((exp) => ({
       ...exp,
-      status: deriveExperimentStatus(exp),
+      status: deriveExperimentStatusFromCounts(exp, aggregate.get(exp.grid_id) ?? {}),
     }));
     if (familyFilter) experiments = experiments.filter((e) => (e.family ?? "") === familyFilter);
     if (decisionFilter) {
@@ -1610,13 +1618,43 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       else experiments = experiments.filter((e) => e.decision === decisionFilter);
     }
     if (statusFilter) experiments = experiments.filter((e) => e.status === statusFilter);
-    res.json(experiments);
+
+    const paginated = req.query.limit !== undefined || req.query.offset !== undefined || req.query.brief === "true";
+    if (!paginated) { res.json(experiments); return; }
+
+    const limit = Math.min(200, Math.max(1, Number.parseInt(String(req.query.limit ?? "50"), 10) || 50));
+    const offset = Math.max(0, Number.parseInt(String(req.query.offset ?? "0"), 10) || 0);
+    const total = experiments.length;
+    const items = experiments
+      .slice()
+      .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id))
+      .slice(offset, offset + limit)
+      .map((exp) => {
+        const validations = Object.values(exp.results);
+        const passed = validations.filter((validation) => validation.passed).length;
+        return {
+          id: exp.id,
+          alias: exp.alias,
+          name: exp.name,
+          description: exp.description,
+          grid_id: exp.grid_id,
+          status: exp.status,
+          family: exp.family,
+          parent_id: exp.parent_id,
+          decision: exp.decision,
+          criteria: exp.criteria,
+          result_summary: { total: validations.length, passed, failed: validations.length - passed },
+          created_at: exp.created_at,
+        };
+      });
+    res.json({ items, total, limit, offset });
   });
 
   // GET /experiments/tree — parent_id forest of experiments
   // NOTE: must be registered before /:id so Express does not capture "tree" as an id.
   router.get("/tree", (_req: Request, res: Response) => {
     const all = store.getAllExperiments();
+    const taskStatusAggregate = store.getTaskStatusCountsByGrid();
     const knownIds = new Set(all.map((e) => e.id));
     const childrenByParent = new Map<string, Experiment[]>();
     const roots: Experiment[] = [];
@@ -1634,7 +1672,11 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const build = (exp: Experiment): any => {
       const kids = (childrenByParent.get(exp.id) ?? []).slice().sort(compareExperiments);
       return {
-        ...experimentBrief(exp),
+        ...experimentBrief(
+          exp,
+          all,
+          deriveExperimentStatusFromCounts(exp, taskStatusAggregate.get(exp.grid_id) ?? {}),
+        ),
         children: kids.map(build),
       };
     };
@@ -1758,8 +1800,11 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       if (decisionFilter === "none") experiments = experiments.filter((e) => !e.decision);
       else experiments = experiments.filter((e) => e.decision === decisionFilter);
     }
+    const taskStatusAggregate = store.getTaskStatusCountsByGrid();
     const statusByExp = new Map<string, Experiment["status"]>();
-    for (const exp of experiments) statusByExp.set(exp.id, deriveExperimentStatus(exp));
+    for (const exp of experiments) {
+      statusByExp.set(exp.id, deriveExperimentStatusFromCounts(exp, taskStatusAggregate.get(exp.grid_id) ?? {}));
+    }
     if (statusFilter !== undefined) experiments = experiments.filter((e) => statusByExp.get(e.id) === statusFilter);
 
     // Deterministic sort: family asc (nulls last), created_at asc, name, id.
@@ -1781,7 +1826,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const byStatus: Record<string, number> = {};
     const byDecision: Record<string, number> = {};
     for (const exp of matchingExperiments) {
-      const status = statusByExp.get(exp.id) ?? deriveExperimentStatus(exp);
+      const status = statusByExp.get(exp.id)!;
       byStatus[status] = (byStatus[status] ?? 0) + 1;
       const dKey = exp.decision ?? "none";
       byDecision[dKey] = (byDecision[dKey] ?? 0) + 1;
@@ -1827,7 +1872,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const leaderboard: LeaderboardEntry[] = [];
     if (reportMetric) {
       const rows: Omit<LeaderboardEntry, "rank">[] = [];
-      for (const exp of matchingExperiments) {
+      for (const exp of returnedExperiments) {
         const agg = aggregateMetrics(exp)[reportMetric.name];
         if (!agg) continue;
         const value = reportMetric.direction === "min" ? agg.min : agg.max;
@@ -1835,7 +1880,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         rows.push({
           id: exp.id,
           name: exp.name,
-          status: statusByExp.get(exp.id) ?? deriveExperimentStatus(exp),
+          status: statusByExp.get(exp.id)!,
           decision: exp.decision ?? null,
           value,
           metric: reportMetric.name,
@@ -1880,7 +1925,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       return diffSummary;
     };
     const reportBrief = (exp: Experiment) => {
-      const status = statusByExp.get(exp.id) ?? deriveExperimentStatus(exp);
+      const status = statusByExp.get(exp.id)
+        ?? deriveExperimentStatusFromCounts(exp, taskStatusAggregate.get(exp.grid_id) ?? {});
       const recommendation = getRecommendation(exp);
       return {
         id: exp.id,
@@ -1905,7 +1951,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       const events = timelineFor(exp);
       const recent = events.slice(-3);
       const kids = (childrenByParent.get(exp.id) ?? []).slice().sort(compareExperiments).map(reportBrief);
-      const status = statusByExp.get(exp.id) ?? deriveExperimentStatus(exp);
+      const status = statusByExp.get(exp.id)!;
       const recommendation = getRecommendation(exp);
       return {
         id: exp.id,
@@ -2118,7 +2164,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       decision_at: exp.decision_at ?? null,
       created_at: exp.created_at,
       parent: parent ? experimentBrief(parent) : null,
-      children: children.map(experimentBrief),
+      children: children.map((child) => experimentBrief(child)),
       task_counts: taskCountsByStatus(exp),
       validation: passFailSummary(exp),
       best_metrics: bestMetricValues(exp),
@@ -2291,7 +2337,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       decision_at: exp.decision_at ?? null,
       created_at: exp.created_at,
       parent: parent ? experimentBrief(parent) : null,
-      children: children.map(experimentBrief),
+      children: children.map((child) => experimentBrief(child)),
       task_counts: taskCountsByStatus(exp),
       validation: passFailSummary(exp),
       best_metrics: bestMetricValues(exp),

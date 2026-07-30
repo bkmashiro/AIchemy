@@ -404,37 +404,14 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       offset = (page - 1) * limit;
     }
 
-    const ACTIVE_STATUSES = ["running", "assigned", "pending", "paused", "blocked"];
-
-    let tasks = store.getAllTasks();
-
-    // Compute counts across ALL tasks before filtering
-    const counts: Record<string, number> = {};
-    for (const t of tasks) {
-      counts[t.status] = (counts[t.status] ?? 0) + 1;
-    }
-
-    if (statusFilter) {
-      tasks = tasks.filter((t) => t.status === statusFilter);
-    } else if (statusGroup === "active") {
-      tasks = tasks.filter((t) => ACTIVE_STATUSES.includes(t.status));
-    } else if (statusGroup === "terminal") {
-      tasks = tasks.filter((t) => TERMINAL_STATUSES.includes(t.status));
-    }
-
-    // Sort by requested field and order
-    tasks = tasks.sort((a, b) => {
-      let cmp: number;
-      if (sortField === "created_at") {
-        cmp = (a.created_at || "").localeCompare(b.created_at || "");
-      } else {
-        cmp = (a.seq ?? 0) - (b.seq ?? 0);
-      }
-      return sortOrder === "asc" ? cmp : -cmp;
+    const { tasks: paginated, total, counts } = store.queryTasksPage({
+      limit,
+      offset,
+      status: statusFilter,
+      statusGroup,
+      sortField,
+      sortOrder,
     });
-
-    const total = tasks.length;
-    const paginated = tasks.slice(offset, offset + limit);
 
     const enriched = paginated.map((t) => {
       const stub = t.stub_id ? store.getStub(t.stub_id) : undefined;

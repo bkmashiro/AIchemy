@@ -22,12 +22,18 @@ export const tasks = sqliteTable("tasks", {
   priority: integer("priority").notNull().default(0),
   seq: integer("seq").notNull().default(0),
   created_at: text("created_at").notNull(),
+  finished_at: text("finished_at"),
+  grid_id: text("grid_id"),
+  experiment_id: text("experiment_id"),
   location: text("location").notNull().default("archive"),
   data: text("data").notNull(),
 }, (table) => [
   index("idx_tasks_status").on(table.status),
   index("idx_tasks_stub_id").on(table.stub_id),
   index("idx_tasks_location").on(table.location),
+  index("idx_tasks_grid_id").on(table.grid_id),
+  index("idx_tasks_experiment_id").on(table.experiment_id),
+  index("idx_tasks_location_status_seq").on(table.location, table.status, table.seq),
 ]);
 
 export const taskMarks = sqliteTable("task_marks", {

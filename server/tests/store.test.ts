@@ -632,6 +632,42 @@ describe("getGridTasks", () => {
   it("returns empty array for unknown grid", () => {
     expect(store.getGridTasks("unknown-grid")).toEqual([]);
   });
+
+  it("parses only rows belonging to the requested grid", () => {
+    const tasks = Array.from({ length: 100 }, (_, index) =>
+      makeTask({ id: `other-${index}`, grid_id: `other-grid-${index}`, status: "completed" }),
+    );
+    tasks.push(makeTask({ id: "target-grid-task", grid_id: "target-grid", status: "completed" }));
+    store.setArchive(tasks);
+
+    const parse = vi.spyOn(JSON, "parse");
+    const result = store.getGridTasks("target-grid");
+
+    expect(result.map((task) => task.id)).toEqual(["target-grid-task"]);
+    expect(parse).toHaveBeenCalledTimes(1);
+    parse.mockRestore();
+  });
+});
+
+describe("queryTasksPage", () => {
+  it("filters, sorts, counts, and paginates in the store contract", () => {
+    store.addToGlobalQueue(makeTask({ id: "page-pending", seq: 1, status: "pending" }));
+    store.addToGlobalQueue(makeTask({ id: "page-complete", seq: 2, status: "completed" }));
+    store.addToGlobalQueue(makeTask({ id: "page-running", seq: 3, status: "running" }));
+    store.addToGlobalQueue(makeTask({ id: "page-failed", seq: 4, status: "failed" }));
+
+    const page = store.queryTasksPage({
+      limit: 1,
+      offset: 1,
+      statusGroup: "active",
+      sortField: "seq",
+      sortOrder: "desc",
+    });
+
+    expect(page.tasks.map((task) => task.id)).toEqual(["page-pending"]);
+    expect(page.total).toBe(2);
+    expect(page.counts).toMatchObject({ pending: 1, running: 1, completed: 1, failed: 1 });
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

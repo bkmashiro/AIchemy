@@ -62,6 +62,19 @@ function deriveGridStatus(tasks: Task[]): Grid["status"] {
   return "pending";
 }
 
+function deriveGridStatusFromCounts(counts: Record<string, number>): Grid["status"] {
+  const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  if (total === 0) return "pending";
+  const completed = counts.completed ?? 0;
+  const failed = (counts.failed ?? 0) + (counts.cancelled ?? 0);
+  const running = (counts.running ?? 0) + (counts.assigned ?? 0);
+  if (completed === total) return "completed";
+  if (running > 0) return "running";
+  if (failed > 0 && completed > 0) return "partial";
+  if (failed === total) return "failed";
+  return "pending";
+}
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router {
@@ -143,12 +156,21 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
   });
 
   // GET /grids
-  router.get("/", (_req: Request, res: Response) => {
+  router.get("/", (req: Request, res: Response) => {
+    const aggregate = store.getTaskStatusCountsByGrid();
     const grids = store.getAllGrids().map((g) => ({
       ...g,
-      status: deriveGridStatus(store.getGridTasks(g.id)),
+      status: deriveGridStatusFromCounts(aggregate.get(g.id) ?? {}),
     }));
-    res.json(grids);
+    const paginated = req.query.limit !== undefined || req.query.offset !== undefined;
+    if (!paginated) { res.json(grids); return; }
+    const limit = Math.min(200, Math.max(1, Number.parseInt(String(req.query.limit ?? "50"), 10) || 50));
+    const offset = Math.max(0, Number.parseInt(String(req.query.offset ?? "0"), 10) || 0);
+    const items = grids
+      .slice()
+      .sort((a, b) => b.created_at.localeCompare(a.created_at) || a.id.localeCompare(b.id))
+      .slice(offset, offset + limit);
+    res.json({ items, total: grids.length, limit, offset });
   });
 
   // GET /grids/:id

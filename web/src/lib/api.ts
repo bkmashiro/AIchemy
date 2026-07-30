@@ -311,8 +311,8 @@ export interface TaskSubmitPayload {
 // ─── API client functions ──────────────────────────────────────────────────────
 
 export const tasksApi = {
-  list: (params?: { page?: number; limit?: number; status?: string; status_group?: string }) =>
-    api.get<PaginatedTasks>("/tasks", { params }).then((r) => r.data),
+  list: (params?: { page?: number; limit?: number; status?: string; status_group?: string }, signal?: AbortSignal) =>
+    api.get<PaginatedTasks>("/tasks", { params, signal }).then((r) => r.data),
   get: (id: string) => api.get<Task>(`/tasks/${id}`).then((r) => r.data),
   assignmentDiagnosis: (id: string) =>
     api.get<AssignmentDiagnosis>(`/tasks/${id}/assignment-diagnosis`).then((r) => r.data),
@@ -346,6 +346,8 @@ export const stubsApi = {
 
 export const gridsApi = {
   list: () => api.get<Grid[]>("/grids").then((r) => r.data),
+  listPage: (params: { limit: number; offset: number }, signal?: AbortSignal) =>
+    api.get<PaginatedGrids>("/grids", { params, signal }).then((r) => r.data),
   get: (id: string) => api.get<Grid & { tasks: Task[] }>(`/grids/${id}`).then((r) => r.data),
   create: (data: {
     script: string;
@@ -419,6 +421,7 @@ export interface TaskValidation {
 
 export interface Experiment {
   id: string;
+  alias?: string;
   name: string;
   description?: string;
   criteria: Record<string, string>;
@@ -446,6 +449,24 @@ export interface Experiment {
   // Git tracking
   git_tracking?: boolean;
   git_repo_path?: string;
+}
+
+export interface ExperimentListItem extends Omit<Experiment, "results"> {
+  result_summary?: { total: number; passed: number; failed: number };
+}
+
+export interface PaginatedExperiments {
+  items: ExperimentListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface PaginatedGrids {
+  items: Grid[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface ExperimentDetail extends Experiment {
@@ -659,6 +680,8 @@ export interface ExperimentSummaryResponse {
 
 export const experimentsApi = {
   list: () => api.get<Experiment[]>("/experiments").then((r) => r.data),
+  listPage: (params: { limit: number; offset: number; family?: string; decision?: string; status?: string }, signal?: AbortSignal) =>
+    api.get<PaginatedExperiments>("/experiments", { params: { ...params, brief: true }, signal }).then((r) => r.data),
   get: (id: string) => api.get<ExperimentDetail>(`/experiments/${id}`).then((r) => r.data),
   delete: (id: string) => api.delete(`/experiments/${id}`).then((r) => r.data),
   retryFailed: (id: string) => api.post(`/experiments/${id}/retry-failed`).then((r) => r.data),

@@ -1,9 +1,9 @@
 import { Link } from "react-router-dom";
-import type { Experiment } from "../../lib/api";
+import type { ExperimentListItem } from "../../lib/api";
 import { formatRelTime } from "../../lib/format";
 import { StatusBadge } from "./StatusBadge";
 
-function progressBarColor(status: Experiment["status"]): string {
+function progressBarColor(status: ExperimentListItem["status"]): string {
   switch (status) {
     case "passed":
       return "bg-green-500";
@@ -16,11 +16,11 @@ function progressBarColor(status: Experiment["status"]): string {
   }
 }
 
-function isPromotedForkPoint(exp: Experiment): boolean {
+function isPromotedForkPoint(exp: ExperimentListItem): boolean {
   return exp.decision === "keep" || exp.decision === "fork";
 }
 
-export function filterExperimentEntryPoints(experiments: Experiment[]): Experiment[] {
+export function filterExperimentEntryPoints(experiments: ExperimentListItem[]): ExperimentListItem[] {
   const entries = experiments.filter(
     (exp) => !exp.parent_id || isPromotedForkPoint(exp),
   );
@@ -30,7 +30,7 @@ export function filterExperimentEntryPoints(experiments: Experiment[]): Experime
 export function ExperimentListTable({
   experiments,
 }: {
-  experiments: Experiment[];
+  experiments: ExperimentListItem[];
 }) {
   if (experiments.length === 0) {
     return (
@@ -73,9 +73,8 @@ export function ExperimentListTable({
         </thead>
         <tbody className="divide-y divide-gray-800/50">
           {entries.map((exp) => {
-            const validations = Object.values(exp.results);
-            const passed = validations.filter((v) => v.passed).length;
-            const total = validations.length;
+            const passed = exp.result_summary?.passed ?? 0;
+            const total = exp.result_summary?.total ?? 0;
             const pct = total > 0 ? Math.round((passed / total) * 100) : 0;
 
             return (

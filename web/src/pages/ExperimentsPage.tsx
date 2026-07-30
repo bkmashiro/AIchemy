@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Experiment,
+  ExperimentListItem,
   ExperimentDetail,
   ExperimentEvent,
   ExperimentTreeNode,
@@ -10,6 +11,7 @@ import {
   ExperimentDiffResponse,
   experimentsApi,
 } from "../lib/api";
+import { useSerialPolling } from "../hooks/useSerialPolling";
 import {
   IntentCard,
   DecisionCard,
@@ -30,36 +32,37 @@ import {
 // ─── List View ──────────────────────────────────────────────────────────────
 
 function ExperimentsList() {
-  const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [experiments, setExperiments] = useState<ExperimentListItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [familyFilter, setFamilyFilter] = useState<string>("");
   const [decisionFilter, setDecisionFilter] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<string>("");
 
-  useEffect(() => {
-    const load = () => {
-      experimentsApi
-        .list()
-        .then(setExperiments)
-        .catch(() => {})
-        .finally(() => setLoading(false));
-    };
-    load();
-    const t = setInterval(load, 15000);
-    return () => clearInterval(t);
-  }, []);
+  const limit = 50;
+  useSerialPolling(async (signal) => {
+    const response = await experimentsApi.listPage({
+      limit,
+      offset: page * limit,
+      family: familyFilter || undefined,
+      decision: decisionFilter || undefined,
+      status: statusFilter || undefined,
+    }, signal);
+    setExperiments(response.items);
+    setTotal(response.total);
+    setLoading(false);
+  }, 15000, `${page}:${familyFilter}:${decisionFilter}:${statusFilter}`);
 
   const families = Array.from(
     new Set(experiments.map((e) => e.family).filter((f): f is string => !!f)),
   ).sort();
 
-  const filtered = experiments.filter((e) => {
-    if (familyFilter && (e.family ?? "") !== familyFilter) return false;
-    if (decisionFilter) {
-      if (decisionFilter === "none" && e.decision) return false;
-      if (decisionFilter !== "none" && e.decision !== decisionFilter) return false;
-    }
-    if (statusFilter && e.status !== statusFilter) return false;
+  const filtered = experiments.filter((experiment) => {
+    if (familyFilter && (experiment.family ?? "") !== familyFilter) return false;
+    if (decisionFilter === "none" && experiment.decision) return false;
+    if (decisionFilter && decisionFilter !== "none" && experiment.decision !== decisionFilter) return false;
+    if (statusFilter && experiment.status !== statusFilter) return false;
     return true;
   });
   const visibleEntryCount = filterExperimentEntryPoints(filtered).length;
@@ -77,13 +80,13 @@ function ExperimentsList() {
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-bold text-white">Experiments</h1>
         <span className="text-xs text-gray-500">
-          {visibleEntryCount} entry point{visibleEntryCount === 1 ? "" : "s"} · {filtered.length} filtered · {experiments.length} total
+          {visibleEntryCount} entry point{visibleEntryCount === 1 ? "" : "s"} · {filtered.length} on page · {total} total
         </span>
       </div>
       <div className="flex flex-wrap gap-2 items-center text-xs">
         <select
           value={familyFilter}
-          onChange={(e) => setFamilyFilter(e.target.value)}
+          onChange={(e) => { setFamilyFilter(e.target.value); setPage(0); }}
           className="bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-300"
         >
           <option value="">All families</option>
@@ -93,7 +96,7 @@ function ExperimentsList() {
         </select>
         <select
           value={decisionFilter}
-          onChange={(e) => setDecisionFilter(e.target.value)}
+          onChange={(e) => { setDecisionFilter(e.target.value); setPage(0); }}
           className="bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-300"
         >
           <option value="">All decisions</option>
@@ -104,7 +107,7 @@ function ExperimentsList() {
         </select>
         <select
           value={statusFilter}
-          onChange={(e) => setStatusFilter(e.target.value)}
+          onChange={(e) => { setStatusFilter(e.target.value); setPage(0); }}
           className="bg-gray-900 border border-gray-800 rounded px-2 py-1 text-gray-300"
         >
           <option value="">All statuses</option>
@@ -120,6 +123,7 @@ function ExperimentsList() {
               setFamilyFilter("");
               setDecisionFilter("");
               setStatusFilter("");
+              setPage(0);
             }}
             className="text-gray-500 hover:text-gray-300"
           >
@@ -132,9 +136,14 @@ function ExperimentsList() {
         families={families}
         decisionFilter={decisionFilter}
         statusFilter={statusFilter}
-        onSelectFamily={setFamilyFilter}
+        onSelectFamily={(family) => { setFamilyFilter(family); setPage(0); }}
       />
       <ExperimentListTable experiments={filtered} />
+      <div className="flex items-center justify-end gap-2 text-xs text-gray-500">
+        <button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))} className="px-2 py-1 rounded border border-gray-800 disabled:opacity-40">Previous</button>
+        <span>{page + 1} / {Math.max(1, Math.ceil(total / limit))}</span>
+        <button disabled={(page + 1) * limit >= total} onClick={() => setPage((value) => value + 1)} className="px-2 py-1 rounded border border-gray-800 disabled:opacity-40">Next</button>
+      </div>
     </div>
   );
 }

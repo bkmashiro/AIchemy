@@ -53,6 +53,21 @@ export const BACKUPS_DIR = path.join(path.dirname(STATE_FILE), "backups");
 
 type FingerprintIndex = Map<string, string>;
 
+export interface TaskPageQuery {
+  limit: number;
+  offset: number;
+  status?: string;
+  statusGroup?: "active" | "terminal" | string;
+  sortField?: "seq" | "created_at";
+  sortOrder?: "asc" | "desc";
+}
+
+export interface TaskPageResult {
+  tasks: Task[];
+  total: number;
+  counts: Record<string, number>;
+}
+
 // ─── Store ──────────────────────────────────────────────────────────────────
 
 class Store {
@@ -202,6 +217,9 @@ class Store {
         priority INTEGER NOT NULL DEFAULT 0,
         seq INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
+        finished_at TEXT,
+        grid_id TEXT,
+        experiment_id TEXT,
         location TEXT NOT NULL DEFAULT 'archive',
         data TEXT NOT NULL
       );
@@ -293,6 +311,28 @@ class Store {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+    `);
+
+    const taskColumns = new Set(
+      (this.sqlite.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((column) => column.name),
+    );
+    for (const [name, type] of [
+      ["finished_at", "TEXT"],
+      ["grid_id", "TEXT"],
+      ["experiment_id", "TEXT"],
+    ] as const) {
+      if (!taskColumns.has(name)) this.sqlite.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${type}`);
+    }
+    this.sqlite.exec(`
+      CREATE INDEX IF NOT EXISTS idx_tasks_grid_id ON tasks(grid_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_experiment_id ON tasks(experiment_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_location_status_seq ON tasks(location, status, seq);
+      UPDATE tasks SET grid_id = json_extract(data, '$.grid_id')
+        WHERE grid_id IS NULL AND json_valid(data);
+      UPDATE tasks SET experiment_id = json_extract(data, '$.experiment_id')
+        WHERE experiment_id IS NULL AND json_valid(data);
+      UPDATE tasks SET finished_at = json_extract(data, '$.finished_at')
+        WHERE finished_at IS NULL AND json_valid(data);
     `);
 
     // Normalize old status values
@@ -415,6 +455,9 @@ class Store {
         priority: task.priority,
         seq: task.seq,
         created_at: task.created_at,
+        finished_at: task.finished_at ?? null,
+        grid_id: task.grid_id ?? null,
+        experiment_id: task.experiment_id ?? null,
         location,
         data: JSON.stringify(task),
       })
@@ -425,6 +468,10 @@ class Store {
           stub_id: task.stub_id ?? null,
           priority: task.priority,
           seq: task.seq,
+          created_at: task.created_at,
+          finished_at: task.finished_at ?? null,
+          grid_id: task.grid_id ?? null,
+          experiment_id: task.experiment_id ?? null,
           location,
           data: JSON.stringify(task),
         },
@@ -1035,6 +1082,49 @@ class Store {
     return tasks;
   }
 
+  queryTasksPage(query: TaskPageQuery): TaskPageResult {
+    const activeStatuses = ["running", "assigned", "pending", "paused", "blocked"];
+    const terminalStatuses = ["completed", "failed", "cancelled"];
+    const filters = [];
+    if (query.status) {
+      filters.push(eq(schema.tasks.status, query.status));
+    } else if (query.statusGroup === "active") {
+      filters.push(inArray(schema.tasks.status, activeStatuses));
+    } else if (query.statusGroup === "terminal") {
+      filters.push(inArray(schema.tasks.status, terminalStatuses));
+    }
+    const where = filters.length > 0 ? and(...filters) : undefined;
+    const sortColumn = query.sortField === "created_at" ? schema.tasks.created_at : schema.tasks.seq;
+    const order = query.sortOrder === "asc" ? asc(sortColumn) : desc(sortColumn);
+
+    const rows = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(where)
+      .orderBy(order)
+      .limit(query.limit)
+      .offset(query.offset)
+      .all();
+    const total = Number(this.db.select({ value: sql<number>`count(*)` })
+      .from(schema.tasks)
+      .where(where)
+      .get()?.value ?? 0);
+    const countRows = this.db.select({
+      status: schema.tasks.status,
+      value: sql<number>`count(*)`,
+    }).from(schema.tasks).groupBy(schema.tasks.status).all();
+    const counts = Object.fromEntries(countRows.map((row) => [row.status, Number(row.value)]));
+
+    const tasks: Task[] = [];
+    for (const row of rows) {
+      try {
+        tasks.push(this._decorateTask(JSON.parse(row.data) as Task));
+      } catch {
+        // Corrupt rows remain available for manual DB inspection but not API output.
+      }
+    }
+    return { tasks, total, counts };
+  }
+
   getActiveTasks(): Task[] {
     const tasks: Task[] = [...this._queryGlobalQueueTasks()];
     for (const stub of this.stubs.values()) {
@@ -1058,11 +1148,24 @@ class Store {
           .values({
             id: t.id, status: t.status, stub_id: t.stub_id ?? null,
             priority: t.priority, seq: t.seq, created_at: t.created_at,
+            finished_at: t.finished_at ?? null, grid_id: t.grid_id ?? null,
+            experiment_id: t.experiment_id ?? null,
             location: "archive", data: JSON.stringify(t),
           })
           .onConflictDoUpdate({
             target: schema.tasks.id,
-            set: { status: t.status, location: "archive", data: JSON.stringify(t) },
+            set: {
+              status: t.status,
+              stub_id: t.stub_id ?? null,
+              priority: t.priority,
+              seq: t.seq,
+              created_at: t.created_at,
+              finished_at: t.finished_at ?? null,
+              grid_id: t.grid_id ?? null,
+              experiment_id: t.experiment_id ?? null,
+              location: "archive",
+              data: JSON.stringify(t),
+            },
           })
           .run();
         this._taskIndex.set(t.id, { location: "archive" });
@@ -1496,25 +1599,57 @@ class Store {
     }
   }
 
-  getGridTasks(gridId: string): Task[] {
-    const active = this.getActiveTasks().filter((t) => t.grid_id === gridId);
-    const seenIds = new Set(active.map((t) => t.id));
-
-    // Query archived tasks with this grid_id from DB
-    const archiveRows = this.db.select({ data: schema.tasks.data })
+  getTaskStatusCountsByGrid(): Map<string, Record<string, number>> {
+    const rows = this.db.select({
+      id: schema.tasks.id,
+      grid_id: schema.tasks.grid_id,
+      status: schema.tasks.status,
+    })
       .from(schema.tasks)
-      .where(eq(schema.tasks.location, "archive"))
+      .where(sql`${schema.tasks.grid_id} IS NOT NULL`)
       .all();
-    const archived: Task[] = [];
-    for (const row of archiveRows) {
-      try {
-        const t = this._decorateTask(JSON.parse(row.data) as Task);
-        if (t.grid_id === gridId && !seenIds.has(t.id)) {
-          archived.push(t);
-        }
-      } catch { /* skip */ }
+    const result = new Map<string, Record<string, number>>();
+    const seen = new Set<string>();
+    const add = (id: string, gridId: string | null | undefined, status: string) => {
+      if (!gridId || seen.has(id)) return;
+      seen.add(id);
+      const counts = result.get(gridId) ?? {};
+      counts[status] = (counts[status] ?? 0) + 1;
+      result.set(gridId, counts);
+    };
+    for (const row of rows) add(row.id, row.grid_id, row.status);
+    for (const stub of this.stubs.values()) {
+      for (const task of stub.tasks) add(task.id, task.grid_id, task.status);
     }
-    return [...active, ...archived];
+    return result;
+  }
+
+  getTaskStatusCounts(gridId: string): Record<string, number> {
+    return this.getTaskStatusCountsByGrid().get(gridId) ?? {};
+  }
+
+  getGridTasks(gridId: string): Task[] {
+    const tasks: Task[] = [];
+    const seen = new Set<string>();
+    for (const stub of this.stubs.values()) {
+      for (const task of stub.tasks) {
+        if (task.grid_id !== gridId || seen.has(task.id)) continue;
+        tasks.push(task);
+        seen.add(task.id);
+      }
+    }
+    const rows = this.db.select({ data: schema.tasks.data })
+      .from(schema.tasks)
+      .where(eq(schema.tasks.grid_id, gridId))
+      .orderBy(asc(schema.tasks.seq))
+      .all();
+    for (const row of rows) {
+      try {
+        const task = this._decorateTask(JSON.parse(row.data) as Task);
+        if (!seen.has(task.id)) tasks.push(task);
+      } catch { /* keep corrupt rows out of API responses */ }
+    }
+    return tasks.sort((a, b) => a.seq - b.seq);
   }
 
   updateGridStatus(gridId: string): void {

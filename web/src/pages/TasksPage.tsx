@@ -12,6 +12,7 @@ import {
   taskStatusLabel,
 } from "../lib/taskStatus";
 import { diagnosisToneClass, taskDiagnosis } from "../lib/taskDiagnostics";
+import { useSerialPolling } from "../hooks/useSerialPolling";
 
 type Filter = "all" | "active" | "terminal";
 
@@ -35,20 +36,23 @@ export default function TasksPage() {
   } | null>(null);
   const navigate = useNavigate();
 
-  const fetchTasks = useCallback(() => {
+  const fetchTasks = useCallback(async (signal?: AbortSignal) => {
     const params: { page: number; limit: number; status_group?: string } = { page, limit: PAGE_LIMIT };
     if (filter === "active") params.status_group = "active";
     if (filter === "terminal") params.status_group = "terminal";
-    tasksApi.list(params)
-      .then((r) => { setTasks(r.tasks); setTotal(r.total); if (r.counts) setCounts(r.counts); setLoading(false); })
-      .catch(() => setLoading(false));
+    try {
+      const response = await tasksApi.list(params, signal);
+      setTasks(response.tasks);
+      setTotal(response.total);
+      if (response.counts) setCounts(response.counts);
+    } catch {
+      // Keep the last successful page visible.
+    } finally {
+      setLoading(false);
+    }
   }, [page, filter]);
 
-  useEffect(() => {
-    fetchTasks();
-    const t = setInterval(fetchTasks, 5000);
-    return () => clearInterval(t);
-  }, [fetchTasks]);
+  useSerialPolling((signal) => fetchTasks(signal), 5000, `${page}:${filter}`);
 
   // Reset to page 1 when filter changes
   useEffect(() => { setPage(1); }, [filter]);

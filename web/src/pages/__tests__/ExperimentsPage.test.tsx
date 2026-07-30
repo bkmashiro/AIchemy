@@ -77,6 +77,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
     experimentsApi: {
       ...actual.experimentsApi,
       list: vi.fn(),
+      listPage: vi.fn(),
       get: vi.fn(),
       getTimeline: vi.fn(),
       getSummary: vi.fn(),
@@ -234,6 +235,7 @@ describe("ExperimentsPage lineage preview", () => {
   beforeEach(() => {
     childSummaryName = "child summary";
     vi.mocked(experimentsApi.list).mockResolvedValue([]);
+    vi.mocked(experimentsApi.listPage).mockResolvedValue({ items: [], total: 0, limit: 50, offset: 0 });
     vi.mocked(experimentsApi.getTimeline).mockImplementation((id: string) => Promise.resolve(timelineEvents(id)));
     vi.mocked(experimentsApi.getTree).mockResolvedValue(tree());
     vi.mocked(experimentsApi.get).mockImplementation((id: string) =>
@@ -249,11 +251,11 @@ describe("ExperimentsPage lineage preview", () => {
   });
 
   it("uses canonical decision filter labels on the experiments list", async () => {
-    vi.mocked(experimentsApi.list).mockResolvedValue([
+    vi.mocked(experimentsApi.listPage).mockResolvedValue({ items: [
       { ...detail("keep-exp", "keep exp"), decision: "keep" },
       { ...detail("try-exp", "try exp"), decision: "try_more" },
       { ...detail("discard-exp", "discard exp"), decision: "discard" },
-    ]);
+    ], total: 3, limit: 50, offset: 0 });
 
     renderListPage();
 
