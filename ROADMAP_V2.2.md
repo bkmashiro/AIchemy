@@ -647,9 +647,13 @@ The status snapshot returns canonical replacement task IDs, terminal counts, mis
 
 `alch doctor` reports server reachability, configured state DB path, auth source, and only a boolean credential-discovered status. It never prints a credential. A 401 response includes actionable operator-config guidance instead of encouraging project-local token wrappers.
 
+**Implementation status (2026-07-30): complete.** Doctor reports the operator config path, auth source, credential presence as a boolean, and server-advertised state/capacity capability without rendering token material.
+
 ### M2. Immutable runtime builds
 
 Evolve `RuntimeProfile` from shared cwd/env defaults to a Git-SHA and dependency-lock-addressed runtime manifest with build/cache status. Remove repeated absolute `PYTHONPATH` assembly once the package is installed into the immutable environment.
+
+**Implementation status (2026-07-30): complete.** Immutable profiles require Git, dependency-lock, and artifact identities, derive a stable runtime ID, expose build/cache status, and reject `PYTHONPATH` assembly.
 
 ### M3. Logical capacity routing
 

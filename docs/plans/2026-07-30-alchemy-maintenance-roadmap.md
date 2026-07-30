@@ -17,9 +17,10 @@
 - [x] Milestone 1 — configuration-driven GPU target catalog, durable idempotent allocation records, custom job names, and canonical managed submission path.
 - [x] Milestone 2 — controller snapshots automatically reconcile allocation state and exact `job_id -> stub_id` binding.
 - [x] Milestone 3 — recommend-only planner preserves explicit partition/QOS/GPU constraints and explains observed ranking.
-- [~] Milestone 4 — logical capacity-lease routing and restart-safe campaign state/history are persisted; automated smoke/DAG/drain/release drivers remain.
+- [~] Milestone 4 — logical routing plus a restart-safe, serial campaign reconciler now cover the full bounded lifecycle with stable side-effect keys and failure cleanup; concrete production smoke/DAG/acquire/release adapters remain intentionally unwired.
 - [x] Milestone 5 — target/allocation/campaign CLI controls and managed-only, pinned-safe bulk cancellation with default dry-run.
-- [ ] Milestones 6–7 — Web operations UI and audited automation remain; no production rollout is implied.
+- [x] Milestone 6 — Capacity & Campaigns Web operations view with serial polling, inventory, ownership/binding, queue state, campaign progress, and dry-run release previews.
+- [x] Milestone 7 — audited policy engine is gated by validated recommendations and server-owned policy injection; default remains recommend-only and no automatic production policy is configured.
 
 ---
 
@@ -595,6 +596,8 @@ alch campaigns reconcile <id>
 
 ## Milestone 6 — Web operations UI (P2)
 
+**Implementation status (2026-07-30): complete.** The combined Capacity & Campaigns view uses the Milestone 0 serial polling hook and exposes only dry-run release previews.
+
 Add Capacity and Campaign views using server snapshots, not browser-triggered SSH:
 
 - target/partition cards with stale timestamp;
@@ -623,6 +626,8 @@ Use the non-overlapping polling contract from Milestone 0.
 ---
 
 ## Milestone 7 — Policy-enabled automatic acquisition (P3)
+
+**Implementation status (2026-07-30): policy substrate complete, rollout disabled.** Policy reconciliation applies at most one action, preserves recommendation resources, requires a validated recommendation and server-owned automatic policy, and restricts release to idle Alchemy-owned unpinned allocations without cleanup obligations. No automatic policy is wired in the server, so the effective default remains recommend-only pending the required operational audit.
 
 Only after several days of recommend-only snapshots match operator decisions:
 
