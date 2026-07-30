@@ -10,6 +10,7 @@
 
 import { Namespace, Socket } from "socket.io";
 import { logger } from "../log";
+import { reconcileSlurmAllocations } from "../api/capacity";
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
 
@@ -89,6 +90,7 @@ export function setupControllerNamespace(ns: Namespace, webNs: Namespace): void 
     // ─── cluster.status ───────────────────────────────────────────────
     socket.on("cluster.status", (payload: any) => {
       _clusterStatus = payload;
+      reconcileSlurmAllocations(Array.isArray(payload?.jobs) ? payload.jobs : [], true);
       logger.info("cluster.status", {
         partitions: payload?.partitions?.length ?? 0,
         jobs: payload?.jobs?.length ?? 0,

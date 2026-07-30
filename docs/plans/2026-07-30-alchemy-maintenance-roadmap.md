@@ -15,7 +15,7 @@
 - [x] Retained Stream K — persisted TTL-bounded, non-preemptive effective priority with explicit expedite/unexpedite APIs.
 - [x] Retained Stream L — native SDK experiment wait with explicit successful terminal-status contract.
 - [x] Milestone 1 — configuration-driven GPU target catalog, durable idempotent allocation records, custom job names, and canonical managed submission path.
-- [~] Milestone 2 — allocation reconciliation and exact `job_id -> stub_id` binding landed; automated controller snapshot ingestion and historical observations remain.
+- [x] Milestone 2 — controller snapshots automatically reconcile allocation state and exact `job_id -> stub_id` binding.
 - [x] Milestone 3 — recommend-only planner preserves explicit partition/QOS/GPU constraints and explains observed ranking.
 - [~] Milestone 4 — logical capacity-lease routing landed; persisted campaign orchestration remains.
 - [ ] Milestones 5–7 — implementation continues below; no production rollout is implied.

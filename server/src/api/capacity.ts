@@ -87,6 +87,42 @@ export function recommendCapacity(
     .sort((a, b) => b.score - a.score || a.target.id.localeCompare(b.target.id));
 }
 
+export function reconcileSlurmAllocations(
+  jobs: Array<{ job_id?: string; state?: string; partition?: string; name?: string }>,
+  complete: boolean,
+): { reconciled: Array<ReturnType<typeof store.updateSlurmAllocation>>; observed_jobs: number; observed_at: string } {
+  const jobsById = new Map(jobs.filter((job) => job.job_id).map((job) => [String(job.job_id), job]));
+  const now = new Date().toISOString();
+  const reconciled = store.getSlurmAllocations().map((allocation) => {
+    const job = allocation.job_id ? jobsById.get(allocation.job_id) : undefined;
+    let state = allocation.state;
+    if (job) {
+      const slurmState = String(job.state ?? "").toUpperCase();
+      if (slurmState === "RUNNING") state = "running";
+      else if (["PENDING", "CONFIGURING", "COMPLETING"].includes(slurmState)) state = "pending";
+      else if (["COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"].includes(slurmState)) state = "released";
+    } else if (complete && ["pending", "running"].includes(state)) {
+      state = "released";
+    }
+    const stub = allocation.job_id
+      ? store.getAllStubs().find((candidate) => candidate.slurm_job_id === allocation.job_id)
+      : undefined;
+    if (stub && stub.slurm_allocation_id !== allocation.id) {
+      stub.slurm_allocation_id = allocation.id;
+      stub.capacity_lease_id = allocation.capacity_lease_id;
+      stub.campaign_id = allocation.campaign_id;
+      store.setStub(stub);
+    }
+    return store.updateSlurmAllocation(allocation.id, {
+      state,
+      stub_id: stub?.id ?? allocation.stub_id,
+      last_observed_at: now,
+      raw_state: job?.state ?? allocation.raw_state,
+    });
+  });
+  return { reconciled, observed_jobs: jobs.length, observed_at: now };
+}
+
 export function createCapacityRouter(
   config: DeployFileConfig | null,
   dependencies: { submit?: CapacitySubmitter } = {},
@@ -207,40 +243,8 @@ export function createCapacityRouter(
   });
 
   router.post("/reconcile", (req: Request, res: Response) => {
-    const jobs = Array.isArray(req.body?.jobs) ? req.body.jobs as Array<{
-      job_id?: string; state?: string; partition?: string; name?: string;
-    }> : [];
-    const jobsById = new Map(jobs.filter((job) => job.job_id).map((job) => [String(job.job_id), job]));
-    const complete = req.body?.complete === true;
-    const now = new Date().toISOString();
-    const reconciled = store.getSlurmAllocations().map((allocation) => {
-      const job = allocation.job_id ? jobsById.get(allocation.job_id) : undefined;
-      let state = allocation.state;
-      if (job) {
-        const slurmState = String(job.state ?? "").toUpperCase();
-        if (slurmState === "RUNNING") state = "running";
-        else if (["PENDING", "CONFIGURING", "COMPLETING"].includes(slurmState)) state = "pending";
-        else if (["COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"].includes(slurmState)) state = "released";
-      } else if (complete && ["pending", "running"].includes(state)) {
-        state = "released";
-      }
-      const stub = allocation.job_id
-        ? store.getAllStubs().find((candidate) => candidate.slurm_job_id === allocation.job_id)
-        : undefined;
-      if (stub && stub.slurm_allocation_id !== allocation.id) {
-        stub.slurm_allocation_id = allocation.id;
-        stub.capacity_lease_id = allocation.capacity_lease_id;
-        stub.campaign_id = allocation.campaign_id;
-        store.setStub(stub);
-      }
-      return store.updateSlurmAllocation(allocation.id, {
-        state,
-        stub_id: stub?.id ?? allocation.stub_id,
-        last_observed_at: now,
-        raw_state: job?.state ?? allocation.raw_state,
-      });
-    });
-    res.json({ reconciled, observed_jobs: jobs.length, observed_at: now });
+    const jobs = Array.isArray(req.body?.jobs) ? req.body.jobs : [];
+    res.json(reconcileSlurmAllocations(jobs, req.body?.complete === true));
   });
 
   return router;
