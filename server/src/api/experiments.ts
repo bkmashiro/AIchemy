@@ -12,7 +12,7 @@
  */
 
 import { Router, Request, Response } from "express";
-import { v4 as uuidv4 } from "uuid";
+import { v4 as uuidv4, v5 as uuidv5 } from "uuid";
 import path from "path";
 import { store } from "../store";
 import { Experiment, ExperimentDecision, ExperimentEvent, ExperimentEventKind, Grid, Task, TaskSpec, SubmissionLintIssue } from "../types";
@@ -25,6 +25,9 @@ import { validateDag } from "../dag";
 import { logger } from "../log";
 import { initExperimentManifest, readExperimentManifest } from "../git-tracking";
 import { lintTaskSpecs } from "../submission-lint";
+import { frozenCampaignObjectHash } from "../campaigns/manifest";
+
+const IDEMPOTENCY_UUID_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
 function validateImmutableRuntimeSpec(sdkSpec: unknown, taskSpecs: TaskSpec[]): string | undefined {
   if (!isPlainObject(sdkSpec) || !isPlainObject(sdkSpec.runtime) || sdkSpec.runtime.immutable !== true) return undefined;
@@ -1120,6 +1123,10 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const located = findTasksOrError(taskIds);
     if (located.error) { res.status(located.error.status).json(located.error.body); return; }
     const found = located.found!;
+    if (found.some((entry) => entry.task.capacity_lease_id && store.getCapacityCampaigns().some((campaign) =>
+      campaign.capacity_lease_id === entry.task.capacity_lease_id && Boolean(campaign.frozen_manifest)))) {
+      res.status(409).json({ error: "Frozen campaign tasks cannot be adopted" }); return;
+    }
     for (const entry of found) {
       if (entry.task.experiment_id || entry.task.grid_id) {
         res.status(409).json({
@@ -1207,6 +1214,15 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     const located = findTasksOrError(taskIds);
     if (located.error) { res.status(located.error.status).json(located.error.body); return; }
     const found = located.found!;
+    const destinationCampaign = exp.sdk_spec?.campaign;
+    if (destinationCampaign?.id || found.some((entry) => {
+      if (entry.task.capacity_lease_id && store.getCapacityCampaigns().some((campaign) =>
+        campaign.capacity_lease_id === entry.task.capacity_lease_id && Boolean(campaign.frozen_manifest))) return true;
+      const source = entry.task.experiment_id ? store.getExperiment(entry.task.experiment_id) : undefined;
+      return Boolean(source?.sdk_spec?.campaign?.id);
+    })) {
+      res.status(409).json({ error: "Frozen campaign experiments and tasks cannot be adopted or moved" }); return;
+    }
 
     for (const entry of found) {
       const ownedByOtherExperiment = !!entry.task.experiment_id && entry.task.experiment_id !== exp.id;
@@ -1333,6 +1349,27 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     if (!name) { res.status(400).json({ error: "name required" }); return; }
     const codeId = typeof code_id === "string" && code_id.trim() ? code_id.trim() : undefined;
     if (code_id !== undefined && !codeId) { res.status(400).json({ error: "code_id must be a non-empty string" }); return; }
+    const idempotencyKey = typeof req.body?.idempotency_key === "string" && req.body.idempotency_key.trim()
+      ? req.body.idempotency_key.trim() : undefined;
+    if (req.body?.idempotency_key !== undefined && !idempotencyKey) {
+      res.status(400).json({ error: "idempotency_key must be a non-empty string" }); return;
+    }
+    const submissionPayload = { ...req.body };
+    delete submissionPayload.idempotency_key;
+    const submissionHash = idempotencyKey ? frozenCampaignObjectHash(submissionPayload) : undefined;
+    if (idempotencyKey) {
+      const existing = store.getAllExperiments().find((experiment) => experiment.idempotency_key === idempotencyKey);
+      if (existing) {
+        if (existing.submission_hash !== submissionHash) {
+          res.status(409).json({ error: "idempotency_key reused with a different experiment payload" }); return;
+        }
+        res.status(200).json(existing); return;
+      }
+    }
+
+    if (idempotencyKey && (!Array.isArray(task_specs) || task_specs.length === 0)) {
+      res.status(400).json({ error: "idempotency_key is currently supported only for DAG task_specs submissions" }); return;
+    }
 
     // ─── DAG task_specs path ──────────────────────────────────────────
     if (task_specs && Array.isArray(task_specs) && task_specs.length > 0) {
@@ -1340,13 +1377,19 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       if (!dagResult.valid) {
         res.status(400).json({ error: `Invalid DAG: ${dagResult.error}` }); return;
       }
+      const conflictingRouting = (task_specs as TaskSpec[]).find((spec) => spec.target_stub_id && spec.capacity_lease_id);
+      if (conflictingRouting) {
+        res.status(400).json({ error: `Task ref "${conflictingRouting.ref}" has mutually exclusive target_stub_id and capacity_lease_id routing selectors` }); return;
+      }
       const immutableRuntimeError = validateImmutableRuntimeSpec(sdk_spec, task_specs as TaskSpec[]);
       if (immutableRuntimeError) {
         res.status(400).json({ error: immutableRuntimeError }); return;
       }
 
-      const experimentId = uuidv4();
-      const gridId = uuidv4();
+      const experimentId = idempotencyKey
+        ? uuidv5(`experiment:${idempotencyKey}`, IDEMPOTENCY_UUID_NAMESPACE) : uuidv4();
+      const gridId = idempotencyKey
+        ? uuidv5(`grid:${idempotencyKey}`, IDEMPOTENCY_UUID_NAMESPACE) : uuidv4();
       const refToTaskId: Record<string, string> = {};
       const taskIds: string[] = [];
       const materializedTaskSpecs = (task_specs as TaskSpec[]).map((spec) => ({
@@ -1377,7 +1420,14 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           dependsOnIds.push(depId);
         }
 
-        const task = createTask({
+        const taskIdempotencyKey = idempotencyKey ? `${idempotencyKey}:task:${spec.ref}` : undefined;
+        const existingTask = taskIdempotencyKey
+          ? store.getAllTasks().find((candidate) => candidate.idempotency_key === taskIdempotencyKey) : undefined;
+        if (existingTask && (existingTask.submission_hash !== submissionHash
+          || existingTask.experiment_id !== experimentId || existingTask.grid_id !== gridId)) {
+          res.status(409).json({ error: `Partial idempotent task ${spec.ref} conflicts with this submission` }); return;
+        }
+        const task = existingTask ?? createTask({
           script: spec.script,
           argv: spec.argv,
           args: spec.args,
@@ -1387,6 +1437,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           ref: spec.ref,
           experiment_id: experimentId,
           grid_id: gridId,
+          idempotency_key: taskIdempotencyKey,
+          submission_hash: submissionHash,
           cwd: spec.cwd ?? cwd,
           python_env: spec.python_env ?? python_env,
           env_setup: spec.env_setup,
@@ -1411,8 +1463,10 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           (task as any).resolved_config = spec.resolved_config;
         }
 
-        store.addToGlobalQueue(task);
-        webNs.emit("task.update", task);
+        if (!existingTask) {
+          store.addToGlobalQueue(task);
+          webNs.emit("task.update", task);
+        }
         refToTaskId[spec.ref] = task.id;
         taskIds.push(task.id);
       }
@@ -1434,6 +1488,8 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
 
       const experiment: Experiment = {
         id: experimentId,
+        idempotency_key: idempotencyKey,
+        submission_hash: submissionHash,
         code_id: codeId,
         name,
         description,

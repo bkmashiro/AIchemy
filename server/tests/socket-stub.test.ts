@@ -815,7 +815,7 @@ describe("resume reconciliation", () => {
     expect(mockSocket.disconnect).not.toHaveBeenCalledWith(true);
     expect(logger.warn).toHaveBeenCalledWith(
       "stub.version_mismatch_allowed",
-      expect.objectContaining({ stub_version: "2.0.0", server_version: "2.1.0" }),
+      expect.objectContaining({ stub_version: "2.0.0", server_version: "2.2.0" }),
     );
   });
 
@@ -826,7 +826,7 @@ describe("resume reconciliation", () => {
     expect(mockSocket.disconnect).not.toHaveBeenCalledWith(true);
     expect(logger.warn).toHaveBeenCalledWith(
       "stub.version_missing",
-      expect.objectContaining({ server_version: "2.1.0" }),
+      expect.objectContaining({ server_version: "2.2.0" }),
     );
   });
 
@@ -838,14 +838,14 @@ describe("resume reconciliation", () => {
       "resume_response",
       expect.objectContaining({
         error: expect.stringContaining("version mismatch"),
-        server_version: "2.1.0",
+        server_version: "2.2.0",
         stub_version: "2.0.0",
       }),
     );
     expect(mockSocket.disconnect).toHaveBeenCalledWith(true);
     expect(logger.error).toHaveBeenCalledWith(
       "stub.version_mismatch",
-      expect.objectContaining({ stub_version: "2.0.0", server_version: "2.1.0" }),
+      expect.objectContaining({ stub_version: "2.0.0", server_version: "2.2.0" }),
     );
   });
 
@@ -859,7 +859,7 @@ describe("resume reconciliation", () => {
       "resume_response",
       expect.objectContaining({
         error: expect.stringContaining("version"),
-        server_version: "2.1.0",
+        server_version: "2.2.0",
       }),
     );
     expect(mockSocket.disconnect).toHaveBeenCalledWith(true);
@@ -874,7 +874,7 @@ describe("resume reconciliation", () => {
       "resume_response",
       expect.objectContaining({
         error: expect.stringContaining("version mismatch"),
-        server_version: "2.1.0",
+        server_version: "2.2.0",
         stub_version: "2.0.0",
       }),
     );

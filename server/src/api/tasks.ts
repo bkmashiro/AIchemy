@@ -77,6 +77,7 @@ export interface TaskInput {
   grid_id?: string;
   param_overrides?: Record<string, any>;
   idempotency_key?: string;
+  submission_hash?: string;
   stub_id?: string;
   target_stub_id?: string;
   target_tags?: string[];
@@ -125,6 +126,8 @@ export function createTask(input: TaskInput): Task {
 
   const task: Task = {
     id: uuidv4(),
+    idempotency_key: input.idempotency_key,
+    submission_hash: input.submission_hash,
     seq,
     fingerprint,
     name: input.name,
@@ -175,6 +178,12 @@ export function createTask(input: TaskInput): Task {
 }
 
 // ─── Surgical task update/replace helpers ────────────────────────────────────
+
+function frozenCampaignOwner(task: Task) {
+  if (!task.capacity_lease_id) return undefined;
+  return store.getCapacityCampaigns().find((campaign) =>
+    campaign.capacity_lease_id === task.capacity_lease_id && Boolean(campaign.frozen_manifest));
+}
 
 const TASK_SPEC_UPDATE_FIELDS = [
   "script", "argv", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
@@ -254,6 +263,7 @@ function createReplacementTask(task: Task, overrides: Partial<Task>): Task {
     param_overrides: merged.param_overrides,
     target_stub_id: merged.target_stub_id,
     target_tags: merged.target_tags,
+    capacity_lease_id: merged.capacity_lease_id,
     python_env: merged.python_env,
     submitted_by: merged.submitted_by,
     depends_on: merged.depends_on,
@@ -676,6 +686,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       res.status(400).json({ error: `run_dir must be an absolute path, got: "${run_dir}"` }); return;
     }
 
+    if (target_stub_id && capacity_lease_id) {
+      res.status(400).json({ error: "target_stub_id and capacity_lease_id are mutually exclusive routing selectors" }); return;
+    }
+
     // Validate target_stub_id references a known online stub
     if (target_stub_id) {
       const stub = store.getStub(target_stub_id);
@@ -689,6 +703,8 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     // Idempotency check
     if (idempotency_key) {
+      const persisted = store.getAllTasks().find((task) => task.idempotency_key === idempotency_key);
+      if (persisted) { res.status(200).json(persisted); return; }
       const existing = idempotencyCache.get(idempotency_key);
       if (existing) {
         const found = store.findTask(existing);
@@ -734,7 +750,7 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       script, argv, args, raw_args, name, cwd, env_setup, env, env_overrides,
       requirements, priority, max_retries, run_dir, param_overrides, target_tags, capacity_lease_id, python_env,
       submitted_by, depends_on, ref, args_template, experiment_id, outputs, metric_schema, auto_retry_on,
-      stub_id, target_stub_id, submission_warnings,
+      stub_id, target_stub_id, idempotency_key, submission_warnings,
     });
 
     // Acquire write lock now so subsequent submits with the same run_dir are rejected
@@ -1000,11 +1016,21 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     const specUpdate = pickTaskSpecUpdates(req.body);
     if (hasTaskSpecUpdates(specUpdate)) {
+      const frozenOwner = frozenCampaignOwner(task);
+      if (frozenOwner) {
+        res.status(409).json({ error: "Frozen campaign tasks cannot be mutated", campaign_id: frozenOwner.id });
+        return;
+      }
       if (!["pending", "blocked"].includes(task.status)) {
         res.status(400).json({ error: `Cannot update task spec in status '${task.status}'` });
         return;
       }
       const validationError = validateTaskSpecUpdate(specUpdate);
+      const mergedRouting = { ...task, ...specUpdate };
+      if (mergedRouting.target_stub_id && mergedRouting.capacity_lease_id) {
+        res.status(400).json({ error: "target_stub_id and capacity_lease_id are mutually exclusive routing selectors" });
+        return;
+      }
       if (validationError) {
         res.status(400).json({ error: validationError });
         return;
@@ -1030,6 +1056,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const found = store.findTask(req.params.id);
     if (!found) { res.status(404).json({ error: "Task not found" }); return; }
     const { task, stubId } = found;
+    const frozenOwner = frozenCampaignOwner(task);
+    if (frozenOwner) {
+      res.status(409).json({ error: "Frozen campaign tasks cannot be rescheduled", campaign_id: frozenOwner.id }); return;
+    }
 
     // Only active tasks can be rescheduled
     if (["completed", "failed", "cancelled"].includes(task.status)) {
@@ -1089,8 +1119,16 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const found = store.findTask(req.params.id);
     if (!found) { res.status(404).json({ error: "Task not found" }); return; }
     const { task, stubId, archived } = found;
+    const frozenOwner = frozenCampaignOwner(task);
+    if (frozenOwner) {
+      res.status(409).json({ error: "Frozen campaign tasks cannot be replaced", campaign_id: frozenOwner.id }); return;
+    }
     const overrides = pickTaskSpecUpdates(req.body?.overrides ?? req.body ?? {});
     const validationError = validateTaskSpecUpdate(overrides);
+    const mergedRouting = { ...task, ...overrides };
+    if (mergedRouting.target_stub_id && mergedRouting.capacity_lease_id) {
+      res.status(400).json({ error: "target_stub_id and capacity_lease_id are mutually exclusive routing selectors" }); return;
+    }
     if (validationError) {
       res.status(400).json({ error: validationError });
       return;

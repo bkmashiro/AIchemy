@@ -161,6 +161,12 @@ def test_task_capacity_lease_is_materialized_in_sdk_spec():
     assert exp.to_spec()["tasks"][0]["capacity_lease_id"] == "lease-1"
 
 
+def test_task_rejects_conflicting_physical_stub_and_logical_lease_selectors():
+    exp = Experiment("conflicting-routing")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        exp.task("train", script="train.py", target_stub_id="stub-1", capacity_lease_id="lease-1")
+
+
 def test_decision_policy_is_declared_in_spec_and_chainable():
     exp = Experiment("policy")
 
@@ -266,7 +272,7 @@ def test_to_spec_returns_defensive_config_copy_for_base_config_and_legacy_assign
 def test_to_spec_includes_sdk_metadata_snapshot():
     spec = Experiment("x").to_spec()
 
-    assert spec["metadata"]["sdk_version"] == "2.1.0"
+    assert spec["metadata"]["sdk_version"] == "2.2.0"
     assert "cwd" in spec["metadata"]
     assert "git_commit" in spec["metadata"]
 

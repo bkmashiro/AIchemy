@@ -215,6 +215,9 @@ class Store {
   }
 
   createCapacityCampaign(input: Omit<CapacityCampaign, "id" | "alias" | "created_at" | "updated_at" | "history">): CapacityCampaign {
+    if (this.getCapacityCampaigns().some((campaign) => campaign.capacity_lease_id === input.capacity_lease_id)) {
+      throw new Error(`Capacity lease already belongs to another campaign: ${input.capacity_lease_id}`);
+    }
     const now = new Date().toISOString();
     const campaign: CapacityCampaign = { ...input, id: randomUUID(), created_at: now, updated_at: now, history: [] };
     this.db.insert(schema.capacityCampaigns).values({
@@ -231,6 +234,9 @@ class Store {
   updateCapacityCampaign(id: string, patch: Partial<CapacityCampaign>): CapacityCampaign | undefined {
     const current = this.getCapacityCampaign(id);
     if (!current) return undefined;
+    if (patch.capacity_lease_id !== undefined && patch.capacity_lease_id !== current.capacity_lease_id) {
+      throw new Error("Capacity campaign lease identity is immutable");
+    }
     const updated: CapacityCampaign = {
       ...current,
       ...patch,
@@ -487,6 +493,7 @@ class Store {
         data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_capacity_campaigns_state ON capacity_campaigns(state, updated_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_capacity_campaigns_lease ON capacity_campaigns(capacity_lease_id);
       CREATE TABLE IF NOT EXISTS capacity_policy_events (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,

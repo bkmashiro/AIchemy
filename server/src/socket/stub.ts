@@ -107,6 +107,41 @@ function generateStubName(hostname: string, gpuName: string, slurmJobId?: string
   return slurmJobId ? `${base}-${slurmJobId}` : base;
 }
 
+export function bindStubCapacityOwnership(stub: Stub): boolean {
+  if (!stub.slurm_job_id) return true;
+  const matches = store.getSlurmAllocations().filter((allocation) => allocation.job_id === stub.slurm_job_id);
+  if (matches.length > 1) throw new Error(`Ambiguous allocation binding for SLURM job ${stub.slurm_job_id}`);
+  const allocation = matches[0];
+  if (!allocation) return true;
+  if (["released", "failed"].includes(allocation.state)) {
+    stub.released = true;
+    stub.status = "offline";
+    stub.max_concurrent = 0;
+    stub.slurm_allocation_id = undefined;
+    stub.capacity_lease_id = undefined;
+    stub.campaign_id = undefined;
+    return false;
+  }
+  if (allocation.stub_id && allocation.stub_id !== stub.id) {
+    throw new Error(`Allocation ${allocation.id} is already bound to stub ${allocation.stub_id}`);
+  }
+  if ((stub.slurm_allocation_id && stub.slurm_allocation_id !== allocation.id)
+    || (stub.capacity_lease_id && stub.capacity_lease_id !== allocation.capacity_lease_id)
+    || (stub.campaign_id && stub.campaign_id !== allocation.campaign_id)) {
+    throw new Error(`Stub ${stub.id} capacity ownership mismatch`);
+  }
+  stub.slurm_allocation_id = allocation.id;
+  stub.capacity_lease_id = allocation.capacity_lease_id;
+  stub.campaign_id = allocation.campaign_id;
+  store.updateSlurmAllocation(allocation.id, {
+    stub_id: stub.id,
+    state: "stub_online",
+    online_at: allocation.online_at ?? new Date().toISOString(),
+    last_observed_at: new Date().toISOString(),
+  });
+  return true;
+}
+
 // ─── Mark running tasks as disconnected (flag only, no status change) ────────
 
 function markTasksDisconnected(stub: Stub, webNs: Namespace): void {
@@ -951,6 +986,14 @@ function handleResume(
 
   // Case D: max_concurrent mismatch — server authoritative
   const maxConcurrent = stub.max_concurrent;
+
+  // Bind exact SLURM ownership before making the stub schedulable.
+  if (!bindStubCapacityOwnership(stub)) {
+    store.setStub(stub);
+    socket.emit("resume_rejected", { reason: "allocation_terminal" });
+    socket.disconnect(true);
+    return;
+  }
 
   // Update stub in store
   store.setStub(stub);

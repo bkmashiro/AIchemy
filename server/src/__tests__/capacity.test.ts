@@ -29,6 +29,12 @@ const config: DeployFileConfig = {
   }],
 };
 
+const frozenManifest = {
+  version: 1,
+  smoke_task: { script: "/opt/python", argv: ["-c", "import torch; assert torch.cuda.is_available()"] },
+  dag: { name: "formal-dag", task_specs: [{ ref: "train", script: "/opt/python", argv: ["train.py"] }] },
+};
+
 beforeEach(() => store.reset());
 
 describe("capacity target catalog and allocation submission", () => {
@@ -142,7 +148,7 @@ describe("capacity target catalog and allocation submission", () => {
     const app = express(); app.use(express.json());
     app.use("/capacity", createCapacityRouter(config));
     const created = await request(app).post("/capacity/campaigns").send({
-      name: "jema-d1", target_id: "slurm-a16", frozen_spec_hash: "sha256:abc",
+      name: "jema-d1", target_id: "slurm-a16", frozen_manifest: frozenManifest,
       max_attempts: 2, max_runtime_seconds: 3600,
     }).expect(201);
     expect(created.body.state).toBe("acquire");
@@ -164,14 +170,8 @@ describe("capacity target catalog and allocation submission", () => {
       state: "requested",
       requested_at: new Date().toISOString(),
     });
-    const advanced = await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
-      .send({ to: "wait_stub", actor: "tester", allocation_id: owned.id }).expect(200);
-    expect(advanced.body.state).toBe("wait_stub");
-    expect(advanced.body.attempts).toBe(1);
-    expect(advanced.body.history).toHaveLength(1);
-    expect(advanced.body.history[0]).toMatchObject({ from: "acquire", to: "wait_stub", actor: "tester" });
-    await request(app).post(`/capacity/campaigns/${created.body.id}/advance`)
-      .send({ to: "submit_dag", actor: "tester" }).expect(409);
+    await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
+      .send({ to: "wait_stub", actor: "tester", allocation_id: owned.id }).expect(409);
     const failed = await request(app).post(`/capacity/campaigns/${created.body.alias}/advance`)
       .send({ to: "failed", actor: "tester", reason: "operator stop" }).expect(200);
     expect(failed.body.cleanup_required).toBe(true);
@@ -371,6 +371,102 @@ describe("capacity target catalog and allocation submission", () => {
     expect(store.isCapacityPolicyDisabled("general")).toBe(true);
   });
 
+  it("persists a frozen campaign manifest under its canonical content hash", async () => {
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config));
+
+    const created = await request(app).post("/capacity/campaigns").send({
+      name: "frozen", target_id: "slurm-a16", frozen_manifest: frozenManifest,
+    }).expect(201);
+
+    expect(created.body.frozen_spec_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(created.body.frozen_manifest).toEqual(frozenManifest);
+    expect(store.getCapacityCampaign(created.body.id)?.frozen_manifest).toEqual(frozenManifest);
+  });
+
+  it("keeps legacy hash-only creation compatible, canonicalizes target aliases, and owns the lease", async () => {
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config));
+
+    const legacy = await request(app).post("/capacity/campaigns").send({
+      name: "legacy", target_id: "a16", frozen_spec_hash: "sha256:legacy",
+    }).expect(201);
+    expect(legacy.body).toMatchObject({ target_id: "slurm-a16", frozen_spec_hash: "sha256:legacy" });
+    expect(legacy.body.capacity_lease_id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(legacy.body.frozen_manifest).toBeUndefined();
+
+    await request(app).post("/capacity/campaigns").send({
+      name: "forged-lease", target_id: "a16", frozen_manifest: frozenManifest, capacity_lease_id: "caller-owned",
+    }).expect(400);
+  });
+
+  it("enforces globally unique immutable campaign lease identities", () => {
+    store.createCapacityCampaign({
+      name: "first", state: "acquire", target_id: "slurm-a16", frozen_spec_hash: "sha256:first",
+      capacity_lease_id: "unique-lease", attempts: 0, max_attempts: 1, max_runtime_seconds: 60,
+    });
+    expect(() => store.createCapacityCampaign({
+      name: "second", state: "acquire", target_id: "slurm-a16", frozen_spec_hash: "sha256:second",
+      capacity_lease_id: "unique-lease", attempts: 0, max_attempts: 1, max_runtime_seconds: 60,
+    })).toThrow(/already belongs/i);
+  });
+
+  it("rejects a caller hash that does not match the frozen manifest", async () => {
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config));
+
+    await request(app).post("/capacity/campaigns").send({
+      name: "forged", target_id: "slurm-a16", frozen_manifest: frozenManifest,
+      frozen_spec_hash: `sha256:${"0".repeat(64)}`,
+    }).expect(409);
+    expect(store.getCapacityCampaigns()).toHaveLength(0);
+  });
+
+  it("exposes start, cancellation, and immutable transition events", async () => {
+    const campaignDriver = {
+      acquire: vi.fn(async () => ({ allocation_id: "allocation-start" })),
+      observeStub: vi.fn(), runSmoke: vi.fn(), submitDag: vi.fn(), observeDag: vi.fn(),
+      drain: vi.fn(), release: vi.fn(), closeout: vi.fn(), cleanup: vi.fn(async () => ({ cleaned: false })),
+    } as unknown as CampaignDriver;
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, { campaignDriver }));
+    const created = await request(app).post("/capacity/campaigns").send({
+      name: "lifecycle", target_id: "slurm-a16", frozen_manifest: frozenManifest,
+    }).expect(201);
+    store.createSlurmAllocation({
+      id: "allocation-start", idempotency_key: "start", campaign_id: created.body.id,
+      capacity_lease_id: created.body.capacity_lease_id, managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "start", owner: "tester", managed_by: "alchemy", pinned: false, state: "requested",
+    });
+
+    const started = await request(app).post(`/capacity/campaigns/${created.body.id}/start`).expect(200);
+    expect(started.body.state).toBe("wait_stub");
+    const cancelled = await request(app).post(`/capacity/campaigns/${created.body.id}/cancel`)
+      .send({ reason: "operator stop" }).expect(202);
+    expect(cancelled.body).toMatchObject({ state: "failed", cleanup_required: true });
+    const events = await request(app).get(`/capacity/campaigns/${created.body.id}/events`).expect(200);
+    expect(events.body).toEqual(expect.arrayContaining([
+      expect.objectContaining({ from: "acquire", to: "wait_stub", actor: "campaign_reconciler" }),
+      expect.objectContaining({ from: "wait_stub", to: "failed", actor: "operator", reason: "operator stop" }),
+    ]));
+  });
+
+  it("retains a cleanup obligation when an owned allocation is pinned", async () => {
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config));
+    const created = await request(app).post("/capacity/campaigns").send({
+      name: "pinned-lifecycle", target_id: "slurm-a16", frozen_manifest: frozenManifest,
+    }).expect(201);
+    store.createSlurmAllocation({
+      idempotency_key: "pinned-campaign", campaign_id: created.body.id,
+      capacity_lease_id: created.body.capacity_lease_id, managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "pinned", owner: "tester", managed_by: "alchemy", pinned: true, state: "running", job_id: "9002",
+    });
+
+    const cancelled = await request(app).post(`/capacity/campaigns/${created.body.id}/cancel`).expect(202);
+    expect(cancelled.body).toMatchObject({ state: "failed", cleanup_required: true });
+  });
+
   it("reconciles a campaign through the restart-safe driver endpoint", async () => {
     const campaignDriver = {
       acquire: vi.fn(async () => ({ allocation_id: "allocation-1" })),
@@ -380,7 +476,7 @@ describe("capacity target catalog and allocation submission", () => {
     const app = express(); app.use(express.json());
     app.use("/capacity", createCapacityRouter(config, { campaignDriver }));
     const created = await request(app).post("/capacity/campaigns").send({
-      name: "automated", target_id: "slurm-a16", frozen_spec_hash: "sha256:abc",
+      name: "automated", target_id: "slurm-a16", frozen_manifest: frozenManifest,
     }).expect(201);
     store.createSlurmAllocation({
       id: "allocation-1", idempotency_key: "automated-acquire", campaign_id: created.body.id,
@@ -399,6 +495,8 @@ describe("capacity target catalog and allocation submission", () => {
     app.use("/capacity", createCapacityRouter(config));
     store.createSlurmAllocation({
       idempotency_key: "reconcile-card-1",
+      campaign_id: "campaign-9001",
+      capacity_lease_id: "lease-9001",
       managed_target_id: "slurm-a16",
       requested_resources: {},
       job_name: "jema-card-1",
@@ -409,6 +507,13 @@ describe("capacity target catalog and allocation submission", () => {
       job_id: "9001",
     });
 
+    store.setStub({
+      id: "stub-9001", name: "gpu-9001", hostname: "gpu", gpu: { name: "A16", count: 1, memory_total_mb: 16384 },
+      slurm_job_id: "9001", slurm_allocation_id: store.getSlurmAllocations()[0].id,
+      capacity_lease_id: "lease-9001", campaign_id: "campaign-9001", status: "online", type: "slurm",
+      connected_at: new Date().toISOString(), last_heartbeat: new Date().toISOString(), max_concurrent: 1, tasks: [],
+    } as any);
+
     const pending = await request(app).post("/capacity/reconcile").send({
       complete: true,
       jobs: [{ job_id: "9001", state: "PENDING", partition: "gpu-small" }],
@@ -418,5 +523,7 @@ describe("capacity target catalog and allocation submission", () => {
 
     const ended = await request(app).post("/capacity/reconcile").send({ complete: true, jobs: [] });
     expect(ended.body.reconciled[0].state).toBe("released");
+    expect(store.getStub("stub-9001")).toMatchObject({ released: true, status: "offline", max_concurrent: 0 });
+    expect(store.getStub("stub-9001")?.capacity_lease_id).toBeUndefined();
   });
 });

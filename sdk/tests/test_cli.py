@@ -826,6 +826,7 @@ def test_tasks_resubmit_clone_preserves_run_dir_and_targets_tags(monkeypatch):
         "display_name": "old-display",
         "status": "failed",
         "target_tags": ["a30", "slurm"],
+        "capacity_lease_id": "lease-1",
     }
     created = {**source, "id": "task-2", "seq": 42, "status": "pending", "raw_args": "--config cfg.yaml --resume"}
     calls = run_cli(
@@ -842,6 +843,7 @@ def test_tasks_resubmit_clone_preserves_run_dir_and_targets_tags(monkeypatch):
     assert body["script"] == "/work/train.py"
     assert body["raw_args"] == "--config cfg.yaml --resume"
     assert body["target_tags"] == ["t4", "slurm"]
+    assert body["capacity_lease_id"] == "lease-1"
     assert body["name"] == "old-display_resubmit"
     assert "run_dir" not in body
     assert body["idempotency_key"].startswith("resubmit:task-1:")
@@ -1998,14 +2000,33 @@ def test_slurm_cancel_is_dry_run_unless_apply_is_explicit(monkeypatch):
     assert applied[0]["body"]["apply"] is True
 
 
-def test_campaign_create_and_advance_use_persisted_state_api(monkeypatch):
+def test_campaign_create_start_cancel_and_events_use_persisted_state_api(monkeypatch, tmp_path):
+    manifest = tmp_path / "campaign.json"
+    manifest.write_text(json.dumps({
+        "version": 1,
+        "smoke_task": {"script": "/opt/python", "argv": ["-c", "import torch"]},
+        "dag": {"name": "formal", "task_specs": []},
+    }))
     created = run_cli(
         monkeypatch,
-        ["campaigns", "create", "jema-d1", "--target", "slurm-a16", "--spec-hash", "sha256:abc"],
+        ["campaigns", "create", "jema-d1", "--target", "slurm-a16", "--manifest", str(manifest)],
         [{"id": "camp-1", "state": "acquire"}],
     )
     assert created[0]["url"] == "http://localhost:3002/api/capacity/campaigns"
-    assert created[0]["body"]["frozen_spec_hash"] == "sha256:abc"
+    assert created[0]["body"]["frozen_manifest"]["version"] == 1
+    assert "frozen_spec_hash" not in created[0]["body"]
+
+    started = run_cli(monkeypatch, ["campaigns", "start", "camp-1"], [{"id": "camp-1", "state": "wait_stub"}])
+    assert started[0]["url"] == "http://localhost:3002/api/capacity/campaigns/camp-1/start"
+
+    cancelled = run_cli(
+        monkeypatch, ["campaigns", "cancel", "camp-1", "--reason", "operator stop"],
+        [{"id": "camp-1", "state": "failed"}],
+    )
+    assert cancelled[0]["body"] == {"reason": "operator stop"}
+
+    events = run_cli(monkeypatch, ["campaigns", "events", "camp-1"], [[]])
+    assert events[0]["url"] == "http://localhost:3002/api/capacity/campaigns/camp-1/events"
 
     advanced = run_cli(
         monkeypatch,

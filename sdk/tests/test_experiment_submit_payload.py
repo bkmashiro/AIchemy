@@ -49,7 +49,7 @@ def test_submit_forwards_sdk_storage_and_metadata_spec(monkeypatch):
         "artifact_root": "/vol/gpudata/artifacts",
     }
     assert captured["sdk_spec"]["storage"] == captured["storage"]
-    assert captured["sdk_spec"]["metadata"]["sdk_version"] == "2.1.0"
+    assert captured["sdk_spec"]["metadata"]["sdk_version"] == "2.2.0"
     assert captured["sdk_spec"]["tasks"] == [{"ref": "train", "script": "train.py"}]
 
 

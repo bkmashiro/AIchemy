@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alchemy-sdk"
-version = "2.1.0"
-description = "Alchemy v2.1 SDK — training script integration library"
+version = "2.2.0"
+description = "Alchemy v2.2 SDK — training script integration library"
 readme = "README.md"
 requires-python = ">=3.10"
 # No hard dependencies: requests is optional (HTTP fallback), torch is optional (AOP checkpoint).

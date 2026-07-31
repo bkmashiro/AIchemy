@@ -461,6 +461,8 @@ class Experiment:
     ) -> TaskNode:
         if ref in self._refs:
             raise ValueError(f"Duplicate task ref: {ref!r}")
+        if target_stub_id and capacity_lease_id:
+            raise ValueError("target_stub_id and capacity_lease_id are mutually exclusive routing selectors")
         if config_mode is not None and config_mode != "yaml_file":
             raise ValueError("config_mode must be 'yaml_file' when set")
         metric_schema = self._normalize_metric_schema(metrics)

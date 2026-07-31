@@ -115,7 +115,7 @@ export const capacityCampaigns = sqliteTable("capacity_campaigns", {
   id: text("id").primaryKey(),
   state: text("state").notNull(),
   target_id: text("target_id").notNull(),
-  capacity_lease_id: text("capacity_lease_id").notNull(),
+  capacity_lease_id: text("capacity_lease_id").notNull().unique(),
   updated_at: text("updated_at").notNull(),
   data: text("data").notNull(),
 });

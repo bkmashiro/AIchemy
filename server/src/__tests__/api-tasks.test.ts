@@ -387,6 +387,15 @@ describe("createTask", () => {
 // ─── POST /tasks ──────────────────────────────────────────────────────────────
 
 describe("POST /tasks", () => {
+  it("rejects conflicting physical stub and logical lease selectors", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/tasks").send({
+      script: "/tmp/train.py", target_stub_id: "stub-1", capacity_lease_id: "lease-1",
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("mutually exclusive");
+  });
+
   it("returns 400 when script is missing", async () => {
     const app = makeApp();
     const res = await request(app).post("/tasks").send({});
@@ -1244,6 +1253,21 @@ describe("Fuzzing: POST /tasks", () => {
 });
 
 describe("Task surgical update/replace", () => {
+  it("rejects mutation and replacement of frozen campaign tasks", async () => {
+    store.createCapacityCampaign({
+      name: "frozen", state: "cuda_smoke", target_id: "slurm-a16", frozen_spec_hash: "sha256:frozen",
+      frozen_manifest: { version: 1, smoke_task: { script: "/tmp/train.py" }, dag: { task_specs: [] } },
+      capacity_lease_id: "lease-frozen", attempts: 0, max_attempts: 1, max_runtime_seconds: 60,
+    });
+    const task = makeTask({ id: "frozen-task", status: "pending", capacity_lease_id: "lease-frozen" });
+    store.addToGlobalQueue(task);
+    const app = makeApp(undefined, makeWebNamespace());
+
+    await request(app).patch(`/tasks/${task.id}`).send({ script: "/tmp/changed.py" }).expect(409);
+    await request(app).post(`/tasks/${task.id}/replace`).send({ overrides: { script: "/tmp/changed.py" } }).expect(409);
+    expect(store.getAllTasks()).toHaveLength(1);
+  });
+
   it("replaces a task attempt and rewires downstream blocked dependencies without cancelling them", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
@@ -1254,6 +1278,7 @@ describe("Task surgical update/replace", () => {
       experiment_id: "exp-replace",
       script: "/tmp/train.py",
       raw_args: "--old-code",
+      capacity_lease_id: "lease-replace",
     });
     const evalTask = makeTask({
       id: "eval-blocked",
@@ -1287,6 +1312,7 @@ describe("Task surgical update/replace", () => {
     expect(replacement.raw_args).toBe("--new-code");
     expect(replacement.env).toEqual({ PYTHONPATH: "/new" });
     expect(replacement.ref).toBe("train");
+    expect(replacement.capacity_lease_id).toBe("lease-replace");
     expect(replacement.replaces_task_id).toBe(train.id);
     expect(replacement.attempt).toBe(2);
     expect(store.findTask(train.id)?.task.status).toBe("cancelled");

@@ -109,6 +109,8 @@ export interface Task {
   // === Identity ===
   id: string;
   alias?: string;
+  idempotency_key?: string;
+  submission_hash?: string;
   seq: number;
   fingerprint: string;
   name?: string;
@@ -384,6 +386,8 @@ export interface ExperimentEvent {
 export interface Experiment {
   id: string;
   alias?: string;
+  idempotency_key?: string;
+  submission_hash?: string;
   code_id?: string;
   name: string;
   description?: string;
@@ -624,6 +628,12 @@ export type CampaignState =
   | "acquire" | "wait_stub" | "cuda_smoke" | "submit_dag" | "wait_dag"
   | "drain" | "release" | "closeout" | "completed" | "failed";
 
+export interface FrozenCampaignManifest {
+  version: 1;
+  smoke_task: Record<string, unknown>;
+  dag: Record<string, unknown>;
+}
+
 export interface CapacityCampaign {
   id: string;
   alias?: string;
@@ -631,6 +641,7 @@ export interface CapacityCampaign {
   state: CampaignState;
   target_id: string;
   frozen_spec_hash: string;
+  frozen_manifest?: FrozenCampaignManifest;
   capacity_lease_id: string;
   allocation_id?: string;
   stub_id?: string;

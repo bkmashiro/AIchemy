@@ -15,7 +15,7 @@ function createCampaign(overrides: Record<string, unknown> = {}) {
     ...overrides,
   });
   store.createSlurmAllocation({
-    id: "allocation-1", idempotency_key: "campaign-acquire", campaign_id: campaign.id,
+    id: "allocation-1", idempotency_key: `${campaign.id}:acquire`, campaign_id: campaign.id,
     capacity_lease_id: campaign.capacity_lease_id, managed_target_id: campaign.target_id,
     requested_resources: {}, job_name: "campaign", owner: "tester", managed_by: "alchemy",
     pinned: false, state: "requested",
@@ -85,28 +85,72 @@ describe("restart-safe campaign reconciliation", () => {
 
   it("bounds retries and performs owned cleanup after a side-effect failure", async () => {
     const campaign = createCampaign({ max_attempts: 1 });
-    const d = driver({ acquire: vi.fn(async () => { throw new Error("controller unavailable"); }) });
+    const d = driver({ acquire: vi.fn(async () => { throw new Error("provider rejected request"); }) });
 
     const result = await reconcileCampaign(campaign.id, d);
 
     expect(result.state).toBe("failed");
     expect(result.attempts).toBe(1);
-    expect(result.last_error).toContain("controller unavailable");
+    expect(result.last_error).toContain("provider rejected request");
     expect(d.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: campaign.id }), `${campaign.id}:cleanup`);
   });
 
-  it("reuses the same acquire key after an ambiguous timeout", async () => {
+  it("does not resurrect a campaign cancelled while acquire is in flight and records a late cleanup obligation", async () => {
+    const campaign = store.createCapacityCampaign({
+      name: "race", state: "acquire", target_id: "slurm-a16", frozen_spec_hash: "sha256:manifest",
+      capacity_lease_id: "lease-race", max_attempts: 2, attempts: 0, max_runtime_seconds: 3600,
+    });
+    let resolveAcquire!: (value: { allocation_id: string }) => void;
+    const pending = new Promise<{ allocation_id: string }>((resolve) => { resolveAcquire = resolve; });
+    const d = driver({ acquire: vi.fn(async () => pending) });
+
+    const inFlight = reconcileCampaign(campaign.id, d);
+    await Promise.resolve();
+    const current = store.getCapacityCampaign(campaign.id)!;
+    store.updateCapacityCampaign(campaign.id, {
+      state: "failed", cleanup_required: false, last_error: "operator cancellation",
+      history: [...current.history, { at: new Date().toISOString(), from: "acquire", to: "failed", actor: "operator" }],
+    });
+    const late = store.createSlurmAllocation({
+      idempotency_key: "late-race", campaign_id: campaign.id, capacity_lease_id: campaign.capacity_lease_id,
+      managed_target_id: campaign.target_id, requested_resources: {}, job_name: "late", owner: "tester",
+      managed_by: "alchemy", pinned: false, state: "requested",
+    });
+    resolveAcquire({ allocation_id: late.id });
+
+    await expect(inFlight).resolves.toMatchObject({ state: "failed", cleanup_required: true, allocation_id: late.id });
+    expect(store.getCapacityCampaign(campaign.id)).toMatchObject({ state: "failed", cleanup_required: true, allocation_id: late.id });
+  });
+
+  it("recovers a persisted exact allocation after an ambiguous timeout without replaying acquire", async () => {
     const campaign = createCampaign();
-    const d = driver();
-    vi.mocked(d.acquire)
-      .mockRejectedValueOnce(new Error("timeout after submit"))
-      .mockResolvedValueOnce({ allocation_id: "allocation-1" });
+    const d = driver({ acquire: vi.fn(async () => { throw new Error("timeout after submit"); }) });
+
+    expect((await reconcileCampaign(campaign.id, d)).state).toBe("wait_stub");
+    expect(d.acquire).toHaveBeenCalledOnce();
+    expect(d.acquire).toHaveBeenCalledWith(expect.anything(), `${campaign.id}:acquire`);
+  });
+
+  it("reuses the same acquire key when an ambiguous error has no persisted allocation", async () => {
+    const campaign = store.createCapacityCampaign({
+      name: "retry", state: "acquire", target_id: "slurm-a16", frozen_spec_hash: "sha256:manifest",
+      capacity_lease_id: "lease-retry", max_attempts: 2, attempts: 0, max_runtime_seconds: 3600,
+    });
+    const acquire = vi.fn()
+      .mockRejectedValueOnce(new Error("timeout before persistence"))
+      .mockImplementationOnce(async () => {
+        const allocation = store.createSlurmAllocation({
+          idempotency_key: "retry-acquire", campaign_id: campaign.id, capacity_lease_id: campaign.capacity_lease_id,
+          managed_target_id: campaign.target_id, requested_resources: {}, job_name: "retry", owner: "tester",
+          managed_by: "alchemy", pinned: false, state: "requested",
+        });
+        return { allocation_id: allocation.id };
+      });
+    const d = driver({ acquire });
 
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("acquire");
     expect((await reconcileCampaign(campaign.id, d)).state).toBe("wait_stub");
-    expect(vi.mocked(d.acquire).mock.calls.map((call) => call[1])).toEqual([
-      `${campaign.id}:acquire`, `${campaign.id}:acquire`,
-    ]);
+    expect(acquire.mock.calls.map((call) => call[1])).toEqual([`${campaign.id}:acquire`, `${campaign.id}:acquire`]);
   });
 
   it("retries persisted cleanup obligations without replaying the campaign", async () => {
@@ -122,9 +166,9 @@ describe("restart-safe campaign reconciliation", () => {
   });
 
   it("persists unresolved cleanup obligations on failure", async () => {
-    const campaign = createCampaign({ max_attempts: 1, allocation_id: "allocation-1" });
+    const campaign = createCampaign({ state: "cuda_smoke", max_attempts: 1, allocation_id: "allocation-1", stub_id: "stub-1" });
     const d = driver({
-      acquire: vi.fn(async () => { throw new Error("controller unavailable"); }),
+      runSmoke: vi.fn(async () => { throw new Error("smoke submission rejected"); }),
       cleanup: vi.fn(async () => ({ cleaned: false })),
     });
 

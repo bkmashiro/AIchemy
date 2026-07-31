@@ -449,6 +449,10 @@ Caps count online, pending, manual, campaign-owned, and autoscaler-owned allocat
 
 **User value:** Submit work against a pending managed allocation and express `card online -> CUDA smoke -> submit DAG -> drain -> release` without a custom watcher.
 
+**Implementation status (2026-07-30): substrate complete; production adapters default unwired.** Campaign creation now persists a canonical SHA-256 hash over a frozen JSON/YAML manifest containing the smoke task and formal DAG. A compile-ready server-owned driver factory recovers canonical allocation, stub, smoke task, experiment, and formal task identities before advancing; destructive paths require exact campaign/lease/managed-target ownership and reject pinned allocations. The compact persisted states (`acquire`, `wait_stub`, `cuda_smoke`, `submit_dag`, `wait_dag`, `drain`, `release`, `closeout`) map one-to-one onto the lifecycle below and retain immutable transition events/idempotency keys. Server startup still supplies no campaign side-effect adapter, so implementation and tests cannot submit production capacity, smoke work, DAGs, drains, or releases.
+
+Lease IDs are server-generated, globally unique, and immutable. Leased stubs reject unleased or differently leased work. Task/DAG submission uses persisted idempotency keys and frozen-content verification; ordinary task mutation/replacement cannot alter frozen campaign work. Cancellation is concurrency-safe, late allocations remain cleanup obligations, and cleanup/drain account for both logical-lease tasks and all work physically bound to the owned stub. Hash-only legacy campaign creation remains accepted but cannot start through the production driver without a frozen manifest.
+
 ### 4.1 Logical targeting
 
 Extend task routing with mutually exclusive selectors:
@@ -500,13 +504,13 @@ Campaign reconciliation survives server/controller reconnects and client exit. I
 ### 4.5 API
 
 ```text
-POST   /api/campaigns
-GET    /api/campaigns
-GET    /api/campaigns/:id
-POST   /api/campaigns/:id/start
-POST   /api/campaigns/:id/cancel
-POST   /api/campaigns/:id/reconcile
-GET    /api/campaigns/:id/events
+POST   /api/capacity/campaigns
+GET    /api/capacity/campaigns
+GET    /api/capacity/campaigns/:id
+POST   /api/capacity/campaigns/:id/start
+POST   /api/capacity/campaigns/:id/cancel
+POST   /api/capacity/campaigns/:id/reconcile
+GET    /api/capacity/campaigns/:id/events
 ```
 
 **Files:**
@@ -646,7 +650,7 @@ Automatic release remains limited to idle, owned, unpinned allocations with no a
 ```text
 Task
   -> target_stub_id?                 exact live worker
-  -> target_capacity_lease_id?       logical pending/replaceable capacity
+  -> capacity_lease_id?              logical pending/replaceable capacity
   -> target_pool_id?                 compatible managed pool
 
 Campaign

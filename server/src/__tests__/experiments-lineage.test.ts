@@ -120,6 +120,47 @@ describe("experiment assignment diagnosis", () => {
 });
 
 describe("experiment submission preflight", () => {
+  it("rejects adopting or moving frozen campaign tasks", async () => {
+    const campaign = store.createCapacityCampaign({
+      name: "frozen", state: "cuda_smoke", target_id: "slurm-a16", frozen_spec_hash: "sha256:frozen",
+      frozen_manifest: { version: 1, smoke_task: { script: "/tmp/smoke.py" }, dag: { task_specs: [{ ref: "train", script: "/tmp/train.py" }] } },
+      capacity_lease_id: "lease-frozen", attempts: 0, max_attempts: 1, max_runtime_seconds: 60,
+    });
+    const task = createTask({ script: "/tmp/smoke.py", capacity_lease_id: campaign.capacity_lease_id });
+    store.addToGlobalQueue(task);
+    const app = makeApp();
+
+    await request(app).post("/experiments/adopt").send({ name: "forged", task_ids: [task.id] }).expect(409);
+  });
+
+  it("durably reuses an idempotent DAG submission and rejects key drift", async () => {
+    const app = makeApp();
+    const body = {
+      name: "idempotent-dag", idempotency_key: "campaign-1:submit_dag",
+      task_specs: [{ ref: "train", script: "/tmp/train.py", capacity_lease_id: "lease-1" }],
+      sdk_spec: { campaign: { id: "campaign-1", capacity_lease_id: "lease-1", frozen_spec_hash: "sha256:manifest" } },
+    };
+
+    const first = await request(app).post("/experiments").send(body).expect(201);
+    const second = await request(app).post("/experiments").send(body).expect(200);
+    expect(second.body.id).toBe(first.body.id);
+    expect(store.getAllTasks()).toHaveLength(1);
+    await request(app).post("/experiments").send({ ...body, name: "drifted" }).expect(409);
+  });
+
+  it("rejects DAG tasks with conflicting physical stub and logical lease selectors", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/experiments").send({
+      name: "conflicting-routing",
+      task_specs: [{
+        ref: "train", script: "/opt/python", target_stub_id: "stub-1", capacity_lease_id: "lease-1",
+      }],
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("mutually exclusive");
+    expect(store.getAllExperiments()).toHaveLength(0);
+  });
+
   it("preserves argv and target_stub_id from DAG task_specs", async () => {
     const app = makeApp();
     store.setStub({

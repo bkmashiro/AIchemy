@@ -23,7 +23,7 @@ DANGEROUS_STATUSES = {"running", "assigned"}
 COMPARE_MAX_REFS = 6  # server caps `/experiments/compare?ids=...` at 6
 TASK_FIELDS = [
     "script", "argv", "args", "raw_args", "name", "cwd", "env_setup", "env", "env_overrides",
-    "requirements", "priority", "max_retries", "param_overrides", "target_tags", "target_stub_id",
+    "requirements", "priority", "max_retries", "param_overrides", "target_tags", "target_stub_id", "capacity_lease_id",
     "python_env", "submitted_by", "depends_on", "ref", "args_template", "experiment_id",
     "outputs", "auto_retry_on",
 ]
@@ -486,13 +486,42 @@ def cmd_campaign_get(args: argparse.Namespace, client: ApiClient) -> None:
 
 
 def cmd_campaign_create(args: argparse.Namespace, client: ApiClient) -> None:
-    print_json(client.post("/capacity/campaigns", {
+    body: dict[str, Any] = {
         "name": args.name,
         "target_id": args.target,
-        "frozen_spec_hash": args.spec_hash,
         "max_attempts": args.max_attempts,
         "max_runtime_seconds": args.max_runtime,
-    }))
+    }
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+        try:
+            raw = manifest_path.read_text()
+            if manifest_path.suffix.lower() == ".json":
+                manifest = json.loads(raw)
+            else:
+                try:
+                    import yaml  # type: ignore[import-not-found]
+                except ImportError as exc:
+                    raise AlchError("YAML campaign manifests require PyYAML; use JSON or install PyYAML") from exc
+                manifest = yaml.safe_load(raw)
+        except (OSError, ValueError) as exc:
+            raise AlchError(f"Cannot read campaign manifest {manifest_path}: {exc}") from exc
+        body["frozen_manifest"] = manifest
+    else:
+        body["frozen_spec_hash"] = args.spec_hash
+    print_json(client.post("/capacity/campaigns", body))
+
+
+def cmd_campaign_start(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/capacity/campaigns/{args.campaign}/start", {}))
+
+
+def cmd_campaign_cancel(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.post(f"/capacity/campaigns/{args.campaign}/cancel", {"reason": args.reason}))
+
+
+def cmd_campaign_events(args: argparse.Namespace, client: ApiClient) -> None:
+    print_json(client.get(f"/capacity/campaigns/{args.campaign}/events"))
 
 
 def cmd_campaign_advance(args: argparse.Namespace, client: ApiClient) -> None:
@@ -965,6 +994,7 @@ def cmd_tasks_move(args: argparse.Namespace, client: ApiClient) -> None:
     body = clone_task_body(task)
     body["target_stub_id"] = stub["id"]
     body.pop("target_tags", None)
+    body.pop("capacity_lease_id", None)
     body["name"] = args.name or f"{task.get('display_name') or task.get('name')}_moved"
     body["idempotency_key"] = f"move:{args.task}:{stub['id']}:{uuid.uuid4()}"
     print_json(short_task(client.post("/tasks", body)))
@@ -992,6 +1022,7 @@ def cmd_tasks_resubmit(args: argparse.Namespace, client: ApiClient) -> None:
     if args.to_stub:
         body["target_stub_id"] = find_stub(client, args.to_stub)["id"]
         body.pop("target_tags", None)
+        body.pop("capacity_lease_id", None)
     if args.to_tags:
         body["target_tags"] = [t.strip() for t in args.to_tags.split(",") if t.strip()]
         body.pop("target_stub_id", None)
@@ -1132,6 +1163,7 @@ def build_resume_body(task: dict[str, Any], *, stub_id: str | None, tags: list[s
     if stub_id:
         body["target_stub_id"] = stub_id
         body.pop("target_tags", None)
+        body.pop("capacity_lease_id", None)
     if tags:
         body["target_tags"] = tags
         body.pop("target_stub_id", None)
@@ -1811,7 +1843,10 @@ def build_parser() -> argparse.ArgumentParser:
     campaign_sub = campaigns.add_subparsers(dest="cmd", required=True)
     p = campaign_sub.add_parser("ls", help="list campaigns"); p.set_defaults(func=cmd_campaign_ls)
     p = campaign_sub.add_parser("get", help="show a campaign"); p.add_argument("campaign"); p.set_defaults(func=cmd_campaign_get)
-    p = campaign_sub.add_parser("create", help="create a frozen campaign"); p.add_argument("name"); p.add_argument("--target", required=True); p.add_argument("--spec-hash", required=True); p.add_argument("--max-attempts", type=int, default=3); p.add_argument("--max-runtime", type=int, default=86400); p.set_defaults(func=cmd_campaign_create)
+    p = campaign_sub.add_parser("create", help="create a frozen campaign"); p.add_argument("name"); p.add_argument("--target", required=True); campaign_source = p.add_mutually_exclusive_group(required=True); campaign_source.add_argument("--manifest", help="frozen JSON/YAML manifest containing smoke_task and dag"); campaign_source.add_argument("--spec-hash", help="legacy hash-only campaign (cannot start with production driver)"); p.add_argument("--max-attempts", type=int, default=3); p.add_argument("--max-runtime", type=int, default=86400); p.set_defaults(func=cmd_campaign_create)
+    p = campaign_sub.add_parser("start", help="run one audited campaign reconcile step"); p.add_argument("campaign"); p.set_defaults(func=cmd_campaign_start)
+    p = campaign_sub.add_parser("cancel", help="fail the campaign and persist owned cleanup obligations"); p.add_argument("campaign"); p.add_argument("--reason", default="operator cancellation"); p.set_defaults(func=cmd_campaign_cancel)
+    p = campaign_sub.add_parser("events", help="show immutable campaign transition events"); p.add_argument("campaign"); p.set_defaults(func=cmd_campaign_events)
     p = campaign_sub.add_parser("advance", help="perform one validated state transition"); p.add_argument("campaign"); p.add_argument("--to", required=True, choices=["wait_stub", "cuda_smoke", "submit_dag", "wait_dag", "drain", "release", "closeout", "completed", "failed"]); p.add_argument("--actor", default="akashi"); p.add_argument("--reason"); p.set_defaults(func=cmd_campaign_advance)
 
     tasks = sub.add_parser("tasks", help="list, inspect, cancel, move, or resubmit tasks")

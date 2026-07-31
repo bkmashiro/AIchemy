@@ -33,6 +33,8 @@ export type AssignmentReasonCode =
   | "target_stub_offline"
   | "target_stub_mismatch"
   | "capacity_lease_mismatch"
+  | "capacity_pending"
+  | "capacity_failed"
   | "dependency_blocked"
   | "invalid_resource_requirement"
   | "slots_full"
@@ -97,6 +99,8 @@ export interface AssignmentDiagnosis {
     target_stub_id?: string;
     target_tags?: string[];
     capacity_lease_id?: string;
+    capacity_allocation_id?: string;
+    capacity_campaign_id?: string;
     python_env?: string;
     gpu_type?: string[];
     gpu_mem_mb?: number;
@@ -248,7 +252,8 @@ export function evaluateStubEligibility(stub: Stub, task: Task): StubEligibility
   if (hasInvalidResourceRequirement(task)) reasons.push("invalid_resource_requirement");
 
   if (task.target_stub_id && stub.id !== task.target_stub_id) reasons.push("target_stub_mismatch");
-  if (task.capacity_lease_id && stub.capacity_lease_id !== task.capacity_lease_id) {
+  if ((task.capacity_lease_id && stub.capacity_lease_id !== task.capacity_lease_id)
+    || (stub.capacity_lease_id && task.capacity_lease_id !== stub.capacity_lease_id)) {
     reasons.push("capacity_lease_mismatch");
   }
   if (stub.status !== "online") {
@@ -324,7 +329,9 @@ function nextActionForBlocker(blocker: AssignmentReasonCode | null): string {
     case "no_online_stubs": return "start_compatible_stub";
     case "target_stub_offline": return "restart_target_or_retarget";
     case "target_stub_mismatch": return "fix_target_stub_id";
-    case "capacity_lease_mismatch": return "wait_for_capacity_lease_stub";
+    case "capacity_lease_mismatch":
+    case "capacity_pending": return "wait_for_capacity_lease_stub";
+    case "capacity_failed": return "inspect_capacity_campaign";
     case "stub_draining": return "wait_or_undrain_stub";
     case "invalid_resource_requirement": return "fix_positive_resource_requirements";
     case "slots_full": return "wait_for_slot";
@@ -387,10 +394,20 @@ function buildDiagnosis(
 }
 
 export function diagnoseTaskAssignment(task: Task, stubs: Stub[] = store.getAllStubs()): AssignmentDiagnosis {
+  const leaseAllocations = task.capacity_lease_id
+    ? store.getSlurmAllocations().filter((allocation) => allocation.capacity_lease_id === task.capacity_lease_id)
+    : [];
+  const leaseAllocation = leaseAllocations.find((allocation) => !["released", "failed"].includes(allocation.state))
+    ?? leaseAllocations[0];
+  const leaseCampaign = task.capacity_lease_id
+    ? store.getCapacityCampaigns().find((campaign) => campaign.capacity_lease_id === task.capacity_lease_id)
+    : undefined;
   const requested: AssignmentDiagnosis["requested"] = {
     target_stub_id: task.target_stub_id,
     target_tags: task.target_tags,
     capacity_lease_id: task.capacity_lease_id,
+    capacity_allocation_id: leaseAllocation?.id,
+    capacity_campaign_id: leaseCampaign?.id,
     python_env: task.python_env,
     gpu_type: task.requirements?.gpu_type,
     gpu_mem_mb: task.requirements?.gpu_mem_mb,
@@ -405,8 +422,20 @@ export function diagnoseTaskAssignment(task: Task, stubs: Stub[] = store.getAllS
   const eligible = rows.filter((row) => row.eligible).map((row) => row.stub_id);
   let blocker: AssignmentReasonCode | null = null;
   if (task.status === "pending" && eligible.length === 0) {
+    const leaseFailed = Boolean(task.capacity_lease_id && leaseAllocations.length > 0
+      && leaseAllocations.every((allocation) => ["released", "failed"].includes(allocation.state)));
+    const leaseReady = Boolean(task.capacity_lease_id && stubs.some((stub) =>
+      stub.status === "online" && stub.capacity_lease_id === task.capacity_lease_id
+      && (!leaseAllocation?.id || stub.slurm_allocation_id === leaseAllocation.id)));
+    const leasePending = Boolean(task.capacity_lease_id && !leaseFailed && !leaseReady
+      && ((leaseAllocation && ["requested", "submitted", "pending", "running"].includes(leaseAllocation.state))
+        || (!leaseAllocation && leaseCampaign && !["completed", "failed"].includes(leaseCampaign.state))));
     const target = task.target_stub_id ? stubs.find((stub) => stub.id === task.target_stub_id) : undefined;
-    if (target?.status === "offline") {
+    if (leaseFailed) {
+      blocker = "capacity_failed";
+    } else if (leasePending) {
+      blocker = "capacity_pending";
+    } else if (target?.status === "offline") {
       blocker = "target_stub_offline";
     } else if (task.target_stub_id && !target) {
       blocker = "target_stub_mismatch";

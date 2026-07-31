@@ -20,13 +20,24 @@ function update(
   reason?: string,
 ): CapacityCampaign {
   if (campaign.state === to && Object.keys(patch).length === 0) return campaign;
+  const current = store.getCapacityCampaign(campaign.id);
+  if (!current) throw new Error(`Campaign ${campaign.id} disappeared during reconciliation`);
+  if (current.state !== campaign.state
+    || current.history.length !== campaign.history.length
+    || current.updated_at !== campaign.updated_at) {
+    if (current.state === "failed" && to === "wait_stub" && typeof patch.allocation_id === "string") {
+      requireOwnedAllocation(current, patch.allocation_id);
+      return store.updateCapacityCampaign(current.id, { allocation_id: patch.allocation_id, cleanup_required: true })!;
+    }
+    return current;
+  }
   const at = new Date().toISOString();
   return store.updateCapacityCampaign(campaign.id, {
     ...patch,
     state: to,
-    history: campaign.state === to ? campaign.history : [...campaign.history, {
+    history: current.state === to ? current.history : [...current.history, {
       at,
-      from: campaign.state,
+      from: current.state,
       to,
       actor: "campaign_reconciler",
       reason,
@@ -40,6 +51,13 @@ async function fail(
   reason: string,
   attempts = campaign.attempts,
 ): Promise<CapacityCampaign> {
+  const current = store.getCapacityCampaign(campaign.id);
+  if (!current) throw new Error(`Campaign ${campaign.id} disappeared during reconciliation`);
+  if (current.state !== campaign.state
+    || current.history.length !== campaign.history.length
+    || current.updated_at !== campaign.updated_at) {
+    return current;
+  }
   let cleanupError: string | undefined;
   let cleanupRequired = true;
   try {
@@ -158,6 +176,35 @@ export async function reconcileCampaign(
         return fail(campaign, driver, `Unsupported campaign state: ${String(campaign.state)}`);
     }
   } catch (error) {
+    const current = store.getCapacityCampaign(campaign.id);
+    if (!current) throw error;
+    const discovered = store.getSlurmAllocations().filter((allocation) =>
+      allocation.managed_by === "alchemy" && !["released", "failed"].includes(allocation.state)
+      && allocation.idempotency_key === `${campaign.id}:acquire`
+      && allocation.campaign_id === campaign.id
+      && allocation.capacity_lease_id === campaign.capacity_lease_id
+      && allocation.managed_target_id === campaign.target_id);
+    if (current.state === "failed") {
+      if (discovered.length > 0) {
+        return store.updateCapacityCampaign(current.id, {
+          allocation_id: current.allocation_id ?? (discovered.length === 1 ? discovered[0].id : undefined),
+          cleanup_required: true,
+        })!;
+      }
+      return current;
+    }
+    if (current.state !== campaign.state || current.history.length !== campaign.history.length
+      || current.updated_at !== campaign.updated_at) return current;
+    const ambiguousAcquireError = campaign.state === "acquire"
+      && /timeout|timed out|unavailable|connection|network|unknown outcome/i.test(String(error));
+    if (campaign.state === "acquire" && ambiguousAcquireError && discovered.length === 1) {
+      requireOwnedAllocation(campaign, discovered[0].id);
+      return update(campaign, "wait_stub", {
+        allocation_id: discovered[0].id,
+        attempts: campaign.attempts + 1,
+        last_error: `Recovered allocation after ambiguous acquire error: ${String(error)}`,
+      }, "ambiguous acquire recovered");
+    }
     const attempts = campaign.attempts + 1;
     if (attempts >= campaign.max_attempts) return fail(campaign, driver, String(error), attempts);
     return store.updateCapacityCampaign(campaign.id, { attempts, last_error: String(error) })!;
