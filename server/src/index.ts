@@ -14,14 +14,12 @@ import { v4 as uuidv4 } from "uuid";
 import { store } from "./store";
 import { setupStubNamespace } from "./socket/stub";
 import { setupWebNamespace } from "./socket/web";
-import { emitToController, setupControllerNamespace } from "./socket/controller";
 import { createGlobalTasksRouter } from "./api/tasks";
 import { createStubsRouter } from "./api/stubs";
 import { createGridsRouter } from "./api/grids";
 import { createExperimentsRouter } from "./api/experiments";
 import { createMetricsRouter } from "./api/metrics";
 import { createSdkRouter } from "./api/sdk";
-import { createClusterRouter } from "./api/cluster";
 import { createWebhooksRouter } from "./api/webhooks";
 import { createRefsRouter } from "./api/refs";
 import { startScheduler, triggerSchedule } from "./scheduler";
@@ -33,7 +31,7 @@ import { startAutoRenew } from "./autorenew";
 import { loadDeployConfig } from "./deploy";
 import { createTunnelManager, TunnelManager } from "./tunnel";
 import { createDeployRouter } from "./api/deploy";
-import { createCapacityRouter } from "./api/capacity";
+import { createCapacityRouter, startManagedSlurmReconciler } from "./api/capacity";
 import { reliableEmitToStub } from "./reliable";
 import { createOperatorRouter } from "./api/operator";
 import { ALCHEMY_VERSION } from "./version";
@@ -70,13 +68,14 @@ const io = new Server(httpServer, {
 
 const stubNs = io.of("/stubs");
 const webNs = io.of("/web");
-const controllerNs = io.of("/controller");
 
 setupWebNamespace(webNs);
 setupStubNamespace(stubNs, webNs, deployConfig);
-setupControllerNamespace(controllerNs, webNs);
 startScheduler(webNs, stubNs);
 startWebhookDispatcher();
+startManagedSlurmReconciler(deployConfig, 30_000, (error) => {
+  logger.warn("capacity.slurm_reconcile_failed", { error: String(error) });
+});
 
 // ─── Startup requeue: on restart, move queued/dispatched tasks off offline stubs ──
 // This prevents tasks from being stuck in stub.tasks for up to 3 minutes until
@@ -263,11 +262,9 @@ api.use("/stubs", createStubsRouter(stubNs, webNs));
 api.use("/grids", createGridsRouter(stubNs, webNs));
 api.use("/experiments", createExperimentsRouter(stubNs, webNs));
 api.use("/refs", createRefsRouter());
-api.use("/cluster", createClusterRouter());
 api.use("/webhooks", createWebhooksRouter());
 api.use("/deploy", createDeployRouter(deployConfig, tunnelMgr));
 api.use("/capacity", createCapacityRouter(deployConfig, {
-  cancel: async (jobId) => emitToController("slurm.cancel", { job_id: jobId }),
   prepareRelease: async (allocation) => {
     if (!allocation.stub_id) return;
     const stub = store.getStub(allocation.stub_id);

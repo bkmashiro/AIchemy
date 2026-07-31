@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSlurmStubScript } from "../deploy";
+import { buildSlurmStubScript, listSlurmJobs } from "../deploy";
 import { StubTarget } from "../types";
 
 function makeSlurmTarget(overrides: Partial<StubTarget> = {}): StubTarget {
@@ -34,7 +34,7 @@ describe("SLURM deploy script generation", () => {
     expect(script).toContain("#SBATCH --time=2-00:00:00");
     expect(script).toContain("  --idle-timeout 600");
     expect(script).toContain("  --default-cwd \"/vol/bitbucket/ys25/jema-v2\" \\");
-    expect(script).toContain("  --tags \"a30,slurm\" \\");
+    expect(script).toContain("  --tags \"alchemy-target=a30,a30,slurm\" \\");
   });
 
   it("uses idle timeout from deploy config when no override is provided", () => {
@@ -67,6 +67,20 @@ describe("SLURM deploy script generation", () => {
 
     expect(script).toContain("  --default-output-dir \"/vol/gpudata/ys25-MySpace/alchemy-runs\"");
     expect(script).not.toContain("/vol/bitbucket/ys25/bad-runs");
+  });
+
+  it("parses a complete SLURM queue snapshot over the managed SSH connection", async () => {
+    const ssh = async () => [
+      "4242|RUNNING|gpgpu|alchemy-a16|gpu-a16-1|2026-07-31T10:00:00",
+      "4243|PENDING|gpgpu|alchemy-a30|Resources|N/A",
+    ].join("\n");
+
+    const jobs = await listSlurmJobs(makeSlurmTarget({ ssh_host: "gpucluster3", ssh_user: "ys25" }), "/tmp/key", ssh);
+
+    expect(jobs).toEqual([
+      { job_id: "4242", state: "RUNNING", partition: "gpgpu", name: "alchemy-a16", reason: "gpu-a16-1", predicted_start_at: "2026-07-31T10:00:00" },
+      { job_id: "4243", state: "PENDING", partition: "gpgpu", name: "alchemy-a30", reason: "Resources" },
+    ]);
   });
 
   it("uses the persisted custom job name verbatim", () => {

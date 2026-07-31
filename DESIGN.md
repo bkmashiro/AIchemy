@@ -149,11 +149,12 @@ Alchemy v2 是一个分布式 ML 任务调度系统，针对高校 GPU 集群（
 └──────────────────────┘
 ```
 
-四层通信链路：
+三层通信链路：
 - **Web ↔ Server**: `/web` namespace，dashboard 接收实时推送
 - **Stub ↔ Server**: `/stubs` namespace，关键事件走 reliable emit（ack 重试）
 - **SDK ↔ Stub**: Unix domain socket，newline-delimited JSON
-- **Controller ↔ Server**: `/controller` namespace，SLURM proxy
+
+Slurm 控制面由 Server 通过 managed target 的 SSH 配置直接执行 `sbatch`、`scancel` 和 `squeue`。不再部署独立 Controller daemon，也不再维护第二套 Socket.IO 控制面。
 
 ---
 
@@ -462,7 +463,7 @@ ML 训练任务有几个特性：
 
 Socket.IO 的 ack callback 机制为关键事件提供了应用层的送达确认，这正是分布式系统里"你以为发出去了但其实没到"这类问题的解。
 
-namespace 隔离（`/stubs`、`/web`、`/controller`）让三类客户端的事件互不干扰，服务器可以精确控制哪些事件广播给哪类客户端。
+namespace 隔离（`/stubs`、`/web`）让执行端和观察端事件互不干扰，服务器可以精确控制哪些事件广播给哪类客户端。Slurm 管理命令走 Server-owned SSH backend，不经 Socket.IO。
 
 ### 为什么 JSON 文件而不是数据库
 

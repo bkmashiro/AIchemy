@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { capacityTargets, createCapacityRouter } from "../api/capacity";
+import { capacityTargets, cancelManagedSlurmAllocation, collectManagedSlurmJobs, createCapacityRouter, reconcileManagedSlurmSnapshot, startManagedSlurmReconciler } from "../api/capacity";
 import { store } from "../store";
 import type { DeployFileConfig, DeployResult } from "../types";
 import type { CampaignDriver } from "../campaigns/reconciler";
@@ -25,7 +25,7 @@ const config: DeployFileConfig = {
     qos: "normal",
     tags: "a16,slurm",
     enabled: true,
-    controller_capability: "slurm",
+    backend_capability: "slurm",
   }],
 };
 
@@ -51,6 +51,7 @@ describe("capacity target catalog and allocation submission", () => {
       partition: "gpu-small",
       gres: "gpu:nvidia_a16:1",
       enabled: true,
+      backend_capability: "slurm",
     })]);
   });
 
@@ -98,6 +99,262 @@ describe("capacity target catalog and allocation submission", () => {
     expect(store.getSlurmAllocations()).toHaveLength(1);
   });
 
+  it("retries legacy Controller-verified failed allocations through the SSH backend", async () => {
+    const existing = store.createSlurmAllocation({
+      idempotency_key: "legacy-controller-retry", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "legacy-controller-retry", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "failed", error: "controller_verified_absent",
+    });
+    const submit = vi.fn(async (): Promise<DeployResult> => ({ ok: true, target: "slurm-a16", job_id: "4242" }));
+    const app = express(); app.use(express.json());
+    app.use("/api/capacity", createCapacityRouter(config, { submit }));
+
+    const response = await request(app).post("/api/capacity/allocations/submit").send({
+      target: "slurm-a16",
+      idempotency_key: existing.idempotency_key,
+      job_name: existing.job_name,
+      server_url: "https://example.invalid",
+      token: "test-token",
+      owner: "tester",
+    }).expect(201);
+
+    expect(response.body.allocation).toMatchObject({ id: existing.id, state: "submitted", job_id: "4242" });
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
+  it("marks a managed queue snapshot incomplete when any unique SSH backend fails", async () => {
+    const multiTargetConfig: DeployFileConfig = {
+      ...config,
+      stubs: [
+        config.stubs[0],
+        { ...config.stubs[0], name: "slurm-a30", ssh_host: "gpucluster4" },
+      ],
+    };
+    const list = vi.fn(async (target: DeployFileConfig["stubs"][number]) => {
+      if (target.name === "slurm-a30") throw new Error("ssh unavailable");
+      return [{ job_id: "4242", state: "RUNNING", partition: "gpgpu", name: "managed" }];
+    });
+
+    const snapshot = await collectManagedSlurmJobs(multiTargetConfig, list);
+
+    expect(snapshot).toEqual({
+      endpoints: [
+        {
+          target_ids: ["slurm-a16"],
+          jobs: [{ job_id: "4242", state: "RUNNING", partition: "gpgpu", name: "managed" }],
+          complete: true,
+        },
+        { target_ids: ["slurm-a30"], jobs: [], complete: false },
+      ],
+      jobs: [{ job_id: "4242", state: "RUNNING", partition: "gpgpu", name: "managed" }],
+      complete: false,
+      failed_targets: ["slurm-a30"],
+    });
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
+  it("scopes identical SLURM job IDs to their managed SSH endpoint", async () => {
+    const scopedConfig: DeployFileConfig = {
+      ...config,
+      stubs: [
+        config.stubs[0],
+        { ...config.stubs[0], name: "slurm-a30", ssh_host: "gpucluster4" },
+      ],
+    };
+    const first = store.createSlurmAllocation({
+      idempotency_key: "scope-a16", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "scope-a16", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "submitted", job_id: "4242",
+    });
+
+    store.setStub({
+      id: "stub-a30-4242", name: "gpu-a30-4242", hostname: "gpu-a30", gpu: { name: "A30", count: 1, memory_total_mb: 24576 },
+      slurm_job_id: "4242", tags: ["alchemy-target=slurm-a30"], status: "online", type: "slurm",
+      connected_at: new Date().toISOString(), last_heartbeat: new Date().toISOString(), max_concurrent: 1, tasks: [],
+    } as any);
+
+    await reconcileManagedSlurmSnapshot(scopedConfig, async (target) => [{
+      job_id: "4242",
+      state: target.name === "slurm-a16" ? "RUNNING" : "PENDING",
+      partition: "gpgpu",
+      name: target.name,
+    }]);
+
+    expect(store.getSlurmAllocation(first.id)?.state).toBe("running");
+    expect(store.getSlurmAllocation(first.id)?.stub_id).toBeUndefined();
+    expect(store.getStub("stub-a30-4242")?.status).toBe("online");
+    expect(store.getStub("stub-a30-4242")?.slurm_allocation_id).toBeUndefined();
+  });
+
+  it("does not release allocations for unqueryable targets", async () => {
+    const scopedConfig: DeployFileConfig = {
+      ...config,
+      stubs: [
+        config.stubs[0],
+        { ...config.stubs[0], name: "slurm-unqueryable", ssh_host: undefined },
+      ],
+    };
+    const enabled = store.createSlurmAllocation({
+      idempotency_key: "enabled-target", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "enabled-target", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4242",
+    });
+    const unqueryable = store.createSlurmAllocation({
+      idempotency_key: "unqueryable-target", managed_target_id: "slurm-unqueryable", requested_resources: {},
+      job_name: "unqueryable-target", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4343",
+    });
+    const list = vi.fn(async () => []);
+
+    const result = await reconcileManagedSlurmSnapshot(scopedConfig, list);
+
+    expect(store.getSlurmAllocation(enabled.id)?.state).toBe("released");
+    expect(store.getSlurmAllocation(unqueryable.id)?.state).toBe("running");
+    expect(result.snapshot.failed_targets).toContain("slurm-unqueryable");
+    expect(list).toHaveBeenCalledOnce();
+  });
+
+  it("continues observing disabled targets with configured SSH", async () => {
+    const disabledConfig: DeployFileConfig = {
+      ...config,
+      stubs: [{ ...config.stubs[0], name: "slurm-disabled", ssh_host: "gpucluster4", enabled: false }],
+    };
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "disabled-target", managed_target_id: "slurm-disabled", requested_resources: {},
+      job_name: "disabled-target", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "submitted", job_id: "4343",
+    });
+    const list = vi.fn(async () => [{
+      job_id: "4343", state: "RUNNING", partition: "gpgpu", name: "disabled-target",
+    }]);
+
+    const result = await reconcileManagedSlurmSnapshot(disabledConfig, list);
+
+    expect(store.getSlurmAllocation(allocation.id)?.state).toBe("running");
+    expect(result.snapshot.complete).toBe(true);
+    expect(list).toHaveBeenCalledOnce();
+  });
+
+  it("does not overlap managed SSH reconciliation ticks", async () => {
+    vi.useFakeTimers();
+    let resolveFirst: ((jobs: []) => void) | undefined;
+    const list = vi.fn(() => new Promise<[]>(resolve => { resolveFirst = resolve; }));
+    const stop = startManagedSlurmReconciler(config, 10, () => undefined, list);
+
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      expect(list).toHaveBeenCalledOnce();
+
+      resolveFirst?.([]);
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(list).toHaveBeenCalledTimes(2);
+    } finally {
+      stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not release an absent allocation when the managed SSH snapshot fails", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "snapshot-failure", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "snapshot-failure", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4242",
+    });
+
+    const result = await reconcileManagedSlurmSnapshot(config, async () => {
+      throw new Error("ssh unavailable");
+    });
+
+    expect(result.snapshot.complete).toBe(false);
+    expect(store.getSlurmAllocation(allocation.id)?.state).toBe("running");
+  });
+
+  it("routes managed cancellation through the configured target SSH backend", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "managed-ssh-cancel", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "managed-ssh-cancel", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4242",
+    });
+    const stop = vi.fn(async () => ({ ok: true, target: "slurm-a16", job_id: "4242" }));
+
+    const result = await cancelManagedSlurmAllocation(config, allocation, stop);
+
+    expect(result).toEqual({ ok: true });
+    expect(stop).toHaveBeenCalledWith(config.stubs[0], config.ssh?.key_path, "4242");
+  });
+
+  it("rejects non-numeric job IDs before invoking the managed SSH backend", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "unsafe-job-id", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "unsafe-job-id", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4242; touch /tmp/pwned",
+    });
+    const stop = vi.fn();
+
+    const result = await cancelManagedSlurmAllocation(config, allocation, stop);
+
+    expect(result).toEqual({ ok: false, error: "Invalid SLURM job ID" });
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("does not reinterpret a persisted target ID through another target alias", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "retired-target", managed_target_id: "retired-target", requested_resources: {},
+      job_name: "retired-target", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4242",
+    });
+    const replacementConfig: DeployFileConfig = {
+      ...config,
+      stubs: [{ ...config.stubs[0], name: "replacement-target", aliases: ["retired-target"] }],
+    };
+    const stop = vi.fn();
+
+    const result = await cancelManagedSlurmAllocation(replacementConfig, allocation, stop);
+
+    expect(result).toEqual({ ok: false, error: "Managed SLURM target unavailable" });
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("rejects managed cancellation when the canonical target is unavailable", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "missing-target", managed_target_id: "missing-target", requested_resources: {},
+      job_name: "missing-target", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "job-missing-target",
+    });
+    const stop = vi.fn();
+
+    const result = await cancelManagedSlurmAllocation(config, allocation, stop);
+
+    expect(result).toEqual({ ok: false, error: "Managed SLURM target unavailable" });
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("rejects an ambiguous job-ID cancellation reference across targets", async () => {
+    const first = store.createSlurmAllocation({
+      idempotency_key: "cancel-collision-a", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "cancel-collision-a", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "4242",
+    });
+    const second = { ...first, id: "cancel-collision-b", idempotency_key: "cancel-collision-b", managed_target_id: "slurm-a30" };
+    const allocations = vi.spyOn(store, "getSlurmAllocations").mockReturnValue([first, second]);
+    const cancel = vi.fn(async () => ({ ok: true }));
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, {
+      cancel,
+      prepareRelease: vi.fn(async () => undefined),
+    }));
+
+    try {
+      const response = await request(app).post("/capacity/allocations/cancel")
+        .send({ allocations: ["4242"], apply: true }).expect(409);
+      expect(response.body.error).toBe("Ambiguous allocation reference");
+      expect(cancel).not.toHaveBeenCalled();
+    } finally {
+      allocations.mockRestore();
+    }
+  });
+
   it("bulk cancellation is dry-run by default and excludes manual or pinned jobs", async () => {
     const cancel = vi.fn(async () => ({ ok: true }));
     const prepareRelease = vi.fn(async () => undefined);
@@ -120,17 +377,17 @@ describe("capacity target catalog and allocation submission", () => {
     const applied = await request(app).post("/capacity/allocations/cancel")
       .send({ allocations: ["job-managed"], apply: true }).expect(200);
     expect(applied.body.cancelled).toHaveLength(1);
-    expect(cancel).toHaveBeenCalledWith("job-managed");
+    expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ job_id: "job-managed", managed_target_id: "slurm-a16" }));
   });
 
   it("returns 503 without releasing an allocation when the cancellation backend rejects", async () => {
     const allocation = store.createSlurmAllocation({
-      idempotency_key: "controller-offline", managed_target_id: "slurm-a16", requested_resources: {},
-      job_name: "controller-offline", owner: "tester", managed_by: "alchemy", pinned: false,
-      state: "running", job_id: "job-controller-offline",
+      idempotency_key: "backend-offline", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "backend-offline", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "job-backend-offline",
     });
     const cancel = vi.fn(async () => {
-      throw new Error("Controller not connected");
+      throw new Error("SSH backend unavailable");
     });
     const app = express(); app.use(express.json());
     app.use("/capacity", createCapacityRouter(config, {
@@ -147,7 +404,7 @@ describe("capacity target catalog and allocation submission", () => {
       cancelled: [],
       skipped: [{ id: allocation.id, reason: "cancel_backend_unavailable" }],
     }));
-    expect(JSON.stringify(response.body)).not.toContain("Controller not connected");
+    expect(JSON.stringify(response.body)).not.toContain("SSH backend unavailable");
     expect(store.getSlurmAllocation(allocation.id)?.state).toBe("running");
   });
 
@@ -547,11 +804,11 @@ describe("capacity target catalog and allocation submission", () => {
     expect(campaignDriver.acquire).toHaveBeenCalledOnce();
   });
 
-  it("reconciles persisted allocation state from a complete SLURM snapshot", async () => {
+  it("rejects client-supplied global SLURM snapshots", async () => {
     const app = express(); app.use(express.json());
     app.use("/capacity", createCapacityRouter(config));
-    store.createSlurmAllocation({
-      idempotency_key: "reconcile-card-1",
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "client-reconcile-rejected",
       campaign_id: "campaign-9001",
       capacity_lease_id: "lease-9001",
       managed_target_id: "slurm-a16",
@@ -560,27 +817,12 @@ describe("capacity target catalog and allocation submission", () => {
       owner: "tester",
       managed_by: "alchemy",
       pinned: false,
-      state: "submitted",
+      state: "running",
       job_id: "9001",
     });
 
-    store.setStub({
-      id: "stub-9001", name: "gpu-9001", hostname: "gpu", gpu: { name: "A16", count: 1, memory_total_mb: 16384 },
-      slurm_job_id: "9001", slurm_allocation_id: store.getSlurmAllocations()[0].id,
-      capacity_lease_id: "lease-9001", campaign_id: "campaign-9001", status: "online", type: "slurm",
-      connected_at: new Date().toISOString(), last_heartbeat: new Date().toISOString(), max_concurrent: 1, tasks: [],
-    } as any);
+    await request(app).post("/capacity/reconcile").send({ complete: true, jobs: [] }).expect(404);
 
-    const pending = await request(app).post("/capacity/reconcile").send({
-      complete: true,
-      jobs: [{ job_id: "9001", state: "PENDING", partition: "gpu-small" }],
-    });
-    expect(pending.status).toBe(200);
-    expect(pending.body.reconciled[0].state).toBe("pending");
-
-    const ended = await request(app).post("/capacity/reconcile").send({ complete: true, jobs: [] });
-    expect(ended.body.reconciled[0].state).toBe("released");
-    expect(store.getStub("stub-9001")).toMatchObject({ released: true, status: "offline", max_concurrent: 0 });
-    expect(store.getStub("stub-9001")?.capacity_lease_id).toBeUndefined();
+    expect(store.getSlurmAllocation(allocation.id)?.state).toBe("running");
   });
 });

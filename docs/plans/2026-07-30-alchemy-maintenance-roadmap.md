@@ -6,7 +6,7 @@
 
 **Architecture:** Keep Alchemy's task scheduler canonical. Separate three concerns: task admission and priority, capacity planning and Slurm allocation, and campaign orchestration. Persist logical allocation/lease identities before a stub is online so tasks and campaigns never depend on a transient stub ID. Keep deploy/restart and production rollout separate from development.
 
-**Tech stack:** Node.js/TypeScript + Express + Socket.IO + SQLite/Drizzle, Python controller and SDK/CLI, React/Vite.
+**Tech stack:** Node.js/TypeScript + Express + Socket.IO + SQLite/Drizzle, Python SDK/CLI, React/Vite, and Server-owned SSH Slurm operations.
 
 **Implementation status (2026-07-30):**
 
@@ -15,7 +15,7 @@
 - [x] Retained Stream K — persisted TTL-bounded, non-preemptive effective priority with explicit expedite/unexpedite APIs.
 - [x] Retained Stream L — native SDK experiment wait with explicit successful terminal-status contract.
 - [x] Milestone 1 — configuration-driven GPU target catalog, durable idempotent allocation records, custom job names, and canonical managed submission path.
-- [x] Milestone 2 — controller snapshots automatically reconcile allocation state and exact `job_id -> stub_id` binding.
+- [x] Milestone 2 — managed SSH snapshots automatically reconcile allocation state and exact `job_id -> stub_id` binding.
 - [x] Milestone 3 — recommend-only planner preserves explicit partition/QOS/GPU constraints and explains observed ranking.
 - [~] Milestone 4 — logical routing plus a restart-safe, serial campaign reconciler now cover the full bounded lifecycle with stable per-step side-effect keys (including ambiguous-timeout retries), canonical campaign/lease/target ownership checks, SDK-to-task lease propagation, bounded retries/runtime, release/closeout proof, and persisted/retryable unresolved cleanup obligations; concrete production smoke/DAG/acquire/release adapters remain intentionally unwired.
 - [x] Milestone 5 — target/allocation/campaign CLI controls and managed-only, pinned-safe bulk cancellation with default dry-run.
@@ -33,7 +33,7 @@
 - Campaigns are bounded, persisted state machines. They may perform only declared transitions: acquire capacity, wait, run a managed smoke, submit a frozen DAG, wait, drain, release, and close out.
 - No destructive preemption in this roadmap. Never kill unrelated running work to satisfy a new campaign.
 - Automatic planning starts in recommend-only mode. Real `sbatch/scancel` requires explicit policy enablement and audited ownership.
-- Development tests use temporary state and mocked Slurm/controller responses. Do not request production APIs, submit Slurm jobs, deploy, restart, or touch live tasks while implementing.
+- Development tests use temporary state and mocked managed SSH/Slurm responses. Do not request production APIs, submit Slurm jobs, deploy, restart, or touch live tasks while implementing.
 
 ## 2. Verified current gaps
 
@@ -48,7 +48,7 @@
 ### Managed Slurm capacity
 
 - `alch slurm submit` and `stubs canary` hard-code A30/A40/T4 choices in `sdk/alchemy_sdk/cli/main.py`; A16 cannot be selected even when deploy/cluster configuration supports it.
-- `server/src/deploy.ts` hard-codes generated job names as `train_stub_<target>`; the controller path hard-codes `train_ct`.
+- The former duplicate Slurm submission paths used inconsistent hard-coded job names; the Server-owned backend now provides one canonical path.
 - Capacity selection is manual. Alchemy does not compare compatible A16/A30/A40/T4 options using ready queue demand, task priority/resources, QOS limits, partition pressure, or already-pending allocations.
 - Slurm submission generally returns only a job ID. Queue reason, predicted start, pending age, partition pressure, and allocation-to-stub binding are not first-class records.
 - A task can target a current `stub_id`, but cannot target a pending allocation/lease before the stub registers.
@@ -78,7 +78,7 @@ Milestone 0 is independent and should land first because current collection endp
 
 - **Stream K:** expedite changes pending order only, is TTL/audit bounded, triggers scheduling, and never bypasses resource/QOS compatibility. Capacity planning reads `effective_priority`; it does not create a second priority field.
 - **Stream L:** campaign `wait` and closeout consume canonical replacement refs, artifact validation status, protocol status, and one experiment-level completion result. A process exit code alone cannot advance a campaign to scientific completion.
-- **Stream M1/M2:** `alch doctor` includes target/controller/allocation capability without secrets; frozen campaign manifests bind an immutable runtime/protocol identity.
+- **Stream M1/M2:** `alch doctor` includes target/backend/allocation capability without secrets; frozen campaign manifests bind an immutable runtime/protocol identity.
 
 ---
 
@@ -250,7 +250,7 @@ Remove argparse `choices` as the source of truth. Expose configured managed targ
 GET /api/capacity/targets
 ```
 
-Each target includes stable ID, aliases, partition, GRES, GPU model/class, VRAM, default QOS/memory/walltime, tags, enabled state, and controller capability. Add `slurm-a16` to deploy configuration with values verified from cluster config; never guess partition/GRES/QOS.
+Each target includes stable ID, aliases, partition, GRES, GPU model/class, VRAM, default QOS/memory/walltime, tags, enabled state, and backend capability. Add `slurm-a16` to deploy configuration with values verified from cluster config; never guess partition/GRES/QOS.
 
 ### 1.2 Persist allocations before stub registration
 
@@ -275,11 +275,11 @@ last_observed_at
 error
 ```
 
-Idempotency keys must prevent duplicate allocations after client/controller timeouts.
+Idempotency keys must prevent duplicate allocations after client or managed SSH backend timeouts.
 
 ### 1.3 One canonical submission path
 
-Converge `server/src/deploy.ts` and controller `slurm.submit` around one typed request/response contract. Both paths must support `job_name`, ownership, campaign/lease IDs, and structured status. Do not leave separate hard-coded `train_stub_*` and `train_ct` semantics.
+Use `server/src/deploy.ts` as the single typed Slurm request/response implementation. Submission, cancellation, and queue snapshots all resolve the canonical managed target and use its configured SSH endpoint.
 
 **Files:**
 - Modify: `deploy-config.yaml`
@@ -289,10 +289,9 @@ Converge `server/src/deploy.ts` and controller `slurm.submit` around one typed r
 - Modify: `server/src/deploy.ts`
 - Modify: `server/src/api/deploy.ts`
 - Create: `server/src/api/capacity.ts`
-- Modify: `controller/alchemy_controller/daemon.py`
 - Modify: `sdk/alchemy_sdk/cli/main.py`
 - Test: `server/src/__tests__/deploy.test.ts`
-- Create: controller tests for target parsing/submission contract
+- Test: managed SSH submission/cancellation/snapshot parsing
 - Test: `sdk/tests/test_cli.py`
 
 **Acceptance gates:**
@@ -309,7 +308,7 @@ Converge `server/src/deploy.ts` and controller `slurm.submit` around one typed r
 
 **User value:** Operators can see why a job is queued, when it may start, partition pressure, and which stub eventually belongs to it without manual SSH.
 
-### 2.1 Enrich controller snapshots
+### 2.1 Enrich managed Slurm snapshots
 
 Collect structured data from `squeue`, `squeue --start` where supported, and `sinfo`:
 
@@ -323,7 +322,7 @@ Partition summaries expose total/idle/allocated/drained nodes and GPUs, pending 
 
 ### 2.2 Persist and reconcile observations
 
-The server reconciles controller snapshots into `slurm_allocations`. Missing jobs require explicit reconciliation states rather than immediately assuming release. Preserve the timeout/late-side-effect grace window.
+The server reconciles managed SSH snapshots into `slurm_allocations`. Missing jobs require explicit reconciliation states rather than immediately assuming release. Preserve the timeout/late-side-effect grace window.
 
 ### 2.3 Bind job to stub
 
@@ -347,22 +346,19 @@ GET /api/capacity/allocations/:id/diagnosis
 `diagnosis` reports queue reason, pending age, predicted start if available, partition/QOS pressure, and suggested operator action.
 
 **Files:**
-- Modify: `controller/alchemy_controller/daemon.py`
-- Modify: `server/src/socket/controller.ts`
 - Modify: `server/src/socket/stub.ts`
-- Modify: `server/src/api/cluster.ts`
 - Modify: `server/src/api/capacity.ts`
 - Modify: `server/src/store/index.ts`
-- Test: controller parser/reconciliation tests
+- Test: managed SSH snapshot/reconciliation tests
 - Test: `server/src/__tests__/stub-identity.test.ts`
-- Create: `server/src/__tests__/capacity-controller.test.ts`
+- Test: `server/src/__tests__/capacity.test.ts`
 
 **Acceptance gates:**
 
 - A pending job displays the real Slurm reason and pending age.
 - Predicted start is clearly nullable and source-labelled.
 - Stub registration binds the exact `slurm_job_id` to one allocation.
-- Controller disconnect marks observations stale without deleting allocations.
+- Managed SSH snapshot failure marks the observation incomplete without deleting allocations.
 - No status endpoint performs SSH directly from the Web request path.
 
 ---
@@ -406,7 +402,7 @@ GET  /api/capacity/plan
 POST /api/capacity/reconcile?mode=recommend
 ```
 
-Persist plan snapshots and reasons. Run simulation against fixtures and read-only captured controller snapshots before enabling mutation.
+Persist plan snapshots and reasons. Run simulation against fixtures and read-only captured managed Slurm snapshots before enabling mutation.
 
 ### 3.4 Policy model
 
@@ -431,7 +427,7 @@ Caps count online, pending, manual, campaign-owned, and autoscaler-owned allocat
 - Modify: `server/src/capacity/` from Stream J if present
 - Modify: `server/src/scheduler.ts` only to reuse canonical compatibility/admission functions
 - Modify: `server/src/api/capacity.ts`
-- Test: `server/src/__tests__/capacity-controller.test.ts`
+- Test: `server/src/__tests__/capacity.test.ts`
 - Test: `server/tests/scheduler.test.ts`
 
 **Acceptance gates:**
@@ -499,7 +495,7 @@ A queued campaign stores a frozen submission manifest or an immutable code/proto
 
 ### 4.4 Recovery
 
-Campaign reconciliation survives server/controller reconnects and client exit. It recovers late-created allocations, canonical task IDs, drain state, and cleanup obligations without duplicate jobs or experiments.
+Campaign reconciliation survives server restarts, managed SSH backend outages, and client exit. It recovers late-created allocations, canonical task IDs, drain state, and cleanup obligations without duplicate jobs or experiments.
 
 ### 4.5 API
 
@@ -625,7 +621,7 @@ Use the non-overlapping polling contract from Milestone 0.
 - UI clearly distinguishes Slurm pending, job running, stub online, task assigned, and campaign complete.
 - Queue reason and snapshot age are visible.
 - No action button silently cancels unrelated jobs.
-- Slow controller/API responses cannot overlap polling.
+- Slow managed SSH/API responses cannot overlap polling.
 
 ---
 
@@ -681,11 +677,10 @@ Run focused gates after every slice and full gates before merging:
 cd server && npm run build
 cd server && npm test -- --run
 cd sdk && uv run pytest
-cd controller && uv run pytest
 cd web && npm test -- --run
 ```
 
-Add fixture-based scale tests for 1,200 experiments / 5,500 tasks and parser fixtures for realistic `sinfo`, `squeue`, `squeue --start`, QOS-cap, Resources, Priority, drained-node, stale-controller, and unknown-ETA outputs.
+Add fixture-based scale tests for 1,200 experiments / 5,500 tasks and parser fixtures for realistic `sinfo`, `squeue`, `squeue --start`, QOS-cap, Resources, Priority, drained-node, stale-snapshot, and unknown-ETA outputs.
 
 Production deployment is not part of roadmap implementation. After merge, deployment requires a separate authorization, an active-task/stub safety check, and a small gated smoke.
 
@@ -704,5 +699,5 @@ Production deployment is not part of roadmap implementation. After merge, deploy
 ## 7. Copy-paste `/goal` handoff
 
 ```text
-/goal Continue Alchemy v2 maintenance from /Users/yuzhe/projects/alchemy-v2/docs/plans/2026-07-30-alchemy-maintenance-roadmap.md. Read ROADMAP_V2.2.md and CLAUDE.md first, inspect git status and current tests, then implement the first unfinished acceptance gate in priority order with RED-GREEN-REFACTOR and small signed commits. Keep task scheduling, capacity planning, and campaign orchestration separate. Use isolated state and mocked controller/Slurm fixtures; do not request production APIs, submit jobs, deploy, restart, or touch live tasks. If code evidence invalidates the roadmap, patch and commit the roadmap before continuing.
+/goal Continue Alchemy v2 maintenance from /Users/yuzhe/projects/alchemy-v2/docs/plans/2026-07-30-alchemy-maintenance-roadmap.md. Read ROADMAP_V2.2.md and CLAUDE.md first, inspect git status and current tests, then implement the first unfinished acceptance gate in priority order with RED-GREEN-REFACTOR and small signed commits. Keep task scheduling, capacity planning, and campaign orchestration separate. Use isolated state and mocked managed SSH/Slurm fixtures; do not request production APIs, submit jobs, deploy, restart, or touch live tasks. If code evidence invalidates the roadmap, patch and commit the roadmap before continuing.
 ```

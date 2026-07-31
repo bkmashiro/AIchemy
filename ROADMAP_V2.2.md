@@ -444,7 +444,7 @@ Store peak usage by task fingerprint. A future submission may use a conservative
 
 **User problem:** Agents manually add and release cards. Independent 600-second stub idle timers may release several cards together and do not understand server-side ready work. Manual scripts and an autoscaler could fight.
 
-**Current behavior:** Slurm stubs default to `idle_timeout=600`; the stub checks every 30 seconds and self-cancels when it has no local running process. This remains a safety fallback, not the desired pool controller.
+**Current behavior:** Slurm stubs default to `idle_timeout=600`; the stub checks every 30 seconds and self-cancels when it has no local running process. This remains a safety fallback, not the desired server-owned capacity manager.
 
 **Files:**
 - Create: `server/src/capacity/`
@@ -454,7 +454,7 @@ Store peak usage by task fingerprint. A future submission may use a conservative
 - Modify: `server/src/index.ts`
 - Modify: `sdk/alchemy_sdk/cli/main.py`
 - Modify: `web/src/` capacity page
-- Test: `server/src/__tests__/capacity-controller.test.ts`
+- Test: `server/src/__tests__/capacity.test.ts`
 
 ### J1. Ownership and leases
 
@@ -492,7 +492,7 @@ scale_down_cooldown_s: 300
 recent_activity_warm_window_s: 1800
 ```
 
-`max_total_a30=3` counts manual, autoscaler-owned, online, and Slurm-pending A30 jobs. This prevents QOS spam and script/controller races.
+`max_total_a30=3` counts manual, autoscaler-owned, online, and Slurm-pending A30 jobs. This prevents QOS spam and competing submission paths.
 
 ### J3. Demand model
 
@@ -513,7 +513,7 @@ reconcile again
 
 Do not let all stubs independently disappear together. If the queue was active in the previous 30 minutes, optionally retain one warm card. A later burst creates a new Slurm job; a cancelled job cannot be resurrected.
 
-Keep stub-local `idle_timeout` as a longer fail-safe once the controller is authoritative, or make it lease-aware so targeted pending work prevents self-cancellation.
+Keep stub-local `idle_timeout` as a longer fail-safe once the server-owned capacity manager is authoritative, or make it lease-aware so targeted pending work prevents self-cancellation.
 
 ### J5. APIs and rollout
 

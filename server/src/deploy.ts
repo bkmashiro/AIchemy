@@ -16,7 +16,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { readFileSync, existsSync } from "fs";
 import { logger } from "./log";
-import { DeployFileConfig, StubTarget, DeployResult } from "./types";
+import { DeployFileConfig, StubTarget, DeployResult, MANAGED_TARGET_TAG_PREFIX } from "./types";
 import { buildSshCmd, sshExec } from "./ssh";
 
 const execAsync = promisify(exec);
@@ -182,11 +182,15 @@ export function buildSlurmStubScript(target: StubTarget, serverUrl: string, toke
   const idleTimeout = overrides?.idle_timeout ?? target.idle_timeout;
   const defaultOutputDir = overrides?.default_output_dir ?? target.default_output_dir;
   const continuation = " " + "\\";
+  const managedTags = [...new Set([
+    `${MANAGED_TARGET_TAG_PREFIX}${target.name}`,
+    ...(target.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean),
+  ])].join(",");
   const args = [
     `--server ${JSON.stringify(serverUrl)}`,
     `--token ${JSON.stringify(token)}`,
     `--max-concurrent ${target.max_concurrent}`,
-    ...(target.tags ? [`--tags ${JSON.stringify(target.tags)}`] : []),
+    `--tags ${JSON.stringify(managedTags)}`,
     ...(target.default_cwd ? [`--default-cwd ${JSON.stringify(target.default_cwd)}`] : []),
     ...(defaultOutputDir ? [`--default-output-dir ${JSON.stringify(defaultOutputDir)}`] : []),
     ...(target.env_setup ? [`--env-setup ${JSON.stringify(target.env_setup)}`] : []),
@@ -258,6 +262,40 @@ async function getSlurmJobStatus(
     logger.warn("deploy.slurm_status_failed", { target: target.name, error: String(err) });
     return { running: false };
   }
+}
+
+export interface SlurmJobSnapshot {
+  job_id: string;
+  state: string;
+  partition: string;
+  name: string;
+  reason?: string;
+  predicted_start_at?: string;
+}
+
+/** Fetch a complete queue snapshot from the target's configured SLURM login node. */
+export async function listSlurmJobs(
+  target: StubTarget,
+  sshKeyPath?: string,
+  runSsh: typeof sshExec = sshExec,
+): Promise<SlurmJobSnapshot[]> {
+  const out = await runSsh(
+    target.ssh_host ?? "",
+    target.ssh_user,
+    'squeue -h -o "%i|%T|%P|%j|%R|%S"',
+    { keyPath: sshKeyPath, timeout: 15_000 },
+  );
+  return out.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
+    const [job_id, state, partition, name, reason, predicted] = line.split("|");
+    return {
+      job_id,
+      state,
+      partition,
+      name,
+      ...(reason && reason !== "N/A" ? { reason } : {}),
+      ...(predicted && predicted !== "N/A" && predicted !== "Unknown" ? { predicted_start_at: predicted } : {}),
+    };
+  }).filter((job) => /^\d+$/.test(job.job_id));
 }
 
 /** Cancel a SLURM job. */

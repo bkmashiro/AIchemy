@@ -19,7 +19,7 @@ import {
   TaskCompletedPayload, TaskFailedPayload,
   TaskConfigPayload, TaskCheckpointPayload, PreflightFailPayload,
   TaskResourcePayload, TaskMetricsPayload, TaskPhasePayload,
-  DeployFileConfig,
+  DeployFileConfig, managedTargetIdsFromTags,
 } from "../types";
 import { maybeDispatch, triggerSchedule, buildRunPayload, computeRunDir, isCheckpointProtected } from "../scheduler";
 import { promoteBlockedTasks, cascadeCancellation } from "../dag";
@@ -109,10 +109,27 @@ function generateStubName(hostname: string, gpuName: string, slurmJobId?: string
 
 export function bindStubCapacityOwnership(stub: Stub): boolean {
   if (!stub.slurm_job_id) return true;
-  const matches = store.getSlurmAllocations().filter((allocation) => allocation.job_id === stub.slurm_job_id);
+  const reportedTargets = managedTargetIdsFromTags(stub.tags);
+  const jobMatches = store.getSlurmAllocations().filter((allocation) => allocation.job_id === stub.slurm_job_id);
+  const boundMatches = jobMatches.filter((allocation) =>
+    stub.slurm_allocation_id === allocation.id || allocation.stub_id === stub.id);
+  const targetMatches = jobMatches.filter((allocation) => reportedTargets.includes(allocation.managed_target_id));
+  const matches = boundMatches.length > 0
+    ? boundMatches
+    : reportedTargets.length > 0 ? targetMatches : jobMatches;
   if (matches.length > 1) throw new Error(`Ambiguous allocation binding for SLURM job ${stub.slurm_job_id}`);
   const allocation = matches[0];
-  if (!allocation) return true;
+  if (!allocation) {
+    if (jobMatches.length > 0 && reportedTargets.length > 0) {
+      logger.warn("capacity.stub_target_mismatch", {
+        stub_id: stub.id,
+        job_id: stub.slurm_job_id,
+        reported_targets: reportedTargets,
+        allocation_targets: [...new Set(jobMatches.map((candidate) => candidate.managed_target_id))],
+      });
+    }
+    return true;
+  }
   if (["released", "failed"].includes(allocation.state)) {
     stub.released = true;
     stub.status = "offline";

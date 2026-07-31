@@ -1,7 +1,8 @@
 import { Router, Request, Response } from "express";
 import { createHash, randomUUID } from "crypto";
-import { deployStub, type SlurmSubmitOptions } from "../deploy";
+import { deployStub, listSlurmJobs, stopStub, type SlurmJobSnapshot, type SlurmSubmitOptions } from "../deploy";
 import { store } from "../store";
+import { managedTargetIdsFromTags } from "../types";
 import type { CapacityTarget, DeployFileConfig, DeployResult, SlurmAllocation, StubTarget } from "../types";
 import { frozenCampaignManifestHash, parseFrozenCampaignManifest } from "../campaigns/manifest";
 import { reconcileCampaign, type CampaignDriver } from "../campaigns/reconciler";
@@ -20,7 +21,7 @@ export type CapacitySubmitter = (
   stubLocalPath?: string,
   overrides?: SlurmSubmitOptions,
 ) => Promise<DeployResult>;
-export type CapacityCanceller = (jobId: string) => Promise<{ ok: boolean; error?: string }>;
+export type CapacityCanceller = (allocation: SlurmAllocation) => Promise<{ ok: boolean; error?: string }>;
 
 export function sanitizeSlurmJobName(value: string): string {
   const normalized = value.trim().toLowerCase()
@@ -45,14 +46,91 @@ export function capacityTargets(config: DeployFileConfig | null): CapacityTarget
     default_walltime: target.time,
     tags: (target.tags ?? "").split(",").map((tag) => tag.trim()).filter(Boolean),
     enabled: target.enabled !== false,
-    controller_capability: target.controller_capability ?? "slurm",
+    backend_capability: target.backend_capability ?? target.controller_capability ?? "slurm",
   }));
 }
 
 function findTarget(config: DeployFileConfig | null, ref: string): StubTarget | undefined {
   return config?.stubs.find((target) => target.type === "slurm" && (
-    target.name === ref || (target.aliases ?? [target.name.replace(/^slurm-/, "")]).includes(ref)
+    target.name === ref || (target.aliases ?? []).includes(ref)
   ));
+}
+
+function findExactTarget(config: DeployFileConfig | null, canonicalId: string): StubTarget | undefined {
+  return config?.stubs.find((target) => target.type === "slurm" && target.name === canonicalId);
+}
+
+export interface ManagedSlurmEndpointSnapshot {
+  target_ids: string[];
+  jobs: SlurmJobSnapshot[];
+  complete: boolean;
+}
+
+export interface ManagedSlurmSnapshot {
+  endpoints: ManagedSlurmEndpointSnapshot[];
+  jobs: SlurmJobSnapshot[];
+  complete: boolean;
+  failed_targets: string[];
+}
+
+export async function collectManagedSlurmJobs(
+  config: DeployFileConfig | null,
+  list: (target: StubTarget, sshKeyPath?: string) => Promise<SlurmJobSnapshot[]> = listSlurmJobs,
+): Promise<ManagedSlurmSnapshot> {
+  const endpointTargets = new Map<string, StubTarget[]>();
+  const endpoints: ManagedSlurmEndpointSnapshot[] = [];
+  const failedTargets: string[] = [];
+
+  for (const target of config?.stubs ?? []) {
+    if (target.type !== "slurm") continue;
+    if (!target.ssh_host) {
+      endpoints.push({ target_ids: [target.name], jobs: [], complete: false });
+      failedTargets.push(target.name);
+      continue;
+    }
+    const endpoint = `${target.ssh_user ?? ""}@${target.ssh_host}`;
+    const targets = endpointTargets.get(endpoint) ?? [];
+    targets.push(target);
+    endpointTargets.set(endpoint, targets);
+  }
+  if (endpoints.length === 0 && endpointTargets.size === 0) {
+    return { endpoints: [], jobs: [], complete: false, failed_targets: [] };
+  }
+
+  const results = await Promise.all([...endpointTargets.values()].map(async (targets): Promise<ManagedSlurmEndpointSnapshot> => {
+    try {
+      return {
+        target_ids: targets.map((target) => target.name),
+        jobs: await list(targets[0], config?.ssh?.key_path),
+        complete: true,
+      };
+    } catch {
+      return { target_ids: targets.map((target) => target.name), jobs: [], complete: false };
+    }
+  }));
+  for (const result of results) {
+    if (!result.complete) failedTargets.push(...result.target_ids);
+  }
+  endpoints.push(...results);
+  return {
+    endpoints,
+    jobs: endpoints.flatMap((endpoint) => endpoint.jobs),
+    complete: endpoints.every((endpoint) => endpoint.complete),
+    failed_targets: failedTargets,
+  };
+}
+
+export async function cancelManagedSlurmAllocation(
+  config: DeployFileConfig | null,
+  allocation: SlurmAllocation,
+  stop: typeof stopStub = stopStub,
+): Promise<{ ok: boolean; error?: string }> {
+  const target = findExactTarget(config, allocation.managed_target_id);
+  if (!target) return { ok: false, error: "Managed SLURM target unavailable" };
+  if (!allocation.job_id) return { ok: false, error: "Managed allocation has no job ID" };
+  if (!/^\d+$/.test(allocation.job_id)) return { ok: false, error: "Invalid SLURM job ID" };
+  const result = await stop(target, config?.ssh?.key_path, allocation.job_id);
+  return result.ok ? { ok: true } : { ok: false, error: result.error ?? "Managed SLURM cancellation failed" };
 }
 
 export interface CapacityRecommendation {
@@ -122,11 +200,14 @@ export function recommendCapacity(
 export function reconcileSlurmAllocations(
   jobs: Array<{ job_id?: string; state?: string; partition?: string; name?: string; reason?: string; predicted_start_at?: string; eligible_at?: string }>,
   complete: boolean,
+  managedTargetIds?: ReadonlySet<string>,
 ): { reconciled: Array<ReturnType<typeof store.updateSlurmAllocation>>; observed_jobs: number; observed_at: string } {
   const jobsById = new Map(jobs.filter((job) => job.job_id).map((job) => [String(job.job_id), job]));
   const jobsByName = new Map(jobs.filter((job) => job.name).map((job) => [String(job.name), job]));
   const now = new Date().toISOString();
-  const reconciled = store.getSlurmAllocations().map((allocation) => {
+  const allocations = store.getSlurmAllocations().filter((allocation) =>
+    !managedTargetIds || managedTargetIds.has(allocation.managed_target_id));
+  const reconciled = allocations.map((allocation) => {
     const job = allocation.job_id ? jobsById.get(allocation.job_id) : jobsByName.get(allocation.job_name);
     let state = allocation.state;
     if (job) {
@@ -140,9 +221,18 @@ export function reconcileSlurmAllocations(
       state = "failed";
     }
     const observedJobId = job?.job_id ? String(job.job_id) : allocation.job_id;
-    const stub = observedJobId
-      ? store.getAllStubs().find((candidate) => candidate.slurm_job_id === observedJobId)
-      : undefined;
+    const stubCandidates = observedJobId
+      ? store.getAllStubs().filter((candidate) => candidate.slurm_job_id === observedJobId)
+      : [];
+    const boundStubs = stubCandidates.filter((candidate) =>
+      candidate.id === allocation.stub_id || candidate.slurm_allocation_id === allocation.id);
+    const targetStubs = stubCandidates.filter((candidate) =>
+      managedTargetIdsFromTags(candidate.tags).includes(allocation.managed_target_id));
+    const matchingStubs = boundStubs.length > 0 ? boundStubs : targetStubs;
+    if (matchingStubs.length > 1) {
+      throw new Error(`Ambiguous stub binding for managed allocation ${allocation.id}`);
+    }
+    const stub = matchingStubs[0];
     if (state === "running" && stub?.status === "online") state = "stub_online";
     if (stub && ["released", "failed"].includes(state)) {
       stub.released = true;
@@ -169,10 +259,58 @@ export function reconcileSlurmAllocations(
       predicted_start_at: job?.predicted_start_at ?? allocation.predicted_start_at,
       eligible_at: job?.eligible_at ?? allocation.eligible_at,
       error: !job && complete && !allocation.job_id && ["requested", "failed"].includes(allocation.state)
-        ? "controller_verified_absent" : allocation.error,
+        ? "slurm_snapshot_verified_absent" : allocation.error,
     });
   });
   return { reconciled, observed_jobs: jobs.length, observed_at: now };
+}
+
+export async function reconcileManagedSlurmSnapshot(
+  config: DeployFileConfig | null,
+  list: (target: StubTarget, sshKeyPath?: string) => Promise<SlurmJobSnapshot[]> = listSlurmJobs,
+): Promise<{
+  snapshot: Awaited<ReturnType<typeof collectManagedSlurmJobs>>;
+  reconciliation: ReturnType<typeof reconcileSlurmAllocations>;
+}> {
+  const snapshot = await collectManagedSlurmJobs(config, list);
+  const endpointResults = snapshot.endpoints.map((endpoint) => reconcileSlurmAllocations(
+    endpoint.jobs,
+    endpoint.complete,
+    new Set(endpoint.target_ids),
+  ));
+  return {
+    snapshot,
+    reconciliation: {
+      reconciled: endpointResults.flatMap((result) => result.reconciled),
+      observed_jobs: snapshot.jobs.length,
+      observed_at: new Date().toISOString(),
+    },
+  };
+}
+
+export function startManagedSlurmReconciler(
+  config: DeployFileConfig | null,
+  intervalMs = 30_000,
+  onError: (error: unknown) => void = () => undefined,
+  list: (target: StubTarget, sshKeyPath?: string) => Promise<SlurmJobSnapshot[]> = listSlurmJobs,
+): () => void {
+  let stopped = false;
+  let running = false;
+  const run = async (): Promise<void> => {
+    if (stopped || running) return;
+    running = true;
+    try {
+      await reconcileManagedSlurmSnapshot(config, list);
+    } catch (error) {
+      onError(error);
+    } finally {
+      running = false;
+    }
+  };
+  const timer = setInterval(() => { void run(); }, intervalMs);
+  timer.unref?.();
+  void run();
+  return () => { stopped = true; clearInterval(timer); };
 }
 
 function releaseBlockReason(allocation: SlurmAllocation): string | undefined {
@@ -215,6 +353,7 @@ export function createCapacityRouter(
 ): Router {
   const router = Router();
   const submit = dependencies.submit ?? deployStub;
+  const cancel = dependencies.cancel ?? ((allocation: SlurmAllocation) => cancelManagedSlurmAllocation(config, allocation));
   if (dependencies.automation && store.isCapacityPolicyDisabled(dependencies.automation.policy.pool_id)) {
     dependencies.automation.policy.enabled = false;
     dependencies.automation.policy.mode = "recommend";
@@ -515,18 +654,30 @@ export function createCapacityRouter(
   router.post("/allocations/cancel", async (req: Request, res: Response): Promise<void> => {
     const refs = Array.isArray(req.body?.allocations) ? req.body.allocations.map(String) : [];
     const apply = req.body?.apply === true;
-    const selected = store.getSlurmAllocations().filter((allocation) => refs.length === 0
-      || refs.includes(allocation.id) || (allocation.alias ? refs.includes(allocation.alias) : false)
-      || (allocation.job_id ? refs.includes(allocation.job_id) : false));
+    const allocations = store.getSlurmAllocations();
+    const selectedById = new Map<string, SlurmAllocation>();
+    if (refs.length === 0) {
+      for (const allocation of allocations) selectedById.set(allocation.id, allocation);
+    } else {
+      for (const ref of refs) {
+        const canonicalMatches = allocations.filter((allocation) =>
+          allocation.id === ref || allocation.alias === ref);
+        const matches = canonicalMatches.length > 0
+          ? canonicalMatches
+          : allocations.filter((allocation) => allocation.job_id === ref);
+        if (matches.length > 1) {
+          res.status(409).json({ error: "Ambiguous allocation reference" });
+          return;
+        }
+        if (matches[0]) selectedById.set(matches[0].id, matches[0]);
+      }
+    }
+    const selected = [...selectedById.values()];
     const eligibility = selected.map((allocation) => ({ allocation, reason: releaseBlockReason(allocation) }));
     const eligible = eligibility.filter((item) => !item.reason).map((item) => item.allocation);
     const skipped: Array<{ id: string; reason: string }> = eligibility.filter((item) => item.reason)
       .map((item) => ({ id: item.allocation.id, reason: item.reason! }));
     if (!apply) { res.json({ dry_run: true, eligible, skipped }); return; }
-    if (!dependencies.cancel) {
-      res.status(503).json({ error: "SLURM cancellation backend unavailable", dry_run: false, eligible, skipped });
-      return;
-    }
     if (!dependencies.prepareRelease) {
       res.status(503).json({ error: "Release admission barrier unavailable", dry_run: false, eligible, skipped });
       return;
@@ -549,7 +700,7 @@ export function createCapacityRouter(
       }
       let result: Awaited<ReturnType<CapacityCanceller>>;
       try {
-        result = await dependencies.cancel(current.job_id!);
+        result = await cancel(current);
       } catch {
         const reason = "cancel_backend_unavailable";
         skipped.push({ id: allocation.id, reason });
@@ -580,8 +731,11 @@ export function createCapacityRouter(
       return;
     }
     const existing = store.getSlurmAllocationByIdempotencyKey(idempotencyKey);
-    const controllerVerifiedRetry = existing?.state === "failed" && existing.error === "controller_verified_absent";
-    if (existing && !controllerVerifiedRetry) {
+    const snapshotVerifiedRetry = existing?.state === "failed" && [
+      "slurm_snapshot_verified_absent",
+      "controller_verified_absent", // Legacy state written before the SSH backend migration.
+    ].includes(existing.error ?? "");
+    if (existing && !snapshotVerifiedRetry) {
       res.status(200).json({
         ok: existing.state !== "failed",
         target: existing.managed_target_id,
@@ -655,11 +809,6 @@ export function createCapacityRouter(
       allocation: updated,
       reused: false,
     });
-  });
-
-  router.post("/reconcile", (req: Request, res: Response) => {
-    const jobs = Array.isArray(req.body?.jobs) ? req.body.jobs : [];
-    res.json(reconcileSlurmAllocations(jobs, req.body?.complete === true));
   });
 
   return router;

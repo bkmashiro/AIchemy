@@ -592,6 +592,15 @@ export interface ExecResponsePayload {
 
 // ─── Deployment Types ────────────────────────────────────────────────────────
 
+export const MANAGED_TARGET_TAG_PREFIX = "alchemy-target=";
+
+export function managedTargetIdsFromTags(tags: string[] | undefined): string[] {
+  return (tags ?? [])
+    .filter((tag) => tag.startsWith(MANAGED_TARGET_TAG_PREFIX))
+    .map((tag) => tag.slice(MANAGED_TARGET_TAG_PREFIX.length))
+    .filter(Boolean);
+}
+
 export interface StubTarget {
   name: string;
   aliases?: string[];
@@ -621,6 +630,8 @@ export interface StubTarget {
   gpu_class?: string;
   gpu_mem_mb?: number;
   enabled?: boolean;
+  backend_capability?: string;
+  /** @deprecated Legacy deploy-config key; use backend_capability. */
   controller_capability?: string;
 }
 
@@ -720,7 +731,7 @@ export interface CapacityTarget {
   default_walltime?: string;
   tags: string[];
   enabled: boolean;
-  controller_capability?: string;
+  backend_capability?: string;
 }
 
 export interface TunnelConfig {
