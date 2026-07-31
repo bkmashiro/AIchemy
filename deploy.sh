@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 
 PORT="${ALCHEMY_PORT:-3002}"
-STATE_FILE="${ALCHEMY_STATE:-/workspace/extra/projects/alchemy-v2/state-v2.json}"
+STATE_FILE="${ALCHEMY_STATE:-$(pwd)/state-v2.json}"
 LOG_FILE="/tmp/alchemy-v2-server.log"
 
 echo "==> Stopping old v2 processes..."
@@ -69,7 +69,7 @@ echo "$TUNNEL_STATUS" | grep -q '"running":true' && echo "    ✓ Tunnel  runnin
 echo ""
 echo "    State: $STATE_FILE"
 echo "    Logs:  $LOG_FILE"
-echo "    Token: ${ALCHEMY_TOKEN:-alchemy-v2-token}"
+echo "    Token: [configured]"
 echo "    Config: $(pwd)/deploy-config.yaml"
 echo ""
 echo "Done. Stubs connect to: wss://alchemy-v2.yuzhes.com/stubs"
