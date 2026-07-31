@@ -533,14 +533,29 @@ export function createCapacityRouter(
     }
     const cancelled = [];
     for (const allocation of eligible) {
-      await dependencies.prepareRelease(allocation);
+      try {
+        await dependencies.prepareRelease(allocation);
+      } catch {
+        const reason = "release_admission_unavailable";
+        skipped.push({ id: allocation.id, reason });
+        res.status(503).json({ error: "Release admission barrier unavailable", dry_run: false, cancelled, skipped });
+        return;
+      }
       const current = store.getSlurmAllocation(allocation.id);
       const postBarrierReason = current ? releaseBlockReason(current) : "allocation_missing";
       if (!current || postBarrierReason) {
         skipped.push({ id: allocation.id, reason: postBarrierReason ?? "release_blocked" });
         continue;
       }
-      const result = await dependencies.cancel(current.job_id!);
+      let result: Awaited<ReturnType<CapacityCanceller>>;
+      try {
+        result = await dependencies.cancel(current.job_id!);
+      } catch {
+        const reason = "cancel_backend_unavailable";
+        skipped.push({ id: allocation.id, reason });
+        res.status(503).json({ error: "SLURM cancellation backend unavailable", dry_run: false, cancelled, skipped });
+        return;
+      }
       if (result.ok) {
         cancelled.push(store.updateSlurmAllocation(allocation.id, {
           state: "released", released_at: new Date().toISOString(),

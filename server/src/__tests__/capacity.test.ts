@@ -123,6 +123,63 @@ describe("capacity target catalog and allocation submission", () => {
     expect(cancel).toHaveBeenCalledWith("job-managed");
   });
 
+  it("returns 503 without releasing an allocation when the cancellation backend rejects", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "controller-offline", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "controller-offline", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "job-controller-offline",
+    });
+    const cancel = vi.fn(async () => {
+      throw new Error("Controller not connected");
+    });
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, {
+      cancel,
+      prepareRelease: vi.fn(async () => undefined),
+    }));
+
+    const response = await request(app).post("/capacity/allocations/cancel")
+      .send({ allocations: [allocation.id], apply: true }).expect(503);
+
+    expect(response.body).toEqual(expect.objectContaining({
+      error: "SLURM cancellation backend unavailable",
+      dry_run: false,
+      cancelled: [],
+      skipped: [{ id: allocation.id, reason: "cancel_backend_unavailable" }],
+    }));
+    expect(JSON.stringify(response.body)).not.toContain("Controller not connected");
+    expect(store.getSlurmAllocation(allocation.id)?.state).toBe("running");
+  });
+
+  it("returns 503 without cancelling when the release admission barrier rejects", async () => {
+    const allocation = store.createSlurmAllocation({
+      idempotency_key: "drain-offline", managed_target_id: "slurm-a16", requested_resources: {},
+      job_name: "drain-offline", owner: "tester", managed_by: "alchemy", pinned: false,
+      state: "running", job_id: "job-drain-offline",
+    });
+    const cancel = vi.fn(async () => ({ ok: true }));
+    const app = express(); app.use(express.json());
+    app.use("/capacity", createCapacityRouter(config, {
+      cancel,
+      prepareRelease: vi.fn(async () => {
+        throw new Error("Stub acknowledgement timeout");
+      }),
+    }));
+
+    const response = await request(app).post("/capacity/allocations/cancel")
+      .send({ allocations: [allocation.id], apply: true }).expect(503);
+
+    expect(response.body).toEqual(expect.objectContaining({
+      error: "Release admission barrier unavailable",
+      dry_run: false,
+      cancelled: [],
+      skipped: [{ id: allocation.id, reason: "release_admission_unavailable" }],
+    }));
+    expect(JSON.stringify(response.body)).not.toContain("Stub acknowledgement timeout");
+    expect(cancel).not.toHaveBeenCalled();
+    expect(store.getSlurmAllocation(allocation.id)?.state).toBe("running");
+  });
+
   it("blocks release while an owned campaign is unresolved", async () => {
     const allocation = store.createSlurmAllocation({
       idempotency_key: "busy-campaign", managed_target_id: "slurm-a16", requested_resources: {},
