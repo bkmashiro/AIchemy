@@ -176,6 +176,7 @@ export function promoteBlockedTasks(completedTaskId: string, webNs: Namespace): 
     // Reassemble command with resolved args
     const command = assembleCommand({
       script: task.script,
+      argv: task.argv,
       args: resolvedArgs,
       raw_args: task.raw_args,
       cwd: task.cwd,

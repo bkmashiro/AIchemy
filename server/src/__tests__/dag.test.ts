@@ -45,8 +45,9 @@ vi.mock("../scheduler", () => ({
 vi.mock("../api/tasks", () => ({
   assembleCommand: (t: any) => {
     const args = t.args;
-    if (typeof args === "string") return `cmd:${t.script} ${args}`;
-    return `cmd:${t.script} ${JSON.stringify(args || {})}`;
+    const argv = JSON.stringify(t.argv || []);
+    if (typeof args === "string") return `cmd:${t.script} argv=${argv} ${args}`;
+    return `cmd:${t.script} argv=${argv} args=${JSON.stringify(args || {})}`;
   },
   generateDisplayName: (t: any) => t.name || t.script || "task",
 }));
@@ -73,6 +74,7 @@ function addTask(overrides: Partial<any> = {}) {
     status: "pending",
     depends_on: undefined,
     args: {},
+    argv: undefined,
     args_template: undefined,
     script: "test.py",
     raw_args: undefined,
@@ -271,6 +273,27 @@ describe("promoteBlockedTasks", () => {
     promoteBlockedTasks("train-1", fakeNs());
     expect(blocked.status).toBe("pending");
     expect(blocked.args).toEqual({ "--seed": "42", "--lr": "0.001" });
+  });
+
+  it("preserves argv in the rebuilt command when promoting a blocked task", () => {
+    addTask({ id: "formal-1", status: "completed" });
+    const blocked = addTask({
+      id: "audit-1",
+      status: "blocked",
+      depends_on: ["formal-1"],
+      script: "audit.py",
+      argv: ["--result", "/results/formal.json", "--output", "/results/audit.json"],
+    });
+
+    promoteBlockedTasks("formal-1", fakeNs());
+
+    expect(blocked.status).toBe("pending");
+    expect(blocked.argv).toEqual([
+      "--result", "/results/formal.json", "--output", "/results/audit.json",
+    ]);
+    expect((blocked as any).command).toContain(
+      'argv=["--result","/results/formal.json","--output","/results/audit.json"]',
+    );
   });
 });
 
