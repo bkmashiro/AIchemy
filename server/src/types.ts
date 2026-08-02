@@ -127,7 +127,7 @@ export interface Task {
   env_setup?: string;
   env?: Record<string, string>;
   env_overrides?: Record<string, string>;  // Per-task env overrides, merged by stub after default_env
-  python_env?: string;           // e.g. "jema", "base", "~/venv" — resolved to activate command
+  python_env?: string;           // Stub available_envs[].name selector (e.g. "jema"), never a path
 
   // === Assembled (read-only, server builds) ===
   command: string;
@@ -322,7 +322,7 @@ export interface TaskSpec {
   args_template?: Record<string, string>;
   depends_on?: string[];  // ref names within experiment
   cwd?: string;
-  python_env?: string;
+  python_env?: string;  // Stub available_envs[].name selector, never a path
   env_setup?: string;
   env?: Record<string, string>;
   env_overrides?: Record<string, string>;

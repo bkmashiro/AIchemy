@@ -403,6 +403,30 @@ describe("POST /tasks", () => {
     expect(res.body.error).toMatch(/script required/i);
   });
 
+  it("rejects scalar gpu_type before the task reaches the scheduler", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/tasks").send({
+      script: "/tmp/train.py",
+      requirements: { gpu_type: "A30" },
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("requirements.gpu_type must be an array");
+    expect(store.getGlobalQueue()).toHaveLength(0);
+  });
+
+  it("rejects an interpreter path used as a python environment selector", async () => {
+    const app = makeApp();
+    const res = await request(app).post("/tasks").send({
+      script: "/tmp/train.py",
+      python_env: "/vol/bitbucket/ys25/conda-envs/jema/bin/python",
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("python_env must be a registered environment name");
+    expect(store.getGlobalQueue()).toHaveLength(0);
+  });
+
   it("creates a task and returns 201", async () => {
     const app = makeApp();
     const res = await request(app)
@@ -1378,6 +1402,94 @@ describe("Task surgical update/replace", () => {
     expect(res.body.env).toEqual({ NEW: "1" });
     expect(res.body.target_tags).toEqual(["a30", "slurm"]);
     expect(res.body.command).toContain("--new");
+  });
+});
+
+describe("task execution spec mutation guards", () => {
+  function addMalformedLegacyTask(status: Task["status"] = "pending") {
+    const task = createTask({
+      script: "/tmp/train.py",
+      requirements: { gpu_type: ["A30"] },
+    });
+    task.requirements = { gpu_type: "A30" } as unknown as Task["requirements"];
+    task.status = status;
+    if (["completed", "failed", "cancelled"].includes(status)) {
+      task.finished_at = new Date().toISOString();
+    }
+    store.addToGlobalQueue(task);
+    return task;
+  }
+
+  it("rejects PATCH that would retain a malformed execution spec", async () => {
+    const app = makeApp();
+    const task = addMalformedLegacyTask();
+
+    const res = await request(app).patch(`/tasks/${task.id}`).send({ priority: 9 });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("requirements.gpu_type must be an array");
+    expect(store.findTask(task.id)?.task.priority).toBe(task.priority);
+  });
+
+  it("rejects replace before creating a malformed successor", async () => {
+    const app = makeApp();
+    const task = addMalformedLegacyTask();
+
+    const res = await request(app).post(`/tasks/${task.id}/replace`).send({ priority: 9 });
+
+    expect(res.status).toBe(400);
+    expect(store.getAllTasks()).toHaveLength(1);
+  });
+
+  it("rejects reschedule before cancelling a malformed legacy task", async () => {
+    const app = makeApp();
+    const task = addMalformedLegacyTask();
+
+    const res = await request(app).post(`/tasks/${task.id}/reschedule`).send({ target_tags: ["a30"] });
+
+    expect(res.status).toBe(400);
+    expect(store.findTask(task.id)?.task.status).toBe("pending");
+    expect(store.getAllTasks()).toHaveLength(1);
+  });
+
+  it("rejects retry before creating a malformed successor", async () => {
+    const app = makeApp();
+    const task = addMalformedLegacyTask("failed");
+
+    const res = await request(app).post(`/tasks/${task.id}/retry`).send({});
+
+    expect(res.status).toBe(400);
+    expect(store.getAllTasks()).toHaveLength(1);
+  });
+
+  it("rejects batch retry without creating a malformed successor", async () => {
+    const app = makeApp();
+    const task = addMalformedLegacyTask("failed");
+
+    const res = await request(app).post("/tasks/batch").send({
+      action: "retry",
+      task_ids: [task.id],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.results[0]).toMatchObject({ id: task.id, ok: false });
+    expect(res.body.results[0].error).toContain("requirements.gpu_type must be an array");
+    expect(store.getAllTasks()).toHaveLength(1);
+  });
+
+  it("rejects batch requeue before mutating a malformed task", async () => {
+    const app = makeApp();
+    const task = addMalformedLegacyTask("failed");
+
+    const res = await request(app).post("/tasks/batch").send({
+      action: "requeue",
+      task_ids: [task.id],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.results[0]).toMatchObject({ id: task.id, ok: false });
+    expect(res.body.results[0].error).toContain("requirements.gpu_type must be an array");
+    expect(store.findTask(task.id)?.task.status).toBe("failed");
   });
 });
 

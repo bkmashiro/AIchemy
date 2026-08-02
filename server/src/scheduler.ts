@@ -16,6 +16,7 @@ import { logger } from "./log";
 import { assignTask, failTask } from "./task-actions";
 import { notifyDispatched } from "./discord";
 import { buildCommandArgv } from "./command";
+import { validateTaskExecutionSpec } from "./task-spec-validation";
 
 // ─── Resource accounting and eligibility ─────────────────────────────────────
 
@@ -145,6 +146,7 @@ function validPositiveRequirement(value: number | undefined): number {
 }
 
 function hasInvalidResourceRequirement(task: Task): boolean {
+  if (validateTaskExecutionSpec(task) !== undefined) return true;
   const requirements = task.requirements;
   if (!requirements) return false;
   return [requirements.cpu_mem_mb, requirements.gpu_mem_mb]
@@ -264,9 +266,11 @@ export function evaluateStubEligibility(stub: Stub, task: Task): StubEligibility
     const stubTags = new Set(stub.tags || []);
     if (!task.target_tags.every((tag) => stubTags.has(tag))) reasons.push("tag_mismatch");
   }
-  if (task.requirements?.gpu_type?.length) {
+  const requestedGpuTypes = Array.isArray(task.requirements?.gpu_type)
+    ? task.requirements.gpu_type : [];
+  if (requestedGpuTypes.length) {
     const stubNorm = normalizeGpuName(stub.gpu.name);
-    const matches = task.requirements.gpu_type.some(
+    const matches = requestedGpuTypes.some(
       (type) => normalizeGpuName(type) === stubNorm || stubNorm.includes(normalizeGpuName(type)),
     );
     if (!matches) reasons.push("gpu_type_mismatch");

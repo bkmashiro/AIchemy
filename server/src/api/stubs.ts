@@ -15,6 +15,7 @@ import { reliableEmitToStub } from "../reliable";
 import { computeFingerprint, writeLockTable, idempotencyCache } from "../dedup";
 import { createTask } from "./tasks";
 import { createExecRouter } from "./exec";
+import { validateTaskExecutionSpec } from "../task-spec-validation";
 
 export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
   const router = Router();
@@ -217,6 +218,10 @@ export function createStubsRouter(stubNs: Namespace, webNs: Namespace): Router {
     } = req.body;
 
     if (!script) { res.status(400).json({ error: "script required" }); return; }
+    const executionSpecError = validateTaskExecutionSpec({ requirements, python_env });
+    if (executionSpecError) {
+      res.status(400).json({ error: executionSpecError }); return;
+    }
 
     // Idempotency check
     if (idempotency_key) {

@@ -47,6 +47,7 @@ interface Task {
 
   // === Environment ===
   cwd?: string;                  // Working directory (inherits from stub)
+  python_env?: string;           // Stub available_envs[].name selector, e.g. "jema"; never a path
   env_setup?: string;            // Shell setup commands (inherits from stub)
   env?: Record<string, string>;  // Extra env vars
 

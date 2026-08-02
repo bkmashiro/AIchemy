@@ -25,6 +25,7 @@ import { validateDag } from "../dag";
 import { logger } from "../log";
 import { initExperimentManifest, readExperimentManifest } from "../git-tracking";
 import { lintTaskSpecs } from "../submission-lint";
+import { validateTaskExecutionSpec } from "../task-spec-validation";
 import { frozenCampaignObjectHash } from "../campaigns/manifest";
 
 const IDEMPOTENCY_UUID_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
@@ -1381,6 +1382,18 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
       if (conflictingRouting) {
         res.status(400).json({ error: `Task ref "${conflictingRouting.ref}" has mutually exclusive target_stub_id and capacity_lease_id routing selectors` }); return;
       }
+      const materializedTaskSpecs = (task_specs as TaskSpec[]).map((spec) => ({
+        ...spec,
+        cwd: spec.cwd ?? cwd,
+        python_env: spec.python_env ?? python_env,
+        target_tags: spec.target_tags ?? target_tags,
+      }));
+      const invalidExecutionSpec = materializedTaskSpecs
+        .map((spec) => ({ spec, error: validateTaskExecutionSpec(spec) }))
+        .find((entry) => entry.error);
+      if (invalidExecutionSpec) {
+        res.status(400).json({ error: `Task ref "${invalidExecutionSpec.spec.ref}": ${invalidExecutionSpec.error}` }); return;
+      }
       const immutableRuntimeError = validateImmutableRuntimeSpec(sdk_spec, task_specs as TaskSpec[]);
       if (immutableRuntimeError) {
         res.status(400).json({ error: immutableRuntimeError }); return;
@@ -1392,12 +1405,6 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         ? uuidv5(`grid:${idempotencyKey}`, IDEMPOTENCY_UUID_NAMESPACE) : uuidv4();
       const refToTaskId: Record<string, string> = {};
       const taskIds: string[] = [];
-      const materializedTaskSpecs = (task_specs as TaskSpec[]).map((spec) => ({
-        ...spec,
-        cwd: spec.cwd ?? cwd,
-        python_env: spec.python_env ?? python_env,
-        target_tags: spec.target_tags ?? target_tags,
-      }));
       const submissionWarnings = lintTaskSpecs(materializedTaskSpecs);
 
       // Resolve parent_id from parent_name (best-effort)
@@ -1560,6 +1567,10 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
     }
     if (Object.values(matrix).some((v: any) => !Array.isArray(v))) {
       res.status(400).json({ error: "matrix values must be arrays" }); return;
+    }
+    const legacyExecutionSpecError = validateTaskExecutionSpec({ requirements });
+    if (legacyExecutionSpecError) {
+      res.status(400).json({ error: legacyExecutionSpecError }); return;
     }
 
     // Create grid internally

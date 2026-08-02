@@ -24,6 +24,7 @@ import { reliableEmitToStub } from "../reliable";
 import { logger } from "../log";
 import { assembleCommand } from "../command";
 import { lintTaskSpecs } from "../submission-lint";
+import { validateTaskExecutionSpec } from "../task-spec-validation";
 export { assembleCommand, buildCommandArgv } from "../command";
 
 // ─── Display name generation ──────────────────────────────────────────────────
@@ -565,6 +566,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           if (!TERMINAL_STATUSES.includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot retry in status '${task.status}'` }); break;
           }
+          const executionSpecError = validateTaskExecutionSpec(task);
+          if (executionSpecError) {
+            results.push({ id: taskId, ok: false, error: executionSpecError }); break;
+          }
           const retryTask = createRetryTask(task);
           store.addToGlobalQueue(retryTask);
           webNs.emit("task.update", retryTask);
@@ -575,6 +580,10 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
           const requeueable = [...TERMINAL_STATUSES, "assigned", "pending"];
           if (!requeueable.includes(task.status)) {
             results.push({ id: taskId, ok: false, error: `Cannot requeue in status '${task.status}'` }); break;
+          }
+          const executionSpecError = validateTaskExecutionSpec(task);
+          if (executionSpecError) {
+            results.push({ id: taskId, ok: false, error: executionSpecError }); break;
           }
           if (found.archived) {
             store.removeFromArchive(taskId);
@@ -688,6 +697,11 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     if (target_stub_id && capacity_lease_id) {
       res.status(400).json({ error: "target_stub_id and capacity_lease_id are mutually exclusive routing selectors" }); return;
+    }
+
+    const executionSpecError = validateTaskExecutionSpec({ requirements, python_env });
+    if (executionSpecError) {
+      res.status(400).json({ error: executionSpecError }); return;
     }
 
     // Validate target_stub_id references a known online stub
@@ -1027,8 +1041,13 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       }
       const validationError = validateTaskSpecUpdate(specUpdate);
       const mergedRouting = { ...task, ...specUpdate };
+      const executionSpecError = validateTaskExecutionSpec(mergedRouting);
       if (mergedRouting.target_stub_id && mergedRouting.capacity_lease_id) {
         res.status(400).json({ error: "target_stub_id and capacity_lease_id are mutually exclusive routing selectors" });
+        return;
+      }
+      if (executionSpecError) {
+        res.status(400).json({ error: executionSpecError });
         return;
       }
       if (validationError) {
@@ -1064,6 +1083,11 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     // Only active tasks can be rescheduled
     if (["completed", "failed", "cancelled"].includes(task.status)) {
       res.status(400).json({ error: `Cannot reschedule in terminal status '${task.status}'` }); return;
+    }
+
+    const executionSpecError = validateTaskExecutionSpec(task);
+    if (executionSpecError) {
+      res.status(400).json({ error: executionSpecError }); return;
     }
 
     const { target_tags, priority } = req.body;
@@ -1126,8 +1150,12 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
     const overrides = pickTaskSpecUpdates(req.body?.overrides ?? req.body ?? {});
     const validationError = validateTaskSpecUpdate(overrides);
     const mergedRouting = { ...task, ...overrides };
+    const executionSpecError = validateTaskExecutionSpec(mergedRouting);
     if (mergedRouting.target_stub_id && mergedRouting.capacity_lease_id) {
       res.status(400).json({ error: "target_stub_id and capacity_lease_id are mutually exclusive routing selectors" }); return;
+    }
+    if (executionSpecError) {
+      res.status(400).json({ error: executionSpecError }); return;
     }
     if (validationError) {
       res.status(400).json({ error: validationError });
@@ -1192,6 +1220,11 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
 
     if (!TERMINAL_STATUSES.includes(task.status)) {
       res.status(400).json({ error: `Cannot retry in status '${task.status}'` }); return;
+    }
+
+    const executionSpecError = validateTaskExecutionSpec(task);
+    if (executionSpecError) {
+      res.status(400).json({ error: executionSpecError }); return;
     }
 
     const force = req.query.force === "true";

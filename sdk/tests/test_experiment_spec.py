@@ -28,7 +28,7 @@ def test_runtime_profile_materializes_shared_execution_environment():
     profile = RuntimeProfile(
         name="jema-v3-a30",
         cwd="/vol/bitbucket/ys25/jema-v3",
-        python_env="/vol/bitbucket/ys25/conda-envs/jema",
+        python_env="jema",
         env={
             "PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/vol/bitbucket/ys25/alchemy-v2/sdk",
         },
@@ -41,7 +41,7 @@ def test_runtime_profile_materializes_shared_execution_environment():
     assert spec["runtime"] == {
         "name": "jema-v3-a30",
         "cwd": "/vol/bitbucket/ys25/jema-v3",
-        "python_env": "/vol/bitbucket/ys25/conda-envs/jema",
+        "python_env": "jema",
         "env": {
             "PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/vol/bitbucket/ys25/alchemy-v2/sdk",
         },
@@ -51,7 +51,7 @@ def test_runtime_profile_materializes_shared_execution_environment():
             "ref": "train",
             "script": "scripts/train.py",
             "cwd": "/vol/bitbucket/ys25/jema-v3",
-            "python_env": "/vol/bitbucket/ys25/conda-envs/jema",
+            "python_env": "jema",
             "env": {
                 "PYTHONPATH": "/vol/bitbucket/ys25/jema-v3/src:/vol/bitbucket/ys25/alchemy-v2/sdk",
                 "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
@@ -135,7 +135,7 @@ def test_task_values_override_runtime_profile_without_mutating_it():
     profile = RuntimeProfile(
         name="base",
         cwd="/base",
-        python_env="/base/python",
+        python_env="base",
         env={"MODE": "base", "KEEP": "yes"},
     )
     exp = Experiment("runtime").runtime(profile)
@@ -143,14 +143,14 @@ def test_task_values_override_runtime_profile_without_mutating_it():
         "train",
         script="train.py",
         cwd="/task",
-        python_env="/task/python",
+        python_env="task",
         env={"MODE": "task"},
     )
 
     task = exp.to_spec()["tasks"][0]
 
     assert task["cwd"] == "/task"
-    assert task["python_env"] == "/task/python"
+    assert task["python_env"] == "task"
     assert task["env"] == {"MODE": "task", "KEEP": "yes"}
     assert profile.env == {"MODE": "base", "KEEP": "yes"}
 
@@ -165,6 +165,26 @@ def test_task_rejects_conflicting_physical_stub_and_logical_lease_selectors():
     exp = Experiment("conflicting-routing")
     with pytest.raises(ValueError, match="mutually exclusive"):
         exp.task("train", script="train.py", target_stub_id="stub-1", capacity_lease_id="lease-1")
+
+
+def test_dry_run_rejects_scalar_gpu_type():
+    exp = Experiment("invalid-gpu-type")
+    exp.task("train", script="train.py", requirements={"gpu_type": "A30"})
+
+    with pytest.raises(ValueError, match=r"requirements\.gpu_type must be an array"):
+        exp.dry_run()
+
+
+def test_dry_run_rejects_python_interpreter_path_as_environment_selector():
+    exp = Experiment("invalid-python-env")
+    exp.task(
+        "train",
+        script="train.py",
+        python_env="/vol/bitbucket/ys25/conda-envs/jema/bin/python",
+    )
+
+    with pytest.raises(ValueError, match="python_env must be a registered environment name"):
+        exp.dry_run()
 
 
 def test_decision_policy_is_declared_in_spec_and_chainable():

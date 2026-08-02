@@ -42,7 +42,11 @@ class TaskNode:
 
 @dataclass(frozen=True)
 class RuntimeProfile:
-    """Reusable, non-secret execution defaults shared by an experiment's tasks."""
+    """Reusable, non-secret execution defaults shared by an experiment's tasks.
+
+    ``python_env`` is a Stub-registered environment name such as ``"jema"``.
+    It is not a filesystem path or Python interpreter path.
+    """
 
     name: str
     cwd: Optional[str] = None
@@ -415,6 +419,7 @@ class Experiment:
         """Validate locally and return the SDK-authored spec without network I/O."""
         self._validate_dag()
         spec = self.to_spec()
+        self._validate_task_execution_specs(spec)
         self._validate_decision_policy(spec)
         spec["warnings"] = self._preflight_warnings(spec)
         return spec
@@ -517,6 +522,7 @@ class Experiment:
     def submit(self, *, dry_run: bool = False, force: bool = False) -> ExperimentResult:
         """Submit the experiment to the server."""
         self._validate_dag()
+        self._validate_task_execution_specs(self.to_spec())
 
         if dry_run:
             self._print_dag()
@@ -641,6 +647,35 @@ class Experiment:
         return _deep_diff(self._parent_config, self.config) or None
 
     # ── Validation ──
+
+    @staticmethod
+    def _validate_task_execution_specs(spec: Mapping[str, Any]) -> None:
+        for task in spec.get("tasks", []):
+            ref = task.get("ref", "<unknown>")
+            requirements = task.get("requirements")
+            if requirements is not None:
+                if not isinstance(requirements, Mapping):
+                    raise ValueError(f"Task {ref!r}: requirements must be an object")
+                gpu_type = requirements.get("gpu_type")
+                if gpu_type is not None and (
+                    not isinstance(gpu_type, list)
+                    or any(not isinstance(value, str) or not value.strip() for value in gpu_type)
+                ):
+                    raise ValueError(
+                        f"Task {ref!r}: requirements.gpu_type must be an array of non-empty strings"
+                    )
+            python_env = task.get("python_env")
+            if python_env is not None and (
+                not isinstance(python_env, str)
+                or not python_env.strip()
+                or python_env != python_env.strip()
+                or "/" in python_env
+                or "\\" in python_env
+            ):
+                raise ValueError(
+                    f"Task {ref!r}: python_env must be a registered environment name, "
+                    "not a filesystem or interpreter path"
+                )
 
     def _validate_decision_policy(self, spec: Mapping[str, Any]) -> None:
         policy = spec.get("decision_policy")

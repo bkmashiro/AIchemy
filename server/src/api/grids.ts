@@ -19,6 +19,7 @@ import { maybeDispatch } from "../scheduler";
 import { initiateKillChain } from "../socket/stub";
 import { computeFingerprint } from "../dedup";
 import { cancelTask, cancelGlobalTask } from "../task-actions";
+import { validateTaskExecutionSpec } from "../task-spec-validation";
 
 // ─── Cartesian product ────────────────────────────────────────────────────────
 
@@ -93,6 +94,10 @@ export function createGridsRouter(_stubNs: Namespace, webNs: Namespace): Router 
     }
     if (Object.values(param_space).some((v) => !Array.isArray(v))) {
       res.status(400).json({ error: "param_space values must be arrays" }); return;
+    }
+    const executionSpecError = validateTaskExecutionSpec({ requirements });
+    if (executionSpecError) {
+      res.status(400).json({ error: executionSpecError }); return;
     }
 
     const gridId = uuidv4();

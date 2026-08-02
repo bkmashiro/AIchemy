@@ -359,6 +359,34 @@ describe("POST /stubs/:id/tasks", () => {
     expect(res.body.error).toMatch(/script required/i);
   });
 
+  it("rejects malformed GPU requirements on direct Stub submission", async () => {
+    const app = makeApp();
+    const stub = makeStub();
+    store.setStub(stub);
+
+    const res = await request(app).post(`/stubs/${stub.id}/tasks`).send({
+      script: "train.py",
+      requirements: { gpu_type: "A30" },
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("requirements.gpu_type must be an array");
+    expect(store.getStub(stub.id)?.tasks).toHaveLength(0);
+  });
+
+  it("rejects interpreter paths on direct Stub submission", async () => {
+    const app = makeApp();
+    const stub = makeStub();
+    store.setStub(stub);
+
+    const res = await request(app).post(`/stubs/${stub.id}/tasks`).send({
+      script: "train.py",
+      python_env: "/vol/bitbucket/ys25/conda-envs/jema/bin/python",
+    });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("python_env must be a registered environment name");
+    expect(store.getStub(stub.id)?.tasks).toHaveLength(0);
+  });
+
   it("creates a task with assigned status (not pending)", async () => {
     const webNs = makeWebNamespace();
     const app = makeApp(undefined, webNs);
