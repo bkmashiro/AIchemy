@@ -1,16 +1,6 @@
 name: PR Fast Checks
 
 on:
-  push:
-    paths:
-      - "server/**"
-      - "sdk/**"
-      - ".github/workflows/pr-fast-checks.yml"
-  pull_request:
-    paths:
-      - "server/**"
-      - "sdk/**"
-      - ".github/workflows/pr-fast-checks.yml"
   workflow_dispatch:
 
 concurrency:
