@@ -1,6 +1,7 @@
 """Unit tests for task preflight checks."""
 from __future__ import annotations
 
+import shlex
 import subprocess
 
 import pytest
@@ -94,7 +95,7 @@ async def test_output_preflight_does_not_create_missing_parent(tmp_path):
     assert not output.parent.exists()
 
     guard = subprocess.run(
-        ["/bin/bash", "-lc", f"set -euo pipefail; test ! -e {output.parent!s}"],
+        ["/bin/bash", "-lc", f"set -euo pipefail; test ! -e {shlex.quote(str(output.parent))}"],
         check=False,
     )
     assert guard.returncode == 0
@@ -119,3 +120,27 @@ async def test_output_preflight_accepts_existing_empty_parent(tmp_path):
 
     assert result.ok
     assert list(output.parent.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_output_preflight_rejects_unwritable_existing_parent(tmp_path):
+    output = tmp_path / "read-only" / "result.json"
+    output.parent.mkdir()
+    output.parent.chmod(0o555)
+    try:
+        result = await run_preflight(
+            task={
+                "task_id": "task-1",
+                "command": "echo ok",
+                "outputs": [str(output)],
+            },
+            stub_id="stub-1",
+            stub_default_cwd=str(tmp_path),
+            server_url="http://127.0.0.1:9",
+            token="token",
+        )
+    finally:
+        output.parent.chmod(0o755)
+
+    assert not result.ok
+    assert "Output path ancestor not writable" in "; ".join(result.errors)
