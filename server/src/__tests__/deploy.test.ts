@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildSlurmStubScript, listSlurmJobs } from "../deploy";
-import { StubTarget } from "../types";
+import {
+  buildRuntimePreflightCommand,
+  buildSlurmStubScript,
+  listSlurmJobs,
+  validateDeployConfig,
+} from "../deploy";
+import { DeployFileConfig, StubTarget } from "../types";
 
 function makeSlurmTarget(overrides: Partial<StubTarget> = {}): StubTarget {
   return {
@@ -91,5 +96,43 @@ describe("SLURM deploy script generation", () => {
       { job_name: "jema-d1-smoke" },
     );
     expect(script).toContain("#SBATCH --job-name=jema-d1-smoke");
+  });
+
+  it("checks the configured runtime before submitting a carrier", () => {
+    const command = buildRuntimePreflightCommand(makeSlurmTarget({
+      python_path: "/vol/bitbucket/ys25/alchemy-v2/runtime/bin/python",
+    }));
+
+    expect(command).toContain("test -x");
+    expect(command).toContain("/vol/bitbucket/ys25/alchemy-v2/runtime/bin/python");
+    expect(command).toContain("import alchemy_stub, socketio, aiohttp, psutil");
+  });
+
+  it("accepts the dedicated Alchemy runtime with neutral defaults", () => {
+    const config: DeployFileConfig = {
+      stubs: [makeSlurmTarget({
+        python_path: "/vol/bitbucket/ys25/alchemy-v2/runtime/bin/python",
+        default_cwd: "/vol/bitbucket/ys25",
+        env_setup: "export XDG_CACHE_HOME=/vol/bitbucket/ys25/.cache",
+      })],
+    };
+
+    expect(validateDeployConfig(config)).toEqual([]);
+  });
+
+  it("rejects infrastructure targets coupled to project runtimes", () => {
+    const config: DeployFileConfig = {
+      stubs: [makeSlurmTarget({
+        python_path: "/vol/bitbucket/ys25/conda-envs/jema/bin/python",
+        default_cwd: "/vol/bitbucket/ys25/jema-v2",
+        env_setup: "export HF_HOME=/vol/bitbucket/ys25/.cache/huggingface",
+      })],
+    };
+
+    expect(validateDeployConfig(config)).toEqual(expect.arrayContaining([
+      expect.stringContaining("python_path"),
+      expect.stringContaining("default_cwd"),
+      expect.stringContaining("HF_HOME"),
+    ]));
   });
 });

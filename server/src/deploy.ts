@@ -41,12 +41,40 @@ export function loadDeployConfig(filePath: string): DeployFileConfig | null {
       logger.warn("deploy.config_invalid", { path: filePath, reason: "stubs must be an array" });
       return null;
     }
+    const validationErrors = validateDeployConfig(parsed);
+    if (validationErrors.length > 0) {
+      logger.error("deploy.config_invalid", { path: filePath, errors: validationErrors });
+      return null;
+    }
     logger.info("deploy.config_loaded", { path: filePath, stub_count: parsed.stubs.length });
     return parsed;
   } catch (err) {
     logger.error("deploy.config_load_failed", { path: filePath, error: String(err) });
     return null;
   }
+}
+
+const ALCHEMY_RUNTIME_PATTERN = /\/alchemy-v2\/runtime\/bin\/python$/;
+const PROJECT_RUNTIME_PATTERN = /(?:^|\/)(?:conda-envs\/jema|jema(?:-v\d+)?|fba-m0)(?:\/|$)/i;
+const PROJECT_CACHE_EXPORT_PATTERN = /(?:^|&&\s*)export\s+(?:TORCH_HOME|HF_HOME|TRANSFORMERS_CACHE)=/;
+
+export function validateDeployConfig(config: DeployFileConfig): string[] {
+  const errors: string[] = [];
+  for (const target of config.stubs) {
+    if (!ALCHEMY_RUNTIME_PATTERN.test(target.python_path)) {
+      errors.push(`target ${target.name}: python_path must use the dedicated Alchemy infrastructure runtime`);
+    } else if (PROJECT_RUNTIME_PATTERN.test(target.python_path)) {
+      errors.push(`target ${target.name}: python_path must use a dedicated infrastructure runtime`);
+    }
+    if (target.default_cwd && PROJECT_RUNTIME_PATTERN.test(target.default_cwd)) {
+      errors.push(`target ${target.name}: default_cwd must be a neutral infrastructure directory`);
+    }
+    const cacheExport = target.env_setup?.match(PROJECT_CACHE_EXPORT_PATTERN)?.[0];
+    if (cacheExport) {
+      errors.push(`target ${target.name}: env_setup must not export project cache ${cacheExport.trim()}`);
+    }
+  }
+  return errors;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -59,6 +87,33 @@ function userAtHost(target: StubTarget): string {
 function slurmUserAtHost(target: StubTarget): string {
   const host = target.ssh_host ?? "";
   return target.ssh_user ? `${target.ssh_user}@${host}` : host;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+export function buildRuntimePreflightCommand(target: StubTarget): string {
+  const python = shellQuote(target.python_path);
+  const pythonPath = shellQuote(target.remote_dir);
+  return [
+    `test -x ${python}`,
+    `PYTHONPATH=${pythonPath} ${python} -c ${shellQuote("import alchemy_stub, socketio, aiohttp, psutil")}`,
+  ].join(" && ");
+}
+
+async function preflightRuntime(target: StubTarget, sshKeyPath?: string): Promise<void> {
+  const host = target.type === "slurm" ? target.ssh_host ?? "" : target.host ?? "";
+  const user = target.type === "slurm" ? target.ssh_user : target.user;
+  try {
+    await sshExec(host, user, buildRuntimePreflightCommand(target), {
+      keyPath: sshKeyPath,
+      jumpHost: target.type === "slurm" ? undefined : target.jump_host,
+      timeout: 30_000,
+    });
+  } catch (err) {
+    throw new Error(`Runtime preflight failed for ${target.name}: python_path=${target.python_path}; required import=alchemy_stub; ${String(err)}`);
+  }
 }
 
 /** Step 1: sync stub package to remote_dir. */
@@ -332,6 +387,14 @@ export async function deployStub(
       return { ok: false, target: target.name, step: "sync", error: String(err) };
     }
 
+    try {
+      await preflightRuntime(target, sshKeyPath);
+      logger.info("deploy.runtime_preflight_ok", { target: target.name, python_path: target.python_path });
+    } catch (err) {
+      logger.error("deploy.runtime_preflight_failed", { target: target.name, python_path: target.python_path, error: String(err) });
+      return { ok: false, target: target.name, step: "runtime_preflight", error: String(err) };
+    }
+
     let jobId: string;
     try {
       jobId = await submitSlurmJob(target, serverUrl, token, sshKeyPath, slurmOverrides);
@@ -351,6 +414,14 @@ export async function deployStub(
   } catch (err) {
     logger.error("deploy.sync_failed", { target: target.name, error: String(err) });
     return { ok: false, target: target.name, step: "sync", error: String(err) };
+  }
+
+  try {
+    await preflightRuntime(target, sshKeyPath);
+    logger.info("deploy.runtime_preflight_ok", { target: target.name, python_path: target.python_path });
+  } catch (err) {
+    logger.error("deploy.runtime_preflight_failed", { target: target.name, python_path: target.python_path, error: String(err) });
+    return { ok: false, target: target.name, step: "runtime_preflight", error: String(err) };
   }
 
   let pid: number | undefined;
@@ -402,6 +473,14 @@ export async function restartStub(
   slurmOverrides?: SlurmSubmitOptions,
 ): Promise<DeployResult> {
   logger.info("deploy.restart", { target: target.name });
+
+  try {
+    await preflightRuntime(target, sshKeyPath);
+    logger.info("deploy.runtime_preflight_ok", { target: target.name, python_path: target.python_path });
+  } catch (err) {
+    logger.error("deploy.runtime_preflight_failed", { target: target.name, python_path: target.python_path, error: String(err) });
+    return { ok: false, target: target.name, step: "runtime_preflight", error: String(err) };
+  }
 
   if (target.type === "slurm") {
     // SLURM restart = submit new sbatch job
