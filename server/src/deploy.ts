@@ -56,7 +56,12 @@ export function loadDeployConfig(filePath: string): DeployFileConfig | null {
 
 const ALCHEMY_RUNTIME_PATTERN = /\/alchemy-v2\/runtime\/bin\/python$/;
 const PROJECT_RUNTIME_PATTERN = /(?:^|\/)(?:conda-envs\/jema|jema(?:-v\d+)?|fba-m0)(?:\/|$)/i;
-const PROJECT_CACHE_EXPORT_PATTERN = /(?:^|&&\s*)export\s+(?:TORCH_HOME|HF_HOME|TRANSFORMERS_CACHE)=/;
+const PROJECT_CACHE_VARIABLES = [
+  "TORCH_HOME",
+  "HF_HOME",
+  "HUGGINGFACE_HUB_CACHE",
+  "TRANSFORMERS_CACHE",
+] as const;
 
 export function validateDeployConfig(config: DeployFileConfig): string[] {
   const errors: string[] = [];
@@ -69,9 +74,11 @@ export function validateDeployConfig(config: DeployFileConfig): string[] {
     if (target.default_cwd && PROJECT_RUNTIME_PATTERN.test(target.default_cwd)) {
       errors.push(`target ${target.name}: default_cwd must be a neutral infrastructure directory`);
     }
-    const cacheExport = target.env_setup?.match(PROJECT_CACHE_EXPORT_PATTERN)?.[0];
-    if (cacheExport) {
-      errors.push(`target ${target.name}: env_setup must not export project cache ${cacheExport.trim()}`);
+    for (const variable of PROJECT_CACHE_VARIABLES) {
+      const assignment = new RegExp(`(?:^|[;\\n]|&&|\\|\\|)\\s*(?:export\\s+)?${variable}\\s*=`);
+      if (target.env_setup && assignment.test(target.env_setup)) {
+        errors.push(`target ${target.name}: env_setup must not set project cache ${variable}`);
+      }
     }
   }
   return errors;

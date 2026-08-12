@@ -120,6 +120,27 @@ describe("SLURM deploy script generation", () => {
     expect(validateDeployConfig(config)).toEqual([]);
   });
 
+  it("rejects project cache exports across shell separators", () => {
+    const config: DeployFileConfig = {
+      stubs: [makeSlurmTarget({
+        python_path: "/vol/bitbucket/ys25/alchemy-v2/runtime/bin/python",
+        default_cwd: "/vol/bitbucket/ys25",
+        env_setup: [
+          "export XDG_CACHE_HOME=/vol/bitbucket/ys25/.cache",
+          "HF_HOME=/project/hf; export HUGGINGFACE_HUB_CACHE=/project/hub",
+          "export TRANSFORMERS_CACHE=/project/transformers && export TORCH_HOME=/project/torch",
+        ].join("\n"),
+      })],
+    };
+
+    expect(validateDeployConfig(config)).toEqual(expect.arrayContaining([
+      expect.stringContaining("HF_HOME"),
+      expect.stringContaining("HUGGINGFACE_HUB_CACHE"),
+      expect.stringContaining("TRANSFORMERS_CACHE"),
+      expect.stringContaining("TORCH_HOME"),
+    ]));
+  });
+
   it("rejects infrastructure targets coupled to project runtimes", () => {
     const config: DeployFileConfig = {
       stubs: [makeSlurmTarget({
