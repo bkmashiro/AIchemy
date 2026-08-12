@@ -194,18 +194,20 @@ async def run_preflight(
         if not os.access(parent, os.W_OK):
             errors.append(f"run_dir parent not writable: {parent}")
 
-    # 3b. Output dir pre-creation (if declared)
+    # 3b. Declared outputs: validate the nearest existing ancestor without
+    # creating the output parent. Producers may use parent non-existence as
+    # their freshness guard; pre-creating it changes task semantics.
     outputs: list[str] = task.get("outputs") or []
     for out_path in outputs:
         out_parent = os.path.dirname(out_path) or "."
-        if not os.path.isdir(out_parent):
-            try:
-                os.makedirs(out_parent, exist_ok=True)
-            except Exception:
-                errors.append(f"Output dir not writable: {out_parent}")
-                continue
-        if not os.access(out_parent, os.W_OK):
-            errors.append(f"Output dir not writable: {out_parent}")
+        ancestor = os.path.abspath(out_parent)
+        while not os.path.exists(ancestor):
+            next_ancestor = os.path.dirname(ancestor)
+            if next_ancestor == ancestor:
+                break
+            ancestor = next_ancestor
+        if not os.path.isdir(ancestor) or not os.access(ancestor, os.W_OK):
+            errors.append(f"Output path ancestor not writable: {ancestor}")
 
     # Early exit on basic errors
     if errors:
