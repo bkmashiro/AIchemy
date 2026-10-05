@@ -656,6 +656,84 @@ class TestKillGraceful:
 # ===========================================================================
 
 class TestStart:
+    @staticmethod
+    def _create_sdk_origins(tmp_path):
+        installed = tmp_path / "installed"
+        checkout = tmp_path / "checkout" / "sdk"
+        for package_dir, marker in (
+            (installed / "alchemy_sdk", "installed"),
+            (checkout / "alchemy_sdk", "checkout"),
+        ):
+            package_dir.mkdir(parents=True)
+            (package_dir / "__init__.py").write_text(f"origin = {marker!r}\n")
+        return installed, checkout
+
+    @pytest.mark.asyncio
+    async def test_child_uses_explicitly_installed_sdk_not_checkout_injection(
+        self, mgr, log_dir, tmp_path, monkeypatch
+    ):
+        """A real task interpreter must import the explicitly installed SDK."""
+        installed, checkout = self._create_sdk_origins(tmp_path)
+        monkeypatch.setattr("alchemy_stub.process_mgr._SDK_DIR", checkout, raising=False)
+        monkeypatch.setenv("PYTHONPATH", str(installed))
+
+        code = "import alchemy_sdk; print(alchemy_sdk.origin)"
+        pid = await mgr.start(
+            task_id="task-sdk-origin",
+            command="python -c 'import alchemy_sdk'",
+            command_argv=[sys.executable, "-c", code],
+        )
+        info = mgr._procs["task-sdk-origin"]
+        assert info.proc is not None
+        assert info.proc.wait(timeout=10) == 0
+        with open(_log_path("task-sdk-origin")) as task_log:
+            assert task_log.read().strip() == "installed"
+        assert pid == info.pid
+
+    @pytest.mark.asyncio
+    async def test_warm_child_uses_explicitly_installed_sdk_not_checkout_injection(
+        self, mgr, log_dir, tmp_path, monkeypatch
+    ):
+        """Warm submissions must preserve explicit PYTHONPATH without SDK prepending."""
+        installed, checkout = self._create_sdk_origins(tmp_path)
+        monkeypatch.setattr("alchemy_stub.process_mgr._SDK_DIR", checkout, raising=False)
+        monkeypatch.setenv("PYTHONPATH", str(installed))
+        task_script = tmp_path / "task.py"
+        task_script.write_text("import alchemy_sdk; print(alchemy_sdk.origin)\n")
+
+        class ExecutingWarmPool:
+            async def submit(self, **kwargs):
+                child_env = os.environ.copy()
+                child_env.update(kwargs["env"])
+                result = subprocess.run(
+                    [sys.executable, str(task_script)],
+                    cwd=kwargs["cwd"],
+                    env=child_env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.stdout = result.stdout.strip()
+                self.env = kwargs["env"]
+                return os.getpid()
+
+            def get_worker_for_task(self, task_id):
+                return os.getpid()
+
+            def pop_task_result(self, task_id):
+                return None
+
+        warm_pool = ExecutingWarmPool()
+        mgr.warm_pool = warm_pool
+        await mgr.start(
+            task_id="task-warm-sdk-origin",
+            command=str(task_script),
+            env={"PYTHONPATH": str(installed)},
+        )
+
+        assert warm_pool.stdout == "installed"
+        assert warm_pool.env["PYTHONPATH"] == str(installed)
+
     @pytest.mark.asyncio
     async def test_start_spawns_process(self, mgr, log_dir):
         """start() should call subprocess.Popen and return PID."""

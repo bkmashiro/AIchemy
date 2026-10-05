@@ -54,7 +54,7 @@ export function loadDeployConfig(filePath: string): DeployFileConfig | null {
   }
 }
 
-const ALCHEMY_RUNTIME_PATTERN = /\/alchemy-v2\/runtime\/bin\/python$/;
+const ALCHEMY_RUNTIME_PATTERN = /(?:\/alchemy-v2\/runtime|\/alchemy-envs\/[A-Za-z0-9_.-]+\/cpython-\d+\.\d+(?:-[A-Za-z0-9_.-]+)?)\/bin\/python$/;
 const PROJECT_RUNTIME_PATTERN = /(?:^|\/)(?:conda-envs\/jema|jema(?:-v\d+)?|fba-m0)(?:\/|$)/i;
 const PROJECT_CACHE_VARIABLES = [
   "TORCH_HOME",
@@ -66,6 +66,9 @@ const PROJECT_CACHE_VARIABLES = [
 export function validateDeployConfig(config: DeployFileConfig): string[] {
   const errors: string[] = [];
   for (const target of config.stubs) {
+    if (target.runtime_mode !== undefined && target.runtime_mode !== "source" && target.runtime_mode !== "installed") {
+      errors.push(`target ${target.name}: runtime_mode must be source or installed`);
+    }
     if (!ALCHEMY_RUNTIME_PATTERN.test(target.python_path)) {
       errors.push(`target ${target.name}: python_path must use the dedicated Alchemy infrastructure runtime`);
     } else if (PROJECT_RUNTIME_PATTERN.test(target.python_path)) {
@@ -102,11 +105,20 @@ function shellQuote(value: string): string {
 
 export function buildRuntimePreflightCommand(target: StubTarget): string {
   const python = shellQuote(target.python_path);
+  if (target.runtime_mode === "installed") {
+    const checkInstalledPackage = "import importlib.util, pathlib, sys; spec = importlib.util.find_spec('alchemy_stub'); assert spec and spec.origin, 'alchemy_stub is not installed'; package = pathlib.Path(spec.origin).resolve(); prefix = pathlib.Path(sys.prefix).resolve(); assert package.is_relative_to(prefix), f'alchemy_stub resolved outside sys.prefix: {package}'; import socketio, aiohttp, psutil";
+    return [`test -x ${python}`, `${python} -I -c ${shellQuote(checkInstalledPackage)}`].join(" && ");
+  }
   const pythonPath = shellQuote(target.remote_dir);
   return [
     `test -x ${python}`,
     `PYTHONPATH=${pythonPath} ${python} -c ${shellQuote("import alchemy_stub, socketio, aiohttp, psutil")}`,
   ].join(" && ");
+}
+
+/** Installed-wheel deployments must never sync old source over the environment. */
+export function shouldSyncStubCode(target: StubTarget): boolean {
+  return target.runtime_mode !== "installed";
 }
 
 async function preflightRuntime(target: StubTarget, sshKeyPath?: string): Promise<void> {
@@ -185,11 +197,11 @@ async function startStub(
     // intentionally ignored
   }
 
-  // Step 3: launch with PYTHONPATH set so no pip install needed
-  // remote_dir contains alchemy_stub/ directly (tar extracted from stub/)
+  // Source mode retains the legacy PYTHONPATH behavior. Installed mode uses
+  // Python isolated mode so cwd, PYTHONPATH and user-site cannot shadow wheels.
   let launchCmd =
-    `PYTHONPATH=${remote_dir}` +
-    ` nohup ${python_path} -m alchemy_stub` +
+    (target.runtime_mode === "installed" ? "" : `PYTHONPATH=${remote_dir}`) +
+    ` nohup ${python_path}${target.runtime_mode === "installed" ? " -I" : ""} -m alchemy_stub` +
     ` --server ${JSON.stringify(serverUrl)}` +
     ` --token ${JSON.stringify(token)}` +
     ` --max-concurrent ${max_concurrent}`;
@@ -270,7 +282,7 @@ export function buildSlurmStubScript(target: StubTarget, serverUrl: string, toke
     `#SBATCH --output=/tmp/alchemy_stub_${target.name}_%j.log`,
     `#SBATCH --error=/tmp/alchemy_stub_${target.name}_%j.log`,
     "",
-    `PYTHONPATH=${target.remote_dir} ${target.python_path} -m alchemy_stub${continuation}`,
+    `${target.runtime_mode === "installed" ? `${target.python_path} -I` : `PYTHONPATH=${target.remote_dir} ${target.python_path}`} -m alchemy_stub${continuation}`,
     ...args.map((arg, idx) => `  ${arg}${idx < args.length - 1 ? continuation : ""}`),
   ].join("\n");
 }
@@ -385,13 +397,15 @@ export async function deployStub(
   logger.info("deploy.start", { target: target.name, type: target.type ?? "ssh" });
 
   if (target.type === "slurm") {
-    // SLURM: sync code to ssh_host, then sbatch
-    try {
-      await syncCodeSlurm(target, localPath, sshKeyPath);
-      logger.info("deploy.synced", { target: target.name });
-    } catch (err) {
-      logger.error("deploy.sync_failed", { target: target.name, error: String(err) });
-      return { ok: false, target: target.name, step: "sync", error: String(err) };
+    // Source mode syncs to ssh_host; installed mode leaves the wheel intact.
+    if (shouldSyncStubCode(target)) {
+      try {
+        await syncCodeSlurm(target, localPath, sshKeyPath);
+        logger.info("deploy.synced", { target: target.name });
+      } catch (err) {
+        logger.error("deploy.sync_failed", { target: target.name, error: String(err) });
+        return { ok: false, target: target.name, step: "sync", error: String(err) };
+      }
     }
 
     try {
@@ -415,12 +429,14 @@ export async function deployStub(
   }
 
   // SSH target
-  try {
-    await syncCode(target, localPath, sshKeyPath);
-    logger.info("deploy.synced", { target: target.name });
-  } catch (err) {
-    logger.error("deploy.sync_failed", { target: target.name, error: String(err) });
-    return { ok: false, target: target.name, step: "sync", error: String(err) };
+  if (shouldSyncStubCode(target)) {
+    try {
+      await syncCode(target, localPath, sshKeyPath);
+      logger.info("deploy.synced", { target: target.name });
+    } catch (err) {
+      logger.error("deploy.sync_failed", { target: target.name, error: String(err) });
+      return { ok: false, target: target.name, step: "sync", error: String(err) };
+    }
   }
 
   try {

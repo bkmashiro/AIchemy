@@ -609,6 +609,8 @@ export interface StubTarget {
   aliases?: string[];
   // SSH/workstation fields
   type?: "ssh" | "slurm";
+  /** Runtime package source: source sync (default) or an already installed wheel. */
+  runtime_mode?: "source" | "installed";
   host?: string;        // SSH: target host; optional for slurm
   user?: string;
   jump_host?: string;

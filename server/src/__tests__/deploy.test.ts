@@ -3,6 +3,7 @@ import {
   buildRuntimePreflightCommand,
   buildSlurmStubScript,
   listSlurmJobs,
+  shouldSyncStubCode,
   validateDeployConfig,
 } from "../deploy";
 import { DeployFileConfig, StubTarget } from "../types";
@@ -27,6 +28,29 @@ function makeSlurmTarget(overrides: Partial<StubTarget> = {}): StubTarget {
 }
 
 describe("SLURM deploy script generation", () => {
+  it("keeps source mode as the default and skips source sync for installed wheels", () => {
+    expect(shouldSyncStubCode(makeSlurmTarget())).toBe(true);
+    expect(shouldSyncStubCode(makeSlurmTarget({ runtime_mode: "installed" }))).toBe(false);
+  });
+
+  it("preflights installed packages in isolated mode from the configured environment", () => {
+    const command = buildRuntimePreflightCommand(makeSlurmTarget({ runtime_mode: "installed" }));
+    expect(command).toContain("-I -c");
+    expect(command).toContain("sys.prefix");
+    expect(command).toContain("alchemy_stub");
+    expect(command).not.toContain("PYTHONPATH=");
+  });
+
+  it("launches installed wheels in isolated mode in generated SLURM scripts", () => {
+    const script = buildSlurmStubScript(
+      makeSlurmTarget({ runtime_mode: "installed" }),
+      "https://alchemy-v2.yuzhes.com",
+      "secret-token",
+    );
+    expect(script).toContain("-I -m alchemy_stub");
+    expect(script).not.toContain("PYTHONPATH=");
+  });
+
   it("includes idle timeout from CLI/API overrides", () => {
     const script = buildSlurmStubScript(
       makeSlurmTarget(),
@@ -118,6 +142,14 @@ describe("SLURM deploy script generation", () => {
     };
 
     expect(validateDeployConfig(config)).toEqual([]);
+  });
+
+  it("accepts the host-scoped installed gpu32 environment", () => {
+    expect(validateDeployConfig({ stubs: [makeSlurmTarget({
+      runtime_mode: "installed",
+      python_path: "/vol/bitbucket/ys25/alchemy-envs/gpu32/cpython-3.14-sdk-6984e28/bin/python",
+      default_cwd: "/vol/bitbucket/ys25",
+    })] })).toEqual([]);
   });
 
   it("rejects project cache exports across shell separators", () => {

@@ -188,7 +188,7 @@ _SLURM_DEFAULT_IDLE_TIMEOUT = 600
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
-        description="Alchemy v2.1 Stub Daemon",
+        description="Alchemy v2.2 Stub Daemon",
         prog="python -m alchemy_stub",
     )
     parser.add_argument("--server", required=True, help="Server WebSocket URL")

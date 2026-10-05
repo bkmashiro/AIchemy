@@ -1,2 +1,2 @@
-"""Alchemy v2.1 Stub Daemon."""
-__version__ = "2.1.0"
+"""Alchemy v2.2 Stub Daemon."""
+__version__ = "2.2.0"
