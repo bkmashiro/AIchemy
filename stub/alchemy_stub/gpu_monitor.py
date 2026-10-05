@@ -5,6 +5,9 @@ import logging
 import os
 import re
 import subprocess
+import ctypes
+import ctypes.util
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +24,8 @@ class GpuMonitor:
         self._slurm_job_id = os.environ.get("SLURM_JOB_ID")
         self._cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
         self._slurm_job_gpus = os.environ.get("SLURM_JOB_GPUS", "")
+        self._cuda_uuid_resolution_attempted = False
+        self._cuda_uuid_resolution: set[str] | None = None
         # EMA state: {gpu_index: smoothed_utilization_pct}
         self._ema: dict[int, float] = {}
 
@@ -42,12 +47,63 @@ class GpuMonitor:
         if all(item.startswith("GPU-") for item in devices):
             return set(devices), True
         if all(re.fullmatch(r"\d+", item) for item in devices):
+            cuda_uuids = self._resolve_visible_cuda_uuids(devices)
+            if cuda_uuids is not None:
+                return cuda_uuids, True
             allocated = [item.strip() for item in self._slurm_job_gpus.split(",") if item.strip()]
             if allocated and all(re.fullmatch(r"\d+", item) for item in allocated) and set(devices) == set(allocated):
                 return set(devices), True
         # Includes MIG UUIDs and mixed/ambiguous identifiers. nvidia-smi's
         # physical GPU rows cannot safely represent a MIG allocation.
         return set(), False
+
+    def _resolve_visible_cuda_uuids(self, visible: list[str]) -> set[str] | None:
+        """Map CUDA-visible ordinals to physical GPU UUIDs through libcuda."""
+        if self._cuda_uuid_resolution_attempted:
+            return self._cuda_uuid_resolution
+        self._cuda_uuid_resolution_attempted = True
+        try:
+            library = ctypes.util.find_library("cuda")
+            if not library:
+                return None
+            driver = ctypes.CDLL(library)
+            init = driver.cuInit
+            count = driver.cuDeviceGetCount
+            get_device = driver.cuDeviceGet
+            get_uuid = driver.cuDeviceGetUuid
+            init.argtypes, init.restype = [ctypes.c_uint], ctypes.c_int
+            count.argtypes, count.restype = [ctypes.POINTER(ctypes.c_int)], ctypes.c_int
+            get_device.argtypes, get_device.restype = [ctypes.POINTER(ctypes.c_int), ctypes.c_int], ctypes.c_int
+
+            class _CuUuid(ctypes.Structure):
+                _fields_ = [("bytes", ctypes.c_ubyte * 16)]
+
+            get_uuid.argtypes, get_uuid.restype = [ctypes.POINTER(_CuUuid), ctypes.c_int], ctypes.c_int
+            if init(0) != 0:
+                return None
+            device_count = ctypes.c_int()
+            if count(ctypes.byref(device_count)) != 0:
+                return None
+            if device_count.value != len(visible):
+                return None
+            resolved: set[str] = set()
+            # CUDA_VISIBLE_DEVICES selects physical identifiers; the driver
+            # exposes that selected set as ordinals 0..count-1, even for "3".
+            for ordinal in range(device_count.value):
+                device = ctypes.c_int()
+                if get_device(ctypes.byref(device), ordinal) != 0:
+                    return None
+                raw_uuid = _CuUuid()
+                if get_uuid(ctypes.byref(raw_uuid), device.value) != 0:
+                    return None
+                resolved.add(f"GPU-{uuid.UUID(bytes=bytes(raw_uuid.bytes))}")
+            if len(resolved) != len(visible):
+                return None
+            self._cuda_uuid_resolution = resolved
+            return resolved
+        except Exception as exc:
+            log.debug("Could not resolve CUDA-visible GPU UUIDs: %s", exc)
+            return None
 
     # ------------------------------------------------------------------ #
     # Availability                                                         #
