@@ -148,6 +148,72 @@ describe("experiment submission preflight", () => {
     await request(app).post("/experiments").send({ ...body, name: "drifted" }).expect(409);
   });
 
+  it("admits valid DAGs regardless of task_specs order", async () => {
+    const app = makeApp();
+    const response = await request(app).post("/experiments").send({
+      name: "unordered-dag",
+      task_specs: [
+        { ref: "eval", script: "eval.py", depends_on: ["train"] },
+        { ref: "root", script: "root.py" },
+        { ref: "train", script: "train.py", depends_on: ["root"] },
+      ],
+    }).expect(201);
+    const byRef = new Map(store.getGridTasks(response.body.grid_id).map((task) => [task.ref, task]));
+    expect(byRef.get("eval")?.depends_on).toEqual([byRef.get("train")?.id]);
+    expect(byRef.get("train")?.depends_on).toEqual([byRef.get("root")?.id]);
+    expect(store.getAllTasks()).toHaveLength(3);
+    expect(store.getAllGrids()).toHaveLength(1);
+    expect(store.getAllExperiments()).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing reference", [{ ref: "first", script: "first.py" }, { ref: "later", script: "later.py", depends_on: ["absent"] }]],
+    ["cycle", [{ ref: "first", script: "first.py", depends_on: ["later"] }, { ref: "later", script: "later.py", depends_on: ["first"] }]],
+  ])("rejects %s without publishing admission state", async (_label, task_specs) => {
+    const emit = vi.fn();
+    const app = express();
+    app.use(express.json());
+    app.use("/experiments", createExperimentsRouter({} as any, { emit } as any));
+    const response = await request(app).post("/experiments").send({ name: "invalid-dag", task_specs });
+    expect(response.status).toBe(400);
+    expect(store.getAllTasks()).toHaveLength(0);
+    expect(store.getAllGrids()).toHaveLength(0);
+    expect(store.getAllExperiments()).toHaveLength(0);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("rolls back DAG writes and publishes no events when a task write fails", async () => {
+    const emit = vi.fn();
+    const app = express();
+    app.use(express.json());
+    app.use("/experiments", createExperimentsRouter({} as any, { emit } as any));
+    const saveTask = vi.spyOn(store as any, "_saveTask");
+    const original = saveTask.getMockImplementation();
+    let writes = 0;
+    saveTask.mockImplementation(function (this: any, task: any, location: any) {
+      writes += 1;
+      if (writes === 2) throw new Error("injected DAG persistence failure");
+      return original?.call(this, task, location);
+    });
+    const response = await request(app).post("/experiments").send({
+      name: "failed-persist-dag", idempotency_key: "failed-persist-key",
+      task_specs: [{ ref: "one", script: "one.py" }, { ref: "two", script: "two.py" }],
+    });
+    saveTask.mockRestore();
+    expect(response.status).toBe(500);
+    expect(store.getAllTasks()).toHaveLength(0);
+    expect(store.getAllGrids()).toHaveLength(0);
+    expect(store.getAllExperiments()).toHaveLength(0);
+    expect(emit).not.toHaveBeenCalled();
+    const retry = await request(app).post("/experiments").send({
+      name: "failed-persist-dag", idempotency_key: "failed-persist-key",
+      task_specs: [{ ref: "one", script: "one.py" }, { ref: "two", script: "two.py" }],
+    }).expect(201);
+    expect(store.getGridTasks(retry.body.grid_id)).toHaveLength(2);
+    expect(store.getAllExperiments()).toHaveLength(1);
+    expect(store.getExperimentEvents(retry.body.id)).toHaveLength(1);
+  });
+
   it("rejects DAG tasks with conflicting physical stub and logical lease selectors", async () => {
     const app = makeApp();
     const res = await request(app).post("/experiments").send({

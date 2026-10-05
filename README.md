@@ -94,7 +94,7 @@ curl -X POST http://localhost:3001/api/tasks \
 ```python
 from alchemy_sdk import Alchemy
 
-with Alchemy(server="http://localhost:3001", collect_gpu=True) as al:
+with Alchemy(server="http://localhost:3001") as al:
     for step in range(100000):
         loss = train_step()
         al.log(step=step, total=100000, loss=loss)

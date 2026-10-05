@@ -257,8 +257,8 @@ class TestGPUCheck:
         mock_torch.cuda.is_available.return_value = False
 
         with patch.dict("sys.modules", {"torch": mock_torch}):
-            with pytest.raises(RuntimeError, match="torch.cuda.is_available\\(\\) returned False"):
-                run_preflight(ctx, reads=[])
+            with pytest.raises(RuntimeError, match="CUDA is required"):
+                run_preflight(ctx, reads=[], device="cuda")
 
     def test_passes_when_cuda_available(self, tmp_path):
         ctx = _make_ctx(tmp_path)
@@ -272,6 +272,21 @@ class TestGPUCheck:
         ctx = _make_ctx(tmp_path)
         with patch.dict("sys.modules", {"torch": None}):
             run_preflight(ctx, reads=[])  # must not raise
+
+    def test_cpu_requirement_does_not_infer_gpu_from_torch_import(self, tmp_path):
+        ctx = _make_ctx(tmp_path)
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = False
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            run_preflight(ctx, reads=[], device="cpu")
+
+    def test_cuda_required_without_cuda_fails_explicitly(self, tmp_path):
+        ctx = _make_ctx(tmp_path)
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = False
+        with patch.dict("sys.modules", {"torch": mock_torch}):
+            with pytest.raises(RuntimeError, match="CUDA is required"):
+                run_preflight(ctx, reads=[], device="cuda")
 
 
 # ---------------------------------------------------------------------------

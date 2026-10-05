@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { evaluateStubEligibility } from "../scheduler";
+import { computeRunDir, evaluateStubEligibility } from "../scheduler";
 import type { Stub, Task } from "../types";
 
 function onlineA30Stub(): Stub {
@@ -46,5 +46,22 @@ describe("scheduler runtime input defense", () => {
 
     expect(result.eligible).toBe(false);
     expect(result.reasons).toContain("invalid_resource_requirement");
+  });
+});
+
+describe("run_dir allocation", () => {
+  it("uses full task IDs for implicit output isolation, not fingerprints", () => {
+    const stub = onlineA30Stub();
+    stub.default_output_dir = "/shared/results";
+    const first = { ...pendingTask(), id: "task-uuid-1", fingerprint: "same-content" };
+    const second = { ...pendingTask(), id: "task-uuid-2", fingerprint: "same-content" };
+
+    expect(computeRunDir(first, stub)).toBe("/shared/results/task-uuid-1");
+    expect(computeRunDir(second, stub)).toBe("/shared/results/task-uuid-2");
+  });
+
+  it("preserves explicitly selected run directories", () => {
+    const task = { ...pendingTask(), run_dir: "/shared/legacy-resume" };
+    expect(computeRunDir(task, onlineA30Stub())).toBe("/shared/legacy-resume");
   });
 });

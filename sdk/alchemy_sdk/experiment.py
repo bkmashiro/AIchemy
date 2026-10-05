@@ -8,6 +8,7 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from typing import Any, Mapping, Optional
@@ -222,6 +223,7 @@ class Experiment:
         self._tasks: list[TaskNode] = []
         self._refs: set[str] = set()
         self._experiment_id: Optional[str] = None
+        self._idempotency_key: Optional[str] = None
 
         # Config + lineage
         self.config: dict[str, Any] = {}
@@ -519,7 +521,22 @@ class Experiment:
             child._refs.add(t.ref)
         return child
 
-    def submit(self, *, dry_run: bool = False, force: bool = False) -> ExperimentResult:
+    @property
+    def idempotency_key(self) -> Optional[str]:
+        """Key for this Experiment's current logical submission, if initialized.
+
+        Save this value if a process may need to resume an uncertain submission.
+        A new key deliberately starts a distinct logical submission.
+        """
+        return self._idempotency_key
+
+    def submit(
+        self,
+        *,
+        dry_run: bool = False,
+        force: bool = False,
+        idempotency_key: Optional[str] = None,
+    ) -> ExperimentResult:
         """Submit the experiment to the server."""
         self._validate_dag()
         self._validate_task_execution_specs(self.to_spec())
@@ -532,6 +549,19 @@ class Experiment:
                 already_exists=False,
                 url="",
             )
+
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                from .submit import ExperimentSubmissionError
+                raise ExperimentSubmissionError(
+                    "idempotency_key must be a non-empty string",
+                    code="invalid_idempotency_key",
+                    idempotency_key=idempotency_key if isinstance(idempotency_key, str) else None,
+                    outcome="not_submitted",
+                )
+            self._idempotency_key = idempotency_key.strip()
+        elif self._idempotency_key is None:
+            self._idempotency_key = str(uuid.uuid4())
 
         from .submit import submit_experiment
 
@@ -566,6 +596,7 @@ class Experiment:
             hypothesis=self.hypothesis,
             expected_outcome=self.expected_outcome,
             fork_reason=self.fork_reason,
+            idempotency_key=self._idempotency_key,
         )
 
         # Backfill task_ids

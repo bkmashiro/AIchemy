@@ -1,10 +1,15 @@
 """ManagedTraining base class for auto-checkpoint/restore training loops."""
 import argparse
+import hashlib
 import json
 import os
 import pickle
+import re
 import signal
+import tempfile
 import time
+import uuid
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -70,8 +75,25 @@ class ManagedTraining(ABC):
         state = self.state()
         path = self._checkpoint_path(self._current_step)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            pickle.dump(state, f)
+        payload = {
+            "__alchemy_checkpoint__": "managed-training",
+            "schema_version": 1,
+            "next_step": self._current_step,
+            "state": state,
+        }
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
         self._last_checkpoint_time = time.time()
         print(f"[ManagedTraining] Checkpoint saved: {path}", flush=True)
 
@@ -83,15 +105,42 @@ class ManagedTraining(ABC):
 
     def _load_checkpoint(self, path: Path) -> None:
         with open(path, "rb") as f:
-            state = pickle.load(f)
+            payload = pickle.load(f)
+        if isinstance(payload, dict) and payload.get("__alchemy_checkpoint__") == "managed-training":
+            if payload.get("schema_version") != 1:
+                raise ValueError(f"Unsupported checkpoint schema_version: {payload.get('schema_version')!r}")
+            next_step = payload.get("next_step")
+            if not isinstance(next_step, int) or isinstance(next_step, bool) or next_step < 0:
+                raise ValueError("Checkpoint metadata next_step must be a non-negative integer")
+            if "state" not in payload:
+                raise ValueError("Checkpoint metadata is missing state")
+            state = payload["state"]
+            self._current_step = next_step
+        else:
+            # Legacy checkpoints were plain state dictionaries. Explicitly retain
+            # compatibility, but make the lossy step inference visible.
+            warnings.warn(
+                "Loading a legacy checkpoint without versioned next_step metadata; "
+                "the step is inferred from a checkpoint_<step>.pkl filename when possible.",
+                UserWarning,
+                stacklevel=2,
+            )
+            state = payload
+            filename_step = _numeric_checkpoint_step(path)
+            if filename_step is not None:
+                self._current_step = filename_step
         self.load_state(state)
         print(f"[ManagedTraining] Restored from: {path}", flush=True)
 
     def _find_latest_checkpoint(self) -> Optional[Path]:
         if not self._checkpoint_dir or not self._checkpoint_dir.exists():
             return None
-        checkpoints = sorted(self._checkpoint_dir.glob("checkpoint_*.pkl"))
-        return checkpoints[-1] if checkpoints else None
+        candidates: list[tuple[int, str, Path]] = []
+        for path in self._checkpoint_dir.glob("checkpoint_*.pkl"):
+            step = _numeric_checkpoint_step(path)
+            if step is not None:
+                candidates.append((step, path.name, path))
+        return max(candidates, default=(0, "", None))[2]
 
     def _should_checkpoint(self, step: int) -> bool:
         if self._immediate_checkpoint:
@@ -168,69 +217,102 @@ class ManagedTraining(ABC):
         instance = training_class()
         instance._checkpoint_every_steps = args.checkpoint_every_steps
         instance._checkpoint_every_minutes = args.checkpoint_every_minutes
-        instance._checkpoint_dir = (
-            Path(args.checkpoint_dir) if args.checkpoint_dir
-            else Path("/tmp/alchemy_checkpoints")
-        )
+        instance._current_step = 0
+        instance._checkpoint_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else _default_checkpoint_dir()
         instance._last_checkpoint_time = time.time()
 
         # Connect to Alchemy (auto-init from env vars)
         instance._alchemy = Alchemy()
 
-        # SIGUSR1 → immediate checkpoint
+        # SIGUSR1 → immediate checkpoint. Restore the caller's handler afterward.
         def _sigusr1_handler(signum, frame):
             instance._immediate_checkpoint = True
-        signal.signal(signal.SIGUSR1, _sigusr1_handler)
+        previous_sigusr1_handler = None
+        signal_handler_installed = False
+        completed = False
+        try:
+            previous_sigusr1_handler = signal.getsignal(signal.SIGUSR1)
+            signal.signal(signal.SIGUSR1, _sigusr1_handler)
+            signal_handler_installed = True
 
-        # Setup model
-        instance.setup(cfg)
+            # Setup model
+            instance.setup(cfg)
 
-        # Restore from checkpoint
-        resume_path = args.resume_from
-        if resume_path:
-            instance._load_checkpoint(Path(resume_path))
-        else:
-            latest = instance._find_latest_checkpoint()
-            if latest:
-                instance._load_checkpoint(latest)
-                # Extract step from filename
+            # Restore from checkpoint
+            resume_path = args.resume_from
+            if resume_path:
+                instance._load_checkpoint(Path(resume_path))
+            else:
+                latest = instance._find_latest_checkpoint()
+                if latest:
+                    instance._load_checkpoint(latest)
+
+            total = args.total_steps
+            data_iter = iter(instance.data_iterator())
+            stopped = False
+            while instance._current_step < total:
+                if instance._alchemy and instance._alchemy.should_stop():
+                    print("[ManagedTraining] Server requested stop; checkpointing without completion.", flush=True)
+                    instance._save_checkpoint()
+                    stopped = True
+                    break
+
                 try:
-                    step_str = latest.stem.split("_")[-1]
-                    instance._current_step = int(step_str)
-                except ValueError:
-                    pass
+                    batch = next(data_iter)
+                except StopIteration:
+                    break
 
-        # Training loop
-        total = args.total_steps
-        data_iter = iter(instance.data_iterator())
+                metrics = instance.step_fn(batch)
+                instance._current_step += 1
+                instance._report_metrics(instance._current_step, total, metrics)
+                if instance._should_checkpoint(instance._current_step):
+                    instance._immediate_checkpoint = False
+                    instance._save_checkpoint()
 
-        while instance._current_step < total:
-            step = instance._current_step
-
-            # Server-requested early stop
-            if instance._alchemy and instance._alchemy.should_stop():
-                print("[ManagedTraining] Server requested stop, checkpointing and exiting.", flush=True)
+            if not stopped:
+                # Persist the exact next step so resume never repeats a finished step.
                 instance._save_checkpoint()
-                break
-
+                completed = True
+        finally:
+            if signal_handler_installed:
+                signal.signal(signal.SIGUSR1, previous_sigusr1_handler)
             try:
-                batch = next(data_iter)
-            except StopIteration:
-                break
+                if instance._alchemy:
+                    if completed:
+                        instance._alchemy.done()
+                    instance._alchemy.close()
+            except BaseException:
+                try:
+                    if instance._alchemy:
+                        instance._alchemy.close()
+                except Exception:
+                    pass
+                raise
 
-            metrics = instance.step_fn(batch)
-            instance._current_step += 1
-            instance._report_metrics(instance._current_step, total, metrics)
+        if completed:
+            print("[ManagedTraining] Training complete.", flush=True)
 
-            # Checkpoint if needed
-            if instance._should_checkpoint(instance._current_step):
-                instance._immediate_checkpoint = False
-                instance._save_checkpoint()
-        else:
-            # Normal completion — final checkpoint
-            instance._save_checkpoint()
 
-        if instance._alchemy:
-            instance._alchemy.done()
+def _numeric_checkpoint_step(path: Path) -> Optional[int]:
+    match = re.fullmatch(r"checkpoint_(\d+)", path.stem)
+    return int(match.group(1)) if match else None
 
-        print("[ManagedTraining] Training complete.", flush=True)
+
+def _default_checkpoint_dir() -> Path:
+    """Choose a stable task/run-scoped default; never share a global /tmp directory."""
+    task_id = os.environ.get("ALCHEMY_TASK_ID")
+    run_dir = os.environ.get("ALCHEMY_RUN_DIR")
+
+    def component(value: str) -> str:
+        readable = re.sub(r"[^A-Za-z0-9_.-]", "_", value).strip("._") or "unnamed"
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        return f"{readable[:64]}-{digest}"
+
+    if run_dir:
+        identity = component(task_id) if task_id else f"standalone-{uuid.uuid4().hex}"
+        return Path(run_dir) / "managed_checkpoints" / identity
+    if task_id:
+        return Path.home() / ".cache" / "alchemy" / "checkpoints" / component(task_id)
+    # Standalone invocations have no durable identity to resume against. Isolate
+    # them instead of accidentally loading another process's checkpoint.
+    return Path.cwd() / ".alchemy_checkpoints" / uuid.uuid4().hex

@@ -1403,6 +1403,7 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         ? uuidv5(`experiment:${idempotencyKey}`, IDEMPOTENCY_UUID_NAMESPACE) : uuidv4();
       const gridId = idempotencyKey
         ? uuidv5(`grid:${idempotencyKey}`, IDEMPOTENCY_UUID_NAMESPACE) : uuidv4();
+      const tasksByRef = new Map<string, Task>();
       const refToTaskId: Record<string, string> = {};
       const taskIds: string[] = [];
       const submissionWarnings = lintTaskSpecs(materializedTaskSpecs);
@@ -1414,19 +1415,9 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         if (parentExp) parentId = parentExp.id;
       }
 
-      // Create tasks in topological order (specs are assumed ordered, but we process roots first)
+      // Allocate every task identity first so depends_on may reference any declared ref.
+      const tasks: Task[] = [];
       for (const spec of task_specs as TaskSpec[]) {
-        // Convert ref-based depends_on to task ID-based
-        const dependsOnIds: string[] = [];
-        for (const depRef of spec.depends_on || []) {
-          const depId = refToTaskId[depRef];
-          if (!depId) {
-            res.status(400).json({ error: `ref "${spec.ref}" depends on "${depRef}" which hasn't been created yet — check task_specs order` });
-            return;
-          }
-          dependsOnIds.push(depId);
-        }
-
         const taskIdempotencyKey = idempotencyKey ? `${idempotencyKey}:task:${spec.ref}` : undefined;
         const existingTask = taskIdempotencyKey
           ? store.getAllTasks().find((candidate) => candidate.idempotency_key === taskIdempotencyKey) : undefined;
@@ -1435,47 +1426,27 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
           res.status(409).json({ error: `Partial idempotent task ${spec.ref} conflicts with this submission` }); return;
         }
         const task = existingTask ?? createTask({
-          script: spec.script,
-          argv: spec.argv,
-          args: spec.args,
-          raw_args: spec.raw_args,
-          args_template: spec.args_template,
-          depends_on: dependsOnIds.length > 0 ? dependsOnIds : undefined,
-          ref: spec.ref,
-          experiment_id: experimentId,
-          grid_id: gridId,
-          idempotency_key: taskIdempotencyKey,
-          submission_hash: submissionHash,
-          cwd: spec.cwd ?? cwd,
-          python_env: spec.python_env ?? python_env,
-          env_setup: spec.env_setup,
-          env: spec.env,
-          env_overrides: spec.env_overrides,
-          requirements: spec.requirements,
-          target_tags: spec.target_tags ?? target_tags,
-          target_stub_id: spec.target_stub_id,
-          capacity_lease_id: spec.capacity_lease_id,
-          max_retries: spec.max_retries ?? 0,
-          priority: spec.priority,
-          outputs: spec.outputs,
-          metric_schema: spec.metric_schema,
-          result_schema: spec.result_schema,
-          ref_template: spec.ref_template,
-          param_point: spec.param_point,
-          submission_warnings: submissionWarningsForRef(submissionWarnings, spec.ref),
+          script: spec.script, argv: spec.argv, args: spec.args, raw_args: spec.raw_args,
+          args_template: spec.args_template, ref: spec.ref, experiment_id: experimentId, grid_id: gridId,
+          idempotency_key: taskIdempotencyKey, submission_hash: submissionHash,
+          cwd: spec.cwd ?? cwd, python_env: spec.python_env ?? python_env, env_setup: spec.env_setup,
+          env: spec.env, env_overrides: spec.env_overrides, requirements: spec.requirements,
+          target_tags: spec.target_tags ?? target_tags, target_stub_id: spec.target_stub_id,
+          capacity_lease_id: spec.capacity_lease_id, max_retries: spec.max_retries ?? 0,
+          priority: spec.priority, outputs: spec.outputs, metric_schema: spec.metric_schema,
+          result_schema: spec.result_schema, ref_template: spec.ref_template,
+          param_point: spec.param_point, submission_warnings: submissionWarningsForRef(submissionWarnings, spec.ref),
         });
-
-        // Attach resolved_config from SDK (experiment config + task overrides)
-        if (spec.resolved_config) {
-          (task as any).resolved_config = spec.resolved_config;
-        }
-
-        if (!existingTask) {
-          store.addToGlobalQueue(task);
-          webNs.emit("task.update", task);
-        }
-        refToTaskId[spec.ref] = task.id;
+        if (spec.resolved_config) (task as any).resolved_config = spec.resolved_config;
+        tasksByRef.set(spec.ref, task);
         taskIds.push(task.id);
+        if (!existingTask) tasks.push(task);
+      }
+      for (const spec of task_specs as TaskSpec[]) {
+        const task = tasksByRef.get(spec.ref)!;
+        task.depends_on = (spec.depends_on || []).map((depRef) => tasksByRef.get(depRef)!.id);
+        if (task.depends_on.length === 0) task.depends_on = undefined;
+        refToTaskId[spec.ref] = task.id;
       }
 
       // Create grid to hold all task_ids (compat with existing grid status tracking)
@@ -1491,8 +1462,6 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         max_retries: 0,
         target_tags,
       };
-      store.setGrid(grid);
-
       const experiment: Experiment = {
         id: experimentId,
         idempotency_key: idempotencyKey,
@@ -1525,18 +1494,18 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         param_space: param_space || undefined,
         param_points: param_points || undefined,
       };
-
-      store.setExperiment(experiment);
       const forkData = parentId || parent_name ? { parent_name: parent_name ?? null, parent_id: parentId ?? null } : undefined;
-      store.addExperimentEvent({
+      const event = {
         id: uuidv4(),
         experiment_id: experiment.id,
-        kind: forkData ? "forked" : "created",
+        kind: forkData ? "forked" as const : "created" as const,
         message: forkData ? `Forked from ${parent_name || parentId}` : "Created experiment",
         actor: operatorActor(req),
         created_at: experiment.created_at,
         data: forkData,
-      });
+      };
+      store.persistExperimentDag({ tasks, grid, experiment, event });
+      for (const task of tasks) webNs.emit("task.update", task);
       triggerSchedule();
 
       webNs.emit("grid.update", grid);

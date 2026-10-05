@@ -20,7 +20,7 @@ def _make_ctx(tmp_path: Path) -> TrainingContext:
 
 
 class TestPreflightGpuCheck:
-    def test_raises_when_torch_available_but_no_cuda(self, tmp_path):
+    def test_raises_when_cuda_explicitly_required_but_unavailable(self, tmp_path):
         al = Alchemy()
         mock_torch = MagicMock()
         mock_torch.cuda.is_available.return_value = False
@@ -29,8 +29,8 @@ class TestPreflightGpuCheck:
             ctx = TrainingContext(al=al)
 
         with patch.dict("sys.modules", {"torch": mock_torch}):
-            with pytest.raises(RuntimeError, match="No GPU detected"):
-                run_preflight(ctx, reads=[])
+            with pytest.raises(RuntimeError, match=r"CUDA is required but torch.cuda.is_available\(\) returned False"):
+                run_preflight(ctx, reads=[], device="cuda")
 
     def test_passes_when_torch_available_with_cuda(self, tmp_path):
         al = Alchemy()
@@ -42,7 +42,20 @@ class TestPreflightGpuCheck:
 
         with patch.dict("sys.modules", {"torch": mock_torch}):
             # Should not raise
+            run_preflight(ctx, reads=[], device="cuda")
+
+    def test_default_device_does_not_require_cuda(self, tmp_path):
+        al = Alchemy()
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = False
+
+        with patch.dict(os.environ, {"ALCHEMY_RUN_DIR": str(tmp_path)}):
+            ctx = TrainingContext(al=al)
+
+        with patch.dict("sys.modules", {"torch": mock_torch}):
             run_preflight(ctx, reads=[])
+
+        mock_torch.cuda.is_available.assert_not_called()
 
     def test_skips_gpu_check_when_torch_not_installed(self, tmp_path):
         al = Alchemy()

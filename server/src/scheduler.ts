@@ -44,6 +44,7 @@ export type AssignmentReasonCode =
   | "python_env_missing"
   | "gpu_memory_insufficient"
   | "gpu_memory_unknown_requires_exclusive"
+  | "gpu_allocation_unknown"
   | "cpu_memory_insufficient"
   | "stub_draining"
   | "stub_offline";
@@ -72,6 +73,7 @@ export interface StubCapacity {
     reservation_overage_mb: number;
     memory_pressure: boolean;
     unknown_active_tasks: number;
+    allocation_known: boolean;
   };
 }
 
@@ -163,9 +165,13 @@ export function getStubCapacity(stub: Stub): StubCapacity {
   const assigned = active.filter((task) => task.status === "assigned");
 
   const telemetryGpus = stub.gpu_stats?.gpus || [];
-  const gpuTotal = telemetryGpus.length > 0
-    ? telemetryGpus.reduce((sum, gpu) => sum + gpu.memory_total_mb, 0)
-    : stub.gpu.vram_total_mb * Math.max(1, stub.gpu.count || 1);
+  const gpuAllocationKnown = stub.type !== "slurm"
+    || (stub.gpu.allocation_known === true && stub.gpu_stats?.allocation_known !== false);
+  const gpuTotal = stub.type === "slurm" && !gpuAllocationKnown
+    ? 0
+    : telemetryGpus.length > 0
+      ? telemetryGpus.reduce((sum, gpu) => sum + gpu.memory_total_mb, 0)
+      : stub.gpu.vram_total_mb * (stub.type === "slurm" ? stub.gpu.count : Math.max(1, stub.gpu.count || 1));
   const gpuLiveUsed = telemetryGpus.length > 0
     ? telemetryGpus.reduce((sum, gpu) => sum + gpu.memory_used_mb, 0)
     : null;
@@ -243,6 +249,7 @@ export function getStubCapacity(stub: Stub): StubCapacity {
       reservation_overage_mb: gpuReservationOverage,
       memory_pressure: gpuPressure,
       unknown_active_tasks: active.filter((task) => requiresExclusiveGpu(task)).length,
+      allocation_known: gpuAllocationKnown && (stub.type !== "slurm" || (stub.gpu.count > 0 && gpuTotal > 0)),
     },
   };
 }
@@ -281,6 +288,9 @@ export function evaluateStubEligibility(stub: Stub, task: Task): StubEligibility
   if (stub.max_concurrent > 0 && capacity.slots.available <= 0) reasons.push("slots_full");
 
   const candidateGpuExclusive = requiresExclusiveGpu(task);
+  if (isGpuTask(task) && !capacity.gpu.allocation_known) {
+    reasons.push("gpu_allocation_unknown");
+  }
   // Exclusive means exclusive placement on the entire stub, not merely no GPU
   // sibling: CPU siblings can still create host-memory and initialization pressure.
   if (capacity.gpu.memory_pressure) {
@@ -322,6 +332,7 @@ const BLOCKER_PRIORITY: AssignmentReasonCode[] = [
   "tag_mismatch",
   "python_env_missing",
   "gpu_memory_unknown_requires_exclusive",
+  "gpu_allocation_unknown",
   "gpu_memory_insufficient",
   "cpu_memory_insufficient",
   "stub_offline",
@@ -341,6 +352,7 @@ function nextActionForBlocker(blocker: AssignmentReasonCode | null): string {
     case "slots_full": return "wait_for_slot";
     case "gpu_memory_insufficient":
     case "gpu_memory_unknown_requires_exclusive":
+    case "gpu_allocation_unknown":
     case "cpu_memory_insufficient": return "wait_for_memory_or_retarget";
     case "gpu_type_mismatch":
     case "tag_mismatch":
@@ -498,7 +510,7 @@ export function scoreStub(stub: Stub, task: Task): number {
 /**
  * Compute run_dir for a task at dispatch time.
  * Priority: task.run_dir > stub.default_output_dir > (stub.default_cwd or cwd) / "runs"
- * Final path: base_output_dir / fingerprint[:12]
+ * Final path: base_output_dir / task.id (stable across restarts of the same task)
  */
 export function computeRunDir(task: Task, stub: Stub): string {
   // If task has an explicit run_dir set by user, use it as-is (treat as full path)
@@ -515,8 +527,7 @@ export function computeRunDir(task: Task, stub: Stub): string {
     baseOutputDir = path.join(base, "runs");
   }
 
-  const fp = task.fingerprint || task.id;
-  return path.join(baseOutputDir, fp.slice(0, 12));
+  return path.join(baseOutputDir, task.id);
 }
 
 // ─── Build run payload ────────────────────────────────────────────────────────
@@ -608,6 +619,20 @@ export function maybeDispatch(stub: Stub): void {
 
   for (const task of toDispatch) {
     const run_dir = computeRunDir(task, stub);
+    const taskCwd = task.cwd ?? stub.deploy_default_cwd ?? stub.default_cwd ?? process.cwd();
+    const unmanagedOutputs = (task.outputs ?? []).filter((output) => {
+      const resolved = path.resolve(taskCwd, output);
+      const relative = path.relative(path.resolve(run_dir), resolved);
+      return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+    });
+    if (unmanagedOutputs.length > 0) {
+      logger.warn("task.run_dir_unmanaged_outputs", {
+        task_id: task.id,
+        run_dir,
+        cwd: taskCwd,
+        outputs: unmanagedOutputs,
+      });
+    }
     // Persist computed run_dir into task so write lock and display work correctly
     const updated = assignTask(stub.id, task.id, run_dir);
     reliableEmitToStub(stub.id, "task.run", buildRunPayload(task, stub));

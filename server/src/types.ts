@@ -6,6 +6,8 @@ export interface GpuInfo {
   name: string;
   vram_total_mb: number;
   count: number;
+  /** False when a Slurm allocation cannot be mapped to physical GPU telemetry. */
+  allocation_known?: boolean;
 }
 
 export interface GpuStatEntry {
@@ -19,6 +21,7 @@ export interface GpuStatEntry {
 export interface GpuStats {
   timestamp: string;
   gpus: GpuStatEntry[];
+  allocation_known?: boolean;
 }
 
 export interface SystemStats {

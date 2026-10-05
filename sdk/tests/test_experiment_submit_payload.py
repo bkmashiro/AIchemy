@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 
 from alchemy_sdk.experiment import Experiment, ExperimentResult
 from alchemy_sdk.submit import submit_experiment
+from alchemy_sdk.submit import ExperimentSubmissionError
 
 
 class _Response:
@@ -51,6 +54,184 @@ def test_submit_forwards_sdk_storage_and_metadata_spec(monkeypatch):
     assert captured["sdk_spec"]["storage"] == captured["storage"]
     assert captured["sdk_spec"]["metadata"]["sdk_version"] == "2.2.0"
     assert captured["sdk_spec"]["tasks"] == [{"ref": "train", "script": "train.py"}]
+    assert captured["idempotency_key"]
+
+
+def test_experiment_reuses_generated_key_after_timeout(monkeypatch):
+    payloads = []
+
+    def fake_urlopen(req, timeout=30):
+        payloads.append(json.loads(req.data.decode()))
+        if len(payloads) == 1:
+            raise TimeoutError("response timed out")
+        return _Response()
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+    exp = Experiment("retry", server="http://alchemy")
+    exp.task("train", script="train.py")
+
+    try:
+        exp.submit()
+    except ExperimentSubmissionError as exc:
+        assert exc.outcome == "unknown"
+        assert exc.idempotency_key == exp.idempotency_key
+        retry_key = exc.request_key
+    else:
+        raise AssertionError("timeout must be reported")
+
+    result = exp.submit()
+    assert result.experiment_id == "exp-1"
+    assert payloads[0] == payloads[1]
+    assert payloads[0]["idempotency_key"] == retry_key
+
+
+def test_submit_custom_key_and_explicit_new_key(monkeypatch):
+    keys = []
+
+    def fake_urlopen(req, timeout=30):
+        keys.append(json.loads(req.data.decode())["idempotency_key"])
+        return _Response()
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+    exp = Experiment("custom", server="http://alchemy")
+    exp.task("train", script="train.py")
+
+    exp.submit(idempotency_key="caller-key")
+    exp.submit()
+    exp.submit(idempotency_key="intentional-rerun")
+    assert keys == ["caller-key", "caller-key", "intentional-rerun"]
+    assert exp.idempotency_key == "intentional-rerun"
+
+
+def test_submit_reports_idempotency_conflict(monkeypatch):
+    def fake_urlopen(req, timeout=30):
+        raise urllib.error.HTTPError(
+            req.full_url, 409, "Conflict", {},
+            io.BytesIO(b'{"error":"idempotency_key reused with a different experiment payload"}'),
+        )
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+    try:
+        submit_experiment(
+            server="http://alchemy", name="payload", description="",
+            task_specs=[{"ref": "train", "script": "train.py"}],
+            idempotency_key="same-key",
+        )
+    except ExperimentSubmissionError as exc:
+        assert exc.code == "idempotency_conflict"
+        assert exc.status == 409
+        assert exc.request_key == "same-key"
+        assert exc.outcome == "rejected"
+        assert "different experiment payload" in exc.response_body
+    else:
+        raise AssertionError("409 must be reported")
+
+
+def test_experiment_successful_repeat_keeps_key_and_reports_existing(monkeypatch):
+    calls = []
+
+    class ExistingResponse(_Response):
+        status = 200
+
+    def fake_urlopen(req, timeout=30):
+        payload = json.loads(req.data.decode())
+        calls.append(payload)
+        return _Response() if len(calls) == 1 else ExistingResponse()
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+    exp = Experiment("repeat", server="http://alchemy")
+    task = exp.task("train", script="train.py")
+
+    first = exp.submit()
+    second = exp.submit()
+
+    assert task.task_id == "task-1"
+    assert first.already_exists is False
+    assert second.already_exists is True
+    assert calls[0] == calls[1]
+
+
+def test_invalid_idempotency_key_is_typed_and_not_sent(monkeypatch):
+    def unexpected_request(*args, **kwargs):
+        raise AssertionError("invalid key must not send a request")
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", unexpected_request)
+    exp = Experiment("invalid", server="http://alchemy")
+    exp.task("train", script="train.py")
+
+    try:
+        exp.submit(idempotency_key=" ")
+    except ExperimentSubmissionError as exc:
+        assert isinstance(exc, RuntimeError)
+        assert exc.code == "invalid_idempotency_key"
+        assert exc.outcome == "not_submitted"
+    else:
+        raise AssertionError("empty key must be rejected")
+
+
+def test_http_error_json_with_non_object_shape_is_typed(monkeypatch):
+    def fake_urlopen(req, timeout=30):
+        raise urllib.error.HTTPError(
+            req.full_url, 422, "Unprocessable Entity", {}, io.BytesIO(b'["bad", null]'),
+        )
+
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", fake_urlopen)
+    try:
+        submit_experiment("http://alchemy", "bad", "", [])
+    except ExperimentSubmissionError as exc:
+        assert exc.code == "http_422"
+        assert exc.outcome == "rejected"
+        assert exc.response_body == '["bad", null]'
+    else:
+        raise AssertionError("HTTP error must be typed for non-object JSON")
+
+
+def test_success_response_without_experiment_id_is_unknown_and_closed(monkeypatch):
+    class MissingIdResponse:
+        status = 201
+        closed = False
+
+        def read(self):
+            return b'{"task_refs":{}}'
+
+        def close(self):
+            self.closed = True
+
+    response = MissingIdResponse()
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", lambda *a, **k: response)
+    try:
+        submit_experiment("http://alchemy", "bad", "", [], idempotency_key="retry-key")
+    except ExperimentSubmissionError as exc:
+        assert exc.code == "invalid_response"
+        assert exc.outcome == "unknown"
+        assert exc.idempotency_key == "retry-key"
+    else:
+        raise AssertionError("a success response without an id must not appear successful")
+    assert response.closed
+
+
+def test_success_response_read_failure_is_typed_and_closed(monkeypatch):
+    class BrokenResponse:
+        status = 201
+        closed = False
+
+        def read(self):
+            raise OSError("connection reset while reading")
+
+        def close(self):
+            self.closed = True
+
+    response = BrokenResponse()
+    monkeypatch.setattr("alchemy_sdk.submit.urllib.request.urlopen", lambda *a, **k: response)
+    try:
+        submit_experiment("http://alchemy", "bad", "", [], idempotency_key="retry-key")
+    except ExperimentSubmissionError as exc:
+        assert exc.code == "invalid_response"
+        assert exc.outcome == "unknown"
+        assert exc.idempotency_key == "retry-key"
+    else:
+        raise AssertionError("response read failure must be typed")
+    assert response.closed
 
 
 def test_submit_forwards_code_id_to_http_payload(monkeypatch):

@@ -73,6 +73,8 @@ class Alchemy:
 
         # Build transport (no-op if nothing available)
         self._transport = make_transport(self._task_id, stub_socket, server)
+        self._closed = False
+        self._done_sent = False
 
         # Throttle state for log()
         self._last_log_time: float = 0.0
@@ -195,10 +197,20 @@ class Alchemy:
 
     def done(self, metrics: Optional[dict[str, Any]] = None) -> None:
         """Signal that training is complete. Sends final metrics if provided."""
+        if self._done_sent:
+            return
         msg: dict[str, Any] = {"type": "done"}
         if metrics:
             msg["metrics"] = metrics
         self._transport.send(msg)
+        self._done_sent = True
+
+    def close(self) -> None:
+        """Close the transport once; safe to call from nested lifecycle adapters."""
+        if self._closed:
+            return
+        self._closed = True
+        self._transport.close()
 
     # ------------------------------------------------------------------
     # Context manager
@@ -208,7 +220,21 @@ class Alchemy:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.done()
+        if exc_type is not None:
+            try:
+                self.close()
+            except Exception:
+                pass
+            return
+        try:
+            self.done()
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
+        self.close()
 
     # ------------------------------------------------------------------
     # AOP decorator
@@ -221,6 +247,7 @@ class Alchemy:
         checkpoint_every: int = 0,
         reads: Optional[list[str]] = None,
         writes: Optional[list[str]] = None,
+        device: Optional[str] = None,
     ):
         """
         Decorator that wraps a training function with a TrainingContext.
@@ -246,9 +273,17 @@ class Alchemy:
                     eval_every=eval_every,
                     checkpoint_every=checkpoint_every,
                 )
-                run_preflight(ctx, reads=reads or [])
-                result = fn(ctx, *args, **kwargs)
-                self.done(metrics=result if isinstance(result, dict) else None)
+                try:
+                    run_preflight(ctx, reads=reads or [], writes=writes or [], device=device)
+                    result = fn(ctx, *args, **kwargs)
+                    self.done(metrics=result if isinstance(result, dict) else None)
+                except BaseException:
+                    try:
+                        self.close()
+                    except Exception:
+                        pass
+                    raise
+                self.close()
                 return result
 
             return wrapper

@@ -1,18 +1,10 @@
-"""Pre-execution checks before spawning a task subprocess.
-
-Implements spec §2 disk flag decision tree and §9 stub preflight checks.
-"""
+"""Pre-execution checks before spawning a task subprocess."""
 from __future__ import annotations
 
 import json
-import logging
 import os
 import tempfile
 from typing import Any
-
-import aiohttp
-
-log = logging.getLogger(__name__)
 
 _OWNER_FILENAME = ".alchemy_owner"
 
@@ -54,7 +46,7 @@ def _read_flag(run_dir: str) -> dict[str, Any] | None:
 
 
 def _write_flag_atomic(run_dir: str, stub_id: str, task_id: str, fingerprint: str) -> None:
-    """Write .alchemy_owner atomically (tmp + rename)."""
+    """Publish a complete owner marker with an atomic, no-replace hard link."""
     os.makedirs(run_dir, exist_ok=True)
     payload = {
         "stub_id": stub_id,
@@ -67,46 +59,31 @@ def _write_flag_atomic(run_dir: str, stub_id: str, task_id: str, fingerprint: st
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(payload, f)
-        os.replace(tmp, dst)
-    except Exception:
+            f.flush()
+        try:
+            # POSIX link creation is atomic and fails if dst already exists.
+            os.link(tmp, dst)
+            return
+        except FileExistsError:
+            owner = _read_flag(run_dir)
+            if (
+                owner
+                and "fingerprint" in owner
+                and owner.get("task_id") == task_id
+                and owner.get("stub_id") == stub_id
+                and owner.get("fingerprint") == fingerprint
+            ):
+                return
+            owner_id = owner.get("task_id") if owner else None
+            if owner_id:
+                raise FileExistsError(f"run_dir already claimed by task {owner_id}")
+            raise FileExistsError("run_dir already has an unreadable or legacy owner claim")
+    finally:
+        # This is our uniquely-created staging file, never the shared claim.
         try:
             os.unlink(tmp)
-        except OSError:
+        except FileNotFoundError:
             pass
-        raise
-
-
-# ------------------------------------------------------------------ #
-# Server verification helper                                           #
-# ------------------------------------------------------------------ #
-
-async def _verify_task_alive_with_server(
-    server_url: str,
-    token: str,
-    task_id: str,
-) -> bool | None:
-    """Ask server whether task_id is still alive (running/dispatched/queued).
-
-    Returns:
-        True  → task is alive (server confirms)
-        False → task is dead  (server confirms)
-        None  → server unreachable
-    """
-    url = f"{server_url}/api/tasks/{task_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 404:
-                    return False
-                if resp.status == 200:
-                    data = await resp.json()
-                    alive_statuses = {"pending", "queued", "dispatched", "running", "paused"}
-                    return data.get("status") in alive_statuses
-    except Exception as e:
-        log.warning("server verification failed for task %s: %s", task_id, e)
-    return None
 
 
 # ------------------------------------------------------------------ #
@@ -218,77 +195,15 @@ async def run_preflight(
     if errors:
         return PreflightResult.fail(*errors)
 
-    # 4. .alchemy_owner disk flag check
-    if run_dir and fingerprint:
-        flag_result = await _check_disk_flag(
-            run_dir=run_dir,
-            fingerprint=fingerprint,
-            stub_id=stub_id,
-            task_id=task_id,
-            server_url=server_url,
-            token=token,
-        )
-        if not flag_result.ok:
-            return flag_result
-
-        # Write / overwrite flag
+    # 4. Atomically claim the output directory before any subprocess can start.
+    if run_dir:
         try:
+            # Empty fingerprints are still recorded: task/stub identity protects
+            # the directory even for older payloads without a fingerprint.
             _write_flag_atomic(run_dir, stub_id, task_id, fingerprint)
+        except FileExistsError as e:
+            return PreflightResult.fail(str(e))
         except Exception as e:
-            return PreflightResult.fail(f"Failed to write .alchemy_owner: {e}")
-
-    elif run_dir:
-        # No fingerprint available — just ensure run_dir is accessible
-        try:
-            os.makedirs(run_dir, exist_ok=True)
-        except Exception as e:
-            return PreflightResult.fail(f"Cannot create run_dir: {e}")
+            return PreflightResult.fail(f"Failed to claim run_dir: {e}")
 
     return PreflightResult.success()
-
-
-async def _check_disk_flag(
-    run_dir: str,
-    fingerprint: str,
-    stub_id: str,
-    task_id: str,
-    server_url: str,
-    token: str,
-) -> PreflightResult:
-    """Implement the .alchemy_owner decision tree from spec §2."""
-    flag = _read_flag(run_dir)
-
-    if flag is None:
-        # No flag → safe to proceed (flag written by caller)
-        return PreflightResult.success()
-
-    flag_fp = flag.get("fingerprint", "")
-    flag_stub = flag.get("stub_id", "")
-    flag_task = flag.get("task_id", "")
-
-    if flag_fp == fingerprint:
-        if flag_stub == stub_id:
-            # Same fingerprint + own stub → own restart, resume
-            log.info("preflight: own restart detected for task %s, resuming", task_id)
-            return PreflightResult.success()
-        else:
-            # Same fingerprint + other stub → verify with server
-            alive = await _verify_task_alive_with_server(server_url, token, flag_task)
-            if alive is None:
-                return PreflightResult.fail(
-                    f"Cannot verify ownership of run_dir {run_dir}: server unreachable"
-                )
-            if alive:
-                return PreflightResult.fail(
-                    f"Directory {run_dir} occupied by alive task {flag_task} on stub {flag_stub}"
-                )
-            # Other stub's task is dead → overwrite flag
-            log.info(
-                "preflight: other stub task %s confirmed dead, overwriting flag", flag_task
-            )
-            return PreflightResult.success()
-    else:
-        return PreflightResult.fail(
-            f"Directory {run_dir} belongs to different task "
-            f"(flag fingerprint {flag_fp!r} != {fingerprint!r})"
-        )

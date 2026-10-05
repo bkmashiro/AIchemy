@@ -150,16 +150,27 @@ describe("scoreStub — hard constraints", () => {
 
   it("insufficient VRAM (static) returns -Infinity", () => {
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 10_000, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 10_000, count: 1, allocation_known: true },
       tasks: [],
     });
     const task = makeTask({ requirements: { gpu_mem_mb: 20_000 } });
     expect(scoreStub(stub, task)).toBe(-Infinity);
   });
 
+  it("blocks GPU work on an older Slurm stub without known allocation metadata", () => {
+    const oldStub = makeStub({
+      gpu: { name: "A100", vram_total_mb: 40_960, count: 1 },
+      tasks: [],
+    });
+    const gpuTask = makeTask({ requirements: { gpu_mem_mb: 1_000 } });
+
+    expect(getStubCapacity(oldStub).gpu.allocation_known).toBe(false);
+    expect(scoreStub(oldStub, gpuTask)).toBe(-Infinity);
+  });
+
   it("sufficient VRAM passes VRAM check", () => {
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 40_960, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 40_960, count: 1, allocation_known: true },
       tasks: [],
     });
     const task = makeTask({ requirements: { gpu_mem_mb: 20_000 } });
@@ -171,7 +182,7 @@ describe("scoreStub — hard constraints", () => {
       { index: 0, utilization_pct: 80, memory_used_mb: 35_000, memory_total_mb: 40_960, temperature_c: 70 },
     ];
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 40_960, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 40_960, count: 1, allocation_known: true },
       gpu_stats: { timestamp: new Date().toISOString(), gpus },
       tasks: [],
     });
@@ -182,7 +193,7 @@ describe("scoreStub — hard constraints", () => {
   it("reserves assigned VRAM before telemetry catches up", () => {
     const assigned = makeTask({ status: "assigned", requirements: { gpu_mem_mb: 18_000 } });
     const stub = makeStub({
-      gpu: { name: "A30", vram_total_mb: 24_000, count: 1 },
+      gpu: { name: "A30", vram_total_mb: 24_000, count: 1, allocation_known: true },
       gpu_stats: {
         timestamp: new Date().toISOString(),
         gpus: [{ index: 0, utilization_pct: 0, memory_used_mb: 1_000, memory_total_mb: 24_000, temperature_c: 40 }],
@@ -200,7 +211,7 @@ describe("scoreStub — hard constraints", () => {
     const previous = process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO;
     process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO = "0.10";
     try {
-      const stub = makeStub({ gpu: { name: "A100", vram_total_mb: 40_000, count: 1 } });
+      const stub = makeStub({ gpu: { name: "A100", vram_total_mb: 40_000, count: 1, allocation_known: true } });
       expect(getStubCapacity(stub).gpu.headroom_mb).toBe(4_000);
     } finally {
       if (previous === undefined) delete process.env.ALCHEMY_GPU_MEMORY_HEADROOM_RATIO;
@@ -211,7 +222,7 @@ describe("scoreStub — hard constraints", () => {
   it("rejects non-positive resource declarations without inflating capacity", () => {
     const invalidAssigned = makeTask({ status: "assigned", requirements: { gpu_mem_mb: -10_000 } });
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 40_000, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 40_000, count: 1, allocation_known: true },
       max_concurrent: 4,
       tasks: [invalidAssigned],
     });
@@ -238,13 +249,21 @@ describe("scoreStub — hard constraints", () => {
 
   it("runs a GPU task without a memory estimate exclusively on the whole stub", () => {
     const running = makeTask({ status: "running", requirements: { gpu_mem_mb: 4_000 } });
-    const stub = makeStub({ max_concurrent: 4, tasks: [running] });
+    const stub = makeStub({
+      gpu: { name: "A100", vram_total_mb: 40960, count: 1, allocation_known: true },
+      max_concurrent: 4,
+      tasks: [running],
+    });
     const unknownGpuTask = makeTask({ requirements: { gpu_type: ["A100"] } });
 
     expect(scoreStub(stub, unknownGpuTask)).toBe(-Infinity);
 
     const exclusiveRunning = makeTask({ status: "running", requirements: { gpu_type: ["A100"] } });
-    const exclusiveStub = makeStub({ max_concurrent: 4, tasks: [exclusiveRunning] });
+    const exclusiveStub = makeStub({
+      gpu: { name: "A100", vram_total_mb: 40960, count: 1, allocation_known: true },
+      max_concurrent: 4,
+      tasks: [exclusiveRunning],
+    });
     const cpuSibling = makeTask({ requirements: { cpu_mem_mb: 512 } });
     expect(scoreStub(exclusiveStub, cpuSibling)).toBe(-Infinity);
   });
@@ -252,7 +271,7 @@ describe("scoreStub — hard constraints", () => {
   it("blocks siblings while an attributed task exceeds its GPU reservation", () => {
     const running = makeTask({ id: "over-budget", status: "running", requirements: { gpu_mem_mb: 4_000 } });
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 80_000, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 80_000, count: 1, allocation_known: true },
       system_stats: {
         cpu_pct: 1,
         mem_used_mb: 1_000,
@@ -270,19 +289,19 @@ describe("scoreStub — hard constraints", () => {
   });
 
   it("gpu_type mismatch returns -Infinity", () => {
-    const stub = makeStub({ gpu: { name: "RTX 3090", vram_total_mb: 24576, count: 1 } });
+    const stub = makeStub({ gpu: { name: "RTX 3090", vram_total_mb: 24576, count: 1, allocation_known: true } });
     const task = makeTask({ requirements: { gpu_type: ["A100"] } });
     expect(scoreStub(stub, task)).toBe(-Infinity);
   });
 
   it("gpu_type match passes", () => {
-    const stub = makeStub({ gpu: { name: "NVIDIA A100", vram_total_mb: 40960, count: 1 } });
+    const stub = makeStub({ gpu: { name: "NVIDIA A100", vram_total_mb: 40960, count: 1, allocation_known: true } });
     const task = makeTask({ requirements: { gpu_type: ["A100"] } });
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
 
   it("gpu_type check normalizes names (case, spaces, dashes)", () => {
-    const stub = makeStub({ gpu: { name: "NVIDIA-RTX-3090", vram_total_mb: 24576, count: 1 } });
+    const stub = makeStub({ gpu: { name: "NVIDIA-RTX-3090", vram_total_mb: 24576, count: 1, allocation_known: true } });
     const task = makeTask({ requirements: { gpu_type: ["rtx 3090"] } });
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
@@ -379,7 +398,7 @@ describe("assignment diagnosis", () => {
     const assigned = makeTask({ status: "assigned", requirements: { gpu_mem_mb: 18_000 } });
     const stub = makeStub({
       id: "a30",
-      gpu: { name: "A30", vram_total_mb: 24_000, count: 1 },
+      gpu: { name: "A30", vram_total_mb: 24_000, count: 1, allocation_known: true },
       gpu_stats: {
         timestamp: new Date().toISOString(),
         gpus: [{ index: 0, utilization_pct: 0, memory_used_mb: 1_000, memory_total_mb: 24_000, temperature_c: 40 }],
@@ -439,8 +458,8 @@ describe("scoreStub — soft scoring", () => {
   });
 
   it("VRAM waste penalty: smaller waste → higher score", () => {
-    const tight = makeStub({ gpu: { name: "A30", vram_total_mb: 24_000, count: 1 }, tasks: [] });
-    const wasteful = makeStub({ gpu: { name: "A100", vram_total_mb: 80_000, count: 1 }, tasks: [] });
+    const tight = makeStub({ gpu: { name: "A30", vram_total_mb: 24_000, count: 1, allocation_known: true }, tasks: [] });
+    const wasteful = makeStub({ gpu: { name: "A100", vram_total_mb: 80_000, count: 1, allocation_known: true }, tasks: [] });
     const task = makeTask({ requirements: { gpu_mem_mb: 20_000 } });
 
     expect(scoreStub(tight, task)).toBeGreaterThan(scoreStub(wasteful, task));
@@ -458,7 +477,7 @@ describe("scoreStub — soft scoring", () => {
   });
 
   it("stub with no gpu_type requirement accepts any GPU", () => {
-    const stub = makeStub({ gpu: { name: "RTX 3090", vram_total_mb: 24576, count: 1 } });
+    const stub = makeStub({ gpu: { name: "RTX 3090", vram_total_mb: 24576, count: 1, allocation_known: true } });
     const task = makeTask({ requirements: { gpu_type: [] } });
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
@@ -476,43 +495,57 @@ describe("computeRunDir", () => {
   });
 
   it("uses stub.default_output_dir as base when no task.run_dir", () => {
-    const task = makeTask({ fingerprint: "abc123456789" });
+    const task = makeTask({ id: "out-dir-task", fingerprint: "abc123456789" });
     const stub = makeStub({ default_output_dir: "/outputs" });
     const dir = computeRunDir(task, stub);
-    expect(dir).toBe("/outputs/abc123456789");
+    expect(dir).toBe("/outputs/out-dir-task");
   });
 
-  it("fingerprint slice is exactly 12 chars", () => {
-    const fp = "abcdef123456789";
-    const task = makeTask({ fingerprint: fp });
+  it("uses the full task ID instead of a fingerprint prefix", () => {
+    const task = makeTask({ id: "task-with-long-id", fingerprint: "abcdef123456789" });
     const stub = makeStub({ default_output_dir: "/out" });
     const dir = computeRunDir(task, stub);
-    const basename = dir.split("/").pop()!;
-    expect(basename).toHaveLength(12);
-    expect(basename).toBe(fp.slice(0, 12));
+    expect(dir).toBe("/out/task-with-long-id");
+  });
+
+  it("different tasks with the same fingerprint get different run directories", () => {
+    const stub = makeStub({ default_output_dir: "/out" });
+    const first = makeTask({ id: "task-one", fingerprint: "shared-fingerprint" });
+    const second = makeTask({ id: "task-two", fingerprint: "shared-fingerprint" });
+
+    expect(computeRunDir(first, stub)).toBe("/out/task-one");
+    expect(computeRunDir(second, stub)).toBe("/out/task-two");
+  });
+
+  it("full task IDs sharing the same 12-character prefix do not collide", () => {
+    const stub = makeStub({ default_output_dir: "/out" });
+    const first = makeTask({ id: "task-12345678-alpha" });
+    const second = makeTask({ id: "task-12345678-beta" });
+
+    expect(first.id.slice(0, 12)).toBe(second.id.slice(0, 12));
+    expect(computeRunDir(first, stub)).not.toBe(computeRunDir(second, stub));
   });
 
   it("falls back to task.cwd/runs when no output dir or default_cwd", () => {
-    const task = makeTask({ fingerprint: "fp0123456789", cwd: "/workspace/project" });
+    const task = makeTask({ id: "cwd-run-task", cwd: "/workspace/project" });
     const stub = makeStub({ default_output_dir: undefined, default_cwd: undefined });
     const dir = computeRunDir(task, stub);
-    expect(dir).toContain("runs");
-    expect(dir).toContain("fp0123456789");
+    expect(dir).toBe("/workspace/project/runs/cwd-run-task");
   });
 
   it("falls back to stub.default_cwd/runs when task has no cwd", () => {
-    const task = makeTask({ fingerprint: "fp0123456789", cwd: undefined });
+    const task = makeTask({ id: "default-cwd-task", cwd: undefined });
     const stub = makeStub({ default_output_dir: undefined, default_cwd: "/home/user/jobs" });
     const dir = computeRunDir(task, stub);
-    expect(dir).toBe("/home/user/jobs/runs/fp0123456789");
+    expect(dir).toBe("/home/user/jobs/runs/default-cwd-task");
   });
 
   it("uses task.id when fingerprint is absent", () => {
     const task = makeTask({ id: "tid-abc123456789", fingerprint: "" });
     const stub = makeStub({ default_output_dir: "/out" });
     const dir = computeRunDir(task, stub);
-    // fp is empty string, falls back to task.id
-    expect(dir).toBe("/out/tid-abc12345");
+    // The task ID is used in full, not truncated.
+    expect(dir).toBe("/out/tid-abc123456789");
   });
 });
 
@@ -538,7 +571,7 @@ describe("buildRunPayload", () => {
     expect(payload.cwd).toBe("/workspace");
     expect(payload.env).toEqual({ FOO: "bar" });
     expect(payload.params).toEqual({ lr: "0.001" });
-    expect(payload.run_dir).toBe("/out/fp0123456789");
+    expect(payload.run_dir).toBe("/out/t-build");
   });
 
   it("includes structured command_argv when task is safe to exec without shell", () => {
@@ -773,7 +806,7 @@ describe("schedule — re-entrancy guard", () => {
       requirements: { gpu_mem_mb: 999_999_999 }, // impossibly large
     });
     store.addToGlobalQueue(task);
-    const stub = makeStub({ gpu: { name: "A100", vram_total_mb: 40960, count: 1 }, tasks: [] });
+    const stub = makeStub({ gpu: { name: "A100", vram_total_mb: 40960, count: 1, allocation_known: true }, tasks: [] });
     store.setStub(stub);
 
     schedule();
@@ -820,7 +853,7 @@ describe("scoreStub — VRAM estimation from running tasks", () => {
   it("deducts running task requirements from total VRAM when no gpu_stats", () => {
     const running = makeTask({ status: "running", requirements: { gpu_mem_mb: 20_000 } });
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 40_960, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 40_960, count: 1, allocation_known: true },
       tasks: [running],
       gpu_stats: undefined,
     });
@@ -831,7 +864,7 @@ describe("scoreStub — VRAM estimation from running tasks", () => {
 
   it("task without gpu_mem_mb requirement passes VRAM check", () => {
     const stub = makeStub({
-      gpu: { name: "A100", vram_total_mb: 40_960, count: 1 },
+      gpu: { name: "A100", vram_total_mb: 40_960, count: 1, allocation_known: true },
       tasks: [],
     });
     const task = makeTask({ requirements: {} });
@@ -860,22 +893,21 @@ describe("edge cases", () => {
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
 
-  it("computeRunDir: uses task.id[:12] when fingerprint is missing", () => {
+  it("computeRunDir: uses the full task ID when fingerprint is missing", () => {
     const task = makeTask({ fingerprint: undefined as any, id: "task-id-longname" });
     const stub = makeStub({ default_output_dir: "/out" });
     const dir = computeRunDir(task, stub);
-    // fp = task.fingerprint || task.id; slice(0,12) of "task-id-longname" = "task-id-long"
-    expect(dir).toBe("/out/task-id-long");
+    expect(dir).toBe("/out/task-id-longname");
   });
 
   it("gpu_type check: partial name match works (e.g. 'a100' matches 'NVIDIA A100 SXM4')", () => {
-    const stub = makeStub({ gpu: { name: "NVIDIA A100 SXM4 80GB", vram_total_mb: 81920, count: 1 } });
+    const stub = makeStub({ gpu: { name: "NVIDIA A100 SXM4 80GB", vram_total_mb: 81920, count: 1, allocation_known: true } });
     const task = makeTask({ requirements: { gpu_type: ["a100"] } });
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });
 
   it("multiple gpu_type options: any match is sufficient", () => {
-    const stub = makeStub({ gpu: { name: "A30", vram_total_mb: 24576, count: 1 } });
+    const stub = makeStub({ gpu: { name: "A30", vram_total_mb: 24576, count: 1, allocation_known: true } });
     const task = makeTask({ requirements: { gpu_type: ["A100", "A30"] } });
     expect(scoreStub(stub, task)).toBeGreaterThan(-Infinity);
   });

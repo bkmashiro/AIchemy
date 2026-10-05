@@ -23,9 +23,9 @@ def _make_gpu_monitor(available: bool = True):
 
 def _fake_smi_output(*util_values: int) -> str:
     """Build fake nvidia-smi CSV output for a single GPU with given utilisation values."""
-    # Format: index, name, utilization.gpu, memory.used, memory.total, temperature.gpu
+    # Format: index, name, utilization.gpu, memory.used, memory.total, temperature.gpu, uuid
     return "\n".join(
-        f"0, Tesla T4, {v}, 1024, 16160, 55" for v in util_values
+        f"0, Tesla T4, {v}, 1024, 16160, 55, GPU-test0" for v in util_values
     )
 
 
@@ -95,8 +95,8 @@ class TestGpuMonitorEMA:
 
         def two_gpu_output(util0: int, util1: int) -> str:
             return (
-                f"0, Tesla T4, {util0}, 1024, 16160, 55\n"
-                f"1, Tesla T4, {util1}, 2048, 16160, 60"
+                f"0, Tesla T4, {util0}, 1024, 16160, 55, GPU-test0\n"
+                f"1, Tesla T4, {util1}, 2048, 16160, 60, GPU-test1"
             )
 
         result = MagicMock()

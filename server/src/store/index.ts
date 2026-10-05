@@ -1802,6 +1802,50 @@ class Store {
     return Array.from(this.grids.values());
   }
 
+  /** Persist an experiment DAG as one SQLite unit before publishing in-memory state. */
+  persistExperimentDag(input: {
+    tasks: Task[];
+    grid: Grid;
+    experiment: Experiment;
+    event: ExperimentEvent;
+  }): void {
+    const { tasks, grid, experiment, event } = input;
+    try {
+      this.db.transaction(() => {
+        for (const task of tasks) this._saveTask(task, "global");
+        this.db.insert(schema.grids).values({ id: grid.id, data: JSON.stringify(grid) }).run();
+        experiment.alias = this.ensureObjectAlias("experiment", experiment.id);
+        this.db.insert(schema.experiments).values({ id: experiment.id, data: JSON.stringify(experiment) }).run();
+        this.db.insert(schema.experimentEvents).values({
+          id: event.id,
+          experiment_id: event.experiment_id,
+          task_id: event.task_id ?? null,
+          kind: event.kind,
+          message: event.message,
+          actor: event.actor ?? null,
+          data_json: event.data ? JSON.stringify(event.data) : null,
+          created_at: event.created_at,
+          deleted_at: event.deleted_at ?? null,
+        }).run();
+      });
+    } catch (err) {
+      // Alias helpers populate caches eagerly; restore those caches from committed DB state.
+      this.aliasByObject.clear();
+      this.objectByAlias.clear();
+      for (const alias of this.db.select().from(schema.objectAliases).all()) {
+        this._cacheAlias(alias.alias, alias.object_kind as AliasObjectKind, alias.object_id);
+      }
+      throw err;
+    }
+
+    for (const task of tasks) {
+      this._taskIndex.set(task.id, { location: "global" });
+      this._indexFingerprint(task);
+    }
+    this.grids.set(grid.id, grid);
+    this.experiments.set(experiment.id, experiment);
+  }
+
   setGrid(grid: Grid): void {
     this.grids.set(grid.id, grid);
     try {

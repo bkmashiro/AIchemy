@@ -91,3 +91,50 @@ def test_log_rejects_undeclared_metrics_when_strict(monkeypatch):
         assert "undeclared metric" in str(exc)
     else:
         raise AssertionError("strict metrics should reject undeclared metric keys")
+
+
+def test_context_manager_exception_does_not_send_done_and_closes_transport(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TASK_ID", "task-1")
+    with patch("alchemy_sdk.client.make_transport") as make_transport:
+        transport = MagicMock()
+        transport.close.side_effect = RuntimeError("close failed")
+        make_transport.return_value = transport
+        al = Alchemy()
+        try:
+            with al:
+                raise ValueError("training failed")
+        except ValueError:
+            pass
+
+    assert not any(call.args[0].get("type") == "done" for call in transport.send.call_args_list)
+    transport.close.assert_called_once()
+
+
+def test_context_manager_does_not_duplicate_done_or_close(monkeypatch):
+    monkeypatch.setenv("ALCHEMY_TASK_ID", "task-1")
+    with patch("alchemy_sdk.client.make_transport") as make_transport:
+        transport = MagicMock()
+        make_transport.return_value = transport
+        al = Alchemy()
+        with al:
+            al.done()
+            al.done()
+
+    assert sum(call.args[0].get("type") == "done" for call in transport.send.call_args_list) == 1
+    transport.close.assert_called_once()
+
+
+def test_managed_forwards_writes_to_preflight(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALCHEMY_TASK_ID", "task-1")
+    monkeypatch.setenv("ALCHEMY_RUN_DIR", str(tmp_path / "run"))
+    with patch("alchemy_sdk.client.make_transport"):
+        al = Alchemy()
+    with patch("alchemy_sdk.preflight.run_preflight") as run_preflight:
+        @al.managed(reads=["input"], writes=["output"])
+        def train(ctx):
+            return None
+        train()
+
+    assert run_preflight.call_args.kwargs == {
+        "reads": ["input"], "writes": ["output"], "device": None
+    }

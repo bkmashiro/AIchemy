@@ -11,7 +11,12 @@ if TYPE_CHECKING:
     from .context import TrainingContext
 
 
-def run_preflight(ctx: "TrainingContext", reads: list[str], writes: list[str] | None = None) -> None:
+def run_preflight(
+    ctx: "TrainingContext",
+    reads: list[str],
+    writes: list[str] | None = None,
+    device: str | None = None,
+) -> None:
     """
     Perform pre-training sanity checks:
 
@@ -19,7 +24,7 @@ def run_preflight(ctx: "TrainingContext", reads: list[str], writes: list[str] | 
     2. Ensure run_dir parent is writable (ALCHEMY_RUN_DIR writable). → raise on fail.
     3. Auto-create run_dir + checkpoint_dir with umask 002.
     4. Disk space warning if < 1 GiB free.
-    5. GPU availability check (if torch importable). → raise on fail.
+    5. Verify an explicitly required CUDA device; torch presence alone does not imply GPU intent.
     6. Detect existing checkpoint → set ctx.is_resume = True.
     """
 
@@ -87,16 +92,19 @@ def run_preflight(ctx: "TrainingContext", reads: list[str], writes: list[str] | 
     except Exception:
         pass  # disk_usage may fail on exotic filesystems — not fatal
 
-    # 6. GPU check — raise if torch installed but no CUDA
-    try:
-        import torch  # type: ignore
+    # 5. Check only an explicit CUDA requirement; torch presence does not imply GPU intent.
+    if device not in (None, "cpu", "cuda"):
+        raise ValueError("device must be one of None, 'cpu', or 'cuda'")
+    if device == "cuda":
+        try:
+            import torch  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("Preflight: CUDA is required but torch is not installed") from exc
         if not torch.cuda.is_available():
             raise RuntimeError(
-                "Preflight: torch.cuda.is_available() returned False. "
-                "No GPU detected. Set CUDA_VISIBLE_DEVICES or check driver."
+                "Preflight: CUDA is required but torch.cuda.is_available() returned False. "
+                "Check CUDA_VISIBLE_DEVICES and the driver."
             )
-    except ImportError:
-        pass  # torch not installed — skip GPU check
 
     # 7. Detect existing checkpoint → set is_resume
     ckpt = ctx.latest_checkpoint()
