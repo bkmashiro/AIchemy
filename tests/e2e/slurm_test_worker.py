@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pwd
 import signal
 import subprocess
 import time
@@ -26,12 +27,22 @@ def main():
     parser.add_argument('--runtime', required=True)
     parser.add_argument('--prepare', action='store_true')
     args = parser.parse_args()
+    # --export=NIL deliberately strips the login environment. Reconstruct the
+    # standard identity variable from the actual allocated process UID.
+    os.environ.setdefault('USER', pwd.getpwuid(os.getuid()).pw_name)
     stage, runtime = Path(args.stage), Path(args.runtime)
     job_id = os.environ['SLURM_JOB_ID']
     port = 35000 + int(job_id) % 16000
     job = stage / ('job-' + job_id)
     job.mkdir(mode=0o700)
     processes = []
+    stop_requested = False
+
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGUSR1, request_stop)
     try:
         (job / 'runtime-probe.json').write_text(json.dumps(runtime_probe(), indent=2))
         ready = stage / 'runtime-ready'
@@ -93,7 +104,7 @@ def main():
         (job / 'ready.json').write_text(json.dumps({'job_id': job_id, 'daemon_pid': daemon.pid,
                                                    'runtime': str(runtime)}))
         deadline = time.monotonic() + 400
-        while not (stage / 'STOP').exists():
+        while not stop_requested and not (stage / 'STOP').exists():
             if daemon.poll() is not None:
                 raise RuntimeError(f'daemon exited status {daemon.returncode}')
             if time.monotonic() >= deadline:
@@ -109,7 +120,9 @@ def main():
                 except subprocess.TimeoutExpired:
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=5)
-        (job / 'cleanup.json').write_text(json.dumps({'owned_processes_stopped': all(p.poll() is not None for p in processes)}))
+        receipt = {'owned_processes_stopped': all(p.poll() is not None for p in processes)}
+        (job / 'cleanup.json').write_text(json.dumps(receipt))
+        print(json.dumps({'test_cleanup_receipt': receipt, 'job_id': job_id}), flush=True)
 
 
 if __name__ == '__main__':

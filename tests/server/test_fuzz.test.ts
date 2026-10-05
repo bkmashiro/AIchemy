@@ -12,6 +12,7 @@ import { spawn, ChildProcess } from "child_process";
 import path from "path";
 import net from "net";
 import fs from "fs";
+import os from "os";
 import { io as ioClient, Socket } from "socket.io-client";
 
 // Disable proxy
@@ -256,7 +257,7 @@ function checkInvariants(state: ServerState, label: string): void {
 let serverProcess: ChildProcess;
 let BASE: string;
 const TOKEN = "alchemy-v2-token";
-const STATE_FILE = `/tmp/alchemy_fuzz_${process.pid}.json`;
+const STATE_FILE = path.join(os.tmpdir(), `alchemy_fuzz_${process.pid}.json`);
 const SERVER_DIR = path.join(__dirname, "../../server");
 
 beforeAll(async () => {

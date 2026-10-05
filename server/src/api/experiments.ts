@@ -1442,10 +1442,12 @@ export function createExperimentsRouter(stubNs: Namespace, webNs: Namespace): Ro
         taskIds.push(task.id);
         if (!existingTask) tasks.push(task);
       }
+      const newlyCreatedTaskIds = new Set(tasks.map((task) => task.id));
       for (const spec of task_specs as TaskSpec[]) {
         const task = tasksByRef.get(spec.ref)!;
         task.depends_on = (spec.depends_on || []).map((depRef) => tasksByRef.get(depRef)!.id);
         if (task.depends_on.length === 0) task.depends_on = undefined;
+        if (newlyCreatedTaskIds.has(task.id) && task.depends_on?.length) task.status = "blocked";
         refToTaskId[spec.ref] = task.id;
       }
 

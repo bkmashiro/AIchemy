@@ -99,9 +99,11 @@ class UnixSocketTransport:
         # Signal state — written by recv thread, read by main thread
         self._signals: dict[str, bool] = {
             "should_stop": False,
-            "should_checkpoint": False,
             "should_eval": False,
         }
+        self._checkpoint_requests: dict[str, bool] = {}
+        self._last_checkpoint_id: str | None = None
+        self._saved_checkpoint_paths: dict[str, str] = {}
         self._signals_lock = threading.Lock()
 
         # Socket state
@@ -198,9 +200,26 @@ class UnixSocketTransport:
             return
         if msg.get("type") == "signal":
             sig = msg.get("signal", "")
+            request_id = msg.get("request_id")
+            acknowledge = False
             with self._signals_lock:
-                if sig in self._signals:
+                if sig == "should_checkpoint" and request_id:
+                    self._checkpoint_requests.setdefault(str(request_id), False)
+                    acknowledge = True
+                elif sig == "should_stop" and request_id:
+                    self._stop_request_id = str(request_id)
+                    self._signals["should_stop"] = True
+                    acknowledge = True
+                elif sig in self._signals:
                     self._signals[sig] = True
+            if acknowledge:
+                # Receipt is distinct from checkpoint completion. Repeated delivery
+                # re-acks the same ID without re-triggering the one-shot request.
+                self.send({"type": "control.received", "request_id": str(request_id)})
+                with self._signals_lock:
+                    saved_path = self._saved_checkpoint_paths.get(str(request_id)) if sig == "should_checkpoint" else None
+                if saved_path:
+                    self.send({"type": "checkpoint", "path": saved_path, "request_id": str(request_id)})
 
     # ------------------------------------------------------------------
     # Heartbeat loop
@@ -222,7 +241,22 @@ class UnixSocketTransport:
 
     def should_checkpoint(self) -> bool:
         with self._signals_lock:
-            return self._signals["should_checkpoint"]
+            pending = next((rid for rid, consumed in self._checkpoint_requests.items() if not consumed), None)
+            if pending is None:
+                return False
+            self._checkpoint_requests[pending] = True
+            self._last_checkpoint_id = pending
+        return True
+
+    def checkpoint_request_id(self) -> str | None:
+        with self._signals_lock:
+            return self._last_checkpoint_id
+
+    def remember_checkpoint(self, request_id: str, path: str) -> None:
+        with self._signals_lock:
+            self._saved_checkpoint_paths[request_id] = path
+            if self._last_checkpoint_id == request_id:
+                self._last_checkpoint_id = None
 
     def should_eval(self) -> bool:
         with self._signals_lock:

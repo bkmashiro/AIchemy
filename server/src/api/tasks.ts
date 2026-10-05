@@ -968,17 +968,41 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       update.name = name;
       update.display_name = name; // user-set name takes over display_name
     }
+    const controls = [...(task.control_requests || [])];
+    const active = task.status === "running" || task.status === "assigned";
+    for (const [field, value] of [["should_stop", should_stop], ["should_checkpoint", should_checkpoint]]) {
+      if (value !== undefined && typeof value !== "boolean") {
+        res.status(400).json({ error: `${field} must be a boolean` }); return;
+      }
+    }
+    if (status === undefined && (should_stop === true || should_checkpoint === true) && (!active || !stubId)) {
+      res.status(409).json({ error: "Cooperative control requires a running or assigned task; cancel queued tasks through status" }); return;
+    }
+    if (status === undefined && should_stop === false && controls.some((c) => c.signal === "should_stop")) {
+      res.status(409).json({ error: "An accepted cooperative stop cannot be revoked" }); return;
+    }
+    const signalsToSend: Array<{ signal: "should_stop" | "should_checkpoint"; request_id: string }> = [];
     if (should_stop !== undefined) {
-      update.should_stop = should_stop;
-      if (should_stop && stubId && (task.status === "running" || task.status === "assigned")) {
-        reliableEmitToStub(stubId, "task.signal", { task_id: task.id, signal: "should_stop" });
+      update.should_stop = Boolean(should_stop);
+      if (should_stop && active && stubId && !controls.some((c) => c.signal === "should_stop")) {
+        const control = { request_id: uuidv4(), signal: "should_stop" as const, status: "pending" as const, updated_at: new Date().toISOString() };
+        controls.push(control);
+        signalsToSend.push({ signal: control.signal, request_id: control.request_id });
       }
     }
     if (should_checkpoint !== undefined) {
-      update.should_checkpoint = should_checkpoint;
-      if (should_checkpoint && stubId) {
-        reliableEmitToStub(stubId, "task.signal", { task_id: task.id, signal: "should_checkpoint" });
+      update.should_checkpoint = Boolean(should_checkpoint);
+      // A false→true transition is one explicit checkpoint request; retries of
+      // the same PATCH reuse the existing identity and cannot retrigger it.
+      const wasRequested = Boolean(task.should_checkpoint);
+      if (should_checkpoint && !wasRequested && active && stubId) {
+        const control = { request_id: uuidv4(), signal: "should_checkpoint" as const, status: "pending" as const, updated_at: new Date().toISOString() };
+        controls.push(control);
+        signalsToSend.push({ signal: control.signal, request_id: control.request_id });
       }
+    }
+    if (controls.length || (should_stop !== undefined && should_stop) || (should_checkpoint !== undefined && should_checkpoint)) {
+      update.control_requests = controls;
     }
     if (status !== undefined) {
       // Status override — limited transitions
@@ -1065,6 +1089,12 @@ export function createGlobalTasksRouter(stubNs?: Namespace, webNs?: Namespace): 
       updated = store.updateGlobalQueueTask(task.id, update);
     }
 
+    if (updated && stubId) {
+      // Persist intent only after all PATCH validation, before delivery.
+      for (const control of signalsToSend) {
+        reliableEmitToStub(stubId, "task.signal", { task_id: task.id, ...control });
+      }
+    }
     if (updated) webNs.emit("task.update", updated);
     res.json(updated || task);
   });

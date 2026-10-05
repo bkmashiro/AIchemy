@@ -12,6 +12,7 @@ import { spawn, ChildProcess } from "child_process";
 import path from "path";
 import net from "net";
 import fs from "fs";
+import os from "os";
 import { io as ioClient, Socket } from "socket.io-client";
 
 // Disable proxy
@@ -210,8 +211,8 @@ async function connectAndResume(url: string, token: string, opts: {
 let serverProcess: ChildProcess;
 let BASE: string;
 let TOKEN: string;
-const STATE_FILE = `/tmp/alchemy_scenario_${process.pid}.json`;
-const DB_FILE = `/tmp/alchemy_scenario_${process.pid}.db`;
+const STATE_FILE = path.join(os.tmpdir(), `alchemy_scenario_${process.pid}.json`);
+const DB_FILE = path.join(os.tmpdir(), `alchemy_scenario_${process.pid}.db`);
 const SERVER_DIR = path.join(__dirname, "../../server");
 
 beforeAll(async () => {
@@ -466,7 +467,7 @@ describe("run_dir computed by server", () => {
 
     expect(payload.run_dir).toBeTruthy();
     expect(typeof payload.run_dir).toBe("string");
-    // run_dir should contain fingerprint[:12]
+    // The server allocates a directory per task identity, stable on redispatch.
     expect(payload.run_dir.length).toBeGreaterThan(10);
 
     buf.destroy();
@@ -498,8 +499,11 @@ describe("run_dir computed by server", () => {
     const t2 = await r2.json();
     const p2 = await buf.waitForTask(t2.id);
 
-    // Same fingerprint → same run_dir
-    expect(p2.run_dir).toBe(p1.run_dir);
+    // The same task identity keeps its run_dir across redispatch, but a new
+    // task with the same fingerprint gets an isolated output directory.
+    expect(p1.run_dir).not.toBe(p2.run_dir);
+    expect(p1.run_dir.endsWith(t1.id)).toBe(true);
+    expect(p2.run_dir.endsWith(t2.id)).toBe(true);
 
     buf.destroy();
     socket.disconnect();

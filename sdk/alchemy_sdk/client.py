@@ -180,7 +180,14 @@ class Alchemy:
         Declare that a checkpoint has been saved at the given path.
         Does NOT call torch.save — caller is responsible for saving.
         """
-        self._transport.send({"type": "checkpoint", "path": path})
+        msg = {"type": "checkpoint", "path": path}
+        request_id = getattr(self._transport, "checkpoint_request_id", lambda: None)()
+        if request_id:
+            msg["request_id"] = request_id
+            remember = getattr(self._transport, "remember_checkpoint", None)
+            if remember:
+                remember(request_id, path)
+        self._transport.send(msg)
 
     def result_artifact(
         self,

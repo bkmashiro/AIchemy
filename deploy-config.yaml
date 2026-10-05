@@ -112,7 +112,7 @@ stubs:
     ssh_user: ys25
     runtime_mode: installed
     remote_dir: /vol/bitbucket/ys25/alchemy-v2/stub
-    python_path: /vol/bitbucket/ys25/alchemy-envs/t4/cpython-3.12-t4-e2e-20261006-d/bin/python
+    python_path: /vol/bitbucket/ys25/alchemy-envs/t4/cpython-3.12-t4-control-20261006-d/bin/python
     max_concurrent: 1
     partition: t4
     gres: "gpu:tesla_t4:1"

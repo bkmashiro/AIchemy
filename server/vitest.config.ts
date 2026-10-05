@@ -10,6 +10,8 @@ export default defineConfig({
       NO_PROXY: "127.0.0.1,localhost",
       no_proxy: "127.0.0.1,localhost",
       DB_FILE: ":memory:",
+      BIND_HOST: "127.0.0.1",
+      DEPLOY_CONFIG: path.resolve(__dirname, "tests/fixtures/deploy-disabled.yaml"),
     },
     // Include tests both in src/ and in ../tests/server/
     include: [

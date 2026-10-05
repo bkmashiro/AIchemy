@@ -208,7 +208,7 @@ vi.mock("../src/task-actions", () => ({
 // ─── Import after mocks ───────────────────────────────────────────────────────
 
 import { initiateKillChain, cancelKillChain, setupStubNamespace } from "../src/socket/stub";
-import { notifyCancelled, notifyFailed } from "../src/discord";
+import { notifyCancelled, notifyFailed, notifyCompleted } from "../src/discord";
 import { markDisconnected, cancelTask, clearDisconnected, resolveDeadTask, createRetryTask, failTask } from "../src/task-actions";
 import { reliableEmitToStub } from "../src/reliable";
 import { triggerSchedule } from "../src/scheduler";
@@ -1252,6 +1252,52 @@ describe("task.zombie event", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Cooperative stop: a zero exit is not experiment success.
+describe("cooperative task controls", () => {
+  it("treats cooperative stop exit 0 as cancelled and does not notify natural completion", () => {
+    const task = makeTask({ should_stop: true, control_requests: [{ request_id: "stop-1", signal: "should_stop", status: "received", updated_at: new Date().toISOString() }] });
+    const stub = makeStub({ tasks: [task] });
+    const { socketHandlers, webNs } = buildHarness({ preExistingStub: stub, resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234, alive: true }] } });
+    socketHandlers["task.completed"]?.({ task_id: task.id, exit_code: 0 }, () => {});
+    expect(_stubs.get(STUB_ID).tasks[0].status).toBe("cancelled");
+    expect(notifyCompleted).not.toHaveBeenCalled();
+    expect(notifyCancelled).toHaveBeenCalled();
+    expect(webNs.emit).toHaveBeenCalledWith("task.update", expect.objectContaining({ id: task.id, status: "cancelled" }));
+  });
+
+  it("does not resurrect an already-terminal task on a delayed completion", () => {
+    const task = makeTask({ status: "cancelled" });
+    const stub = makeStub({ tasks: [task] });
+    const { socketHandlers } = buildHarness({ preExistingStub: stub });
+    socketHandlers["task.completed"]?.({ task_id: task.id, exit_code: 0 }, () => {});
+    expect(_stubs.get(STUB_ID).tasks[0].status).toBe("cancelled");
+    expect(notifyCompleted).not.toHaveBeenCalled();
+  });
+
+  it("persists receipt separately and only completes a checkpoint after its path is reported", () => {
+    const task = makeTask({ control_requests: [{ request_id: "ckpt-1", signal: "should_checkpoint", status: "pending", updated_at: new Date().toISOString() }] });
+    const stub = makeStub({ tasks: [task] });
+    const { socketHandlers } = buildHarness({ preExistingStub: stub, resumePayload: { running_tasks: [{ task_id: task.id, pid: 1234, alive: true }] } });
+    const receivedAck = vi.fn();
+    socketHandlers["task.control.received"]?.({ task_id: task.id, request_id: "ckpt-1", signal: "should_checkpoint" }, receivedAck);
+    expect(receivedAck).toHaveBeenCalledWith({ ok: true });
+    expect(_stubs.get(STUB_ID).tasks[0].control_requests[0].status).toBe("received");
+
+    const earlyAck = vi.fn();
+    socketHandlers["task.control.completed"]?.({ task_id: task.id, request_id: "ckpt-1", path: "/runs/ckpt.pt" }, earlyAck);
+    expect(earlyAck).toHaveBeenCalledWith({ ok: false });
+    expect(_stubs.get(STUB_ID).tasks[0].control_requests[0].status).toBe("received");
+
+    socketHandlers["task.checkpoint"]?.({ task_id: task.id, request_id: "ckpt-1", path: "/runs/ckpt.pt" }, () => {});
+    // Another periodic save may become latest before the first completion ACK.
+    socketHandlers["task.checkpoint"]?.({ task_id: task.id, path: "/runs/periodic.pt" }, () => {});
+    const completedAck = vi.fn();
+    socketHandlers["task.control.completed"]?.({ task_id: task.id, request_id: "ckpt-1", path: "/runs/ckpt.pt" }, completedAck);
+    expect(completedAck).toHaveBeenCalledWith({ ok: true });
+    expect(_stubs.get(STUB_ID).tasks[0].control_requests[0]).toMatchObject({ status: "completed", path: "/runs/ckpt.pt" });
+  });
+});
+
 // Grid completion
 // ═══════════════════════════════════════════════════════════════════════════════
 

@@ -965,11 +965,79 @@ describe("PATCH /tasks/:id", () => {
     expect(res.status).toBe(200);
     expect(res.body.should_stop).toBe(true);
     expect(initiateKillChain).not.toHaveBeenCalled();
-    expect(reliableEmitToStub).toHaveBeenCalledWith(stub.id, "task.signal", {
+    expect(reliableEmitToStub).toHaveBeenCalledWith(stub.id, "task.signal", expect.objectContaining({
       task_id: task.id,
       signal: "should_stop",
-    });
+      request_id: expect.any(String),
+    }));
+    const requestId = res.body.control_requests?.[0]?.request_id;
+    await request(app).patch(`/tasks/${task.id}`).send({ should_stop: true });
+    expect(reliableEmitToStub).toHaveBeenCalledTimes(1);
+    expect(store.getTask(stub.id, task.id)?.control_requests?.[0]?.request_id).toBe(requestId);
     expect(store.getTask(stub.id, task.id)?.status).toBe("running");
+    const revoke = await request(app).patch(`/tasks/${task.id}`).send({ should_stop: false });
+    expect(revoke.status).toBe(409);
+    expect(store.getTask(stub.id, task.id)?.should_stop).toBe(true);
+  });
+
+  it("does not publish an unsaved control intent after a database failure", async () => {
+    const app = makeApp(undefined, makeWebNamespace());
+    const task = makeTask({ status: "running" });
+    const stub = makeStub({ tasks: [task] });
+    store.setStub(stub);
+    const write = vi.spyOn(store as any, "_saveTask").mockImplementationOnce(() => { throw new Error("injected control DB failure"); });
+    const failed = await request(app).patch(`/tasks/${task.id}`).send({ should_stop: true });
+    expect(failed.status).toBe(500);
+    expect(store.getTask(stub.id, task.id)?.should_stop).toBe(false);
+    expect(store.getTask(stub.id, task.id)?.control_requests || []).toHaveLength(0);
+    expect(reliableEmitToStub).not.toHaveBeenCalled();
+    write.mockRestore();
+    const retried = await request(app).patch(`/tasks/${task.id}`).send({ should_stop: true });
+    expect(retried.status).toBe(200);
+    expect(reliableEmitToStub).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let control flags bypass an explicit cancellation", async () => {
+    const app = makeApp(undefined, makeWebNamespace());
+    const task = makeTask({ status: "running" });
+    const stub = makeStub({ tasks: [task] });
+    store.setStub(stub);
+    const res = await request(app).patch(`/tasks/${task.id}`).send({ status: "cancelled", should_checkpoint: true });
+    expect(res.status).toBe(200);
+    expect(initiateKillChain).toHaveBeenCalledWith(stub.id, task.id);
+    expect(reliableEmitToStub).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid control booleans and queued controls without persisting intent", async () => {
+    const app = makeApp(undefined, makeWebNamespace());
+    const task = makeTask({ status: "pending" });
+    const stub = makeStub({ tasks: [task] });
+    store.setStub(stub);
+    const invalid = await request(app).patch(`/tasks/${task.id}`).send({ should_stop: "false" });
+    expect(invalid.status).toBe(400);
+    const queued = await request(app).patch(`/tasks/${task.id}`).send({ should_checkpoint: true });
+    expect(queued.status).toBe(409);
+    expect(store.getTask(stub.id, task.id)?.control_requests || []).toHaveLength(0);
+    expect(reliableEmitToStub).not.toHaveBeenCalled();
+  });
+
+  it("treats should_checkpoint as one explicit request per false→true edge", async () => {
+    const webNs = makeWebNamespace();
+    const app = makeApp(undefined, webNs);
+    const task = makeTask({ status: "running" });
+    const stub = makeStub({ tasks: [task] });
+    store.setStub(stub);
+
+    const first = await request(app).patch(`/tasks/${task.id}`).send({ should_checkpoint: true });
+    const firstId = first.body.control_requests[0].request_id;
+    await request(app).patch(`/tasks/${task.id}`).send({ should_checkpoint: true });
+    expect(reliableEmitToStub).toHaveBeenCalledTimes(1);
+
+    await request(app).patch(`/tasks/${task.id}`).send({ should_checkpoint: false });
+    const second = await request(app).patch(`/tasks/${task.id}`).send({ should_checkpoint: true });
+    expect(second.body.control_requests).toHaveLength(2);
+    expect(second.body.control_requests[1].request_id).not.toBe(firstId);
+    expect(reliableEmitToStub).toHaveBeenCalledTimes(2);
   });
 
   it("kill via PATCH calls cancelGlobalTask for pending task with no stub", async () => {

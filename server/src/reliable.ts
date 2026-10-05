@@ -78,7 +78,8 @@ export async function reliableEmitToStub(stubId: string, event: string, payload:
   let currentSocket = socket;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      await emitWithAck(currentSocket, event, payload);
+      const response = await emitWithAck(currentSocket, event, payload);
+      if (response?.ok === false) throw new Error(`negative ack for ${event}`);
       return; // ack received
     } catch (err) {
       // Abort if stub reconnected since we started

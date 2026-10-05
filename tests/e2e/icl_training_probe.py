@@ -41,6 +41,52 @@ def main() -> None:
     source = stage / ('missing-input' if args.mode == 'missing_read' else 'input.txt')
     writes = [str(stage / 'missing-parent' / 'output')] if args.mode == 'bad_write' else []
 
+    if args.mode == 'control':
+        @al.managed(total_steps=args.steps, reads=[str(stage / 'input.txt')], device='cpu')
+        def controlled(ctx):
+            checkpoints, errors = [], []
+            periodic_written = False
+            seen = []
+
+            def save_checkpoint(kind, request_id=None):
+                nonlocal checkpoints
+                failure = stage / ('fail-once-' + args.case)
+                if kind == 'requested' and failure.exists():
+                    failure.unlink()
+                    raise OSError('intentional checkpoint save failure')
+                path = ctx.checkpoint_dir / ((request_id or kind) + '.json')
+                temporary = path.with_suffix('.tmp')
+                temporary.write_text(json.dumps({'task_id': provenance['task_id'],
+                                                  'request_id': request_id, 'kind': kind, 'seen': seen}))
+                temporary.replace(path)
+                al.checkpoint(str(path))
+                checkpoints.append({'kind': kind, 'request_id': request_id, 'path': str(path)})
+
+            for step in ctx.steps():
+                seen.append(step)
+                if al.should_checkpoint():
+                    request_id = al._transport.checkpoint_request_id()
+                    try:
+                        save_checkpoint('requested', request_id)
+                    except OSError as error:
+                        errors.append({'request_id': request_id, 'error': str(error)})
+                if not periodic_written and any(c['kind'] == 'requested' for c in checkpoints):
+                    save_checkpoint('periodic')
+                    periodic_written = True
+                entry.write_text(json.dumps({**provenance, 'run_dir': str(ctx.run_dir),
+                                             'step': step, 'checkpoints': checkpoints, 'errors': errors}))
+                ctx.log(loss=1.0 / (step + 1))
+                time.sleep(0.2)
+            stopped = al.should_stop()
+            if stopped:
+                save_checkpoint('stop')
+            ctx.write_result({**provenance, 'stopped': stopped, 'seen': seen,
+                              'checkpoints': checkpoints, 'errors': errors}, 'control-result.json')
+            return {'stopped': int(stopped)}
+
+        controlled()
+        return
+
     if args.mode == 'managed':
         # The restored state tracks actual executed steps, independently of filenames.
         al._transport.close()

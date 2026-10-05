@@ -1626,17 +1626,21 @@ class Store {
         return undefined;
       }
     }
-    stub.tasks[idx] = { ...prev, ...update };
-    const updated = stub.tasks[idx];
-    this._reindexTask(prev, updated);
-
+    const updated = { ...prev, ...update };
     if (!this._isActive(updated.status)) {
+      stub.tasks[idx] = updated;
+      this._reindexTask(prev, updated);
       this._archiveTask(stubId, taskId, updated);
     } else {
-      this.db.transaction((tx) => {
+      // Commit the next snapshot before exposing it to readers/control retries.
+      // A failed write must not leave an in-memory intent that was never saved.
+      const nextStub = { ...stub, tasks: stub.tasks.map((task, index) => index === idx ? updated : task) };
+      this.db.transaction(() => {
         this._saveTask(updated, "stub");
-        this._saveStub(stub);
+        this._saveStub(nextStub);
       });
+      stub.tasks[idx] = updated;
+      this._reindexTask(prev, updated);
     }
     this._emitTaskStatusChange(prev, updated);
     return updated;

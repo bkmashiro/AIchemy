@@ -43,6 +43,25 @@ class TestHttpTransportSignals:
 
 
 class TestUnixSocketTransportSignals:
+    def test_periodic_checkpoint_does_not_reuse_completed_request_id(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            transport = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            al = Alchemy()
+            al._transport = transport
+            with patch.object(transport, "send") as send:
+                transport._handle_message('{"type":"signal","signal":"should_checkpoint","request_id":"requested"}')
+                assert al.should_checkpoint() is True
+                al.checkpoint("/runs/requested.pt")
+                assert send.call_args.args[0]["request_id"] == "requested"
+                al.checkpoint("/runs/periodic.pt")
+                assert "request_id" not in send.call_args.args[0]
+                transport._handle_message('{"type":"signal","signal":"should_checkpoint","request_id":"requested"}')
+                assert send.call_args.args[0] == {"type": "checkpoint", "request_id": "requested", "path": "/runs/requested.pt"}
+                assert al.should_checkpoint() is False
+            transport.close()
+
     def test_signals_initially_false(self):
         """Signal flags start False before any message received."""
         with patch.object(UnixSocketTransport, "_connect", return_value=False), \
@@ -67,8 +86,9 @@ class TestUnixSocketTransportSignals:
              patch.object(UnixSocketTransport, "_recv_loop"), \
              patch.object(UnixSocketTransport, "_heartbeat_loop"):
             t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
-            t._handle_message('{"type": "signal", "signal": "should_checkpoint"}')
+            t._handle_message('{"type": "signal", "signal": "should_checkpoint", "request_id": "ckpt-1"}')
             assert t.should_checkpoint() is True
+            assert t.should_checkpoint() is False
             assert t.should_stop() is False
 
     def test_handle_should_eval_signal(self):
@@ -78,6 +98,31 @@ class TestUnixSocketTransportSignals:
             t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
             t._handle_message('{"type": "signal", "signal": "should_eval"}')
             assert t.should_eval() is True
+
+    def test_checkpoint_retry_is_deduped_and_new_request_is_one_shot(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            t._handle_message('{"type":"signal","signal":"should_checkpoint","request_id":"same"}')
+            t._handle_message('{"type":"signal","signal":"should_checkpoint","request_id":"same"}')
+            assert t.should_checkpoint() is True
+            assert t.should_checkpoint() is False
+            t._handle_message('{"type":"signal","signal":"should_checkpoint","request_id":"next"}')
+            assert t.should_checkpoint() is True
+
+    def test_stop_is_level_triggered_and_acknowledged_once(self):
+        with patch.object(UnixSocketTransport, "_connect", return_value=False), \
+             patch.object(UnixSocketTransport, "_recv_loop"), \
+             patch.object(UnixSocketTransport, "_heartbeat_loop"):
+            t = UnixSocketTransport("/tmp/nonexistent.sock", "task-abc")
+            with patch.object(t, "send") as send:
+                t._handle_message('{"type":"signal","signal":"should_stop","request_id":"stop-1"}')
+                t._handle_message('{"type":"signal","signal":"should_stop","request_id":"stop-1"}')
+                assert t.should_stop() is True
+                assert t.should_stop() is True
+                assert send.call_count == 2
+                send.assert_called_with({"type": "control.received", "request_id": "stop-1"})
 
     def test_handle_unknown_signal_ignored(self):
         with patch.object(UnixSocketTransport, "_connect", return_value=False), \

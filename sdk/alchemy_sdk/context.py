@@ -225,7 +225,9 @@ class TrainingContext:
             self._fire("on_step_start", step)
             if self.should_eval():
                 self._fire("on_eval", step)
-            if self.should_checkpoint():
+            if self._hooks["on_checkpoint"] and self.should_checkpoint():
+                # One-shot remote requests must remain available to an explicit
+                # loop poll when there is no registered checkpoint hook.
                 self._fire("on_checkpoint", step)
 
             yield step

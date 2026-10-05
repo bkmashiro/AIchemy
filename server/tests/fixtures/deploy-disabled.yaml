@@ -1,0 +1,4 @@
+# Never inherit production tunnel or deployment targets in test servers.
+tunnel:
+  enabled: false
+stubs: []

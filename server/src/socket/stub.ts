@@ -385,8 +385,28 @@ export function setupStubNamespace(ns: Namespace, webNs: Namespace, deployConfig
 
     socket.on("task.checkpoint", (payload: TaskCheckpointPayload, ack?: Function) => {
       const stubId = socketToStub.get(socket.id);
-      if (stubId) handleTaskCheckpoint(stubId, payload, webNs);
-      if (ack) ack({ ok: true });
+      let ok = false;
+      try {
+        ok = Boolean(stubId && handleTaskCheckpoint(stubId, payload, webNs));
+      } catch (error) {
+        logger.error("task.checkpoint_persist_failed", { task_id: payload.task_id, error: String(error) });
+      }
+      if (ack) ack({ ok });
+    });
+
+    socket.on("task.control.received", (payload: { task_id: string; request_id: string; signal: "should_stop" | "should_checkpoint" }, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      const ok = Boolean(stubId && updateTaskControl(stubId, payload.task_id, payload.request_id, "received"));
+      if (ack) ack({ ok });
+    });
+
+    socket.on("task.control.completed", (payload: { task_id: string; request_id: string; path: string }, ack?: Function) => {
+      const stubId = socketToStub.get(socket.id);
+      const task = stubId ? store.getTask(stubId, payload.task_id) : undefined;
+      const checkpoint = task?.control_requests?.find((c) => c.request_id === payload.request_id && c.signal === "should_checkpoint");
+      const ok = Boolean(checkpoint && payload.path && checkpoint.path === payload.path
+        && stubId && updateTaskControl(stubId, payload.task_id, payload.request_id, "completed", payload.path));
+      if (ack) ack({ ok });
     });
 
     socket.on("preflight.fail", (payload: PreflightFailPayload, ack?: Function) => {
@@ -938,7 +958,7 @@ function handleResume(
         }
       } else {
         // Stub reports it running — clear any disconnected flag
-        if (task.stub_offline) {
+        if (task.disconnected_at || task.stub_offline) {
           const cleared = clearDisconnected(stubId, task.id);
           if (cleared) webNs.emit("task.update", cleared);
         }
@@ -1039,6 +1059,15 @@ function handleResume(
     config: { max_concurrent: maxConcurrent },
   });
 
+  for (const task of store.getStub(stubId)?.tasks || []) {
+    if (!["running", "assigned"].includes(task.status)) continue;
+    for (const control of task.control_requests || []) {
+      if (control.status !== "completed" && (control.signal !== "should_checkpoint" || task.should_checkpoint)) {
+        reliableEmitToStub(stubId, "task.signal", { task_id: task.id, signal: control.signal, request_id: control.request_id });
+      }
+    }
+  }
+
   // Notify web
   webNs.emit("stub.online", sanitizeStub(stub));
 
@@ -1108,6 +1137,28 @@ function handleTaskStarted(stubId: string, payload: TaskStartedPayload, webNs: N
 function handleTaskCompleted(stubId: string, payload: TaskCompletedPayload, webNs: Namespace): void {
   const task = store.getTask(stubId, payload.task_id);
   if (!task) return;
+
+  if (["completed", "failed", "cancelled"].includes(task.status)) return;
+  const cooperativelyStopped = Boolean(task.should_stop || task.control_requests?.some((c) => c.signal === "should_stop"));
+  if (cooperativelyStopped && payload.exit_code === 0) {
+    cancelKillChain(payload.task_id);
+    const updated = store.updateTask(stubId, payload.task_id, {
+      status: "cancelled" as import("../types").TaskStatus,
+      exit_code: payload.exit_code,
+      finished_at: new Date().toISOString(),
+      death_cause: "cooperative_stop",
+    });
+    if (updated) {
+      webNs.emit("task.update", updated);
+      notifyCancelled(updated).catch(() => {});
+      cascadeCancellation(payload.task_id, webNs);
+      if (updated.grid_id) checkGridCompletion(updated.grid_id, webNs);
+      const stub = store.getStub(stubId);
+      if (stub) maybeDispatch(stub);
+      triggerSchedule();
+    }
+    return;
+  }
 
   cancelKillChain(payload.task_id);
 
@@ -1314,16 +1365,29 @@ function handleTaskConfig(stubId: string, payload: TaskConfigPayload, webNs: Nam
   if (updated) webNs.emit("task.update", updated);
 }
 
-function handleTaskCheckpoint(stubId: string, payload: TaskCheckpointPayload, webNs: Namespace): void {
+function handleTaskCheckpoint(stubId: string, payload: TaskCheckpointPayload, webNs: Namespace): boolean {
   const task = store.getTask(stubId, payload.task_id);
-  if (!task) return;
+  if (!task || !payload.path || ["completed", "failed", "cancelled"].includes(task.status)) return false;
+  if (payload.request_id) {
+    const control = task.control_requests?.find((item) => item.request_id === payload.request_id && item.signal === "should_checkpoint");
+    if (!control) return false;
+    if (control.path === payload.path) return true; // idempotent replay after a lost ACK
+    if (control.status === "completed") return false;
+  }
 
   const newCount = (task.checkpoint_count || 0) + 1;
   const exports = { ...(task.exports || {}), last_checkpoint_path: payload.path };
+  const controls = (task.control_requests || []).map((item) => ({ ...item }));
+  if (payload.request_id) {
+    const control = controls.find((item) => item.request_id === payload.request_id)!;
+    control.path = payload.path;
+    control.updated_at = new Date().toISOString();
+  }
   const updated = store.updateTask(stubId, payload.task_id, {
     checkpoint_path: payload.path,
     checkpoint_count: newCount,
     exports,
+    ...(payload.request_id ? { control_requests: controls } : {}),
   });
   if (updated) {
     webNs.emit("task.update", updated);
@@ -1342,6 +1406,33 @@ function handleTaskCheckpoint(stubId: string, payload: TaskCheckpointPayload, we
       }
     }
   }
+  return Boolean(updated);
+}
+
+function updateTaskControl(
+  stubId: string,
+  taskId: string,
+  requestId: string,
+  status: "received" | "completed",
+  path?: string,
+): boolean {
+  const task = store.getTask(stubId, taskId);
+  if (!task || ["completed", "failed", "cancelled"].includes(task.status)) return false;
+  const controls = (task.control_requests || []).map((item) => ({ ...item }));
+  const control = controls.find((item) => item.request_id === requestId);
+  if (!control || (status === "completed" && control.signal !== "should_checkpoint")) return false;
+  if (control.status !== "completed") {
+    control.status = status;
+    control.updated_at = new Date().toISOString();
+    if (path) control.path = path;
+    try {
+      if (!store.updateTask(stubId, taskId, { control_requests: controls })) return false;
+    } catch (error) {
+      logger.error("task.control_persist_failed", { task_id: taskId, request_id: requestId, error: String(error) });
+      return false;
+    }
+  }
+  return true;
 }
 
 function createAutoEvalTask(parentTask: Task, stubId: string, webNs: Namespace): void {

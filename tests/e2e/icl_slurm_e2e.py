@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--evidence', required=True)
     parser.add_argument('--sdk-wheel', type=Path, required=True)
     parser.add_argument('--stub-wheel', type=Path, required=True)
+    parser.add_argument('--controls', action='store_true', help='also validate checkpoint/stop and a real SSH link outage')
     args = parser.parse_args()
     for wheel in [args.sdk_wheel, args.stub_wheel]:
         if not wheel.is_file():
@@ -47,8 +48,8 @@ def main():
     def save():
         (evidence / 'summary.json').write_text(json.dumps(summary, indent=2))
 
-    def remote(code):
-        result = subprocess.run([*SSH, 'python3 -'], input=code, text=True, capture_output=True, timeout=40)
+    def remote(code, timeout=40):
+        result = subprocess.run([*SSH, 'python3 -'], input=code, text=True, capture_output=True, timeout=timeout)
         if result.returncode:
             raise RuntimeError('login SSH failed: ' + result.stderr[-1500:])
         return result.stdout
@@ -134,13 +135,20 @@ def main():
 #SBATCH --gres=gpu:tesla_t4:1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem={memory}
-#SBATCH --time=00:10:00
+#SBATCH --time=00:20:00
 #SBATCH --job-name=alchemy-t4-{memory}
 #SBATCH --output={stage}/slurm-%j.log
 #SBATCH --chdir={stage}
 set -euo pipefail
 umask 077
-/usr/bin/python3.12 -I {stage}/worker.py --stage {stage} --runtime {runtime} {'--prepare' if prepare else ''}
+/usr/bin/python3.12 -I {stage}/worker.py --stage {stage} --runtime {runtime} {'--prepare' if prepare else ''} &
+worker_pid=$!
+trap 'kill -USR1 "$worker_pid" 2>/dev/null || true' USR1
+worker_status=0
+while kill -0 "$worker_pid" 2>/dev/null; do
+  if wait "$worker_pid"; then worker_status=0; else worker_status=$?; fi
+done
+exit "$worker_status"
 ''')
         payload = [sdk_wheel, stub_wheel, REPO / 'tests/e2e/slurm_runtime_probe.py',
                    REPO / 'tests/e2e/slurm_test_worker.py', REPO / 'tests/e2e/icl_training_probe.py',
@@ -209,6 +217,91 @@ import json
 print(json.dumps([json.loads((Path(x)/'result.json').read_text()) for x in {[result_a['run_dir'],result_b['run_dir']]!r}]))
 '''))
         check('real_sdk_installed_python312', all(x['prefix'] == runtime and x['sdk_origin'].startswith(runtime) for x in result))
+        if args.controls:
+            def read_trace(case):
+                return json.loads(remote(f'from pathlib import Path\nimport sys\nsys.stdout.write((Path({stage!r})/"entries"/{(case+".json")!r}).read_text())\n'))
+
+            case = 'cooperative-control'
+            remote(f'from pathlib import Path\n(Path({stage!r})/{("fail-once-"+case)!r}).touch()\n')
+            exp = Experiment(name + '-controls', server=base)
+            exp.base_config({'probe_parameter': 17})
+            train = exp.task('train', script=runtime + '/bin/python',
+                             argv=[stage + '/probe.py', '--stage', stage, '--case', case,
+                                   '--mode', 'control', '--steps', '2000'], cwd=stage,
+                             target_stub_id=stubs[a]['id'], requirements={'cpu_mem_mb': 128, 'gpu_mem_mb': 256})
+            exp.task('must-not-run', script='/bin/true', depends_on=[train], cwd=stage,
+                     target_stub_id=stubs[a]['id'], requirements={'cpu_mem_mb': 64})
+            submitted = exp.submit(idempotency_key=name + '-controls')
+            tid, downstream = submitted.task_refs['train'], submitted.task_refs['must-not-run']
+            summary['tasks'][tid] = {'case': case}
+            summary['tasks'][downstream] = {'case': 'blocked-descendant'}
+            wait(lambda: api('/tasks/' + tid).get('progress'), 30)
+
+            def checkpoint_request():
+                api('/tasks/' + tid, 'PATCH', {'should_checkpoint': False})
+                patched = api('/tasks/' + tid, 'PATCH', {'should_checkpoint': True})
+                return patched['control_requests'][-1]['request_id']
+
+            def control_state(request_id):
+                task = api('/tasks/' + tid)
+                return next(c for c in task['control_requests'] if c['request_id'] == request_id)
+
+            failed_request = checkpoint_request()
+            wait(lambda: control_state(failed_request)['status'] == 'received', 20)
+            trace = read_trace(case)
+            check('failed_save_not_falsely_completed', control_state(failed_request)['status'] != 'completed'
+                  and any(e['request_id'] == failed_request for e in trace['errors']))
+            first_request = checkpoint_request()
+            wait(lambda: control_state(first_request)['status'] == 'completed', 25)
+            saved = control_state(first_request)
+            body = json.loads(remote(f'from pathlib import Path\nprint(Path({saved["path"]!r}).read_text())\n'))
+            check('checkpoint_completion_corresponds_to_real_file', body['request_id'] == first_request and body['task_id'] == tid)
+            duplicate = api('/tasks/' + tid, 'PATCH', {'should_checkpoint': True})
+            check('repeat_checkpoint_patch_reuses_identity', len(duplicate['control_requests']) == 2)
+            wait(lambda: api('/tasks/' + tid).get('checkpoint_path', '').endswith('/periodic.json'), 20)
+            check('periodic_save_does_not_overwrite_control_path', control_state(first_request)['path'] == saved['path'])
+
+            before = read_trace(case)
+            previous_pid = api('/tasks/' + tid)['pid']
+            tunnel.terminate();tunnel.wait(timeout=10)
+            def disconnected():
+                task = api('/tasks/' + tid)
+                return task if task.get('disconnected_at') else None
+            offline = wait(disconnected, 25)
+            check('link_loss_does_not_fail_training', offline['status'] == 'running' and offline['pid'] == previous_pid)
+            offline_request = checkpoint_request()
+            check('offline_control_stays_pending', control_state(offline_request)['status'] == 'pending')
+            after = read_trace(case)
+            check('training_advances_while_server_unreachable', after['step'] > before['step'])
+            reconnect_log = (evidence / 'reconnect-tunnel.log').open('w');files.append(reconnect_log)
+            tunnel = subprocess.Popen([*SSH[:-1], '-N', '-o', 'ExitOnForwardFailure=yes',
+                                       '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2',
+                                       '-R', '127.0.0.1:34228:127.0.0.1:34227', SSH[-1]],
+                                      stdout=reconnect_log, stderr=subprocess.STDOUT, start_new_session=True)
+            processes.append(tunnel)
+            wait(lambda: control_state(offline_request)['status'] == 'completed', 65)
+            recovered = api('/tasks/' + tid)
+            check('same_task_and_pid_survive_reconnect', recovered['pid'] == previous_pid and not recovered.get('disconnected_at'))
+            trace = read_trace(case)
+            requested = [c for c in trace['checkpoints'] if c['kind'] == 'requested']
+            check('replayed_requests_saved_exactly_once', [c['request_id'] for c in requested] == [first_request, offline_request], requested)
+            stopped = api('/tasks/' + tid, 'PATCH', {'should_stop': True})
+            stop_id = stopped['control_requests'][-1]['request_id']
+            final = task_wait(tid)
+            check('cooperative_zero_exit_is_cancelled', final['status'] == 'cancelled' and final.get('exit_code') == 0
+                  and final.get('death_cause') == 'cooperative_stop')
+            check('stop_received_by_sdk', any(c['request_id'] == stop_id and c['status'] == 'received' for c in final['control_requests']))
+            descendant = api('/tasks/' + downstream)
+            summary['tasks'][downstream].update(descendant)
+            check('stopped_training_does_not_promote_success_dag', descendant['status'] == 'cancelled' and not descendant.get('pid'))
+            terminal_experiment = wait(lambda: (
+                lambda data: data if data['status'] != 'running' else None
+            )(api('/experiments/' + submitted.experiment_id)), 10)
+            check('stopped_experiment_is_terminal_non_success', terminal_experiment['status'] in ['failed', 'partial', 'cancelled'], terminal_experiment['status'])
+            final_report = json.loads(remote(f'from pathlib import Path\nprint((Path({final["run_dir"]!r})/"control-result.json").read_text())\n'))
+            check('stop_saves_checkpoint_and_result_before_exit', final_report['stopped']
+                  and final_report['checkpoints'][-1]['kind'] == 'stop' and len(final_report['seen']) < 2000)
+            summary['control_result'] = final_report
         summary['status'] = 'passed'
     except BaseException as error:
         summary['status'] = 'failed';summary['error'] = str(error)
@@ -220,23 +313,46 @@ print(json.dumps([json.loads((Path(x)/'result.json').read_text()) for x in {[res
 import json,subprocess,time,re
 p=Path({stage!r});jobs={summary['jobs']!r}
 if p.exists(): (p/'STOP').touch()
+if jobs:
+ subprocess.run(['scancel','--signal=USR1','--batch',*jobs],capture_output=True)
+
+def cleanup_receipt(j):
+ # The Slurm stdout file existed from startup; use its explicit receipt to
+ # avoid negative-directory caching of newly created shared-mount files.
+ log=p/('slurm-'+j+'.log')
+ if log.exists():
+  for line in reversed(log.read_text().splitlines()):
+   try: item=json.loads(line)
+   except ValueError: continue
+   if isinstance(item,dict) and item.get('job_id')==j and 'test_cleanup_receipt' in item:
+    return item['test_cleanup_receipt']
+ f=p/('job-'+j)/'cleanup.json'
+ return json.loads(f.read_text()) if f.exists() else None
+
 deadline=time.monotonic()+30
 while jobs and time.monotonic()<deadline:
- if all((p/('job-'+j)/'cleanup.json').exists() for j in jobs): break
+ if all(cleanup_receipt(j) for j in jobs): break
  time.sleep(.5)
-time.sleep(1)
+time.sleep(3)
 output={{'logs':{{}},'cleanup':{{}},'scheduler':{{}}}}
 for j in jobs:
  f=p/('slurm-'+j+'.log');output['logs'][j]=f.read_text()[-30000:] if f.exists() else 'missing log'
- f=p/('job-'+j)/'cleanup.json';output['cleanup'][j]=json.loads(f.read_text()) if f.exists() else None
+ output['cleanup'][j]=cleanup_receipt(j)
  r=subprocess.run(['scontrol','show','job',j],capture_output=True,text=True)
  output['scheduler'][j]=r.stdout or r.stderr
  state=re.search(r'JobState=(\\w+)',r.stdout)
- if state and state.group(1) in ['RUNNING','PENDING','COMPLETING','SUSPENDED']:
+ if state and state.group(1)=='COMPLETING' and output['cleanup'][j]:
+  # Batch exit and scheduler epilog completion are separate acknowledgements.
+  # Do not cancel a successfully exiting job merely because epilog is in flight.
+  time.sleep(10)
+  r=subprocess.run(['scontrol','show','job',j],capture_output=True,text=True)
+  output['scheduler'][j]=r.stdout or r.stderr
+  state=re.search(r'JobState=(\\w+)',r.stdout)
+ if state and state.group(1) in ['RUNNING','PENDING','SUSPENDED']:
   subprocess.run(['scancel',j],capture_output=True)
   output['scheduler'][j]+='\\nController cancelled this still-active test job after bounded cleanup.'
 print(json.dumps(output))
-''')
+''', timeout=80)
             receipts = json.loads(text)
             (evidence / 'slurm-logs.json').write_text(json.dumps(receipts['logs'], indent=2))
             summary['cleanup'] = receipts['cleanup']

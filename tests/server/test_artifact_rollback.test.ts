@@ -11,6 +11,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn, ChildProcess } from "child_process";
 import path from "path";
 import net from "net";
+import os from "os";
 
 // Disable proxy
 delete process.env.http_proxy;
@@ -69,8 +70,8 @@ async function apiGet(url: string, token: string) {
 let serverProcess: ChildProcess;
 let BASE_URL: string;
 const TOKEN = "alchemy-v2-token";
-const STATE_FILE = `/tmp/alchemy_test_rollback_state_${process.pid}.json`;
-const DB_FILE = `/tmp/alchemy_test_rollback_state_${process.pid}.db`;
+const STATE_FILE = path.join(os.tmpdir(), `alchemy_test_rollback_state_${process.pid}.json`);
+const DB_FILE = path.join(os.tmpdir(), `alchemy_test_rollback_state_${process.pid}.db`);
 const SERVER_DIR = path.join(__dirname, "../../server");
 
 beforeAll(async () => {

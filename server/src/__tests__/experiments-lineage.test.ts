@@ -161,6 +161,9 @@ describe("experiment submission preflight", () => {
     const byRef = new Map(store.getGridTasks(response.body.grid_id).map((task) => [task.ref, task]));
     expect(byRef.get("eval")?.depends_on).toEqual([byRef.get("train")?.id]);
     expect(byRef.get("train")?.depends_on).toEqual([byRef.get("root")?.id]);
+    expect(byRef.get("root")?.status).toBe("pending");
+    expect(byRef.get("train")?.status).toBe("blocked");
+    expect(byRef.get("eval")?.status).toBe("blocked");
     expect(store.getAllTasks()).toHaveLength(3);
     expect(store.getAllGrids()).toHaveLength(1);
     expect(store.getAllExperiments()).toHaveLength(1);

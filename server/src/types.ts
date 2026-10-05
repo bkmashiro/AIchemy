@@ -228,6 +228,13 @@ export interface Task {
   // should_stop is a cooperative SDK signal. It must not imply process kill.
   should_stop: boolean;
   should_checkpoint: boolean;
+  control_requests?: Array<{
+    request_id: string;
+    signal: "should_stop" | "should_checkpoint";
+    status: "pending" | "received" | "completed";
+    path?: string;
+    updated_at: string;
+  }>;
   // kill_requested is server-internal intent for destructive task.kill chains.
   kill_requested?: boolean;
 
@@ -533,6 +540,7 @@ export interface TaskConfigPayload {
 export interface TaskCheckpointPayload {
   task_id: string;
   path: string;
+  request_id?: string;
 }
 
 export interface PreflightFailPayload {

@@ -63,6 +63,8 @@ class TaskSocket:
         on_notify: Callable[..., Awaitable[None]] | None = None,
         on_phase: Callable[..., Awaitable[None]] | None = None,
         on_zombie: Callable[..., Awaitable[None]] | None = None,
+        on_control_received: Callable[..., Awaitable[None]] | None = None,
+        on_control_completed: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         self.task_id = task_id
         self.pid = pid
@@ -75,11 +77,16 @@ class TaskSocket:
         self._on_notify = on_notify
         self._on_phase = on_phase
         self._on_zombie = on_zombie
+        self._on_control_received = on_control_received
+        self._on_control_completed = on_control_completed
 
         self._sock_path = task_socket_path(task_id)
         self._server: asyncio.AbstractServer | None = None
         self._last_heartbeat = time.monotonic()
         self._writers: list[asyncio.StreamWriter] = []
+        self._controls: dict[str, dict[str, Any]] = {}
+        self._received_controls: set[str] = set()
+        self._completed_controls: set[str] = set()
         self._zombie_task: asyncio.Task | None = None
         self._running = False
 
@@ -135,6 +142,12 @@ class TaskSocket:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self._writers.append(writer)
+        for request_id, control in self._controls.items():
+            try:
+                writer.write((json.dumps({"type": "signal", "signal": control["signal"], "request_id": request_id}) + "\n").encode())
+                await writer.drain()
+            except (ConnectionError, OSError):
+                break
         try:
             while True:
                 line = await reader.readline()
@@ -165,7 +178,34 @@ class TaskSocket:
             return
 
         mtype = msg.get("type")
-        if mtype == "heartbeat":
+        if mtype == "control.received":
+            request_id = msg.get("request_id")
+            if request_id and request_id in self._controls:
+                self._received_controls.add(request_id)
+                if self._on_control_received:
+                    await self._on_control_received(self.task_id, request_id, self._controls[request_id]["signal"])
+        elif mtype == "checkpoint":
+            request_id = msg.get("request_id")
+            path = msg.get("path", "")
+            if not path:
+                return
+            if request_id and request_id not in self._controls:
+                # A completed retry or unknown control must never be downgraded
+                # into an unsolicited checkpoint, which would double-count it.
+                return
+            if request_id and self._controls[request_id]["signal"] != "should_checkpoint":
+                return
+            if request_id and request_id in self._controls:
+                if not self._on_checkpoint or not self._on_control_completed:
+                    return
+                await self._on_checkpoint(self.task_id, path, request_id)
+                await self._on_control_completed(self.task_id, request_id, path)
+                self._controls.pop(request_id, None)
+                self._received_controls.discard(request_id)
+                self._completed_controls.add(request_id)
+            elif self._on_checkpoint:
+                await self._on_checkpoint(self.task_id, path)
+        elif mtype == "heartbeat":
             self._last_heartbeat = time.monotonic()
         elif mtype == "progress":
             self._last_heartbeat = time.monotonic()
@@ -180,9 +220,7 @@ class TaskSocket:
         elif mtype == "eval":
             if self._on_eval:
                 await self._on_eval(self.task_id, msg.get("metrics") or {})
-        elif mtype == "checkpoint":
-            if self._on_checkpoint:
-                await self._on_checkpoint(self.task_id, msg.get("path", ""))
+
         elif mtype == "config":
             if self._on_config:
                 await self._on_config(self.task_id, msg.get("config") or {})
@@ -209,6 +247,25 @@ class TaskSocket:
                 await self._on_phase(self.task_id, msg.get("phase", ""))
         else:
             log.debug("unknown SDK message type: %s", mtype)
+
+    async def send_control(self, signal: str, request_id: str) -> bool:
+        """Queue/deliver a control to all SDK connections; ID deduplicates retries."""
+        if signal == "should_stop":
+            self._controls[request_id] = {"signal": signal}
+        elif signal == "should_checkpoint":
+            if request_id in self._completed_controls:
+                return True
+            self._controls.setdefault(request_id, {"signal": signal})
+        else:
+            return False
+        payload = (json.dumps({"type": "signal", "signal": signal, "request_id": request_id}) + "\n").encode()
+        for writer in tuple(self._writers):
+            try:
+                writer.write(payload)
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+        return True
 
     # ------------------------------------------------------------------ #
     # Zombie detection                                                     #

@@ -38,6 +38,27 @@ def _make_ctx(tmp_path, total_steps=10, eval_every=0, checkpoint_every=0, manage
 # _makedirs_002 — umask thread safety
 # ---------------------------------------------------------------------------
 
+def test_steps_leaves_one_shot_checkpoint_for_explicit_poll_without_hook(tmp_path):
+    ctx, al = _make_ctx(tmp_path)
+    al.should_checkpoint.side_effect = [True, False]
+    iterator = ctx.steps()
+    assert next(iterator) == 0
+    al.should_checkpoint.assert_not_called()
+    assert ctx.should_checkpoint() is True
+    assert ctx.should_checkpoint() is False
+
+
+def test_steps_consumes_one_shot_checkpoint_when_hook_handles_it(tmp_path):
+    ctx, al = _make_ctx(tmp_path)
+    al.should_checkpoint.side_effect = [True, False]
+    handled = []
+    ctx.on("on_checkpoint", lambda context, step: handled.append(step))
+    iterator = ctx.steps()
+    assert next(iterator) == 0
+    assert handled == [0]
+    assert ctx.should_checkpoint() is False
+
+
 class TestMakedirs002:
     def test_creates_directory(self, tmp_path):
         from alchemy_sdk.context import _makedirs_002

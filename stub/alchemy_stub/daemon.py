@@ -83,6 +83,7 @@ class StubDaemon:
         self.gpu_monitor = GpuMonitor()
         self.system_monitor = SystemMonitor(gpu_monitor=self.gpu_monitor)
         self.task_socket_registry = TaskSocketRegistry()
+        self._pending_task_controls: dict[str, dict[str, dict[str, str]]] = {}
 
         identity = config.identity_hash
         # Use /tmp for PID file and log dir to avoid home-dir permission issues
@@ -194,8 +195,9 @@ class StubDaemon:
             data = _extract_dict(args)
             ack = _find_ack(args)
             if data:
-                if ack: ack({"ok": True})
-                await self._handle_task_signal(data)
+                delivered = await self._handle_task_signal(data)
+                if ack:
+                    ack({"ok": delivered})
 
         @sio.on("config.update", namespace="/stubs")
         async def on_config_update(*args):
@@ -633,7 +635,14 @@ class StubDaemon:
                 on_notify=self._on_sdk_notify,
                 on_phase=self._on_sdk_phase,
                 on_zombie=self._on_task_zombie,
+                on_control_received=self._on_control_received,
+                on_control_completed=self._on_control_completed,
             )
+            task_socket = self.task_socket_registry.get(task_id)
+            pending = self._pending_task_controls.pop(task_id, {})
+            if task_socket:
+                for request_id, control in pending.items():
+                    await task_socket.send_control(control["signal"], request_id)
         except Exception as e:
             log.warning("Failed to create task socket for %s: %s", task_id, e)
 
@@ -657,11 +666,33 @@ class StubDaemon:
         finally:
             self._killing.discard(task_id)
 
-    async def _handle_task_signal(self, data: dict) -> None:
-        # Legacy handler kept for backward compatibility — currently a no-op.
-        task_id: str = data.get("task_id", "")
-        sig: str = data.get("signal", "")
-        log.debug("task.signal (ignored, deprecated): task=%s signal=%s", task_id, sig)
+    async def _handle_task_signal(self, data: dict) -> bool:
+        """Forward server intent to a live SDK socket; no false ACK here."""
+        task_id = data.get("task_id")
+        signal = data.get("signal")
+        request_id = data.get("request_id")
+        if not task_id or signal not in {"should_stop", "should_checkpoint"}:
+            return False
+        request_id = request_id or f"legacy:{task_id}:{signal}"
+        task_socket = self.task_socket_registry.get(task_id)
+        if task_socket:
+            return await task_socket.send_control(signal, request_id)
+        self._pending_task_controls.setdefault(task_id, {})[request_id] = {"signal": signal}
+        return False
+
+    async def _on_control_received(self, task_id: str, request_id: str, signal: str) -> None:
+        await self._emit_control_ack("task.control.received", {"task_id": task_id, "request_id": request_id, "signal": signal})
+
+    async def _on_control_completed(self, task_id: str, request_id: str, path: str) -> None:
+        await self._emit_control_ack("task.control.completed", {"task_id": task_id, "request_id": request_id, "path": path})
+
+    async def _emit_control_ack(self, event: str, payload: dict) -> None:
+        """Require server persistence ACK before dropping a delivered control."""
+        if not self._connected:
+            raise ConnectionError(f"cannot acknowledge {event} while disconnected")
+        response = await self.sio.call(event, payload, namespace="/stubs", timeout=10)
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            raise RuntimeError(f"server rejected {event} for task {payload.get('task_id')}")
 
     async def _handle_config_update(self, data: dict) -> None:
         if "max_concurrent" in data:
@@ -811,6 +842,7 @@ class StubDaemon:
             await self._emit("task.log", {"task_id": task_id, "lines": lines})
 
     async def _on_task_completed(self, task_id: str, exit_code: int, death_cause: str = "success", has_checkpoint: bool = False) -> None:
+        self._pending_task_controls.pop(task_id, None)
         self.last_task_time = time.time()
         duration_s = round(time.time() - self._task_start_times.pop(task_id, time.time()))
         jlog("info", "task.completed", task_id=task_id, exit_code=exit_code, duration_s=duration_s)
@@ -824,6 +856,7 @@ class StubDaemon:
         })
 
     async def _on_task_failed(self, task_id: str, exit_code: int, error: str, death_cause: str = "code_error", has_checkpoint: bool = False) -> None:
+        self._pending_task_controls.pop(task_id, None)
         self.last_task_time = time.time()
         duration_s = round(time.time() - self._task_start_times.pop(task_id, time.time()))
         jlog("warn", "task.failed", task_id=task_id, exit_code=exit_code, error=error, death_cause=death_cause, duration_s=duration_s)
@@ -895,8 +928,12 @@ class StubDaemon:
     async def _on_sdk_eval(self, task_id: str, metrics: dict) -> None:
         await self._emit("task.eval", {"task_id": task_id, "metrics": metrics})
 
-    async def _on_sdk_checkpoint(self, task_id: str, path: str) -> None:
-        await self._emit("task.checkpoint", {"task_id": task_id, "path": path})
+    async def _on_sdk_checkpoint(self, task_id: str, path: str, request_id: str | None = None) -> None:
+        payload = {"task_id": task_id, "path": path, **({"request_id": request_id} if request_id else {})}
+        if request_id:
+            await self._emit_control_ack("task.checkpoint", payload)
+        else:
+            await self._emit("task.checkpoint", payload)
 
     async def _on_sdk_config(self, task_id: str, config: dict) -> None:
         await self._emit("task.config", {"task_id": task_id, "config": config})

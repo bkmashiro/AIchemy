@@ -854,6 +854,23 @@ class TestSdkCallbacks:
         assert ckpt_calls[0][0][1]["path"] == "/checkpoints/step100.pt"
 
     @pytest.mark.asyncio
+    async def test_task_signal_routes_to_registered_task_socket(self, daemon):
+        task_socket = MagicMock()
+        task_socket.send_control = AsyncMock(return_value=True)
+        daemon.task_socket_registry.get.return_value = task_socket
+        assert await daemon._handle_task_signal({
+            "task_id": "task-1", "signal": "should_checkpoint", "request_id": "ckpt-1",
+        }) is True
+        task_socket.send_control.assert_awaited_once_with("should_checkpoint", "ckpt-1")
+
+    @pytest.mark.asyncio
+    async def test_task_signal_is_not_acked_when_task_socket_missing(self, daemon):
+        daemon.task_socket_registry.get.return_value = None
+        assert await daemon._handle_task_signal({
+            "task_id": "task-1", "signal": "should_stop", "request_id": "stop-1",
+        }) is False
+
+    @pytest.mark.asyncio
     async def test_on_sdk_result_emits_event(self, daemon):
         await daemon._on_sdk_result(
             "task-1",
