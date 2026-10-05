@@ -7,6 +7,15 @@ import pytest
 from alchemy_sdk.experiment import Experiment, RuntimeProfile
 
 
+@pytest.mark.parametrize("value", [0, -1, True, "128", float("nan"), float("inf")])
+@pytest.mark.parametrize("field", ["cpu_mem_mb", "gpu_mem_mb"])
+def test_invalid_memory_requirement_rejected_locally(value, field):
+    exp = Experiment("invalid-memory")
+    exp.task("train", script="/opt/python", requirements={field: value})
+    with pytest.raises(ValueError, match=f"requirements.{field} must be a positive finite number"):
+        exp.dry_run()
+
+
 def test_experiment_code_id_is_explicit_human_reference_in_spec():
     spec = Experiment(
         code_id="jema.atari.coverage500.v1",
@@ -461,14 +470,12 @@ def test_dry_run_accepts_explicit_exclusive_gpu_without_memory_reservation():
     assert not any(w["code"] == "gpu_memory_unreserved" for w in warnings)
 
 
-def test_dry_run_warns_non_positive_resource_requirement():
+def test_dry_run_rejects_non_positive_resource_requirement_before_submission():
     exp = Experiment("invalid-resource")
     exp.task("train", script="/bin/python", requirements={"cpu_mem_mb": 0})
 
-    warnings = exp.dry_run()["warnings"]
-
-    warning = next(w for w in warnings if w["code"] == "invalid_resource_requirement")
-    assert warning["field"] == "requirements.cpu_mem_mb"
+    with pytest.raises(ValueError, match=r"requirements.cpu_mem_mb.*omit it when not required"):
+        exp.dry_run()
 
 
 def test_dry_run_warns_duplicate_relative_output_args():

@@ -10,6 +10,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 export function validateTaskExecutionSpec(input: TaskExecutionSpecInput): string | undefined {
   if (input.requirements !== undefined) {
     if (!isPlainObject(input.requirements)) return "requirements must be an object";
+    for (const field of ["cpu_mem_mb", "gpu_mem_mb"]) {
+      const value = input.requirements[field];
+      if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+        return `requirements.${field} must be a positive finite number; omit it when not required`;
+      }
+    }
     const gpuType = input.requirements.gpu_type;
     if (gpuType !== undefined) {
       if (!Array.isArray(gpuType)) return "requirements.gpu_type must be an array of non-empty strings";

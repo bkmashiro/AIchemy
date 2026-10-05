@@ -28,6 +28,16 @@ function makeApp() {
 beforeEach(() => store.reset());
 
 describe("experiment task execution spec validation", () => {
+  it.each([0, -1, true, "128"])("rejects invalid memory requirement %s before queuing", async (value) => {
+    for (const field of ["cpu_mem_mb", "gpu_mem_mb"]) {
+      const res = await request(makeApp()).post("/experiments").send({
+        name: "invalid-memory", task_specs: [{ ref: "train", script: "/opt/python", requirements: { [field]: value } }],
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain(`requirements.${field} must be a positive finite number`);
+      expect(store.getAllTasks()).toHaveLength(0);
+    }
+  });
   it("rejects malformed GPU requirements before materializing DAG tasks", async () => {
     const res = await request(makeApp()).post("/experiments").send({
       name: "invalid-gpu-type",

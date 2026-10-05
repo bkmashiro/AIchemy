@@ -5,6 +5,7 @@ import copy
 import hashlib
 import itertools
 import json
+import math
 import os
 import re
 import subprocess
@@ -687,6 +688,20 @@ class Experiment:
             if requirements is not None:
                 if not isinstance(requirements, Mapping):
                     raise ValueError(f"Task {ref!r}: requirements must be an object")
+                for field in ("cpu_mem_mb", "gpu_mem_mb"):
+                    if field not in requirements:
+                        continue
+                    value = requirements[field]
+                    try:
+                        valid = (not isinstance(value, bool) and isinstance(value, (int, float))
+                                 and value > 0 and math.isfinite(value))
+                    except OverflowError:
+                        valid = False
+                    if not valid:
+                        raise ValueError(
+                            f"Task {ref!r}: requirements.{field} must be a positive finite number; "
+                            "omit it when not required"
+                        )
                 gpu_type = requirements.get("gpu_type")
                 if gpu_type is not None and (
                     not isinstance(gpu_type, list)

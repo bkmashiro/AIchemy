@@ -38,6 +38,7 @@ import { ALCHEMY_VERSION } from "./version";
 import { startWebhookDispatcher } from "./webhooks";
 
 const PORT = parseInt(process.env.PORT || "3002", 10);
+const BIND_HOST = process.env.BIND_HOST;
 
 // ─── Deploy config ──────────────────────────────────────────────────────────
 
@@ -344,7 +345,7 @@ process.on("SIGINT", async () => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-httpServer.listen(PORT, () => {
+httpServer.listen({ port: PORT, host: BIND_HOST }, () => {
   logger.info("server.start", { port: PORT, version: ALCHEMY_VERSION });
   store.startPersistence();
 
